@@ -25,3 +25,11 @@ HEAD	fast_expert_io.c	397.0	17.0	0.00	0	0	keep	C extension benchmark: 18.8 GB/s 
 575e370	Qwen3.5-397B-A17B-4bit	397.0	17.0	0.35	19007	26.2	discard	C extension integrated - memory contention with MLX, 2.6GB/s (worse than mmap)
 c4b2795	Qwen3.5-397B-A17B-4bit	397.0	17.0	1.16	9008	26.0	keep	batch-experts 50tok - mx.eval 224→183ms (18% faster), 2 syncs/layer
 c4b2795	Qwen3.5-397B-A17B-4bit	397.0	17.0	1.28	9184	26.9	keep	batch-experts 200tok - 58% cache hit plateau, 1.28 tok/s steady state
+13e265c	Qwen3.5-397B-A17B-4bit	397.0	17.0	1.67	5325	28.1	keep	K=6 expert pruning 50tok - 40% less I/O, coherent output
+13e265c	Qwen3.5-397B-A17B-4bit	397.0	17.0	2.37	3661	28.2	keep	K=4 expert pruning 100tok - 60% hit, best cached config
+13e265c	Qwen3.5-397B-A17B-4bit	397.0	17.0	2.72	2882	28.1	discard	K=3 expert pruning - quality collapse (model outputs end token only)
+5619b18	Qwen3.5-397B-A17B-4bit	397.0	17.0	2.21	3364	5.4	keep	no-cache mode 100tok - 81% less RAM, mx.eval 183→124ms (32% compute win)
+5619b18	Qwen3.5-397B-A17B-4bit	397.0	17.0	2.23	3263	5.7	discard	no-cache+C-ext - same as mmap (9 scattered reads = structural bottleneck)
+5619b18	Qwen3.5-397B-A17B-4bit	397.0	17.0	2.20	3591	13.2	keep	10GB cache sweep - 43% hit, 13.2GB RAM
+5619b18	Qwen3.5-397B-A17B-4bit	397.0	17.0	2.33	3633	21.5	keep	20GB cache sweep - 54% hit, 21.5GB RAM
+b52d187	Qwen3.5-397B-A17B-4bit	397.0	17.0	2.05	3068	5.9	keep	packed layers 0-8 + no-cache - 6.6-7.5 GB/s packed vs 5.3 scattered (25% faster)
