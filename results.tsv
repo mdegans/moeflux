@@ -59,3 +59,4 @@ HEAD	benchmark	0.0	0.0	0.00	0	0	keep	BATCH SWEEP: per-layer=20.7ms, every-4=13.0
 HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	0.00	0	0	discard	overlapped route+convert: SLOWER (118ms vs 70ms) — GIL contention kills threading for mx.array
 HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	0.00	0	0	keep	C ext pread→Metal buffer: 39ms for 240 experts (43 GB/s) vs Python 188ms — 4.8x speedup, byte-perfect
 HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	4.22	1558	7.2	discard	fast-load integrated: io_wait=43ms mx.eval=37ms but GARBAGE output (routing→buffer mapping bug)
+HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	0.00	0	0	keep	fast_moe_load stacked: 37ms warm (45 GB/s) for 240 experts → pre-stacked Metal buffers
