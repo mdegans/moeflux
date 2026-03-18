@@ -6237,21 +6237,25 @@ int main(int argc, char **argv) {
             char path[1024];
             snprintf(path, sizeof(path), "%s/%s/layer_%02d.bin", model_path,
                      g_use_2bit ? "packed_experts_2bit" : "packed_experts", i);
-            // Warm fd: normal (page cached)
             layer_fds[i] = open(path, O_RDONLY);
-            // Cold fd: F_NOCACHE (bypass page cache for first-time reads)
-            layer_fds_cold[i] = open(path, O_RDONLY);
-            if (layer_fds_cold[i] >= 0) fcntl(layer_fds_cold[i], F_NOCACHE, 1);
+            layer_fds_cold[i] = -1;  // no longer used (trust OS page cache)
             layer_mmaps[i] = MAP_FAILED;
             layer_mmap_sizes[i] = 0;
             if (layer_fds[i] >= 0) {
                 expert_layers_available++;
+                // Enable aggressive readahead: each pread of 3.9MB should be
+                // a single large I/O, not fragmented into 512KB chunks
+                fcntl(layer_fds[i], F_RDAHEAD, 1);
                 struct stat st;
                 if (fstat(layer_fds[i], &st) == 0 && st.st_size > 0) {
                     layer_mmaps[i] = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, layer_fds[i], 0);
                     if (layer_mmaps[i] != MAP_FAILED) {
                         layer_mmap_sizes[i] = st.st_size;
-                        madvise(layer_mmaps[i], st.st_size, MADV_RANDOM);
+                        // No madvise: kernel default is best.
+                        // MADV_RANDOM disables readahead (tested: hurts).
+                        // MADV_SEQUENTIAL doesn't reduce I/O fragmentation (tested: no effect).
+                        // The kernel fragments 3.9MB preads into ~5.7 disk ops regardless
+                        // of hints — this is inherent to the page cache's physical page layout.
                     }
                 }
             }
