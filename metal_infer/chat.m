@@ -310,19 +310,24 @@ static void md_print(const char *text) {
         }
 
         // Bullet lists at line start: - item or * item → • item
-        // Handle both "- text" (one token) and "-" + " text" (split across tokens)
+        // Handle split tokens: marker may arrive alone, spaces in next token
         if (g_md.line_start && c == '-' && (text[i+1] == ' ' || text[i+1] == '\0')) {
-            printf("  \033[33m•\033[0m");  // yellow bullet
-            if (text[i+1] == ' ') i++; // skip the space if present
+            printf("  \033[33m•\033[0m");
+            if (text[i+1] == ' ') i++;
             g_md.line_start = 0;
             continue;
         }
-        // * as bullet only when followed by space (not bold **)
-        if (g_md.line_start && c == '*' && text[i+1] == ' ') {
-            printf("  \033[33m•\033[0m");
-            i++;
-            g_md.line_start = 0;
-            continue;
+        // * as bullet: when followed by space, end of token, OR multiple spaces
+        // Must NOT be ** (bold) — check that next non-space char isn't *
+        if (g_md.line_start && c == '*' && text[i+1] != '*') {
+            // Check if this looks like a bullet (followed by space or end of token)
+            if (text[i+1] == ' ' || text[i+1] == '\0' || text[i+1] == '\t') {
+                printf("  \033[33m•\033[0m");
+                // Skip trailing whitespace after the bullet marker
+                while (text[i+1] == ' ' || text[i+1] == '\t') i++;
+                g_md.line_start = 0;
+                continue;
+            }
         }
 
         // Numbered lists at line start: 1. item → colored number
