@@ -5847,8 +5847,8 @@ static void serve_loop(
                 free(reqbuf); close(client_fd); continue;
             }
 
-            int max_gen = extract_max_tokens(body, 512);
-            if (max_gen > 4096) max_gen = 4096;
+            int max_gen = extract_max_tokens(body, 8192);
+            if (max_gen > 32768) max_gen = 32768;
 
             char request_id[64];
             snprintf(request_id, sizeof(request_id), "chatcmpl-%llu", ++req_counter);
