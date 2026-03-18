@@ -5599,7 +5599,9 @@ static PromptTokens *tokenize_user_turn(const char *user_content) {
 // Prefixes with <|im_end|>\n to close the previous assistant turn, then the new user turn.
 // Used when the KV cache already contains the prior conversation state.
 static PromptTokens *tokenize_continuation_turn(const char *user_content) {
-    const char *prefix = "<|im_end|>\n<|im_start|>user\n";
+    // EOS/<|im_end|> is already in the state (fed through model at end of generation)
+    // Just need the newline + new user turn + assistant prompt
+    const char *prefix = "\n<|im_start|>user\n";
     const char *suffix = "<|im_end|>\n<|im_start|>assistant\n";
 
     size_t prompt_len = strlen(prefix) + strlen(user_content) + strlen(suffix) + 1;
@@ -5877,7 +5879,14 @@ static void serve_loop(
             }
             body += 4;
 
-            // Extract user content from messages
+            // Extract session_id and max_tokens BEFORE content extraction
+            // (extract_last_content mutates the body buffer in place)
+            int max_gen = extract_max_tokens(body, 8192);
+            if (max_gen > 32768) max_gen = 32768;
+            char req_session_id[64] = {0};
+            int has_session = extract_session_id(body, req_session_id, sizeof(req_session_id));
+
+            // Extract user content from messages (mutates body — must be last)
             char *content = extract_last_content(body);
             if (!content || strlen(content) == 0) {
                 http_write_str(client_fd,
@@ -5885,13 +5894,6 @@ static void serve_loop(
                     "{\"error\":\"no content in messages\"}\n");
                 free(reqbuf); close(client_fd); continue;
             }
-
-            int max_gen = extract_max_tokens(body, 8192);
-            if (max_gen > 32768) max_gen = 32768;
-
-            // ---- Session caching: check if we can continue an existing session ----
-            char req_session_id[64] = {0};
-            int has_session = extract_session_id(body, req_session_id, sizeof(req_session_id));
             int is_continuation = (has_session &&
                                    active_session_id[0] != '\0' &&
                                    strcmp(req_session_id, active_session_id) == 0);
@@ -6063,7 +6065,23 @@ static void serve_loop(
             int think_tokens = 0;
 
             for (int gen = 0; gen < max_gen; gen++) {
-                if (next_token == EOS_TOKEN_1 || next_token == EOS_TOKEN_2) break;
+                if (next_token == EOS_TOKEN_1 || next_token == EOS_TOKEN_2) {
+                    // Feed EOS through the model so session state includes it
+                    cache_telemetry_note_token();
+                    embed_lookup(wf, next_token, hidden);
+                    for (int layer = 0; layer < NUM_LAYERS; layer++) {
+                        int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
+                        fused_layer_forward(wf, layer, hidden,
+                                            is_full ? kv_caches[layer] : NULL,
+                                            is_full ? NULL : layer_states[layer],
+                                            pos,
+                                            layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
+                                            K, layer_fds[layer]);
+                    }
+                    discard_deferred_experts();
+                    pos++;
+                    break;
+                }
 
                 // Think budget enforcement
                 if (next_token == THINK_START_TOKEN) in_think = 1;
