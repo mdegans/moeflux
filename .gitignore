@@ -34,3 +34,10 @@ logs/
 
 # Experiment data
 metal_infer/routing_data.bin
+
+# Rust
+target/
+Cargo.lock
+
+# Generated per-variant index (rebuild via tools/gen_expert_index.py)
+expert_index_*.json

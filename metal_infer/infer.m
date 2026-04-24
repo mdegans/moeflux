@@ -957,16 +957,30 @@ static MetalCtx *metal_setup(void) {
         free(ctx); return NULL;
     }
 
-    // Compile shaders from source
+    // Compile shaders from source. Lookup order:
+    //   1. $MOEFLUX_SHADERS_PATH (explicit override — used by
+    //      moeflux-sys's build.rs so tests and downstream consumers
+    //      don't depend on cwd).
+    //   2. ./shaders.metal  (standalone binary, run-from-source).
+    //   3. metal_infer/shaders.metal  (run from moeflux repo root).
     NSError *error = nil;
-    NSArray *paths = @[@"shaders.metal", @"metal_infer/shaders.metal"];
     NSString *src = nil;
-    for (NSString *p in paths) {
+    const char *env_path = getenv("MOEFLUX_SHADERS_PATH");
+    if (env_path && *env_path) {
+        NSString *p = [NSString stringWithUTF8String:env_path];
         src = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:&error];
-        if (src) break;
     }
     if (!src) {
-        fprintf(stderr, "ERROR: Cannot find shaders.metal\n");
+        NSArray *paths = @[@"shaders.metal", @"metal_infer/shaders.metal"];
+        for (NSString *p in paths) {
+            src = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:&error];
+            if (src) break;
+        }
+    }
+    if (!src) {
+        fprintf(stderr, "ERROR: Cannot find shaders.metal "
+                "(set MOEFLUX_SHADERS_PATH, or run from a dir "
+                "containing shaders.metal / metal_infer/shaders.metal)\n");
         free(ctx); return NULL;
     }
 

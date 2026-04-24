@@ -1,0 +1,21 @@
+[package]
+name          = "moeflux"
+description   = "Safe Rust bindings to the moeflux streaming-experts MoE Metal backend."
+version       = { workspace = true }
+edition       = { workspace = true }
+rust-version  = { workspace = true }
+license       = { workspace = true }
+repository    = { workspace = true }
+authors       = { workspace = true }
+readme        = "README.md"
+
+[features]
+default = []
+
+# Re-exported variant features — consumers select the model here and
+# the -sys crate gets the matching C define via build.rs.
+model-qwen3-5-a17b      = ["moeflux-sys/model-qwen3-5-a17b"]
+model-qwen3-6-35b-a3b   = ["moeflux-sys/model-qwen3-6-35b-a3b"]
+
+[dependencies]
+moeflux-sys = { workspace = true }

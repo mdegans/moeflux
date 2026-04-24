@@ -1,0 +1,36 @@
+[package]
+name          = "moeflux-sys"
+description   = "Raw FFI bindings to the moeflux streaming-experts MoE Metal backend."
+version       = { workspace = true }
+edition       = { workspace = true }
+rust-version  = { workspace = true }
+license       = { workspace = true }
+repository    = { workspace = true }
+authors       = { workspace = true }
+links         = "moeflux"
+readme        = "README.md"
+# Don't publish the 69GB of model weights + Metal shaders by accident.
+# Only the sources + header + build.rs get packaged.
+include       = [
+    "src/**",
+    "build.rs",
+    "wrapper.h",
+    "README.md",
+    "LICENSE",
+    # The C/Metal sources are one level up; we copy them via build.rs
+    # at publish time. For local path-dep consumers (drama_llama),
+    # build.rs reads them directly from ../../metal_infer.
+]
+
+[features]
+# No default — exactly one model variant must be selected by the
+# consuming crate. See model_variant.h in the C sources for the
+# full list; downstream docs in docs/model_variants.md.
+default = []
+
+model-qwen3-5-a17b      = []
+model-qwen3-6-35b-a3b   = []
+
+[build-dependencies]
+cc      = "1"
+bindgen = "0.72"
