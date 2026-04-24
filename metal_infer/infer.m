@@ -2109,6 +2109,115 @@ static void linear_attn_state_free(LinearAttnState *s) {
 }
 
 // ============================================================================
+// KV + linear-attn state truncation primitives (moeflux additions)
+// ============================================================================
+//
+// drama_llama's Decoder trait uses position-indexed KV truncation for
+// prefix-cache reuse. Full-attention KV is addressable by position so
+// truncation is an O(1) length update plus an optional memset.
+//
+// Linear-attention (GatedDeltaNet) state is a recurrence: at position N
+// the (conv_state, ssm_state) pair holds the folded history of all
+// prior tokens. It cannot be partially truncated. Option A (this patch):
+// any reset of a linear layer returns it to the empty-sequence state,
+// and the caller must re-prefill from position 0 to recover a matching
+// state at position p0. Option B (state save/restore at drama_llama's
+// Prompt breakpoints) is planned for later; see NOTES.md.
+
+// Reset a full-attention KV cache to positions [0, new_len). Assumes
+// new_len <= kv->len. Zeros the [new_len, old_len) slice for
+// cleanliness (no stale K/V bleeding into later decodes).
+static void kv_cache_truncate(KVCache *kv, int new_len) {
+    if (!kv || new_len < 0) return;
+    if (new_len > kv->len) return;  // no-op if already shorter
+    int old_len = kv->len;
+    int stride = NUM_KV_HEADS * HEAD_DIM;
+    if (new_len < old_len) {
+        size_t clear_entries = (size_t)(old_len - new_len);
+        memset(kv->k_cache + (size_t)new_len * stride, 0,
+               clear_entries * stride * sizeof(float));
+        memset(kv->v_cache + (size_t)new_len * stride, 0,
+               clear_entries * stride * sizeof(float));
+    }
+    kv->len = new_len;
+}
+
+// Reset a linear-attention recurrence state to the empty-sequence
+// state. Lossy by construction — see Option A note above.
+static void linear_attn_state_reset(LinearAttnState *s) {
+    if (!s) return;
+    memset(s->conv_state, 0,
+           (CONV_KERNEL_SIZE - 1) * LINEAR_CONV_DIM * sizeof(float));
+    memset(s->ssm_state, 0,
+           LINEAR_NUM_V_HEADS * LINEAR_VALUE_DIM * LINEAR_KEY_DIM
+               * sizeof(float));
+}
+
+// Clear all per-layer state (both full-attn and linear-attn).
+// Equivalent to the empty-sequence condition right after allocation.
+static void mf_state_clear_all(
+    KVCache **kv_caches, void **layer_states)
+{
+    if (!kv_caches || !layer_states) return;
+    for (int i = 0; i < NUM_LAYERS; i++) {
+        int is_full = ((i + 1) % FULL_ATTN_INTERVAL == 0);
+        if (is_full) {
+            kv_cache_truncate(kv_caches[i], 0);
+        } else {
+            linear_attn_state_reset((LinearAttnState *)layer_states[i]);
+        }
+    }
+}
+
+// Truncate to positions [0, p0). Full-attn layers are truncated
+// precisely; linear-attn layers are reset to the empty-sequence state
+// (Option A). `p0 < 0` is treated as 0 (full clear); `p1 < 0` is
+// treated as "to end" but is only used to bound the memset in
+// full-attn layers — passing p1 < 0 or p1 >= kv->len both mean "clear
+// to the tail".
+static void mf_state_truncate(
+    KVCache **kv_caches, void **layer_states, int p0, int p1)
+{
+    if (!kv_caches || !layer_states) return;
+    int new_len = (p0 < 0) ? 0 : p0;
+    for (int i = 0; i < NUM_LAYERS; i++) {
+        int is_full = ((i + 1) % FULL_ATTN_INTERVAL == 0);
+        if (is_full) {
+            KVCache *kv = kv_caches[i];
+            if (!kv) continue;
+            int effective_end =
+                (p1 < 0 || p1 > kv->len) ? kv->len : p1;
+            int truncate_to =
+                (new_len < effective_end) ? new_len : effective_end;
+            kv_cache_truncate(kv, truncate_to);
+        } else {
+            // Option A: any truncation of a linear-attn layer resets
+            // it to empty. Caller re-prefills from position 0.
+            linear_attn_state_reset(
+                (LinearAttnState *)layer_states[i]);
+        }
+    }
+}
+
+// Largest position present in the KV across full-attention layers.
+// All full-attn layers stay in lock-step during normal forward flow,
+// so any of them is a valid source of truth; we take the max as a
+// defensive read in case a prior partial write left them out of sync.
+// Returns -1 if no full-attn layer has any entries.
+static int mf_state_pos_max(KVCache **kv_caches) {
+    if (!kv_caches) return -1;
+    int max_len = -1;
+    for (int i = 0; i < NUM_LAYERS; i++) {
+        int is_full = ((i + 1) % FULL_ATTN_INTERVAL == 0);
+        if (!is_full) continue;
+        KVCache *kv = kv_caches[i];
+        if (!kv) continue;
+        if (kv->len > max_len) max_len = kv->len;
+    }
+    return max_len;
+}
+
+// ============================================================================
 // Full attention layer forward (single token, incremental)
 // ============================================================================
 
