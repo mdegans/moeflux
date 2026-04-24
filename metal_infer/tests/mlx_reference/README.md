@@ -62,3 +62,44 @@ The A3B bug was localized in three phases:
 Running the A3B prompt "The quick brown fox" through moeflux should produce
 "jumps over the lazy dog" as the first five generated tokens — matching MLX's
 canonical pangram completion.
+
+## Automated regression test (`cargo test`)
+
+`generate_goldens.py` captures top-K MLX logits for the last prompt position
+and writes a plain-text fixture to `crates/moeflux/tests/fixtures/`. The Rust
+test `crates/moeflux/tests/mlx_regression.rs` runs moeflux on the same prompt
+and asserts top-20 set overlap ≥ 95% + argmax match. This would have caught
+the gate-offset bug on the first run (pre-fix argmax wouldn't match).
+
+Regen:
+
+```bash
+uv run --with mlx --with mlx-lm python3 generate_goldens.py \
+  --model <mlx-model-dir> --variant <slug> \
+  --out ../../../crates/moeflux/tests/fixtures/mlx_golden_<slug>.txt
+```
+
+Run (per variant — variants are mutually exclusive Cargo features):
+
+```bash
+# A3B
+cargo test -p moeflux --features model-qwen3-6-35b-a3b \
+  mlx_regression_a3b -- --ignored --nocapture
+
+# A17B — fixture not yet committed; see host-RAM note below
+cargo test -p moeflux --features model-qwen3-5-a17b \
+  mlx_regression_a17b -- --ignored --nocapture
+```
+
+### Host-RAM requirement for A17B
+
+MLX loads the full checkpoint into memory (unlike moeflux's streaming
+experts). The A17B 4-bit MLX checkpoint is ~210 GB on disk; generating its
+golden needs a host with roughly that much RAM (or slow, SSD-thrashing
+swap). On a machine that can't host it, the test skips gracefully with a
+"fixture not found" message — it does not fail.
+
+When regenerating A17B, any Apple Silicon machine with ≥256 GB unified
+memory works (e.g. M2/M3/M4 Ultra Mac Studio, some high-spec MacBook Pros).
+Cloud hosts with enough RAM are also fine; the script is CPU-only Python
+with mlx_lm.
