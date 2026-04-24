@@ -7577,3 +7577,246 @@ const char *mf_model_name(const mf_ctx *ctx) {
     // read from the loaded manifest instead.
     return "Qwen3.5-397B-A17B-4bit";
 }
+
+// ============================================================================
+// State snapshot / restore (Option B)
+// ============================================================================
+//
+// Binary format:
+//
+//   [u32 magic = 'MFLX' 0x4D464C58]
+//   [u32 version = 1]
+//   [u32 num_layers       — must equal NUM_LAYERS]
+//   [u32 full_attn_interval— must equal FULL_ATTN_INTERVAL]
+//   [u32 num_kv_heads     — must equal NUM_KV_HEADS]
+//   [u32 head_dim         — must equal HEAD_DIM]
+//   [u32 linear_conv_bytes— must equal (CONV_KERNEL_SIZE-1) * LINEAR_CONV_DIM * 4]
+//   [u32 linear_ssm_bytes — must equal NUM_V_HEADS * VALUE_DIM * KEY_DIM * 4]
+//
+//   for each layer i in [0, NUM_LAYERS):
+//     if i is full-attention:
+//       [i32 kv_len]
+//       [kv_len * NUM_KV_HEADS * HEAD_DIM * f32: k_cache]
+//       [kv_len * NUM_KV_HEADS * HEAD_DIM * f32: v_cache]
+//     if i is linear-attention:
+//       [linear_conv_bytes: GPU buf_conv_state contents]
+//       [linear_ssm_bytes:  GPU buf_delta_state contents]
+//
+// All integers are little-endian native. The header locks the format
+// to this build's shape constants — any mismatch rejects the load.
+
+#define MF_SNAPSHOT_MAGIC      0x4D464C58u  // 'MFLX'
+#define MF_SNAPSHOT_VERSION    1u
+#define MF_SNAPSHOT_HEADER_U32 8
+
+static size_t mf_full_attn_stride_bytes(void) {
+    return (size_t)NUM_KV_HEADS * HEAD_DIM * sizeof(float);
+}
+
+static size_t mf_linear_conv_bytes(void) {
+    return (size_t)(CONV_KERNEL_SIZE - 1) * LINEAR_CONV_DIM
+           * sizeof(float);
+}
+
+static size_t mf_linear_ssm_bytes(void) {
+    return (size_t)LINEAR_NUM_V_HEADS * LINEAR_VALUE_DIM
+           * LINEAR_KEY_DIM * sizeof(float);
+}
+
+size_t mf_state_size(const mf_ctx *ctx) {
+    if (!ctx || !ctx->kv_caches) return 0;
+    size_t n = MF_SNAPSHOT_HEADER_U32 * sizeof(uint32_t);
+    size_t fa_stride = mf_full_attn_stride_bytes();
+    size_t la_conv = mf_linear_conv_bytes();
+    size_t la_ssm = mf_linear_ssm_bytes();
+    for (int i = 0; i < NUM_LAYERS; i++) {
+        int is_full = ((i + 1) % FULL_ATTN_INTERVAL == 0);
+        if (is_full) {
+            n += sizeof(int32_t);
+            KVCache *kv = ctx->kv_caches[i];
+            int len = (kv && kv->len > 0) ? kv->len : 0;
+            n += 2 * (size_t)len * fa_stride;
+        } else {
+            n += la_conv + la_ssm;
+        }
+    }
+    return n;
+}
+
+long long mf_state_save(mf_ctx *ctx, void *buf, size_t buf_len) {
+    if (!ctx || !buf) return -1;
+    size_t need = mf_state_size(ctx);
+    if (buf_len < need) return -1;
+
+    uint8_t *p = (uint8_t *)buf;
+    uint32_t header[MF_SNAPSHOT_HEADER_U32] = {
+        MF_SNAPSHOT_MAGIC,
+        MF_SNAPSHOT_VERSION,
+        (uint32_t)NUM_LAYERS,
+        (uint32_t)FULL_ATTN_INTERVAL,
+        (uint32_t)NUM_KV_HEADS,
+        (uint32_t)HEAD_DIM,
+        (uint32_t)mf_linear_conv_bytes(),
+        (uint32_t)mf_linear_ssm_bytes(),
+    };
+    memcpy(p, header, sizeof(header));
+    p += sizeof(header);
+
+    size_t fa_stride = mf_full_attn_stride_bytes();
+    size_t la_conv = mf_linear_conv_bytes();
+    size_t la_ssm = mf_linear_ssm_bytes();
+
+    for (int i = 0; i < NUM_LAYERS; i++) {
+        int is_full = ((i + 1) % FULL_ATTN_INTERVAL == 0);
+        if (is_full) {
+            KVCache *kv = ctx->kv_caches[i];
+            int32_t len = (kv && kv->len > 0) ? kv->len : 0;
+            memcpy(p, &len, sizeof(len));
+            p += sizeof(len);
+            if (len > 0 && kv) {
+                size_t bytes = (size_t)len * fa_stride;
+                memcpy(p, kv->k_cache, bytes);
+                p += bytes;
+                memcpy(p, kv->v_cache, bytes);
+                p += bytes;
+            }
+        } else {
+            // GatedDeltaNet recurrence state lives in Metal buffers
+            // on the GPU fast path. buf_conv_state / buf_delta_state
+            // index by position in the linear-layer stream, not the
+            // 60-layer stream — skip full-attn layers to get there.
+            int linear_idx = i - (i + 1) / FULL_ATTN_INTERVAL;
+            if (g_metal
+                && g_metal->buf_conv_state[linear_idx]
+                && g_metal->buf_delta_state[linear_idx]) {
+                memcpy(p, [g_metal->buf_conv_state[linear_idx] contents],
+                       la_conv);
+                p += la_conv;
+                memcpy(p, [g_metal->buf_delta_state[linear_idx] contents],
+                       la_ssm);
+                p += la_ssm;
+            } else {
+                // Metal unavailable: snapshot the CPU fallback state
+                // at the same layout so load() can round-trip it.
+                // Behavior on CPU fallback is undefined per the
+                // moeflux.h contract but we do best-effort here.
+                LinearAttnState *s =
+                    (LinearAttnState *)ctx->layer_states[i];
+                if (s) {
+                    memcpy(p, s->conv_state, la_conv);
+                    p += la_conv;
+                    memcpy(p, s->ssm_state, la_ssm);
+                    p += la_ssm;
+                } else {
+                    memset(p, 0, la_conv + la_ssm);
+                    p += la_conv + la_ssm;
+                }
+            }
+        }
+    }
+    return (long long)(p - (uint8_t *)buf);
+}
+
+int mf_state_load(mf_ctx *ctx, const void *buf, size_t buf_len) {
+    if (!ctx || !buf) return -1;
+    if (buf_len < MF_SNAPSHOT_HEADER_U32 * sizeof(uint32_t)) return -1;
+
+    const uint8_t *p = (const uint8_t *)buf;
+    const uint8_t *end = p + buf_len;
+
+    uint32_t header[MF_SNAPSHOT_HEADER_U32];
+    memcpy(header, p, sizeof(header));
+    p += sizeof(header);
+
+    if (header[0] != MF_SNAPSHOT_MAGIC) return -1;
+    if (header[1] != MF_SNAPSHOT_VERSION) return -1;
+    if (header[2] != (uint32_t)NUM_LAYERS) return -1;
+    if (header[3] != (uint32_t)FULL_ATTN_INTERVAL) return -1;
+    if (header[4] != (uint32_t)NUM_KV_HEADS) return -1;
+    if (header[5] != (uint32_t)HEAD_DIM) return -1;
+    if (header[6] != (uint32_t)mf_linear_conv_bytes()) return -1;
+    if (header[7] != (uint32_t)mf_linear_ssm_bytes()) return -1;
+
+    size_t fa_stride = mf_full_attn_stride_bytes();
+    size_t la_conv = mf_linear_conv_bytes();
+    size_t la_ssm = mf_linear_ssm_bytes();
+
+    // Preflight: verify buffer is long enough to cover what the
+    // header claims. Restore is destructive, so reject before
+    // mutating state.
+    {
+        const uint8_t *q = p;
+        for (int i = 0; i < NUM_LAYERS; i++) {
+            int is_full = ((i + 1) % FULL_ATTN_INTERVAL == 0);
+            if (is_full) {
+                if ((size_t)(end - q) < sizeof(int32_t)) return -1;
+                int32_t len;
+                memcpy(&len, q, sizeof(len));
+                q += sizeof(len);
+                if (len < 0) return -1;
+                size_t bytes = 2 * (size_t)len * fa_stride;
+                if ((size_t)(end - q) < bytes) return -1;
+                q += bytes;
+            } else {
+                size_t bytes = la_conv + la_ssm;
+                if ((size_t)(end - q) < bytes) return -1;
+                q += bytes;
+            }
+        }
+    }
+
+    // Preflight ok — restore.
+    for (int i = 0; i < NUM_LAYERS; i++) {
+        int is_full = ((i + 1) % FULL_ATTN_INTERVAL == 0);
+        if (is_full) {
+            int32_t len;
+            memcpy(&len, p, sizeof(len));
+            p += sizeof(len);
+            KVCache *kv = ctx->kv_caches[i];
+            if (!kv) return -1;
+            if (len > 0) {
+                size_t bytes = (size_t)len * fa_stride;
+                memcpy(kv->k_cache, p, bytes);
+                p += bytes;
+                memcpy(kv->v_cache, p, bytes);
+                p += bytes;
+            }
+            // Zero the [len, max) slice so any stale tail from a
+            // prior evaluation does not leak into attention reads.
+            if ((size_t)len * fa_stride < MAX_SEQ_LEN * fa_stride) {
+                size_t tail = (MAX_SEQ_LEN - (size_t)len) * fa_stride;
+                memset((uint8_t *)kv->k_cache
+                           + (size_t)len * fa_stride,
+                       0, tail);
+                memset((uint8_t *)kv->v_cache
+                           + (size_t)len * fa_stride,
+                       0, tail);
+            }
+            kv->len = len;
+        } else {
+            int linear_idx = i - (i + 1) / FULL_ATTN_INTERVAL;
+            if (g_metal
+                && g_metal->buf_conv_state[linear_idx]
+                && g_metal->buf_delta_state[linear_idx]) {
+                memcpy([g_metal->buf_conv_state[linear_idx] contents],
+                       p, la_conv);
+                p += la_conv;
+                memcpy([g_metal->buf_delta_state[linear_idx] contents],
+                       p, la_ssm);
+                p += la_ssm;
+            } else {
+                LinearAttnState *s =
+                    (LinearAttnState *)ctx->layer_states[i];
+                if (s) {
+                    memcpy(s->conv_state, p, la_conv);
+                    p += la_conv;
+                    memcpy(s->ssm_state, p, la_ssm);
+                    p += la_ssm;
+                } else {
+                    p += la_conv + la_ssm;  // nowhere to write
+                }
+            }
+        }
+    }
+    return 0;
+}

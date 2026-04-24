@@ -116,6 +116,63 @@ int32_t mf_eos(const mf_ctx *ctx);
 // not free. Stable for the process lifetime.
 const char *mf_model_name(const mf_ctx *ctx);
 
+// ============================================================================
+// State snapshot / restore (Option B in NOTES.md)
+// ============================================================================
+//
+// Let callers serialize the full inference state — KV caches for the
+// 15 full-attention layers, GatedDeltaNet recurrence buffers for the
+// 45 linear-attention layers — into an opaque byte buffer, and later
+// restore from it. Enables prefix-cache reuse across evaluations
+// without the re-prefill cost that mf_memory_seq_rm otherwise forces
+// on linear layers.
+//
+// Intended callsite shape in drama_llama:
+//
+//   // After evaluating a prefix the caller wants to cache:
+//   size_t n = mf_state_size(ctx);
+//   void *snapshot = malloc(n);
+//   mf_state_save(ctx, snapshot, n);
+//   // ... later, on cache hit for the same prefix ...
+//   mf_memory_clear(ctx);
+//   mf_state_load(ctx, snapshot, n);
+//   // ctx now matches the state at snapshot time. Decode continues
+//   // from the recorded position (visible via mf_memory_seq_pos_max).
+//
+// Snapshot size scales linearly with the KV length at the time of
+// save. For a prefix of P positions on Qwen3.5-397B the snapshot is
+// roughly (15 * 2 * P * NUM_KV_HEADS * HEAD_DIM * 4B) for the KV
+// portion plus a fixed ~190MB for the GatedDeltaNet recurrence state
+// (not proportional to P — recurrence state has the same shape at
+// every position).
+//
+// Constraints:
+// - Call only at token boundaries (after mf_eval_prompt or
+//   mf_eval_token returns). Pending deferred GPU expert compute must
+//   have finalized.
+// - The binary format encodes the model's shape constants; loading a
+//   snapshot into a moeflux built with different constants fails.
+// - The CPU-fallback linear-attention path is not snapshotted. Save
+//   / load is only correct on the Metal GPU path (the default for
+//   moeflux's target hardware).
+
+// Byte size the caller must allocate to hold the current snapshot.
+// Return value changes as KV length changes, so query after each
+// evaluation if unsure. Returns 0 on NULL ctx.
+size_t mf_state_size(const mf_ctx *ctx);
+
+// Serialize the current state into `buf`. `buf_len` must be at least
+// the value returned by mf_state_size. Returns the number of bytes
+// actually written on success, or -1 on failure (NULL ctx / buf, or
+// buf_len too small).
+long long mf_state_save(mf_ctx *ctx, void *buf, size_t buf_len);
+
+// Replace the current state with the one encoded in `buf`. Returns 0
+// on success, -1 on failure (NULL args, truncated/corrupt buffer,
+// mismatched model-shape header). On failure the ctx state is
+// undefined — caller should follow up with mf_memory_clear.
+int mf_state_load(mf_ctx *ctx, const void *buf, size_t buf_len);
+
 #ifdef __cplusplus
 }
 #endif

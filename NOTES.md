@@ -58,32 +58,36 @@ typedef struct {
   full-attn layer, optionally memset `[start*stride, end*stride)`.
   ~50 LOC as the scout doc predicted.
 
-### ⚠ Linear-attention layers are not position-truncatable (Option A now, B later)
+### ⚠ Linear-attention layers are not position-truncatable
 
 45 of the 60 layers are GatedDeltaNet linear-attention. They hold
 a recurrence state (`conv_state` + `ssm_state`) that is NOT
 position-indexed. `mf_memory_seq_rm` cannot cleanly truncate them.
 
-**Phase 3/4 posture: Option A — full reset.** `mf_memory_seq_rm`
-zeroes linear-attn state entirely. The caller (drama_llama) must
-re-prefill from position 0 after any truncation. This means the
-drama_llama prefix cache gets NO linear-attn benefit — full
-re-prefill on every prefix-miss.
+**Option A — full reset (mf_memory_seq_rm).** Zeros linear-attn
+state entirely. The caller must re-prefill from position 0 to
+recover a matching state. Simple, lossy.
 
-**Option B (deferred; try at end of current session if context
-allows):** snapshot `(conv_state, ssm_state)` for all linear
-layers at `Prompt`-primitive breakpoints, restore on cache hit.
-Avoids re-ingestion at the cost of extra memory per cached prefix.
-Without B, Cogito 600B on 96GB Mac will barely hit its tok/s
-target because every Council turn re-prefills the full thread
-history.
+**Option B — state snapshot / restore (implemented).** The
+`mf_state_size` / `mf_state_save` / `mf_state_load` API
+serializes the full inference state (15 full-attn KV caches +
+45 GatedDeltaNet recurrence buffers) into a caller-allocated
+byte buffer. drama_llama stores one snapshot per cache entry
+alongside the prefix tokens; on hit, load the snapshot and
+continue decoding without re-prefill.
 
-Required for B:
-- `mf_state_save(buf) / mf_state_load(buf)` — serialize/deserialize
-  all per-layer state (full-attn KV + linear-attn recurrence).
-- drama_llama-side: cache entry stores the opaque state bytes in
-  addition to the prefix tokens.
-- Not "major surgery if we're careful" — Mike's words; agreed.
+Format details in `moeflux.h`. Fixed part (~190MB for linear
+recurrence) + variable KV part (~30KB/position × up to ~M
+positions) per snapshot. 4-byte magic + version + shape header
+rejects mismatched model builds.
+
+Metal fast path is the authoritative linear-attn state
+(`g_metal->buf_delta_state[i]` / `buf_conv_state[i]`). The CPU
+`LinearAttnState` fallback snapshot is best-effort — moeflux.h
+documents save/load as Metal-path-only.
+
+Smoke test covers: size → save → mutate → load → pos_max check
+→ restored-vs-fresh logit equality diagnostic.
 
 ### Shape is runtime-parameterizable at the shader level
 
@@ -203,8 +207,8 @@ need:
       `libmoeflux.a` target
 - [x] 3b.5 C smoke test (tests/smoke.c) — builds clean; actual
       run needs a real model locally (gated on Mike's download)
-- [ ] (deferred) Option B: `mf_state_save` / `mf_state_load` for
-      linear-attn state snapshotting
+- [x] Option B: `mf_state_size` / `mf_state_save` / `mf_state_load`
+      for linear-attn + KV snapshot/restore. Smoke test extended.
 - [ ] (Phase 4) Replace tokenizer.h with Rust-side tokenization
 - [ ] (Phase 4) Rust-facing wrapper crate on top of libmoeflux.a
 
