@@ -74,6 +74,37 @@ def main():
         hf_config = json.load(f)
     text_config = hf_config.get('text_config', hf_config)
 
+    # Quantization config: resolve a per-tensor `bits` for every quantized
+    # tensor. MLX stores defaults at the top level of the `quantization`
+    # block and per-tensor overrides as nested dicts keyed by the full
+    # (unsanitized) tensor-base name, e.g.:
+    #   "quantization": {
+    #     "group_size": 64, "bits": 4,
+    #     "language_model.model.layers.0.mlp.gate": {"group_size": 64, "bits": 8},
+    #     ...
+    #   }
+    # A3B has 8-bit overrides on `mlp.gate` and `mlp.shared_expert_gate`;
+    # everything else is 4-bit. A17B has no overrides.
+    q_block = hf_config.get('quantization', {}) or {}
+    default_bits = q_block.get('bits', 4)
+    default_group_size = q_block.get('group_size', 64)
+    # base-name (no `.weight`/`.scales`/`.biases` suffix) -> bits
+    per_tensor_bits = {}
+    for k, v in q_block.items():
+        if isinstance(v, dict) and 'bits' in v:
+            per_tensor_bits[k] = int(v['bits'])
+
+    def lookup_bits(original_name: str) -> int:
+        """Return bits for a quantized tensor. `original_name` is the
+        unsanitized name as it appears in the safetensors index."""
+        # Strip trailing .weight / .scales / .biases to get the base key
+        base = original_name
+        for suf in ('.weight', '.scales', '.biases'):
+            if base.endswith(suf):
+                base = base[:-len(suf)]
+                break
+        return per_tensor_bits.get(base, default_bits)
+
     # Filter: keep only language_model weights, skip vision_tower
     # Also skip expert weights (switch_mlp.{gate_proj,up_proj,down_proj}.{weight,scales,biases})
     # unless --include-experts is set
@@ -151,6 +182,8 @@ def main():
                                             or text_config.get('partial_rotary_factor', 0.25)),
         "rope_theta":                      (rope_params.get('rope_theta')
                                             or text_config.get('rope_theta', 10000000.0)),
+        "default_bits":                    default_bits,
+        "default_group_size":               default_group_size,
     }
     manifest = {
         "model": str(model_path),
@@ -204,14 +237,33 @@ def main():
                 sf.seek(data_start + tensor_offsets[0])
                 data = sf.read(byte_len)
 
+            # A17B stores `linear_attn.A_log` as F32; A3B stores it as BF16.
+            # moeflux's C engine reads it as `float *A_log` unconditionally,
+            # so A3B gets garbage without a conversion. Promote BF16 → F32
+            # here so the binary file always carries F32 for A_log and the
+            # C code needs no per-variant branching.
+            if san_name.endswith('.linear_attn.A_log') and dtype == 'BF16':
+                # bf16 is stored high-16-bits of an f32; reconstruct by
+                # shifting into the top half of a uint32.
+                bf16 = np.frombuffer(data, dtype=np.uint16)
+                u32 = bf16.astype(np.uint32) << 16
+                data = u32.tobytes()
+                byte_len = len(data)
+                dtype = 'F32'
+
             out_f.write(data)
 
-            manifest["tensors"][san_name] = {
+            tensor_entry = {
                 "offset": offset,
                 "size": byte_len,
                 "shape": shape,
                 "dtype": dtype,
             }
+            # Emit `bits` only for quantized weight tensors (U32 packed).
+            # Scales/biases are bf16 and not bit-packed.
+            if dtype == "U32":
+                tensor_entry["bits"] = lookup_bits(orig_name)
+            manifest["tensors"][san_name] = tensor_entry
 
             offset += byte_len
             total_bytes += byte_len
