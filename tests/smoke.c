@@ -187,6 +187,16 @@ int main(int argc, char **argv) {
     // restore the snapshot, and verify pos_max returns to 4 and the
     // next token at pos=4 produces logits close to the logits we
     // recorded right after the original prefill.
+    // Clear the KV so the re-prefill doesn't append on top of the
+    // still-present positions 0..3 from the original prefill and grow
+    // kv_len past what mf_state_size is computed for.
+    mf_memory_clear(ctx);
+    if (mf_eval_prompt(ctx, prompt, 4, 0, 0, logits) != 0) {
+        fprintf(stderr, "[smoke] FAIL: re-prefill for state test\n");
+        mf_free_model(ctx);
+        return 1;
+    }
+
     fprintf(stderr, "[smoke] mf_state_size (current snapshot size)\n");
     size_t snap_size = mf_state_size(ctx);
     fprintf(stderr, "[smoke] snap_size = %zu bytes\n", snap_size);
@@ -200,15 +210,6 @@ int main(int argc, char **argv) {
     if (!snap) {
         fprintf(stderr, "[smoke] FAIL: out-of-memory allocating snapshot\n");
         mf_free_model(ctx);
-        return 1;
-    }
-
-    // Re-run the original prefill so we can capture post-prefill
-    // logits as a reference for the restore check. (memory_clear
-    // happened just above.)
-    if (mf_eval_prompt(ctx, prompt, 4, 0, 0, logits) != 0) {
-        fprintf(stderr, "[smoke] FAIL: re-prefill for state test\n");
-        free(snap); mf_free_model(ctx);
         return 1;
     }
 

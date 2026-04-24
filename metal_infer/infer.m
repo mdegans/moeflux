@@ -7523,10 +7523,10 @@ int32_t mf_eos(const mf_ctx *ctx) {
 
 const char *mf_model_name(const mf_ctx *ctx) {
     (void)ctx;
-    // Hardcoded to upstream's target. When runtime shape
-    // parameterization lands (Phase 5 for Cogito 600B), this will
+    // Name of the compile-time variant. When runtime shape
+    // parameterization lands (Phase 5 for Cogito 600B) this will
     // read from the loaded manifest instead.
-    return "Qwen3.5-397B-A17B-4bit";
+    return MOEFLUX_MODEL_NAME;
 }
 
 // ============================================================================
