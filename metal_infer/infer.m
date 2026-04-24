@@ -925,18 +925,24 @@ typedef struct {
     id<MTLComputePipelineState> rms_norm_qk;     // per-head RMS normalize for q and k
     id<MTLComputePipelineState> compute_decay_beta; // g_decay and beta_gate for delta-net
     id<MTLComputePipelineState> gated_rms_norm;  // z-gated output normalization
-    // Persistent GPU state buffers for linear attention layers
-    #define NUM_LINEAR_LAYERS 45
-    id<MTLBuffer> buf_delta_state[NUM_LINEAR_LAYERS];   // [64*128*128] float per layer
-    id<MTLBuffer> buf_conv_state[NUM_LINEAR_LAYERS];     // [3*12288] float per layer
-    // Scratch buffers for delta-net inputs/outputs
-    id<MTLBuffer> buf_delta_q;        // [2048] float
-    id<MTLBuffer> buf_delta_k;        // [2048] float
-    id<MTLBuffer> buf_delta_v;        // [8192] float
-    id<MTLBuffer> buf_delta_g_decay;  // [64] float
-    id<MTLBuffer> buf_delta_beta;     // [64] float
-    id<MTLBuffer> buf_delta_output;   // [8192] float
-    id<MTLBuffer> buf_conv_input;     // [12288] float
+    // Persistent GPU state buffers for linear attention layers.
+    //
+    // NUM_LINEAR_LAYERS is the count of non-full-attention layers under
+    // the (i+1) % FULL_ATTN_INTERVAL == 0 rule. For NUM_LAYERS=60 /
+    // FULL_ATTN_INTERVAL=4 (A17B) that's 45; for NUM_LAYERS=40 /
+    // FULL_ATTN_INTERVAL=4 (A3B) it's 30. The formula handles both
+    // without a variant-specific literal.
+    #define NUM_LINEAR_LAYERS (NUM_LAYERS - (NUM_LAYERS / FULL_ATTN_INTERVAL))
+    id<MTLBuffer> buf_delta_state[NUM_LINEAR_LAYERS];
+    id<MTLBuffer> buf_conv_state[NUM_LINEAR_LAYERS];
+    // Scratch buffers for delta-net inputs/outputs.
+    id<MTLBuffer> buf_delta_q;        // LINEAR_TOTAL_KEY floats
+    id<MTLBuffer> buf_delta_k;        // LINEAR_TOTAL_KEY floats
+    id<MTLBuffer> buf_delta_v;        // LINEAR_TOTAL_VALUE floats
+    id<MTLBuffer> buf_delta_g_decay;  // LINEAR_NUM_V_HEADS floats
+    id<MTLBuffer> buf_delta_beta;     // LINEAR_NUM_V_HEADS floats
+    id<MTLBuffer> buf_delta_output;   // LINEAR_TOTAL_VALUE floats
+    id<MTLBuffer> buf_conv_input;     // LINEAR_CONV_DIM floats
     id<MTLBuffer> buf_conv_output;    // [12288] float
 } MetalCtx;
 
@@ -1155,29 +1161,38 @@ static MetalCtx *metal_setup(void) {
                (double)(NUM_ATTN_HEADS * MAX_SEQ_LEN * sizeof(float)) / 1e6);
     }
 
-    // Persistent GPU state buffers for delta-net (linear attention layers)
+    // Persistent GPU state buffers for delta-net (linear attention layers).
+    // All sizes flow from model_variant.h macros so adding a variant (e.g.
+    // A3B with 32 v-heads) doesn't require per-literal edits.
     if (ctx->delta_net_step) {
+        const size_t delta_state_floats =
+            (size_t)LINEAR_NUM_V_HEADS * LINEAR_VALUE_DIM * LINEAR_KEY_DIM;
+        const size_t conv_state_floats =
+            (size_t)(CONV_KERNEL_SIZE - 1) * LINEAR_CONV_DIM;
         for (int i = 0; i < NUM_LINEAR_LAYERS; i++) {
-            ctx->buf_delta_state[i] = [ctx->device newBufferWithLength:64*128*128*sizeof(float)
+            ctx->buf_delta_state[i] = [ctx->device newBufferWithLength:delta_state_floats * sizeof(float)
                                                                options:MTLResourceStorageModeShared];
-            memset([ctx->buf_delta_state[i] contents], 0, 64*128*128*sizeof(float));
-            ctx->buf_conv_state[i] = [ctx->device newBufferWithLength:3*12288*sizeof(float)
+            memset([ctx->buf_delta_state[i] contents], 0, delta_state_floats * sizeof(float));
+            ctx->buf_conv_state[i] = [ctx->device newBufferWithLength:conv_state_floats * sizeof(float)
                                                               options:MTLResourceStorageModeShared];
-            memset([ctx->buf_conv_state[i] contents], 0, 3*12288*sizeof(float));
+            memset([ctx->buf_conv_state[i] contents], 0, conv_state_floats * sizeof(float));
         }
-        // Scratch buffers for delta-net inputs/outputs (allocated once, reused)
-        ctx->buf_delta_q       = [ctx->device newBufferWithLength:2048*sizeof(float)  options:MTLResourceStorageModeShared];
-        ctx->buf_delta_k       = [ctx->device newBufferWithLength:2048*sizeof(float)  options:MTLResourceStorageModeShared];
-        ctx->buf_delta_v       = [ctx->device newBufferWithLength:8192*sizeof(float)  options:MTLResourceStorageModeShared];
-        ctx->buf_delta_g_decay = [ctx->device newBufferWithLength:64*sizeof(float)    options:MTLResourceStorageModeShared];
-        ctx->buf_delta_beta    = [ctx->device newBufferWithLength:64*sizeof(float)    options:MTLResourceStorageModeShared];
-        ctx->buf_delta_output  = [ctx->device newBufferWithLength:8192*sizeof(float)  options:MTLResourceStorageModeShared];
-        ctx->buf_conv_input    = [ctx->device newBufferWithLength:12288*sizeof(float) options:MTLResourceStorageModeShared];
-        ctx->buf_conv_output   = [ctx->device newBufferWithLength:12288*sizeof(float) options:MTLResourceStorageModeShared];
+        // Scratch buffers for delta-net inputs/outputs (allocated once, reused).
+        ctx->buf_delta_q       = [ctx->device newBufferWithLength:LINEAR_TOTAL_KEY   * sizeof(float) options:MTLResourceStorageModeShared];
+        ctx->buf_delta_k       = [ctx->device newBufferWithLength:LINEAR_TOTAL_KEY   * sizeof(float) options:MTLResourceStorageModeShared];
+        ctx->buf_delta_v       = [ctx->device newBufferWithLength:LINEAR_TOTAL_VALUE * sizeof(float) options:MTLResourceStorageModeShared];
+        ctx->buf_delta_g_decay = [ctx->device newBufferWithLength:LINEAR_NUM_V_HEADS * sizeof(float) options:MTLResourceStorageModeShared];
+        ctx->buf_delta_beta    = [ctx->device newBufferWithLength:LINEAR_NUM_V_HEADS * sizeof(float) options:MTLResourceStorageModeShared];
+        ctx->buf_delta_output  = [ctx->device newBufferWithLength:LINEAR_TOTAL_VALUE * sizeof(float) options:MTLResourceStorageModeShared];
+        ctx->buf_conv_input    = [ctx->device newBufferWithLength:LINEAR_CONV_DIM    * sizeof(float) options:MTLResourceStorageModeShared];
+        ctx->buf_conv_output   = [ctx->device newBufferWithLength:LINEAR_CONV_DIM    * sizeof(float) options:MTLResourceStorageModeShared];
+        const size_t scratch_floats =
+            2 * LINEAR_TOTAL_KEY + LINEAR_TOTAL_VALUE +
+            2 * LINEAR_NUM_V_HEADS + LINEAR_TOTAL_VALUE + 2 * LINEAR_CONV_DIM;
         printf("[metal] Delta-net GPU buffers: %d layers (%.1f MB state + %.1f MB scratch)\n",
                NUM_LINEAR_LAYERS,
-               NUM_LINEAR_LAYERS * (64*128*128*4 + 3*12288*4) / 1e6,
-               (2048+2048+8192+64+64+8192+12288+12288) * 4 / 1e6);
+               NUM_LINEAR_LAYERS * (delta_state_floats + conv_state_floats) * sizeof(float) / 1e6,
+               scratch_floats * sizeof(float) / 1e6);
     }
 
     // Create shared event for CPU-GPU async pipeline
@@ -1188,14 +1203,18 @@ static MetalCtx *metal_setup(void) {
     return ctx;
 }
 
-// Reset delta-net and conv GPU state buffers (call at start of new generation)
+// Reset delta-net and conv GPU state buffers (call at start of new generation).
 static void reset_delta_net_state(void) {
     if (!g_metal || !g_metal->delta_net_step) return;
+    const size_t delta_state_bytes =
+        (size_t)LINEAR_NUM_V_HEADS * LINEAR_VALUE_DIM * LINEAR_KEY_DIM * sizeof(float);
+    const size_t conv_state_bytes =
+        (size_t)(CONV_KERNEL_SIZE - 1) * LINEAR_CONV_DIM * sizeof(float);
     for (int i = 0; i < NUM_LINEAR_LAYERS; i++) {
         if (g_metal->buf_delta_state[i])
-            memset([g_metal->buf_delta_state[i] contents], 0, 64*128*128*sizeof(float));
+            memset([g_metal->buf_delta_state[i] contents], 0, delta_state_bytes);
         if (g_metal->buf_conv_state[i])
-            memset([g_metal->buf_conv_state[i] contents], 0, 3*12288*sizeof(float));
+            memset([g_metal->buf_conv_state[i] contents], 0, conv_state_bytes);
     }
 }
 
@@ -6179,16 +6198,18 @@ static void serve_loop(
     memset(gpu_delta_snapshots, 0, sizeof(gpu_delta_snapshots));
     memset(gpu_conv_snapshots, 0, sizeof(gpu_conv_snapshots));
     if (g_metal && g_metal->delta_net_step) {
+        const size_t delta_state_bytes =
+            (size_t)LINEAR_NUM_V_HEADS * LINEAR_VALUE_DIM * LINEAR_KEY_DIM * sizeof(float);
+        const size_t conv_state_bytes =
+            (size_t)(CONV_KERNEL_SIZE - 1) * LINEAR_CONV_DIM * sizeof(float);
         for (int i = 0; i < NUM_LINEAR_LAYERS; i++) {
             if (g_metal->buf_delta_state[i]) {
-                size_t sz = 64*128*128*sizeof(float);
-                gpu_delta_snapshots[i] = malloc(sz);
-                memcpy(gpu_delta_snapshots[i], [g_metal->buf_delta_state[i] contents], sz);
+                gpu_delta_snapshots[i] = malloc(delta_state_bytes);
+                memcpy(gpu_delta_snapshots[i], [g_metal->buf_delta_state[i] contents], delta_state_bytes);
             }
             if (g_metal->buf_conv_state[i]) {
-                size_t sz = 3*12288*sizeof(float);
-                gpu_conv_snapshots[i] = malloc(sz);
-                memcpy(gpu_conv_snapshots[i], [g_metal->buf_conv_state[i] contents], sz);
+                gpu_conv_snapshots[i] = malloc(conv_state_bytes);
+                memcpy(gpu_conv_snapshots[i], [g_metal->buf_conv_state[i] contents], conv_state_bytes);
             }
         }
     }
