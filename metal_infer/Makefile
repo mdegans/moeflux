@@ -25,6 +25,20 @@ CFLAGS = -O2 -Wall -Wextra -fobjc-arc -DACCELERATE_NEW_LAPACK
 FRAMEWORKS = -framework Metal -framework Foundation -framework Accelerate
 LDFLAGS = -lpthread -lcompression
 
+# Model variant selection. Defaults to Qwen3.5-A17B (upstream's target);
+# set MODEL=qwen3-6-35b-a3b on the command line to build for the smaller
+# Qwen3.6-35B-A3B shape. See model_variant.h for the full list and
+# docs/model_variants.md for how to add a new one.
+MODEL ?= qwen3-5-a17b
+ifeq ($(MODEL),qwen3-5-a17b)
+MODEL_DEFINE = -DMOEFLUX_MODEL_QWEN3_5_A17B
+else ifeq ($(MODEL),qwen3-6-35b-a3b)
+MODEL_DEFINE = -DMOEFLUX_MODEL_QWEN3_6_35B_A3B
+else
+$(error Unknown MODEL=$(MODEL). Supported: qwen3-5-a17b, qwen3-6-35b-a3b)
+endif
+CFLAGS += $(MODEL_DEFINE)
+
 TARGET = metal_infer
 MAIN_SRC = main.m
 
