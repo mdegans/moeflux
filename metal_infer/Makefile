@@ -76,8 +76,17 @@ $(LIB_TARGET): $(LIB_OBJ)
 
 lib: $(LIB_TARGET)
 
+# C smoke test — links against libmoeflux.a. Does not actually run
+# during `make`; invoke via ./smoke <weights> <manifest> <vocab>
+# <experts_dir>. See ../tests/smoke.c.
+SMOKE_TARGET = smoke
+SMOKE_SRC = ../tests/smoke.c
+
+$(SMOKE_TARGET): $(SMOKE_SRC) $(LIB_TARGET) moeflux.h
+	$(CC) -O2 -Wall -I. $(SMOKE_SRC) $(LIB_TARGET) $(FRAMEWORKS) $(LDFLAGS) -o $(SMOKE_TARGET)
+
 clean:
-	rm -f $(TARGET) $(INFER_TARGET) $(LIB_TARGET) $(LIB_OBJ) $(SHADER_AIR) $(SHADER_LIB)
+	rm -f $(TARGET) $(INFER_TARGET) $(LIB_TARGET) $(LIB_OBJ) $(SMOKE_TARGET) $(SHADER_AIR) $(SHADER_LIB)
 
 # Run targets
 run: $(TARGET)

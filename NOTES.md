@@ -196,15 +196,17 @@ need:
 
 ## Open tasks in order
 
-- [ ] 3b.2 strip + Makefile update (+ verify `infer` still builds)
-- [ ] 3b.3 add `mf_memory_seq_rm`, `mf_memory_clear`,
-      `mf_memory_seq_pos_max`
-- [ ] 3b.4 add `mf_*` C API (moeflux.h + wrapper functions) +
+- [x] 3b.2 strip + Makefile update (+ verify `infer` still builds)
+- [x] 3b.3 add `mf_memory_seq_rm`, `mf_memory_clear`,
+      `mf_memory_seq_pos_max` (static helpers in infer.m)
+- [x] 3b.4 add `mf_*` C API (moeflux.h + wrapper functions) +
       `libmoeflux.a` target
-- [ ] 3b.5 C smoke test (tests/smoke.c)
+- [x] 3b.5 C smoke test (tests/smoke.c) — builds clean; actual
+      run needs a real model locally (gated on Mike's download)
 - [ ] (deferred) Option B: `mf_state_save` / `mf_state_load` for
       linear-attn state snapshotting
 - [ ] (Phase 4) Replace tokenizer.h with Rust-side tokenization
+- [ ] (Phase 4) Rust-facing wrapper crate on top of libmoeflux.a
 
 ## Key line-number references
 

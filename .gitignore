@@ -3,6 +3,7 @@ metal_infer/infer
 metal_infer/metal_infer
 metal_infer/bench_pread
 metal_infer/libmoeflux.a
+metal_infer/smoke
 *.o
 *.air
 *.metallib
