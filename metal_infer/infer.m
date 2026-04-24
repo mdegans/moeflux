@@ -1543,7 +1543,7 @@ static void gpu_encode_expert_forward_slot(
         up_w_off   = UP_W_OFF_2;   up_s_off   = UP_S_OFF_2;   up_b_off   = UP_B_OFF_2;
         down_w_off = DOWN_W_OFF_2; down_s_off = DOWN_S_OFF_2; down_b_off = DOWN_B_OFF_2;
     } else {
-        gate_w_off = 0;        gate_s_off = 2097152;  gate_b_off = 2228224;
+        gate_w_off = 0;        gate_s_off = GATE_S_OFF;  gate_b_off = GATE_B_OFF;
         up_w_off   = UP_W_OFF;  up_s_off   = UP_S_OFF;  up_b_off   = UP_B_OFF;
         down_w_off = DOWN_W_OFF;  down_s_off = DOWN_S_OFF;  down_b_off = DOWN_B_OFF;
     }
@@ -1639,7 +1639,7 @@ static void gpu_encode_expert_forward_slot_buf(
         up_w_off   = UP_W_OFF_2;   up_s_off   = UP_S_OFF_2;   up_b_off   = UP_B_OFF_2;
         down_w_off = DOWN_W_OFF_2; down_s_off = DOWN_S_OFF_2; down_b_off = DOWN_B_OFF_2;
     } else {
-        gate_w_off = 0;        gate_s_off = 2097152;  gate_b_off = 2228224;
+        gate_w_off = 0;        gate_s_off = GATE_S_OFF;  gate_b_off = GATE_B_OFF;
         up_w_off   = UP_W_OFF;  up_s_off   = UP_S_OFF;  up_b_off   = UP_B_OFF;
         down_w_off = DOWN_W_OFF;  down_s_off = DOWN_S_OFF;  down_b_off = DOWN_B_OFF;
     }
@@ -1739,7 +1739,7 @@ static void gpu_encode_experts_batched(
         up_w_off   = UP_W_OFF_2;   up_s_off   = UP_S_OFF_2;   up_b_off   = UP_B_OFF_2;
         down_w_off = DOWN_W_OFF_2; down_s_off = DOWN_S_OFF_2; down_b_off = DOWN_B_OFF_2;
     } else {
-        gate_w_off = 0;        gate_s_off = 2097152;  gate_b_off = 2228224;
+        gate_w_off = 0;        gate_s_off = GATE_S_OFF;  gate_b_off = GATE_B_OFF;
         up_w_off   = UP_W_OFF;  up_s_off   = UP_S_OFF;  up_b_off   = UP_B_OFF;
         down_w_off = DOWN_W_OFF;  down_s_off = DOWN_S_OFF;  down_b_off = DOWN_B_OFF;
     }
@@ -1825,8 +1825,8 @@ static void gpu_encode_expert_forward(
     id<MTLCommandBuffer> cmdbuf
 ) {
     NSUInteger gate_w_off = 0;
-    NSUInteger gate_s_off = 2097152;
-    NSUInteger gate_b_off = 2228224;
+    NSUInteger gate_s_off = GATE_S_OFF;
+    NSUInteger gate_b_off = GATE_B_OFF;
     NSUInteger up_w_off   = UP_W_OFF;
     NSUInteger up_s_off   = UP_S_OFF;
     NSUInteger up_b_off   = UP_B_OFF;
@@ -1948,7 +1948,7 @@ static void gpu_expert_forward(
         up_w_off   = UP_W_OFF_2;   up_s_off   = UP_S_OFF_2;   up_b_off   = UP_B_OFF_2;
         down_w_off = DOWN_W_OFF_2; down_s_off = DOWN_S_OFF_2; down_b_off = DOWN_B_OFF_2;
     } else {
-        gate_w_off = 0;        gate_s_off = 2097152;  gate_b_off = 2228224;
+        gate_w_off = 0;        gate_s_off = GATE_S_OFF;  gate_b_off = GATE_B_OFF;
         up_w_off   = UP_W_OFF;  up_s_off   = UP_S_OFF;  up_b_off   = UP_B_OFF;
         down_w_off = DOWN_W_OFF;  down_s_off = DOWN_S_OFF;  down_b_off = DOWN_B_OFF;
     }
@@ -2905,8 +2905,8 @@ static void moe_forward(
                 }
 
                 uint32_t *gw = (uint32_t *)expert_data;
-                uint16_t *gs_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? GATE_S_OFF_2 : 2097152));
-                uint16_t *gb_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? GATE_B_OFF_2 : 2228224));
+                uint16_t *gs_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? GATE_S_OFF_2 : GATE_S_OFF));
+                uint16_t *gb_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? GATE_B_OFF_2 : GATE_B_OFF));
                 uint32_t *uw = (uint32_t *)((char *)expert_data + (g_use_2bit ? UP_W_OFF_2 : UP_W_OFF));
                 uint16_t *us_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? UP_S_OFF_2 : UP_S_OFF));
                 uint16_t *ub_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? UP_B_OFF_2 : UP_B_OFF));
@@ -4016,6 +4016,59 @@ static void wait_deferred_experts_gpu(void) {
 static void finalize_deferred_experts(void) {
     if (!g_deferred.active) return;
 
+    // ---- MOEFLUX_DUMP_L0: dump layer-0 MoE sub-components ----
+    // Captured at finalize time (after GPU experts have run). Emits:
+    //   h_mid        - post-attention residual, BEFORE MLP added
+    //   out          - final layer output (= h_mid + moe_out + shared_out)
+    //   shared_raw   - raw shared-expert output (before sigmoid gate)
+    //   expert_outs  - per-expert output for top-K
+    //   weights+idx  - expert weights and indices
+    //   gate_score   - shared-expert gate pre-sigmoid score
+    static int s_l0_components_dumped = 0;
+    if (g_deferred.layer_idx == 0 && !s_l0_components_dumped && getenv("MOEFLUX_DUMP_L0") != NULL) {
+        s_l0_components_dumped = 1;
+        const char *prefix = getenv("MOEFLUX_DUMP_L0");
+        char path[1024];
+        snprintf(path, sizeof(path), "%s_l0_components.bin", prefix);
+        FILE *fd = fopen(path, "wb");
+        if (fd) {
+            int32_t hdr[3] = { HIDDEN_DIM, g_deferred.actual_K, 0 };
+            fwrite(hdr, sizeof(int32_t), 3, fd);
+            // h_mid (buf_h_mid contents — only populated on GPU combine path;
+            // on CPU path g_deferred.h_mid has it)
+            if (g_deferred.gpu_combined && g_metal && g_metal->buf_h_mid) {
+                fwrite([g_metal->buf_h_mid contents], sizeof(float), HIDDEN_DIM, fd);
+            } else {
+                fwrite(g_deferred.h_mid, sizeof(float), HIDDEN_DIM, fd);
+            }
+            // final output (buf_moe_hidden)
+            if (g_metal && g_metal->buf_moe_hidden) {
+                fwrite([g_metal->buf_moe_hidden contents], sizeof(float), HIDDEN_DIM, fd);
+            }
+            // shared_raw (buf_shared_out — pre-sigmoid-gate)
+            if (g_metal && g_metal->buf_shared_out) {
+                fwrite([g_metal->buf_shared_out contents], sizeof(float), HIDDEN_DIM, fd);
+            }
+            // per-expert outputs (up to MAX_K=8)
+            for (int k = 0; k < g_deferred.actual_K; k++) {
+                if (g_metal && g_metal->buf_multi_expert_out[k] && g_deferred.valid[k]) {
+                    fwrite([g_metal->buf_multi_expert_out[k] contents],
+                           sizeof(float), HIDDEN_DIM, fd);
+                } else {
+                    float zero[HIDDEN_DIM] = {0};
+                    fwrite(zero, sizeof(float), HIDDEN_DIM, fd);
+                }
+            }
+            // weights and scalar gate_score
+            fwrite(g_deferred.expert_weights, sizeof(float), g_deferred.actual_K, fd);
+            fwrite(&g_deferred.shared_gate_score, sizeof(float), 1, fd);
+            fclose(fd);
+            fprintf(stderr, "[MOEFLUX_DUMP_L0] wrote %s (h_mid + out + shared_raw + "
+                    "%d expert_outs + weights + gate_score, gpu_combined=%d)\n",
+                    path, g_deferred.actual_K, g_deferred.gpu_combined);
+        }
+    }
+
     if (g_deferred.gpu_combined) {
         // GPU-side combine: hidden state is already in buf_moe_hidden.
         // buf_input already has the normalized input for the next layer's CMD1.
@@ -4529,6 +4582,23 @@ static void fused_layer_forward(
             }
         }
         if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd1_wait += t1 - t0; }
+    }
+
+    // ---- MOEFLUX_DUMP_L0: dump `hidden` = previous layer's output ----
+    // At this point, finalize_deferred_experts() has completed (for both
+    // fast and slow paths), so `hidden` holds layer N-1's output (or the
+    // raw embedding for N=0). Fires on the first prompt token only.
+    if (pos == 0 && getenv("MOEFLUX_DUMP_L0") != NULL) {
+        const char *prefix = getenv("MOEFLUX_DUMP_L0");
+        char path[1024];
+        snprintf(path, sizeof(path), "%s_l%d_in.bin", prefix, layer_idx);
+        FILE *fd = fopen(path, "wb");
+        if (fd) {
+            int32_t hdr[2] = { HIDDEN_DIM, layer_idx };
+            fwrite(hdr, sizeof(int32_t), 2, fd);
+            fwrite(hidden, sizeof(float), HIDDEN_DIM, fd);
+            fclose(fd);
+        }
     }
 
     // =====================================================================
@@ -5206,11 +5276,51 @@ static void fused_layer_forward(
 
     // ---- Softmax + top-K (CPU) ----
     if (g_timing_enabled) { t0 = now_ms(); }
+
+    // ---- MOEFLUX_DUMP_L0: snapshot raw gate logits before softmax ----
+    // Env-gated diagnostic for numerically comparing per-layer MLP inputs
+    // and gate outputs against an MLX reference run. Set
+    // MOEFLUX_DUMP_L0=/path/prefix. Writes /path/prefix_l{N}.bin, one file
+    // per layer, on the first call per layer (first prompt token, pos=0).
+    float dump_raw_gate[NUM_EXPERTS];
+    int dump_l0_active = (pos == 0 && getenv("MOEFLUX_DUMP_L0") != NULL);
+    if (dump_l0_active) {
+        memcpy(dump_raw_gate, gate_scores, NUM_EXPERTS * sizeof(float));
+    }
+
     cpu_softmax(gate_scores, NUM_EXPERTS);
     int expert_indices[64];
     float expert_weights[64];
     cpu_topk(gate_scores, NUM_EXPERTS, K, expert_indices, expert_weights);
     cpu_normalize_weights(expert_weights, K);
+
+    // ---- MOEFLUX_DUMP_L0: emit dump ----
+    if (dump_l0_active) {
+        const char *prefix = getenv("MOEFLUX_DUMP_L0");
+        char path[1024];
+        snprintf(path, sizeof(path), "%s_l%d.bin", prefix, layer_idx);
+        FILE *fd = fopen(path, "wb");
+        if (fd) {
+            int32_t hdr[4] = { HIDDEN_DIM, NUM_EXPERTS, K, layer_idx };
+            fwrite(hdr, sizeof(int32_t), 4, fd);
+            fwrite(h_post, sizeof(float), HIDDEN_DIM, fd);
+            fwrite(dump_raw_gate, sizeof(float), NUM_EXPERTS, fd);
+            fwrite(gate_scores, sizeof(float), NUM_EXPERTS, fd);
+            fwrite(expert_indices, sizeof(int32_t), K, fd);
+            fwrite(expert_weights, sizeof(float), K, fd);
+            fclose(fd);
+            fprintf(stderr, "[MOEFLUX_DUMP_L0] wrote %s  top-%d: [",
+                    path, K);
+            for (int k = 0; k < K; k++) {
+                fprintf(stderr, "%s%d(%.3f)", k ? "," : "",
+                        expert_indices[k], expert_weights[k]);
+            }
+            fprintf(stderr, "]\n");
+        } else {
+            fprintf(stderr, "[MOEFLUX_DUMP_L0] failed to open %s for writing\n", path);
+        }
+    }
+
     if (g_freq_tracking) {
         for (int k = 0; k < K; k++) {
             g_expert_freq[layer_idx][expert_indices[k]]++;
@@ -5656,8 +5766,8 @@ static void fused_layer_forward(
 
             // CPU fallback offsets — use 4-bit layout (2-bit CPU path not yet implemented)
             uint32_t *gw = (uint32_t *)expert_data;
-            uint16_t *gs_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? GATE_S_OFF_2 : 2097152));
-            uint16_t *gb_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? GATE_B_OFF_2 : 2228224));
+            uint16_t *gs_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? GATE_S_OFF_2 : GATE_S_OFF));
+            uint16_t *gb_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? GATE_B_OFF_2 : GATE_B_OFF));
             uint32_t *uw = (uint32_t *)((char *)expert_data + (g_use_2bit ? UP_W_OFF_2 : UP_W_OFF));
             uint16_t *us_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? UP_S_OFF_2 : UP_S_OFF));
             uint16_t *ub_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? UP_B_OFF_2 : UP_B_OFF));
