@@ -39,11 +39,9 @@ def parse_safetensors_header(filepath):
 
 def main():
     parser = argparse.ArgumentParser(description='Extract non-expert weights to binary')
-    parser.add_argument('--model', type=str,
-                        default=os.path.expanduser(
-                            '~/.cache/huggingface/hub/models--mlx-community--Qwen3.5-397B-A17B-4bit'
-                            '/snapshots/39159bd8aa74f5c8446d2b2dc584f62bb51cb0d3'),
-                        help='Path to model directory')
+    parser.add_argument('--model', type=str, required=True,
+                        help='Path to MLX-converted model directory '
+                             '(containing model.safetensors.index.json + config.json)')
     parser.add_argument('--output', type=str, default='.',
                         help='Output directory for model_weights.bin and .json')
     parser.add_argument('--include-experts', action='store_true',
@@ -64,6 +62,17 @@ def main():
         idx = json.load(f)
 
     weight_map = idx['weight_map']
+
+    # Load model config — drives the manifest's "config" block instead
+    # of hardcoded A17B values. qwen3_5_moe nests the text-model config
+    # under "text_config"; fall back to the root for older formats.
+    config_path = model_path / 'config.json'
+    if not config_path.exists():
+        print(f"ERROR: {config_path} not found", file=sys.stderr)
+        sys.exit(1)
+    with open(config_path) as f:
+        hf_config = json.load(f)
+    text_config = hf_config.get('text_config', hf_config)
 
     # Filter: keep only language_model weights, skip vision_tower
     # Also skip expert weights (switch_mlp.{gate_proj,up_proj,down_proj}.{weight,scales,biases})
@@ -117,42 +126,50 @@ def main():
 
     # Write binary file
     bin_path = output_dir / 'model_weights.bin'
+    # Pull config from the model's HuggingFace config.json; each key
+    # maps 1:1 to a field the C engine expects.
+    rope_params = text_config.get('rope_parameters', {})
+    cfg_out = {
+        "hidden_size":                     text_config['hidden_size'],
+        "num_hidden_layers":               text_config['num_hidden_layers'],
+        "num_attention_heads":             text_config['num_attention_heads'],
+        "num_key_value_heads":             text_config['num_key_value_heads'],
+        "head_dim":                        text_config['head_dim'],
+        "vocab_size":                      text_config['vocab_size'],
+        "rms_norm_eps":                    text_config.get('rms_norm_eps', 1e-6),
+        "num_experts":                     text_config['num_experts'],
+        "num_experts_per_tok":             text_config['num_experts_per_tok'],
+        "moe_intermediate_size":           text_config['moe_intermediate_size'],
+        "shared_expert_intermediate_size": text_config['shared_expert_intermediate_size'],
+        "full_attention_interval":         text_config['full_attention_interval'],
+        "linear_num_value_heads":          text_config['linear_num_value_heads'],
+        "linear_num_key_heads":            text_config['linear_num_key_heads'],
+        "linear_key_head_dim":             text_config['linear_key_head_dim'],
+        "linear_value_head_dim":           text_config['linear_value_head_dim'],
+        "linear_conv_kernel_dim":          text_config['linear_conv_kernel_dim'],
+        "partial_rotary_factor":           (rope_params.get('partial_rotary_factor')
+                                            or text_config.get('partial_rotary_factor', 0.25)),
+        "rope_theta":                      (rope_params.get('rope_theta')
+                                            or text_config.get('rope_theta', 10000000.0)),
+    }
     manifest = {
         "model": str(model_path),
         "num_tensors": len(all_tensors),
         "tensors": {},
-        # Model config for the C engine
-        "config": {
-            "hidden_size": 4096,
-            "num_hidden_layers": 60,
-            "num_attention_heads": 32,
-            "num_key_value_heads": 2,
-            "head_dim": 256,
-            "vocab_size": 248320,
-            "rms_norm_eps": 1e-6,
-            "num_experts": 512,
-            "num_experts_per_tok": 10,
-            "moe_intermediate_size": 1024,
-            "shared_expert_intermediate_size": 1024,
-            "full_attention_interval": 4,
-            "linear_num_value_heads": 64,
-            "linear_num_key_heads": 16,
-            "linear_key_head_dim": 128,
-            "linear_value_head_dim": 128,
-            "linear_conv_kernel_dim": 4,
-            "partial_rotary_factor": 0.25,
-            "rope_theta": 10000000.0,
-        }
+        "config": cfg_out,
     }
 
-    # Layer type map
-    layer_types = []
-    for i in range(60):
-        if (i + 1) % 4 == 0:
-            layer_types.append("full_attention")
-        else:
-            layer_types.append("linear_attention")
-    manifest["config"]["layer_types"] = layer_types
+    # Layer type map: take it from config when present (qwen3_5_moe
+    # ships an explicit layer_types list); otherwise fall back to the
+    # 3-linear : 1-full pattern driven by full_attention_interval.
+    if 'layer_types' in text_config:
+        manifest["config"]["layer_types"] = list(text_config['layer_types'])
+    else:
+        interval = cfg_out["full_attention_interval"]
+        manifest["config"]["layer_types"] = [
+            "full_attention" if (i + 1) % interval == 0 else "linear_attention"
+            for i in range(cfg_out["num_hidden_layers"])
+        ]
 
     print(f"\nWriting {bin_path}...")
     t0 = time.time()
