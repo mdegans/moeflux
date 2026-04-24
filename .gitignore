@@ -1,8 +1,8 @@
 # Build artifacts
 metal_infer/infer
-metal_infer/chat
 metal_infer/metal_infer
 metal_infer/bench_pread
+metal_infer/libmoeflux.a
 *.o
 *.air
 *.metallib
@@ -31,7 +31,5 @@ __pycache__/
 logs/
 *.log
 
-# Test binaries and experiment data
-metal_infer/test_lzfse
-metal_infer/repack_experts_lz4
+# Experiment data
 metal_infer/routing_data.bin

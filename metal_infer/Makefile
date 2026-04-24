@@ -1,7 +1,7 @@
-# Makefile for metal_infer — Pure C/Metal MoE inference engine
+# Makefile for moeflux/metal_infer — streaming-experts MoE inference
 #
 # Targets:
-#   make          — build metal_infer binary
+#   make          — build metal_infer + infer binaries
 #   make run      — single expert forward pass
 #   make verify   — verify Metal vs CPU reference
 #   make bench    — benchmark single expert (10 iterations)
@@ -9,8 +9,13 @@
 #   make moebench — benchmark MoE (10 iterations)
 #   make full     — full 60-layer MoE forward pass (K=4)
 #   make fullbench — benchmark full 60-layer forward (3 iterations)
-#   make chat     — build interactive chat TUI
 #   make clean    — remove build artifacts
+#
+# Upstream had a `chat` HTTP/SSE client target — stripped in the
+# moeflux fork since drama_llama drives generation. See NOTES.md.
+#
+# A `libmoeflux.a` static-library target will be added in Phase 3b.4
+# once the mf_* C API surface is in place.
 #
 # Note: Metal shaders are compiled from source at runtime via
 # MTLDevice newLibraryWithSource:, so no offline metal compiler needed.
@@ -34,11 +39,7 @@ SHADER_LIB = shaders.metallib
 INFER_TARGET = infer
 INFER_SRC = infer.m
 
-# Chat TUI (interactive multi-turn)
-CHAT_TARGET = chat
-CHAT_SRC = chat.m
-
-.PHONY: all clean run verify bench moe moebench full fullbench fast metallib infer infer-run chat-run build-chat
+.PHONY: all clean run verify bench moe moebench full fullbench fast metallib infer infer-run
 
 all: $(TARGET) $(INFER_TARGET)
 
@@ -59,12 +60,8 @@ $(SHADER_LIB): $(SHADER_AIR)
 $(INFER_TARGET): $(INFER_SRC)
 	$(CC) $(CFLAGS) $(FRAMEWORKS) $(LDFLAGS) $(INFER_SRC) -o $(INFER_TARGET)
 
-# Build the chat client (thin HTTP/SSE client + linenoise line editor)
-$(CHAT_TARGET): $(CHAT_SRC) linenoise.c linenoise.h
-	$(CC) -O2 -Wall -fobjc-arc -framework Foundation $(CHAT_SRC) linenoise.c -o $(CHAT_TARGET)
-
 clean:
-	rm -f $(TARGET) $(INFER_TARGET) $(CHAT_TARGET) $(SHADER_AIR) $(SHADER_LIB)
+	rm -f $(TARGET) $(INFER_TARGET) $(SHADER_AIR) $(SHADER_LIB)
 
 # Run targets
 run: $(TARGET)
@@ -96,8 +93,3 @@ build-infer: $(INFER_TARGET)
 
 infer-run: $(INFER_TARGET)
 	./$(INFER_TARGET) --prompt "Hello, what is" --tokens 20 --k 4
-
-# Chat TUI targets (use: make chat)
-
-chat-run: $(CHAT_TARGET)
-	./$(CHAT_TARGET) --k 4
