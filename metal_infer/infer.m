@@ -6630,6 +6630,8 @@ static void print_usage(const char *prog) {
     printf("  --help               This message\n");
 }
 
+#if !defined(MOEFLUX_LIB)
+
 int main(int argc, char **argv) {
     @autoreleasepool {
         const char *model_path = MODEL_PATH_DEFAULT;
@@ -7257,4 +7259,321 @@ int main(int argc, char **argv) {
         return 0;
     }
 }
+
+#endif // !MOEFLUX_LIB
 #endif // CHAT_MODE
+
+// ============================================================================
+// moeflux public C API — stable surface consumed by drama_llama
+// ============================================================================
+//
+// These wrappers orchestrate the primitives defined above into a
+// drama_llama-friendly shape: opaque context handle, caller-allocated
+// logit buffers, no internal sampling. Included in both the `infer`
+// binary build (unreferenced; the linker strips them) and the
+// `libmoeflux.a` build (the sole entry points).
+//
+// Call site orientation:
+//   mf_init_model  ← mirrors main() setup (line ~6735 onward in the
+//                    pre-API version); builds the same WeightFile /
+//                    Vocabulary / per-layer-state tuple that
+//                    serve_loop expects.
+//   mf_eval_prompt ← mirrors main()'s batch-prefill loop (line ~7001),
+//                    with discard_deferred_experts on intermediate
+//                    tokens and complete_deferred_experts on the last
+//                    token before the final norm + lm_head.
+//   mf_eval_token  ← mirrors the per-token generation body
+//                    (line ~7141); single token, full pipeline.
+
+#include "moeflux.h"
+
+struct mf_ctx {
+    WeightFile *wf;
+    Vocabulary *vocab;
+    void **layer_states;     // [NUM_LAYERS], LinearAttnState* for linear
+    KVCache **kv_caches;     // [NUM_LAYERS], non-NULL on full-attn layers
+    void **layer_mmaps;      // [NUM_LAYERS], MAP_FAILED where unavailable
+    size_t *layer_mmap_sizes;// [NUM_LAYERS]
+    int *layer_fds;          // [NUM_LAYERS], -1 where unavailable
+    float *hidden;           // [HIDDEN_DIM]
+    float *logits;           // [VOCAB_SIZE]
+    uint16_t *final_norm_w;  // borrowed from wf, do not free
+    int K;                   // experts per token (typical 4)
+};
+
+mf_ctx *mf_init_model(const char *weights_path,
+                      const char *manifest_path,
+                      const char *vocab_path,
+                      const char *experts_dir,
+                      int experts_per_tok,
+                      int use_2bit)
+{
+    if (!weights_path || !manifest_path || !vocab_path || !experts_dir) {
+        return NULL;
+    }
+
+    // 1. Metal context (sets the file-scope g_metal as a side effect).
+    if (!g_metal) {
+        g_metal = metal_setup();
+        // g_metal == NULL → CPU fallback is allowed; we do not fail
+        // init here. The downstream kernels guard against it.
+    }
+
+    // 2. I/O thread pool.
+    io_pool_init();
+
+    // 3. Weight file mmap + manifest load.
+    WeightFile *wf = open_weights(weights_path, manifest_path);
+    if (!wf) return NULL;
+
+    // 4. Bind weights as a Metal buffer (no-op if CPU fallback).
+    if (g_metal) {
+        metal_set_weights(g_metal, wf->data, wf->size);
+    }
+
+    // 5. Vocabulary load.
+    Vocabulary *vocab = load_vocab(vocab_path);
+    if (!vocab) {
+        // WeightFile teardown is best-effort — upstream main() leaks
+        // this on exit, so we match its behavior rather than inventing
+        // a free path that might double-unmap.
+        return NULL;
+    }
+
+    // Flip the 2-bit flag if requested; must happen before expert
+    // files are opened since the directory name depends on it.
+    if (use_2bit) g_use_2bit = 1;
+
+    // 6. Allocate ctx and per-layer arrays up front so failure paths
+    //    can call mf_free_model cleanly.
+    mf_ctx *ctx = calloc(1, sizeof(struct mf_ctx));
+    if (!ctx) return NULL;
+    ctx->wf = wf;
+    ctx->vocab = vocab;
+    ctx->K = (experts_per_tok > 0) ? experts_per_tok : NUM_EXPERTS_PER_TOK;
+    ctx->layer_states = calloc(NUM_LAYERS, sizeof(void *));
+    ctx->kv_caches = calloc(NUM_LAYERS, sizeof(KVCache *));
+    ctx->layer_mmaps = calloc(NUM_LAYERS, sizeof(void *));
+    ctx->layer_mmap_sizes = calloc(NUM_LAYERS, sizeof(size_t));
+    ctx->layer_fds = calloc(NUM_LAYERS, sizeof(int));
+    if (!ctx->layer_states || !ctx->kv_caches || !ctx->layer_mmaps
+        || !ctx->layer_mmap_sizes || !ctx->layer_fds) {
+        mf_free_model(ctx);
+        return NULL;
+    }
+
+    // 7. Open + mmap packed expert files. Missing files are
+    //    tolerated (layer_fds[i] stays -1, layer_mmaps[i] stays
+    //    MAP_FAILED); fused_layer_forward handles the absence by
+    //    zeroing expert outputs. The 2-bit / 4-bit split follows
+    //    the same directory layout as main().
+    memset(g_expert_seen, 0, sizeof(g_expert_seen));
+    const char *subdir = use_2bit ? "packed_experts_2bit"
+                                  : "packed_experts";
+    for (int i = 0; i < NUM_LAYERS; i++) {
+        ctx->layer_fds[i] = -1;
+        ctx->layer_mmaps[i] = MAP_FAILED;
+        ctx->layer_mmap_sizes[i] = 0;
+
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/%s/layer_%02d.bin",
+                 experts_dir, subdir, i);
+        int fd = open(path, O_RDONLY);
+        if (fd < 0) continue;
+        fcntl(fd, F_RDAHEAD, 0);
+
+        struct stat st;
+        if (fstat(fd, &st) != 0 || st.st_size <= 0) {
+            close(fd);
+            continue;
+        }
+
+        void *m = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+        ctx->layer_fds[i] = fd;
+        if (m != MAP_FAILED) {
+            ctx->layer_mmaps[i] = m;
+            ctx->layer_mmap_sizes[i] = st.st_size;
+        }
+    }
+
+    // 8. Per-layer state. 15 full-attention layers get a KV cache;
+    //    45 linear-attention layers get a GatedDeltaNet recurrence.
+    for (int i = 0; i < NUM_LAYERS; i++) {
+        int is_full = ((i + 1) % FULL_ATTN_INTERVAL == 0);
+        if (is_full) {
+            ctx->kv_caches[i] = kv_cache_new();
+        } else {
+            ctx->layer_states[i] = linear_attn_state_new();
+        }
+    }
+
+    // 9. Working buffers.
+    ctx->hidden = calloc(HIDDEN_DIM, sizeof(float));
+    ctx->logits = calloc(VOCAB_SIZE, sizeof(float));
+    ctx->final_norm_w = get_tensor_ptr(wf, "model.norm.weight");
+
+    // 10. Zero GPU delta-net state before any forward pass so the
+    //     first evaluation starts from a clean recurrence.
+    reset_delta_net_state();
+
+    return ctx;
+}
+
+void mf_free_model(mf_ctx *ctx) {
+    if (!ctx) return;
+    if (ctx->kv_caches) {
+        for (int i = 0; i < NUM_LAYERS; i++) {
+            if (ctx->kv_caches[i]) kv_cache_free(ctx->kv_caches[i]);
+        }
+        free(ctx->kv_caches);
+    }
+    if (ctx->layer_states) {
+        for (int i = 0; i < NUM_LAYERS; i++) {
+            if (ctx->layer_states[i]) {
+                linear_attn_state_free(
+                    (LinearAttnState *)ctx->layer_states[i]);
+            }
+        }
+        free(ctx->layer_states);
+    }
+    if (ctx->layer_mmaps) {
+        for (int i = 0; i < NUM_LAYERS; i++) {
+            if (ctx->layer_mmaps[i] && ctx->layer_mmaps[i] != MAP_FAILED
+                && ctx->layer_mmap_sizes[i] > 0) {
+                munmap(ctx->layer_mmaps[i], ctx->layer_mmap_sizes[i]);
+            }
+        }
+        free(ctx->layer_mmaps);
+    }
+    if (ctx->layer_mmap_sizes) free(ctx->layer_mmap_sizes);
+    if (ctx->layer_fds) {
+        for (int i = 0; i < NUM_LAYERS; i++) {
+            if (ctx->layer_fds[i] >= 0) close(ctx->layer_fds[i]);
+        }
+        free(ctx->layer_fds);
+    }
+    if (ctx->hidden) free(ctx->hidden);
+    if (ctx->logits) free(ctx->logits);
+    // wf->data is mmap'd; upstream main() leaks it on exit. We match
+    // that rather than inventing a free path. vocab similarly.
+    free(ctx);
+}
+
+// Run one token through the 60-layer stack at `pos`, updating all
+// per-layer state in place. If `emit_logits` is nonzero, apply the
+// final RMS norm + lm_head and write logits to ctx->logits. Otherwise
+// call discard_deferred_experts() instead of complete_deferred_experts
+// to let the last layer's GPU expert compute retire without the CPU
+// readback (prefill optimization from main.m's batch-prefill loop).
+static void mf_step_internal(mf_ctx *ctx,
+                             int32_t token,
+                             size_t pos,
+                             int emit_logits)
+{
+    embed_lookup(ctx->wf, (int)token, ctx->hidden);
+
+    for (int layer = 0; layer < NUM_LAYERS; layer++) {
+        int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
+        void *mmap_base = (ctx->layer_mmaps[layer] != MAP_FAILED)
+                              ? ctx->layer_mmaps[layer]
+                              : NULL;
+        fused_layer_forward(
+            ctx->wf, layer, ctx->hidden,
+            is_full ? ctx->kv_caches[layer] : NULL,
+            is_full ? NULL : (LinearAttnState *)ctx->layer_states[layer],
+            (int)pos, mmap_base, ctx->K, ctx->layer_fds[layer]);
+    }
+
+    if (!emit_logits) {
+        discard_deferred_experts();
+        return;
+    }
+
+    complete_deferred_experts();
+
+    if (ctx->final_norm_w) {
+        float normed[HIDDEN_DIM];
+        cpu_rms_norm(ctx->hidden, ctx->final_norm_w, normed,
+                     HIDDEN_DIM, RMS_NORM_EPS);
+        memcpy(ctx->hidden, normed, HIDDEN_DIM * sizeof(float));
+    }
+
+    lm_head_forward(ctx->wf, ctx->hidden, ctx->logits);
+}
+
+int mf_eval_prompt(mf_ctx *ctx,
+                   const int32_t *tokens,
+                   size_t n,
+                   size_t start_pos,
+                   int seq_id,
+                   float *logits_out)
+{
+    (void)seq_id;
+    if (!ctx) return -1;
+    if (n == 0) return 0;
+    if (!tokens || !logits_out) return -1;
+
+    // Intermediate tokens: state-update only, no logits. Last token:
+    // full pipeline so we can write logits_out.
+    for (size_t i = 0; i + 1 < n; i++) {
+        mf_step_internal(ctx, tokens[i], start_pos + i, /*emit*/ 0);
+    }
+    mf_step_internal(ctx, tokens[n - 1], start_pos + n - 1, /*emit*/ 1);
+
+    memcpy(logits_out, ctx->logits, VOCAB_SIZE * sizeof(float));
+    return 0;
+}
+
+int mf_eval_token(mf_ctx *ctx,
+                  int32_t token,
+                  size_t pos,
+                  int seq_id,
+                  float *logits_out)
+{
+    (void)seq_id;
+    if (!ctx || !logits_out) return -1;
+    mf_step_internal(ctx, token, pos, /*emit*/ 1);
+    memcpy(logits_out, ctx->logits, VOCAB_SIZE * sizeof(float));
+    return 0;
+}
+
+void mf_memory_clear(mf_ctx *ctx) {
+    if (!ctx) return;
+    mf_state_clear_all(ctx->kv_caches, ctx->layer_states);
+}
+
+int mf_memory_seq_rm(mf_ctx *ctx, int seq_id, int p0, int p1) {
+    (void)seq_id;
+    if (!ctx) return 0;
+    mf_state_truncate(ctx->kv_caches, ctx->layer_states, p0, p1);
+    return 1;
+}
+
+int mf_memory_seq_pos_max(mf_ctx *ctx, int seq_id) {
+    (void)seq_id;
+    if (!ctx) return -1;
+    return mf_state_pos_max(ctx->kv_caches);
+}
+
+size_t mf_n_vocab(const mf_ctx *ctx) {
+    (void)ctx;
+    return VOCAB_SIZE;
+}
+
+size_t mf_n_ctx(const mf_ctx *ctx) {
+    (void)ctx;
+    return MAX_SEQ_LEN;
+}
+
+int32_t mf_eos(const mf_ctx *ctx) {
+    (void)ctx;
+    return EOS_TOKEN_1;
+}
+
+const char *mf_model_name(const mf_ctx *ctx) {
+    (void)ctx;
+    // Hardcoded to upstream's target. When runtime shape
+    // parameterization lands (Phase 5 for Cogito 600B), this will
+    // read from the loaded manifest instead.
+    return "Qwen3.5-397B-A17B-4bit";
+}

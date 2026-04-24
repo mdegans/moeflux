@@ -39,7 +39,12 @@ SHADER_LIB = shaders.metallib
 INFER_TARGET = infer
 INFER_SRC = infer.m
 
-.PHONY: all clean run verify bench moe moebench full fullbench fast metallib infer infer-run
+# Static library for Rust FFI (drama_llama's MoefluxDecoder).
+# Built with -DMOEFLUX_LIB so infer.m's main() is excluded.
+LIB_TARGET = libmoeflux.a
+LIB_OBJ = infer_lib.o
+
+.PHONY: all clean run verify bench moe moebench full fullbench fast metallib infer infer-run lib
 
 all: $(TARGET) $(INFER_TARGET)
 
@@ -60,8 +65,19 @@ $(SHADER_LIB): $(SHADER_AIR)
 $(INFER_TARGET): $(INFER_SRC)
 	$(CC) $(CFLAGS) $(FRAMEWORKS) $(LDFLAGS) $(INFER_SRC) -o $(INFER_TARGET)
 
+# Build the static library (main() excluded via -DMOEFLUX_LIB).
+# Consumers link this alongside Metal, Foundation, Accelerate, and
+# -lpthread -lcompression (same linker flags as the infer binary).
+$(LIB_OBJ): $(INFER_SRC) moeflux.h
+	$(CC) $(CFLAGS) $(FRAMEWORKS) -DMOEFLUX_LIB -c $(INFER_SRC) -o $(LIB_OBJ)
+
+$(LIB_TARGET): $(LIB_OBJ)
+	ar rcs $(LIB_TARGET) $(LIB_OBJ)
+
+lib: $(LIB_TARGET)
+
 clean:
-	rm -f $(TARGET) $(INFER_TARGET) $(SHADER_AIR) $(SHADER_LIB)
+	rm -f $(TARGET) $(INFER_TARGET) $(LIB_TARGET) $(LIB_OBJ) $(SHADER_AIR) $(SHADER_LIB)
 
 # Run targets
 run: $(TARGET)
