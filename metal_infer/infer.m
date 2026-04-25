@@ -31,7 +31,7 @@
  *   This allows the next layer's CMD1 to submit immediately without waiting
  *   for CMD3 completion — the GPU queue serializes CMD3(N-1) then CMD1(N).
  *   Saves ~0.83ms/layer deferred_wait + CPU combine + input_norm overhead.
- *   Multi-expert buffers (MAX_K=8 independent slots) allow all K expert
+ *   Multi-expert buffers (MAX_K=16 independent slots) allow all K expert
  *   forwards to be encoded into a single command buffer.
  *   Batched encoding: 2 encoders per expert (gate+up fused, SwiGLU+down fused)
  *   + 2 for shared expert = K*2 + 2 total encoders in CMD3.
@@ -134,7 +134,7 @@ typedef struct {
 } LZ4IndexEntry;
 
 static LZ4IndexEntry *g_lz4_index[NUM_LAYERS];  // per-layer index (NULL if not using LZ4)
-static void *g_lz4_comp_bufs[8];                 // pre-allocated compressed read buffers (MAX_K=8)
+static void *g_lz4_comp_bufs[16];                // pre-allocated compressed read buffers (MAX_K=16)
 static int g_use_lz4 = 0;                        // auto-detected from packed_experts_lz4/
 
 // ============================================================================
@@ -908,7 +908,7 @@ typedef struct {
     // Each expert k uses slot [k].
     // Double-buffered: set A (data) for GPU compute, set B (data_B) for background pread.
     // Gate/up/act/out only need one set (GPU uses them after pread completes).
-    #define MAX_K 8
+    #define MAX_K 16
     id<MTLBuffer> buf_multi_expert_data[MAX_K];   // [EXPERT_SIZE bytes] each — buffer set A
     id<MTLBuffer> buf_multi_expert_data_B[MAX_K]; // [EXPERT_SIZE bytes] each — buffer set B (prefetch)
     id<MTLBuffer> buf_multi_expert_gate[MAX_K];   // [MOE_INTERMEDIATE floats]
@@ -937,7 +937,7 @@ typedef struct {
     // CMD3 GPU-side combine buffers (weighted_sum + residual + norm on GPU)
     id<MTLComputePipelineState> moe_combine_residual;  // fused combine kernel
     id<MTLBuffer> buf_moe_hidden;     // [HIDDEN_DIM floats] GPU combine output (hidden state)
-    id<MTLBuffer> buf_combine_params; // [10 floats] expert weights[8] + shared_gate_score + padding
+    id<MTLBuffer> buf_combine_params; // [18 floats] expert weights[16] + shared_gate_score + padding
     id<MTLBuffer> buf_cmd3_sum_sq;    // [1 float] for RMS norm reduction in CMD3
     // Shared event for CPU-GPU synchronization (async pipeline)
     id<MTLSharedEvent> pipeline_event;   // CPU signals when buf_input is ready
@@ -1161,7 +1161,7 @@ static MetalCtx *metal_setup(void) {
     // CMD3 GPU-side combine buffers
     ctx->buf_moe_hidden    = [ctx->device newBufferWithLength:HIDDEN_DIM * sizeof(float)
                                                        options:MTLResourceStorageModeShared];
-    ctx->buf_combine_params = [ctx->device newBufferWithLength:10 * sizeof(float)
+    ctx->buf_combine_params = [ctx->device newBufferWithLength:18 * sizeof(float)
                                                         options:MTLResourceStorageModeShared];
     ctx->buf_cmd3_sum_sq    = [ctx->device newBufferWithLength:sizeof(float)
                                                         options:MTLResourceStorageModeShared];
@@ -5652,12 +5652,12 @@ static void fused_layer_forward(
             // Prepare combine params: expert_weights[0..K-1] + shared_gate_score
             {
                 float *params = (float *)[g_metal->buf_combine_params contents];
-                // Zero all 10 slots first (unused experts get weight=0)
-                memset(params, 0, 10 * sizeof(float));
+                // Zero all 18 slots first (unused experts get weight=0)
+                memset(params, 0, 18 * sizeof(float));
                 for (int k = 0; k < actual_K; k++) {
                     params[k] = valid[k] ? expert_weights[k] : 0.0f;
                 }
-                params[8] = shared_gate_score;
+                params[16] = shared_gate_score;
             }
 
             // Enc C1: moe_combine_residual
@@ -5667,15 +5667,15 @@ static void fused_layer_forward(
                 [enc setBuffer:g_metal->buf_h_mid         offset:0 atIndex:0];   // h_mid
                 [enc setBuffer:g_metal->buf_shared_out    offset:0 atIndex:1];   // shared_out
                 [enc setBuffer:g_metal->buf_moe_hidden    offset:0 atIndex:2];   // output: hidden
-                // Bind all 8 expert output buffers (unused ones have weight=0 in params)
+                // Bind all MAX_K=16 expert output buffers (unused ones have weight=0 in params)
                 for (int k = 0; k < MAX_K; k++) {
                     [enc setBuffer:g_metal->buf_multi_expert_out[k] offset:0 atIndex:(3 + k)];
                 }
-                [enc setBuffer:g_metal->buf_combine_params offset:0 atIndex:11]; // params
+                [enc setBuffer:g_metal->buf_combine_params offset:0 atIndex:19]; // params
                 uint32_t dim = HIDDEN_DIM;
                 uint32_t k_val = (uint32_t)actual_K;
-                [enc setBytes:&dim   length:4 atIndex:12];
-                [enc setBytes:&k_val length:4 atIndex:13];
+                [enc setBytes:&dim   length:4 atIndex:20];
+                [enc setBytes:&k_val length:4 atIndex:21];
                 uint32_t tgs = (dim + 255) / 256;
                 [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];

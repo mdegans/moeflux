@@ -1325,7 +1325,7 @@ kernel void gated_rms_norm(
 //   hidden[i] = h_mid[i] + sum_k(expert_weight[k] * expert_out[k][i])
 //               + sigmoid(shared_gate_score) * shared_out[i]
 //
-// All 8 expert output buffers are always bound (unused ones have weight=0).
+// All MAX_K=16 expert output buffers are always bound (unused ones have weight=0).
 // This avoids variable buffer bindings and keeps the dispatch simple.
 //
 // Dispatch: (dim + 255) / 256 threadgroups, 256 threads each.
@@ -1341,28 +1341,45 @@ kernel void moe_combine_residual(
     device const float* expert_out4 [[buffer(7)]],   // [dim] expert 4
     device const float* expert_out5 [[buffer(8)]],   // [dim] expert 5
     device const float* expert_out6 [[buffer(9)]],   // [dim] expert 6
-    device const float* expert_out7 [[buffer(10)]],  // [dim] expert 7
-    device const float* params      [[buffer(11)]],  // [10]: weights[0..7], shared_gate_score, (unused)
-    constant uint&      dim         [[buffer(12)]],
-    constant uint&      K           [[buffer(13)]],
+    device const float* expert_out7  [[buffer(10)]], // [dim] expert 7
+    device const float* expert_out8  [[buffer(11)]], // [dim] expert 8
+    device const float* expert_out9  [[buffer(12)]], // [dim] expert 9
+    device const float* expert_out10 [[buffer(13)]], // [dim] expert 10
+    device const float* expert_out11 [[buffer(14)]], // [dim] expert 11
+    device const float* expert_out12 [[buffer(15)]], // [dim] expert 12
+    device const float* expert_out13 [[buffer(16)]], // [dim] expert 13
+    device const float* expert_out14 [[buffer(17)]], // [dim] expert 14
+    device const float* expert_out15 [[buffer(18)]], // [dim] expert 15
+    device const float* params       [[buffer(19)]], // [18]: weights[0..15], shared_gate_score, (unused)
+    constant uint&      dim          [[buffer(20)]],
+    constant uint&      K            [[buffer(21)]],
     uint tid [[thread_position_in_grid]]
 ) {
     if (tid >= dim) return;
 
-    // Read expert weights and shared gate from params buffer
-    float shared_gate = 1.0f / (1.0f + exp(-params[8]));  // sigmoid(shared_gate_score)
+    // Read expert weights and shared gate from params buffer.
+    // Layout: params[0..15] = expert weights, params[16] = shared_gate_score, params[17] = pad.
+    float shared_gate = 1.0f / (1.0f + exp(-params[16]));  // sigmoid(shared_gate_score)
 
     // Weighted sum of expert outputs
     float moe = 0.0f;
-    // Unrolled for MAX_K=8 with branch on K to avoid reading invalid buffers
-    if (K > 0) moe += params[0] * expert_out0[tid];
-    if (K > 1) moe += params[1] * expert_out1[tid];
-    if (K > 2) moe += params[2] * expert_out2[tid];
-    if (K > 3) moe += params[3] * expert_out3[tid];
-    if (K > 4) moe += params[4] * expert_out4[tid];
-    if (K > 5) moe += params[5] * expert_out5[tid];
-    if (K > 6) moe += params[6] * expert_out6[tid];
-    if (K > 7) moe += params[7] * expert_out7[tid];
+    // Unrolled for MAX_K=16 with branch on K to avoid reading invalid buffers
+    if (K >  0) moe += params[ 0] * expert_out0[tid];
+    if (K >  1) moe += params[ 1] * expert_out1[tid];
+    if (K >  2) moe += params[ 2] * expert_out2[tid];
+    if (K >  3) moe += params[ 3] * expert_out3[tid];
+    if (K >  4) moe += params[ 4] * expert_out4[tid];
+    if (K >  5) moe += params[ 5] * expert_out5[tid];
+    if (K >  6) moe += params[ 6] * expert_out6[tid];
+    if (K >  7) moe += params[ 7] * expert_out7[tid];
+    if (K >  8) moe += params[ 8] * expert_out8[tid];
+    if (K >  9) moe += params[ 9] * expert_out9[tid];
+    if (K > 10) moe += params[10] * expert_out10[tid];
+    if (K > 11) moe += params[11] * expert_out11[tid];
+    if (K > 12) moe += params[12] * expert_out12[tid];
+    if (K > 13) moe += params[13] * expert_out13[tid];
+    if (K > 14) moe += params[14] * expert_out14[tid];
+    if (K > 15) moe += params[15] * expert_out15[tid];
 
     hidden_out[tid] = h_mid[tid] + moe + shared_gate * shared_out[tid];
 }
