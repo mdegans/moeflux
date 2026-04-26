@@ -141,6 +141,15 @@ int mf_embed_lookup(mf_ctx *ctx, int32_t token_id, float *out);
 int mf_rms_norm_cpu(mf_ctx *ctx, const char *weight_name,
                     const float *x, float *out);
 
+// Apply rotary position embedding to a Q/K pair at position `pos`.
+// `q` is `NUM_ATTN_HEADS * HEAD_DIM` floats, `k` is
+// `NUM_KV_HEADS * HEAD_DIM` floats; both are mutated in place. Uses
+// the active architecture's `ROTARY_DIM` and `ROPE_THETA`. The first
+// `ROTARY_DIM` channels of each head are rotated using the
+// non-traditional pairing `(x[i], x[i+half])`. Returns 0 on success,
+// -1 on NULL args or `pos < 0`.
+int mf_apply_rotary_emb(mf_ctx *ctx, int32_t pos, float *q, float *k);
+
 // ============================================================================
 // State snapshot / restore (Option B in NOTES.md)
 // ============================================================================

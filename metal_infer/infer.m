@@ -7785,6 +7785,13 @@ int mf_rms_norm_cpu(mf_ctx *ctx, const char *weight_name,
     return 0;
 }
 
+int mf_apply_rotary_emb(mf_ctx *ctx, int32_t pos, float *q, float *k) {
+    if (!ctx || !q || !k || pos < 0) return -1;
+    apply_rotary_emb(q, k, pos, NUM_ATTN_HEADS, NUM_KV_HEADS,
+                     HEAD_DIM, ROTARY_DIM);
+    return 0;
+}
+
 // ============================================================================
 // State snapshot / restore (Option B)
 // ============================================================================

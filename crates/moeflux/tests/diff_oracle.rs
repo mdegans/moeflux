@@ -92,6 +92,15 @@ pub trait DiffBackend {
     /// Returns a `HIDDEN_DIM`-long f32 vector.
     fn rms_norm_cpu(&self, weight_name: &str, x: &[f32]) -> Vec<f32>;
 
+    /// Apply rotary position embedding to Q and K at `pos`. Returns
+    /// `(q_out, k_out)`; inputs are not mutated.
+    fn apply_rotary_emb(
+        &self,
+        pos: i32,
+        q: &[f32],
+        k: &[f32],
+    ) -> (Vec<f32>, Vec<f32>);
+
     /// Prefill `tokens` at `start_pos`. Returns the n_vocab-length
     /// logit vector for the position immediately after the last
     /// token in `tokens`.
@@ -159,6 +168,20 @@ impl DiffBackend for CBackend {
             .rms_norm_cpu(weight_name, x, &mut out)
             .expect("CBackend rms_norm_cpu");
         out
+    }
+
+    fn apply_rotary_emb(
+        &self,
+        pos: i32,
+        q: &[f32],
+        k: &[f32],
+    ) -> (Vec<f32>, Vec<f32>) {
+        let mut q_out = q.to_vec();
+        let mut k_out = k.to_vec();
+        self.0
+            .apply_rotary_emb(pos, &mut q_out, &mut k_out)
+            .expect("CBackend apply_rotary_emb");
+        (q_out, k_out)
     }
 
     fn eval_prompt(&mut self, tokens: &[i32], start_pos: usize) -> Vec<f32> {
@@ -239,6 +262,20 @@ impl DiffBackend for RsBackend {
             .rms_norm_cpu(weight_name, x, &mut out)
             .expect("RsBackend rms_norm_cpu");
         out
+    }
+
+    fn apply_rotary_emb(
+        &self,
+        pos: i32,
+        q: &[f32],
+        k: &[f32],
+    ) -> (Vec<f32>, Vec<f32>) {
+        let mut q_out = q.to_vec();
+        let mut k_out = k.to_vec();
+        self.0
+            .apply_rotary_emb(pos, &mut q_out, &mut k_out)
+            .expect("RsBackend apply_rotary_emb");
+        (q_out, k_out)
     }
 
     fn eval_prompt(&mut self, tokens: &[i32], start_pos: usize) -> Vec<f32> {
@@ -468,6 +505,111 @@ fn variants_match_c() {
         c.n_ctx(),
         c.eos(),
     );
+}
+
+/// ULP-bounded diff for the RoPE kernel (Phase 3, slice 3).
+///
+/// Not bit-exact — see `riir/rope.rs` module docs. Two compiler
+/// choices compound: (1) Apple clang at `-O3` auto-vectorizes the
+/// scalar `cosf`/`sinf` calls through Apple's libm vector variants,
+/// while Rust extern-`"C"` calls don't vectorize; (2) clang with
+/// `-ffp-contract=on` fuses the rotation's `q0*cos_a - q1*sin_a`
+/// into FMA instructions, which Rust's plain `*` / `-` do not.
+///
+/// Both are compiler-choice artifacts, not porting bugs. We set the
+/// threshold to 128 ULPs — well above the observed ~30 ULP drift
+/// from FMA-vs-non-FMA but still tight enough to flag any real
+/// algorithmic bug (which would produce thousands of ULPs of drift,
+/// or NaN/inf, or sign flips).
+///
+/// Relative-error perspective: 128 ULPs at f32-near-1.0 ≈ 1.5e-5,
+/// far below the noise floor of the surrounding 4-bit-quantized
+/// weights and bf16 scales the rest of the model uses.
+const MAX_ULP_DRIFT: u32 = 128;
+
+/// Distance between two `f32` values measured in ULPs (units in last
+/// place). Same-sign only; sign disagreement returns u32::MAX so it
+/// fails any reasonable bound.
+fn ulp_diff(a: f32, b: f32) -> u32 {
+    if a.to_bits() == b.to_bits() {
+        return 0;
+    }
+    if a.is_nan() || b.is_nan() {
+        return u32::MAX;
+    }
+    if a.is_sign_negative() != b.is_sign_negative() {
+        return u32::MAX;
+    }
+    let ai = a.to_bits();
+    let bi = b.to_bits();
+    if ai > bi { ai - bi } else { bi - ai }
+}
+
+#[test]
+#[ignore = "long running; needs moeflux artifacts"]
+fn rope_close_c_vs_rust() {
+    use moeflux::riir::VARIANT;
+
+    let c: CBackend = open_backend();
+    let rs: RsBackend = open_backend();
+
+    let head_dim = VARIANT.head_dim;
+    let q_len = VARIANT.num_attn_heads * head_dim;
+    let k_len = VARIANT.num_kv_heads * head_dim;
+
+    let q_in: Vec<f32> = (0..q_len)
+        .map(|i| ((i as f32) * 0.013).sin() * 0.7 + 0.1)
+        .collect();
+    let k_in: Vec<f32> = (0..k_len)
+        .map(|i| ((i as f32) * 0.019).cos() * 0.5 - 0.2)
+        .collect();
+
+    let positions: [i32; 5] = [0, 1, 17, 1024, 65535];
+    for &pos in &positions {
+        let (c_q, c_k) = c.apply_rotary_emb(pos, &q_in, &k_in);
+        let (rs_q, rs_k) = rs.apply_rotary_emb(pos, &q_in, &k_in);
+
+        let q_max_ulp = c_q
+            .iter()
+            .zip(rs_q.iter())
+            .map(|(&a, &b)| ulp_diff(a, b))
+            .max()
+            .unwrap_or(0);
+        let k_max_ulp = c_k
+            .iter()
+            .zip(rs_k.iter())
+            .map(|(&a, &b)| ulp_diff(a, b))
+            .max()
+            .unwrap_or(0);
+        let q_diff_count = c_q
+            .iter()
+            .zip(rs_q.iter())
+            .filter(|&(&a, &b)| a.to_bits() != b.to_bits())
+            .count();
+        let k_diff_count = c_k
+            .iter()
+            .zip(rs_k.iter())
+            .filter(|&(&a, &b)| a.to_bits() != b.to_bits())
+            .count();
+
+        eprintln!(
+            "[diff:rope pos={pos}] Q max_ulp={q_max_ulp} ({}/{} differ); \
+             K max_ulp={k_max_ulp} ({}/{} differ)",
+            q_diff_count,
+            c_q.len(),
+            k_diff_count,
+            c_k.len(),
+        );
+
+        assert!(
+            q_max_ulp <= MAX_ULP_DRIFT,
+            "[diff:rope pos={pos}] Q max ULP drift {q_max_ulp} > {MAX_ULP_DRIFT}"
+        );
+        assert!(
+            k_max_ulp <= MAX_ULP_DRIFT,
+            "[diff:rope pos={pos}] K max ULP drift {k_max_ulp} > {MAX_ULP_DRIFT}"
+        );
+    }
 }
 
 /// Bit-exact diff for the CPU RMSNorm kernel (Phase 3, slice 2).

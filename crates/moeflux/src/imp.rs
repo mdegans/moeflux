@@ -245,6 +245,26 @@ impl Ctx {
         if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
     }
 
+    /// Apply rotary position embedding to Q and K at `pos`. Both
+    /// buffers are mutated in place. Diff-oracle dump point for the
+    /// RoPE kernel.
+    pub fn apply_rotary_emb(
+        &self,
+        pos: i32,
+        q: &mut [f32],
+        k: &mut [f32],
+    ) -> Result<(), Error> {
+        let rc = unsafe {
+            sys::mf_apply_rotary_emb(
+                self.inner.as_ptr(),
+                pos,
+                q.as_mut_ptr(),
+                k.as_mut_ptr(),
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
+    }
+
     /// Reset the sequence to empty.
     pub fn memory_clear(&mut self) {
         unsafe { sys::mf_memory_clear(self.inner.as_ptr()) }

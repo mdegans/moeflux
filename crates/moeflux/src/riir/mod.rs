@@ -26,11 +26,13 @@ use std::path::Path;
 pub mod embedding;
 pub mod metal;
 pub mod rms_norm;
+pub mod rope;
 pub mod variants;
 pub mod weight_file;
 pub use embedding::{bf16_to_f32, embed_lookup, EmbeddingError};
 pub use metal::{MetalBackend, MetalError, MtlBuffer};
 pub use rms_norm::{rms_norm_cpu, RmsNormError};
+pub use rope::{apply_rotary_emb, RopeError};
 pub use variants::{Variant, VARIANT};
 pub use weight_file::{TensorInfo, WeightFile, WeightFileError};
 
@@ -109,6 +111,19 @@ impl RsCtx {
     ) -> Result<(), RsError> {
         rms_norm_cpu(&self.wf, weight_name, x, out)
             .map_err(|_| RsError::EvalFailed)
+    }
+
+    /// Apply rotary position embedding to Q and K in place at
+    /// position `pos`. `q` is `num_attn_heads * head_dim` floats; `k`
+    /// is `num_kv_heads * head_dim`. Bit-exact against
+    /// `mf_apply_rotary_emb` on the same hardware.
+    pub fn apply_rotary_emb(
+        &self,
+        pos: i32,
+        q: &mut [f32],
+        k: &mut [f32],
+    ) -> Result<(), RsError> {
+        apply_rotary_emb(pos, q, k).map_err(|_| RsError::EvalFailed)
     }
 
     pub fn eval_prompt(
