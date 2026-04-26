@@ -34,3 +34,10 @@ mod imp;
 
 #[cfg(target_os = "macos")]
 pub use imp::*;
+
+/// Pure-Rust port of the host-side dispatch (under construction —
+/// Phase 0 scaffold). Available when the `riir-port` Cargo feature
+/// is enabled. Runs alongside the C-via-`moeflux-sys` path so the
+/// differential test harness can compare them.
+#[cfg(all(target_os = "macos", feature = "riir-port"))]
+pub mod riir;

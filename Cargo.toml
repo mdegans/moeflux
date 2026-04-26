@@ -15,6 +15,7 @@ authors       = ["Michael de Gans <michael.john.degans@gmail.com>"]
 
 [workspace.dependencies]
 moeflux-sys = { path = "crates/moeflux-sys", version = "=0.1.0-pre.0" }
+thiserror   = "1.0"
 
 [profile.release]
 opt-level = 3
