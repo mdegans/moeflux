@@ -25,10 +25,12 @@ use std::path::Path;
 
 pub mod embedding;
 pub mod metal;
+pub mod rms_norm;
 pub mod variants;
 pub mod weight_file;
 pub use embedding::{bf16_to_f32, embed_lookup, EmbeddingError};
 pub use metal::{MetalBackend, MetalError, MtlBuffer};
+pub use rms_norm::{rms_norm_cpu, RmsNormError};
 pub use variants::{Variant, VARIANT};
 pub use weight_file::{TensorInfo, WeightFile, WeightFileError};
 
@@ -93,6 +95,20 @@ impl RsCtx {
         out: &mut [f32],
     ) -> Result<(), RsError> {
         embed_lookup(&self.wf, token_id, out).map_err(|_| RsError::EvalFailed)
+    }
+
+    /// CPU RMSNorm against the weight tensor `weight_name`. `x` and
+    /// `out` are both `HIDDEN_DIM` long. Bit-exact against
+    /// `mf_rms_norm_cpu` on the same hardware (deterministic CPU
+    /// arithmetic, sequential reduction order).
+    pub fn rms_norm_cpu(
+        &self,
+        weight_name: &str,
+        x: &[f32],
+        out: &mut [f32],
+    ) -> Result<(), RsError> {
+        rms_norm_cpu(&self.wf, weight_name, x, out)
+            .map_err(|_| RsError::EvalFailed)
     }
 
     pub fn eval_prompt(

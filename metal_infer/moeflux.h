@@ -132,6 +132,15 @@ const char *mf_model_name(const mf_ctx *ctx);
 // (or before any) eval calls.
 int mf_embed_lookup(mf_ctx *ctx, int32_t token_id, float *out);
 
+// CPU RMS normalization. Loads `weight_name` from the weight file
+// (must be a BF16 tensor of length HIDDEN_DIM), then computes
+// `out[i] = x[i] / sqrt(mean(x*x) + EPS) * weight[i]` for the active
+// architecture's RMS_NORM_EPS. `x` and `out` are both HIDDEN_DIM
+// floats. Returns 0 on success, -1 on NULL args / missing tensor.
+// Read-only on `ctx`.
+int mf_rms_norm_cpu(mf_ctx *ctx, const char *weight_name,
+                    const float *x, float *out);
+
 // ============================================================================
 // State snapshot / restore (Option B in NOTES.md)
 // ============================================================================

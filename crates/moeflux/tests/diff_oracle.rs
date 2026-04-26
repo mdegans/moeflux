@@ -88,6 +88,10 @@ pub trait DiffBackend {
     /// First per-kernel diff point landed in Phase 3.
     fn embed(&self, token_id: i32) -> Vec<f32>;
 
+    /// CPU RMSNorm against the BF16 weight tensor `weight_name`.
+    /// Returns a `HIDDEN_DIM`-long f32 vector.
+    fn rms_norm_cpu(&self, weight_name: &str, x: &[f32]) -> Vec<f32>;
+
     /// Prefill `tokens` at `start_pos`. Returns the n_vocab-length
     /// logit vector for the position immediately after the last
     /// token in `tokens`.
@@ -146,6 +150,14 @@ impl DiffBackend for CBackend {
     fn embed(&self, token_id: i32) -> Vec<f32> {
         let mut out = vec![0.0f32; moeflux::riir::VARIANT.hidden_dim];
         self.0.embed(token_id, &mut out).expect("CBackend embed");
+        out
+    }
+
+    fn rms_norm_cpu(&self, weight_name: &str, x: &[f32]) -> Vec<f32> {
+        let mut out = vec![0.0f32; moeflux::riir::VARIANT.hidden_dim];
+        self.0
+            .rms_norm_cpu(weight_name, x, &mut out)
+            .expect("CBackend rms_norm_cpu");
         out
     }
 
@@ -218,6 +230,14 @@ impl DiffBackend for RsBackend {
     fn embed(&self, token_id: i32) -> Vec<f32> {
         let mut out = vec![0.0f32; moeflux::riir::VARIANT.hidden_dim];
         self.0.embed(token_id, &mut out).expect("RsBackend embed");
+        out
+    }
+
+    fn rms_norm_cpu(&self, weight_name: &str, x: &[f32]) -> Vec<f32> {
+        let mut out = vec![0.0f32; moeflux::riir::VARIANT.hidden_dim];
+        self.0
+            .rms_norm_cpu(weight_name, x, &mut out)
+            .expect("RsBackend rms_norm_cpu");
         out
     }
 
@@ -448,6 +468,78 @@ fn variants_match_c() {
         c.n_ctx(),
         c.eos(),
     );
+}
+
+/// Bit-exact diff for the CPU RMSNorm kernel (Phase 3, slice 2).
+///
+/// Composes on top of slice 1: feed the embedding output of several
+/// token IDs through RMSNorm and compare bit-for-bit against the C
+/// path. Three weight tensors exercised:
+///
+/// - `model.norm.weight` (the final RMSNorm before LM head)
+/// - `model.layers.0.input_layernorm.weight` (per-layer attention
+///   input norm)
+/// - `model.layers.0.post_attention_layernorm.weight` (per-layer MLP
+///   input norm)
+///
+/// All three are BF16 weight tensors of length `HIDDEN_DIM`. CPU
+/// RMSNorm is deterministic on a given machine, so we expect every
+/// output element to be byte-identical between C and Rust.
+#[test]
+#[ignore = "long running; needs moeflux artifacts"]
+fn rms_norm_cpu_bit_exact_c_vs_rust() {
+    use moeflux::riir::VARIANT;
+
+    let c: CBackend = open_backend();
+    let rs: RsBackend = open_backend();
+
+    let token_ids: [i32; 4] = [0, 1, VARIANT.eos_token_1, VARIANT.vocab_size as i32 - 1];
+    let weight_names: [&str; 3] = [
+        "model.norm.weight",
+        "model.layers.0.input_layernorm.weight",
+        "model.layers.0.post_attention_layernorm.weight",
+    ];
+
+    for &tok in &token_ids {
+        let x = c.embed(tok);
+        for w_name in &weight_names {
+            let c_out = c.rms_norm_cpu(w_name, &x);
+            let rs_out = rs.rms_norm_cpu(w_name, &x);
+
+            let diffs: Vec<(usize, f32, f32)> = c_out
+                .iter()
+                .zip(rs_out.iter())
+                .enumerate()
+                .filter_map(|(i, (&a, &b))| {
+                    if a.to_bits() != b.to_bits() {
+                        Some((i, a, b))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            if !diffs.is_empty() {
+                let first = &diffs[0];
+                panic!(
+                    "[diff:rms_norm_cpu token={tok} w={w_name}] {} of {} elements differ; \
+                     first at index {} (c={} rs={})",
+                    diffs.len(),
+                    c_out.len(),
+                    first.0,
+                    first.1,
+                    first.2,
+                );
+            }
+
+            eprintln!(
+                "[diff:rms_norm_cpu token={tok} w={w_name}] {} elements bit-equal; \
+                 first 4: {:?}",
+                c_out.len(),
+                &c_out[..4],
+            );
+        }
+    }
 }
 
 /// Bit-exact diff for the embedding kernel (Phase 3, slice 1).

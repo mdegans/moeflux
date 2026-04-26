@@ -222,6 +222,29 @@ impl Ctx {
         if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
     }
 
+    /// CPU RMSNorm against the weight tensor named `weight_name`
+    /// (typically `model.norm.weight` or one of the per-layer
+    /// `*.input_layernorm.weight` / `*.post_attention_layernorm.weight`
+    /// tensors). Diff-oracle dump point for the RMSNorm kernel.
+    pub fn rms_norm_cpu(
+        &self,
+        weight_name: &str,
+        x: &[f32],
+        out: &mut [f32],
+    ) -> Result<(), Error> {
+        let cname =
+            std::ffi::CString::new(weight_name).map_err(|_| Error::PathHasNul)?;
+        let rc = unsafe {
+            sys::mf_rms_norm_cpu(
+                self.inner.as_ptr(),
+                cname.as_ptr(),
+                x.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
+    }
+
     /// Reset the sequence to empty.
     pub fn memory_clear(&mut self) {
         unsafe { sys::mf_memory_clear(self.inner.as_ptr()) }

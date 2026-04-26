@@ -7775,6 +7775,16 @@ int mf_embed_lookup(mf_ctx *ctx, int32_t token_id, float *out) {
     return 0;
 }
 
+int mf_rms_norm_cpu(mf_ctx *ctx, const char *weight_name,
+                    const float *x, float *out)
+{
+    if (!ctx || !weight_name || !x || !out) return -1;
+    uint16_t *w_bf16 = (uint16_t *)get_tensor_ptr(ctx->wf, weight_name);
+    if (!w_bf16) return -1;
+    cpu_rms_norm(x, w_bf16, out, HIDDEN_DIM, RMS_NORM_EPS);
+    return 0;
+}
+
 // ============================================================================
 // State snapshot / restore (Option B)
 // ============================================================================
