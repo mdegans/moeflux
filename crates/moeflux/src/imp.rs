@@ -211,6 +211,17 @@ impl Ctx {
         if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
     }
 
+    /// Embed a single token via the C path's `embed_lookup`. Writes
+    /// `HIDDEN_DIM` floats into `out`. Used by the RIIR diff oracle as
+    /// the per-layer dump point for the embedding kernel; not part of
+    /// production decode.
+    pub fn embed(&self, token_id: i32, out: &mut [f32]) -> Result<(), Error> {
+        let rc = unsafe {
+            sys::mf_embed_lookup(self.inner.as_ptr(), token_id, out.as_mut_ptr())
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
+    }
+
     /// Reset the sequence to empty.
     pub fn memory_clear(&mut self) {
         unsafe { sys::mf_memory_clear(self.inner.as_ptr()) }

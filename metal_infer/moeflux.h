@@ -117,6 +117,22 @@ int32_t mf_eos(const mf_ctx *ctx);
 const char *mf_model_name(const mf_ctx *ctx);
 
 // ============================================================================
+// Diff-oracle hooks (RIIR Phase 3 — per-layer dump points)
+// ============================================================================
+//
+// Surgical accessors that expose moeflux's internal forward-pass
+// primitives so the differential test harness in the Rust crate can
+// compare per-layer outputs against the in-progress pure-Rust port.
+// Not part of the production decode path; safe to ignore in non-test
+// callers.
+
+// Compute the embedding for a single token. Writes HIDDEN_DIM floats
+// into `out`. Returns 0 on success, -1 on error (NULL args, token_id
+// out of vocabulary range). Read-only on `ctx`; safe to call between
+// (or before any) eval calls.
+int mf_embed_lookup(mf_ctx *ctx, int32_t token_id, float *out);
+
+// ============================================================================
 // State snapshot / restore (Option B in NOTES.md)
 // ============================================================================
 //

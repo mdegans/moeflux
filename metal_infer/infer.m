@@ -7759,6 +7759,23 @@ const char *mf_model_name(const mf_ctx *ctx) {
 }
 
 // ============================================================================
+// Diff-oracle hooks (RIIR Phase 3 — per-layer dump points)
+// ============================================================================
+//
+// Thin accessors that expose the existing static forward-pass primitives
+// at the FFI boundary so the differential test harness can compare
+// per-layer outputs against the pure-Rust port (`riir::*`). No new
+// computation; each function delegates to the original `static`
+// implementation.
+
+int mf_embed_lookup(mf_ctx *ctx, int32_t token_id, float *out) {
+    if (!ctx || !out) return -1;
+    if (token_id < 0 || (size_t)token_id >= VOCAB_SIZE) return -1;
+    embed_lookup(ctx->wf, token_id, out);
+    return 0;
+}
+
+// ============================================================================
 // State snapshot / restore (Option B)
 // ============================================================================
 //

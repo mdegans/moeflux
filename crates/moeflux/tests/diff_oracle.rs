@@ -84,6 +84,10 @@ pub trait DiffBackend {
     fn eos(&self) -> i32;
     fn model_name(&self) -> &'static str;
 
+    /// Embed a single token. Returns a `HIDDEN_DIM`-long f32 vector.
+    /// First per-kernel diff point landed in Phase 3.
+    fn embed(&self, token_id: i32) -> Vec<f32>;
+
     /// Prefill `tokens` at `start_pos`. Returns the n_vocab-length
     /// logit vector for the position immediately after the last
     /// token in `tokens`.
@@ -139,6 +143,12 @@ impl DiffBackend for CBackend {
         self.0.model_name()
     }
 
+    fn embed(&self, token_id: i32) -> Vec<f32> {
+        let mut out = vec![0.0f32; moeflux::riir::VARIANT.hidden_dim];
+        self.0.embed(token_id, &mut out).expect("CBackend embed");
+        out
+    }
+
     fn eval_prompt(&mut self, tokens: &[i32], start_pos: usize) -> Vec<f32> {
         let mut logits = vec![0.0f32; self.0.n_vocab()];
         self.0
@@ -166,8 +176,8 @@ impl DiffBackend for CBackend {
     }
 }
 
-/// Pure-Rust impl. Phase 0: stub — every method panics. Phase 4
-/// onwards: real implementation.
+/// Pure-Rust impl. Phase 3: methods become real as their kernels are
+/// ported (embedding landed; the rest still `todo!()`).
 pub struct RsBackend(RsCtx);
 
 impl DiffBackend for RsBackend {
@@ -203,6 +213,12 @@ impl DiffBackend for RsBackend {
     }
     fn model_name(&self) -> &'static str {
         self.0.model_name()
+    }
+
+    fn embed(&self, token_id: i32) -> Vec<f32> {
+        let mut out = vec![0.0f32; moeflux::riir::VARIANT.hidden_dim];
+        self.0.embed(token_id, &mut out).expect("RsBackend embed");
+        out
     }
 
     fn eval_prompt(&mut self, tokens: &[i32], start_pos: usize) -> Vec<f32> {
@@ -432,6 +448,87 @@ fn variants_match_c() {
         c.n_ctx(),
         c.eos(),
     );
+}
+
+/// Bit-exact diff for the embedding kernel (Phase 3, slice 1).
+///
+/// The embedding lookup is fully deterministic CPU code on both
+/// sides — quantized 4-bit dequant + bf16-via-bit-shift. Outputs
+/// must match to the last bit. Running both backends against the
+/// same mmap'd weight blob, anything but byte-equal output indicates
+/// a porting bug.
+///
+/// Picks 8 token IDs spanning the vocabulary's interesting points:
+/// 0 (BOS in most setups), 1, the canonical EOS, the secondary EOS,
+/// the think-start / think-end specials, a mid-vocabulary id, and
+/// `vocab_size - 1`. Out-of-range ids are tested separately for the
+/// error path.
+#[test]
+#[ignore = "long running; needs moeflux artifacts"]
+fn embed_bit_exact_c_vs_rust() {
+    use moeflux::riir::VARIANT;
+
+    let c: CBackend = open_backend();
+    let rs: RsBackend = open_backend();
+
+    let vocab = VARIANT.vocab_size as i32;
+    let token_ids: [i32; 8] = [
+        0,
+        1,
+        VARIANT.eos_token_1,
+        VARIANT.eos_token_2,
+        VARIANT.think_start_token,
+        VARIANT.think_end_token,
+        vocab / 2,
+        vocab - 1,
+    ];
+
+    for &tok in &token_ids {
+        let c_emb = c.embed(tok);
+        let rs_emb = rs.embed(tok);
+        assert_eq!(
+            c_emb.len(),
+            VARIANT.hidden_dim,
+            "[diff:embed token={tok}] C output length mismatch"
+        );
+        assert_eq!(
+            rs_emb.len(),
+            VARIANT.hidden_dim,
+            "[diff:embed token={tok}] Rust output length mismatch"
+        );
+
+        let diffs: Vec<(usize, f32, f32)> = c_emb
+            .iter()
+            .zip(rs_emb.iter())
+            .enumerate()
+            .filter_map(|(i, (&a, &b))| {
+                if a.to_bits() != b.to_bits() {
+                    Some((i, a, b))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if !diffs.is_empty() {
+            let first = &diffs[0];
+            panic!(
+                "[diff:embed token={tok}] {} of {} elements differ; \
+                 first at index {} (c={} rs={})",
+                diffs.len(),
+                c_emb.len(),
+                first.0,
+                first.1,
+                first.2,
+            );
+        }
+
+        eprintln!(
+            "[diff:embed token={tok}] {} elements bit-equal; first 4: {:?}",
+            c_emb.len(),
+            &c_emb[..4],
+        );
+    }
 }
 
 #[test]
