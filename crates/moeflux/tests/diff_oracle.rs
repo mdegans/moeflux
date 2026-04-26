@@ -99,7 +99,10 @@ pub trait DiffBackend {
 }
 
 /// C-via-`moeflux-sys` impl. Thin wrapper around [`moeflux::Ctx`].
-pub struct CBackend(Ctx);
+/// Field is public so tests in this file can call inherent `Ctx`
+/// methods that aren't on the [`DiffBackend`] trait (e.g.
+/// state_save / state_load checks in later phases).
+pub struct CBackend(pub Ctx);
 
 impl DiffBackend for CBackend {
     fn open(
@@ -376,6 +379,61 @@ pub fn open_backend<B: DiffBackend>() -> B {
 /// and both `mf_free_model + Ctx::open` and `memory_clear` leave
 /// process-global state we don't control. The real diff strategy
 /// (Phase 3+) compares intermediate tensors at layer boundaries.
+/// Smoke-test the Rust `WeightFile` against the real A3B artifacts.
+/// Loads the manifest + mmap, asserts tensor count matches what the
+/// C path's `[manifest]` log line reports (1397 tensors for A3B),
+/// and that a couple of well-known tensors are present with the
+/// expected dtype.
+#[test]
+#[ignore = "long running; needs moeflux artifacts"]
+fn weight_file_loads_a3b() {
+    let art = artifacts_dir();
+    let wf = moeflux::riir::WeightFile::open(
+        &art.join("model_weights.bin"),
+        &art.join("model_weights.json"),
+    )
+    .expect("WeightFile::open");
+    eprintln!(
+        "[diff:weight_file] {} tensors in {:.2} GB",
+        wf.len(),
+        wf.file_size() as f64 / 1e9,
+    );
+
+    // 1397 is the value the C `[manifest]` log prints for A3B.
+    assert_eq!(wf.len(), 1397, "tensor count drifted from C");
+
+    // The token-embedding tensor exists in every Qwen MoE export.
+    let embed = wf
+        .tensor_info("model.embed_tokens.weight")
+        .expect("model.embed_tokens.weight");
+    assert!(!embed.dtype.is_empty(), "embed_tokens dtype empty");
+    eprintln!(
+        "[diff:weight_file] embed_tokens dtype={} shape={:?} bits={} size={}",
+        embed.dtype, embed.shape, embed.bits, embed.size,
+    );
+    let bytes = wf
+        .tensor_bytes("model.embed_tokens.weight")
+        .expect("embed bytes");
+    assert_eq!(bytes.len() as u64, embed.size);
+}
+
+/// Cross-check that the pure-Rust `riir::VARIANT` shape constants
+/// agree with the C runtime values for the same Cargo feature.
+/// Catches drift between `model_variant.h` and `riir/variants.rs`.
+#[test]
+#[ignore = "long running; needs moeflux artifacts"]
+fn variants_match_c() {
+    let c: CBackend = open_backend();
+    moeflux::riir::variants::assert_matches_c(&c.0);
+    eprintln!(
+        "[diff:variants] {} n_vocab={} n_ctx={} eos={}",
+        c.model_name(),
+        c.n_vocab(),
+        c.n_ctx(),
+        c.eos(),
+    );
+}
+
 #[test]
 #[ignore = "long running; needs moeflux artifacts"]
 fn harness_loads() {

@@ -21,6 +21,11 @@
 
 use std::path::Path;
 
+pub mod variants;
+pub mod weight_file;
+pub use variants::{Variant, VARIANT};
+pub use weight_file::{TensorInfo, WeightFile, WeightFileError};
+
 /// Pure-Rust analogue of [`crate::imp::Ctx`]. API surface mirrors the
 /// C wrapper 1:1 during the port — the diff harness compares behavior
 /// at this boundary.
@@ -52,19 +57,19 @@ impl RsCtx {
     }
 
     pub fn n_vocab(&self) -> usize {
-        todo!("RIIR Phase 1: variants + weight_file")
+        VARIANT.vocab_size
     }
 
     pub fn n_ctx(&self) -> usize {
-        todo!("RIIR Phase 1: variants")
+        variants::MAX_SEQ_LEN
     }
 
     pub fn eos(&self) -> i32 {
-        todo!("RIIR Phase 1: variants")
+        VARIANT.eos_token_1
     }
 
     pub fn model_name(&self) -> &'static str {
-        todo!("RIIR Phase 1: variants")
+        VARIANT.name
     }
 
     pub fn eval_prompt(

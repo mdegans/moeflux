@@ -23,8 +23,16 @@ model-qwen3-6-35b-a3b   = ["moeflux-sys/model-qwen3-6-35b-a3b"]
 # simultaneously, which is the configuration the differential test
 # harness uses. Removed at the Phase 6 cutover, when the Rust path
 # becomes the only path.
-riir-port = ["dep:thiserror"]
+riir-port = [
+    "dep:thiserror",
+    "dep:memmap2",
+    "dep:serde",
+    "dep:serde_json",
+]
 
 [dependencies]
 moeflux-sys = { workspace = true }
 thiserror   = { workspace = true, optional = true }
+memmap2     = { workspace = true, optional = true }
+serde       = { workspace = true, optional = true }
+serde_json  = { workspace = true, optional = true }
