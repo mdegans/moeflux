@@ -21,8 +21,10 @@
 
 use std::path::Path;
 
+pub mod metal;
 pub mod variants;
 pub mod weight_file;
+pub use metal::{MetalBackend, MetalError, MtlBuffer};
 pub use variants::{Variant, VARIANT};
 pub use weight_file::{TensorInfo, WeightFile, WeightFileError};
 
