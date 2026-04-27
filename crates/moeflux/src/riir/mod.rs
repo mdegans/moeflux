@@ -26,6 +26,7 @@ use std::path::Path;
 pub mod embedding;
 pub mod lm_head;
 pub mod metal;
+pub mod moe_router;
 pub mod rms_norm;
 pub mod rope;
 pub mod sdpa;
@@ -34,6 +35,7 @@ pub mod weight_file;
 pub use embedding::{bf16_to_f32, embed_lookup, EmbeddingError};
 pub use lm_head::{lm_head_cpu, LmHeadError};
 pub use metal::{MetalBackend, MetalError, MtlBuffer};
+pub use moe_router::{moe_router_cpu, MoeRouterError};
 pub use rms_norm::{rms_norm_cpu, rms_norm_per_head_cpu, RmsNormError};
 pub use rope::{apply_rotary_emb, RopeError};
 pub use sdpa::{sdpa_cpu, SdpaError};
@@ -172,6 +174,23 @@ impl RsCtx {
         out: &mut [f32],
     ) -> Result<(), RsError> {
         lm_head_cpu(&self.wf, x, out).map_err(|_| RsError::EvalFailed)
+    }
+
+    /// MoE router: softmax → top-K → normalize. `scores` is mutated in
+    /// place (post-call it holds the softmaxed probabilities).
+    /// `indices` (length `k`) receives the top-K expert IDs in the
+    /// selection-sort slot order matching `mf_moe_router_cpu`;
+    /// `weights` (length `k`) receives the normalized expert weights.
+    /// ULP-bounded against the C path (libm `expf` in softmax).
+    pub fn moe_router_cpu(
+        &self,
+        scores: &mut [f32],
+        k: usize,
+        indices: &mut [i32],
+        weights: &mut [f32],
+    ) -> Result<(), RsError> {
+        moe_router_cpu(scores, k, indices, weights)
+            .map_err(|_| RsError::EvalFailed)
     }
 
     pub fn eval_prompt(

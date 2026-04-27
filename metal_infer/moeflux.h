@@ -194,6 +194,21 @@ int mf_sdpa_cpu(mf_ctx *ctx, int32_t kv_len,
 // `ctx`.
 int mf_lm_head_cpu(mf_ctx *ctx, const float *x, float *out);
 
+// CPU MoE router: softmax → top-K → normalize. `scores` is `n_scores`
+// raw gate logits, mutated in place (afterwards holds softmax
+// probabilities). `indices_out` and `weights_out` are parallel arrays
+// of length `k`; on success they hold the top-K expert IDs and their
+// normalized weights, in the slot order produced by the C
+// selection-sort `cpu_topk` (NOT sorted by score).
+//
+// `k` must satisfy `1 <= k <= n_scores`. Returns 0 on success, -1 on
+// NULL args / out-of-range `k`. Read-only on `ctx`.
+int mf_moe_router_cpu(mf_ctx *ctx,
+                      float *scores, int32_t n_scores,
+                      int32_t k,
+                      int32_t *indices_out,
+                      float *weights_out);
+
 // ============================================================================
 // State snapshot / restore (Option B in NOTES.md)
 // ============================================================================

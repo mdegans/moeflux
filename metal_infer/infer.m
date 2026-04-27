@@ -7856,6 +7856,20 @@ int mf_lm_head_cpu(mf_ctx *ctx, const float *x, float *out) {
     return 0;
 }
 
+int mf_moe_router_cpu(mf_ctx *ctx,
+                      float *scores, int32_t n_scores,
+                      int32_t k,
+                      int32_t *indices_out,
+                      float *weights_out)
+{
+    if (!ctx || !scores || !indices_out || !weights_out) return -1;
+    if (n_scores <= 0 || k <= 0 || k > n_scores) return -1;
+    cpu_softmax(scores, (int)n_scores);
+    cpu_topk(scores, (int)n_scores, (int)k, indices_out, weights_out);
+    cpu_normalize_weights(weights_out, (int)k);
+    return 0;
+}
+
 // ============================================================================
 // State snapshot / restore (Option B)
 // ============================================================================

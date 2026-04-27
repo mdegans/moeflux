@@ -336,6 +336,32 @@ impl Ctx {
         if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
     }
 
+    /// CPU MoE router: softmax → top-K → normalize. `scores` is the
+    /// raw gate logit vector (mutated in place — afterwards holds
+    /// softmax probabilities). `indices` and `weights` are output
+    /// parallel arrays both of length `k`; the slot order matches the
+    /// C selection-sort and is not sorted by score. Diff-oracle dump
+    /// point for the per-layer expert-routing decision.
+    pub fn moe_router_cpu(
+        &self,
+        scores: &mut [f32],
+        k: usize,
+        indices: &mut [i32],
+        weights: &mut [f32],
+    ) -> Result<(), Error> {
+        let rc = unsafe {
+            sys::mf_moe_router_cpu(
+                self.inner.as_ptr(),
+                scores.as_mut_ptr(),
+                scores.len() as i32,
+                k as i32,
+                indices.as_mut_ptr(),
+                weights.as_mut_ptr(),
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
+    }
+
     /// Reset the sequence to empty.
     pub fn memory_clear(&mut self) {
         unsafe { sys::mf_memory_clear(self.inner.as_ptr()) }

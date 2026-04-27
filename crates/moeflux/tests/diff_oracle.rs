@@ -128,6 +128,12 @@ pub trait DiffBackend {
     /// vector is `VOCAB_SIZE` floats (raw logits).
     fn lm_head_cpu(&self, x: &[f32]) -> Vec<f32>;
 
+    /// MoE router: softmax → top-K → normalize. Takes the raw gate
+    /// logits, returns `(indices, weights)` parallel arrays of length
+    /// `k`. `scores` is consumed as input; the C path mutates it in
+    /// place but the trait surface hands over an owned copy each call.
+    fn moe_router_cpu(&self, scores: Vec<f32>, k: usize) -> (Vec<i32>, Vec<f32>);
+
     /// Prefill `tokens` at `start_pos`. Returns the n_vocab-length
     /// logit vector for the position immediately after the last
     /// token in `tokens`.
@@ -246,6 +252,16 @@ impl DiffBackend for CBackend {
             .lm_head_cpu(x, &mut out)
             .expect("CBackend lm_head_cpu");
         out
+    }
+
+    fn moe_router_cpu(&self, scores: Vec<f32>, k: usize) -> (Vec<i32>, Vec<f32>) {
+        let mut s = scores;
+        let mut idx = vec![0i32; k];
+        let mut w = vec![0.0f32; k];
+        self.0
+            .moe_router_cpu(&mut s, k, &mut idx, &mut w)
+            .expect("CBackend moe_router_cpu");
+        (idx, w)
     }
 
     fn eval_prompt(&mut self, tokens: &[i32], start_pos: usize) -> Vec<f32> {
@@ -377,6 +393,16 @@ impl DiffBackend for RsBackend {
             .lm_head_cpu(x, &mut out)
             .expect("RsBackend lm_head_cpu");
         out
+    }
+
+    fn moe_router_cpu(&self, scores: Vec<f32>, k: usize) -> (Vec<i32>, Vec<f32>) {
+        let mut s = scores;
+        let mut idx = vec![0i32; k];
+        let mut w = vec![0.0f32; k];
+        self.0
+            .moe_router_cpu(&mut s, k, &mut idx, &mut w)
+            .expect("RsBackend moe_router_cpu");
+        (idx, w)
     }
 
     fn eval_prompt(&mut self, tokens: &[i32], start_pos: usize) -> Vec<f32> {
@@ -1158,6 +1184,118 @@ fn lm_head_cpu_bit_exact_c_vs_rust() {
             c_out.len(),
             argmax(&c_out),
             &c_out[..4],
+        );
+    }
+}
+
+/// ULP-bounded diff for the MoE router (Phase 3, slice 7).
+///
+/// Pipeline: softmax → top-K → normalize. The softmax's per-element
+/// `expf` is the only ULP source — Apple clang `-O3` auto-vectorizes
+/// scalar `expf` calls into Apple libm's `vexpf`, while Rust extern
+/// `"C"` calls don't, so we expect single-digit ULP drift on the
+/// softmaxed scores. The selected expert *index set* should be
+/// identical across both sides — top-K selection is deterministic
+/// once you have identical inputs, and the softmax ULP gap is
+/// orders of magnitude below the score separation that would change
+/// which experts are picked.
+///
+/// Two synthetic gate-score patterns:
+///
+/// 1. **clear-winner**: NUM_EXPERTS scores with K large bumps
+///    several orders of magnitude above the noise floor. The set of
+///    top-K indices must match exactly.
+/// 2. **mild-spread**: scores drawn from a smooth trig sweep. The
+///    set match is still expected (gaps still much wider than ULP
+///    drift) but stresses tighter gaps in the top-K cutoff zone.
+///
+/// Weights compared after canonicalizing slot order by index — the
+/// C selection-sort produces a slot ordering that depends on the
+/// historical replacement order, which is itself input-dependent
+/// but identical across our two backends since both walk the score
+/// array in the same order.
+#[test]
+#[ignore = "long running; needs moeflux artifacts"]
+fn moe_router_cpu_close_c_vs_rust() {
+    use moeflux::riir::VARIANT;
+
+    let c: CBackend = open_backend();
+    let rs: RsBackend = open_backend();
+
+    let n_experts = VARIANT.num_experts;
+    let k = VARIANT.num_experts_per_tok;
+    assert!(n_experts >= k && k >= 1);
+
+    // Pattern 1: clear-winner. Smooth low-magnitude background plus K
+    // large bumps placed at deterministic indices.
+    let mut clear: Vec<f32> = (0..n_experts)
+        .map(|i| ((i as f32) * 0.011).sin() * 0.01 + 0.0)
+        .collect();
+    let bump_indices: Vec<usize> =
+        (0..k).map(|i| (i * (n_experts / k.max(1))) % n_experts).collect();
+    for (slot, &idx) in bump_indices.iter().enumerate() {
+        clear[idx] = 5.0 + slot as f32 * 0.5;
+    }
+
+    // Pattern 2: mild-spread. All scores within a narrower band so
+    // the top-K cutoff is closer to the noise floor.
+    let spread: Vec<f32> = (0..n_experts)
+        .map(|i| ((i as f32) * 0.013).cos() * 0.7 + ((i as f32) * 0.041).sin() * 0.3)
+        .collect();
+
+    for (label, scores) in [("clear", &clear), ("spread", &spread)] {
+        let (c_idx, c_w) = c.moe_router_cpu(scores.clone(), k);
+        let (rs_idx, rs_w) = rs.moe_router_cpu(scores.clone(), k);
+
+        // Set equality on indices.
+        let mut c_sorted = c_idx.clone();
+        let mut rs_sorted = rs_idx.clone();
+        c_sorted.sort();
+        rs_sorted.sort();
+        assert_eq!(
+            c_sorted, rs_sorted,
+            "[diff:moe_router {label}] index set mismatch (c={c_idx:?} rs={rs_idx:?})"
+        );
+
+        // Map C/Rust slot → score for canonical comparison by index.
+        let c_pairs: Vec<(i32, f32)> =
+            c_idx.iter().copied().zip(c_w.iter().copied()).collect();
+        let rs_pairs: Vec<(i32, f32)> =
+            rs_idx.iter().copied().zip(rs_w.iter().copied()).collect();
+        let mut c_by_idx: std::collections::HashMap<i32, f32> = c_pairs.into_iter().collect();
+        let mut rs_by_idx: std::collections::HashMap<i32, f32> = rs_pairs.into_iter().collect();
+
+        let mut max_ulp = 0u32;
+        let mut max_abs_diff = 0.0f32;
+        for &idx in &c_sorted {
+            let cw = c_by_idx.remove(&idx).unwrap();
+            let rw = rs_by_idx.remove(&idx).unwrap();
+            max_ulp = max_ulp.max(ulp_diff(cw, rw));
+            max_abs_diff = max_abs_diff.max((cw - rw).abs());
+        }
+        let weight_sum_c: f32 = c_w.iter().sum();
+        let weight_sum_rs: f32 = rs_w.iter().sum();
+
+        eprintln!(
+            "[diff:moe_router {label} n={n_experts} k={k}] \
+             max_ulp={max_ulp} max_abs_diff={max_abs_diff:.3e} \
+             c_sum={weight_sum_c:.6} rs_sum={weight_sum_rs:.6}"
+        );
+
+        // ULP bound: same regime as RoPE. Single libm call per element
+        // in softmax, bounded per call; normalization is one further
+        // sum + divide on K floats.
+        assert!(
+            max_ulp <= MAX_ULP_DRIFT,
+            "[diff:moe_router {label}] max ULP drift {max_ulp} > {MAX_ULP_DRIFT}"
+        );
+        assert!(
+            (weight_sum_c - 1.0).abs() < 1e-5,
+            "[diff:moe_router {label}] C weights don't sum to 1 ({weight_sum_c})"
+        );
+        assert!(
+            (weight_sum_rs - 1.0).abs() < 1e-5,
+            "[diff:moe_router {label}] Rust weights don't sum to 1 ({weight_sum_rs})"
         );
     }
 }
