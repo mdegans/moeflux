@@ -112,6 +112,18 @@ pub trait DiffBackend {
         x: &[f32],
     ) -> Vec<f32>;
 
+    /// CPU scaled dot-product attention with sigmoid-gated output for
+    /// one query position against `kv_len` cached positions. Returns
+    /// the `num_attn_heads * head_dim`-long gated attention output.
+    fn sdpa_cpu(
+        &self,
+        kv_len: i32,
+        q: &[f32],
+        q_gate: &[f32],
+        k_cache: &[f32],
+        v_cache: &[f32],
+    ) -> Vec<f32>;
+
     /// Prefill `tokens` at `start_pos`. Returns the n_vocab-length
     /// logit vector for the position immediately after the last
     /// token in `tokens`.
@@ -206,6 +218,21 @@ impl DiffBackend for CBackend {
         self.0
             .rms_norm_per_head_cpu(weight_name, num_heads, head_dim, &mut out)
             .expect("CBackend rms_norm_per_head_cpu");
+        out
+    }
+
+    fn sdpa_cpu(
+        &self,
+        kv_len: i32,
+        q: &[f32],
+        q_gate: &[f32],
+        k_cache: &[f32],
+        v_cache: &[f32],
+    ) -> Vec<f32> {
+        let mut out = vec![0.0f32; q.len()];
+        self.0
+            .sdpa_cpu(kv_len, q, q_gate, k_cache, v_cache, &mut out)
+            .expect("CBackend sdpa_cpu");
         out
     }
 
@@ -314,6 +341,21 @@ impl DiffBackend for RsBackend {
         self.0
             .rms_norm_per_head_cpu(weight_name, num_heads, head_dim, &mut out)
             .expect("RsBackend rms_norm_per_head_cpu");
+        out
+    }
+
+    fn sdpa_cpu(
+        &self,
+        kv_len: i32,
+        q: &[f32],
+        q_gate: &[f32],
+        k_cache: &[f32],
+        v_cache: &[f32],
+    ) -> Vec<f32> {
+        let mut out = vec![0.0f32; q.len()];
+        self.0
+            .sdpa_cpu(kv_len, q, q_gate, k_cache, v_cache, &mut out)
+            .expect("RsBackend sdpa_cpu");
         out
     }
 
@@ -720,6 +762,107 @@ fn rms_norm_cpu_bit_exact_c_vs_rust() {
                 &c_out[..4],
             );
         }
+    }
+}
+
+/// ULP-bounded diff for the SDPA core (Phase 3, slice 5).
+///
+/// `cpu_sdpa` does scaled dot-product attention + sigmoid gating in
+/// one pass: per-head GQA dot product Q·K, scale, softmax, weighted
+/// sum of V, then `out *= sigmoid(q_gate)`. Two libm calls per output
+/// element (`expf` in softmax, `expf` in sigmoid) put it firmly in
+/// ULP-bounded territory — same compiler-choice considerations as RoPE
+/// (auto-vectorized libm vector variants on the C side, scalar libm
+/// from Rust extern `"C"` calls), but compounded across more
+/// reductions and more transcendental calls per element.
+///
+/// Synthetic Q/K/V buffers at three `kv_len` points to characterize
+/// how drift scales with cache length — the load-bearing assertion
+/// here is "Rust output and C output have the same shape" (high
+/// cosine similarity, small max-abs-diff relative to the magnitude of
+/// the output) rather than "every element matches to N ULPs," because
+/// the compounded transcendental calls easily push individual
+/// elements past any tight ULP bound.
+///
+/// Cosine ≥ 0.9999 catches porting bugs (sign flips, GQA mis-grouping,
+/// off-by-one indexing all collapse it well below this), and max-abs
+/// drift / max-abs output ≤ 1e-3 catches localized blow-ups while
+/// staying well above the per-element FMA-vs-non-FMA noise floor.
+#[test]
+#[ignore = "long running; needs moeflux artifacts"]
+fn sdpa_cpu_close_c_vs_rust() {
+    use moeflux::riir::VARIANT;
+
+    let c: CBackend = open_backend();
+    let rs: RsBackend = open_backend();
+
+    let head_dim = VARIANT.head_dim;
+    let num_attn_heads = VARIANT.num_attn_heads;
+    let num_kv_heads = VARIANT.num_kv_heads;
+    let q_dim = num_attn_heads * head_dim;
+    let kv_dim = num_kv_heads * head_dim;
+
+    // Synthetic per-position vectors. Magnitudes loosely match
+    // post-RMSNorm + post-RoPE statistics observed in practice.
+    let q: Vec<f32> = (0..q_dim)
+        .map(|i| ((i as f32) * 0.011).sin() * 0.6 + 0.05)
+        .collect();
+    let q_gate: Vec<f32> = (0..q_dim)
+        .map(|i| ((i as f32) * 0.007).cos() * 1.2 - 0.1)
+        .collect();
+
+    // Probe at small / medium / longer cache to see how drift scales.
+    for &kv_len in &[1i32, 8, 64, 512] {
+        let kv_len_u = kv_len as usize;
+        let kv_total = kv_len_u * kv_dim;
+        let k_cache: Vec<f32> = (0..kv_total)
+            .map(|i| ((i as f32) * 0.013).sin() * 0.5 + 0.02)
+            .collect();
+        let v_cache: Vec<f32> = (0..kv_total)
+            .map(|i| ((i as f32) * 0.017).cos() * 0.4 - 0.05)
+            .collect();
+
+        let c_out = c.sdpa_cpu(kv_len, &q, &q_gate, &k_cache, &v_cache);
+        let rs_out = rs.sdpa_cpu(kv_len, &q, &q_gate, &k_cache, &v_cache);
+
+        let max_ulp = c_out
+            .iter()
+            .zip(rs_out.iter())
+            .map(|(&a, &b)| ulp_diff(a, b))
+            .max()
+            .unwrap_or(0);
+        let diff_count = c_out
+            .iter()
+            .zip(rs_out.iter())
+            .filter(|&(&a, &b)| a.to_bits() != b.to_bits())
+            .count();
+        let max_abs_diff = c_out
+            .iter()
+            .zip(rs_out.iter())
+            .map(|(&a, &b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let max_abs_out = c_out
+            .iter()
+            .map(|&a| a.abs())
+            .fold(0.0f32, f32::max);
+        let cos = cosine_sim(&c_out, &rs_out);
+
+        eprintln!(
+            "[diff:sdpa kv_len={kv_len}] cosine={cos:.6} max_abs_diff={max_abs_diff:.3e} \
+             max_abs_out={max_abs_out:.3e} max_ulp={max_ulp} ({}/{} differ)",
+            diff_count,
+            c_out.len(),
+        );
+
+        assert!(
+            cos >= 0.9999,
+            "[diff:sdpa kv_len={kv_len}] cosine sim {cos:.6} below 0.9999"
+        );
+        assert!(
+            max_abs_diff <= 1e-3 * max_abs_out.max(1e-6),
+            "[diff:sdpa kv_len={kv_len}] max abs diff {max_abs_diff:.3e} \
+             > 1e-3 * max abs out ({max_abs_out:.3e})"
+        );
     }
 }
 

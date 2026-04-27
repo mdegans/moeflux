@@ -27,12 +27,14 @@ pub mod embedding;
 pub mod metal;
 pub mod rms_norm;
 pub mod rope;
+pub mod sdpa;
 pub mod variants;
 pub mod weight_file;
 pub use embedding::{bf16_to_f32, embed_lookup, EmbeddingError};
 pub use metal::{MetalBackend, MetalError, MtlBuffer};
 pub use rms_norm::{rms_norm_cpu, rms_norm_per_head_cpu, RmsNormError};
 pub use rope::{apply_rotary_emb, RopeError};
+pub use sdpa::{sdpa_cpu, SdpaError};
 pub use variants::{Variant, VARIANT};
 pub use weight_file::{TensorInfo, WeightFile, WeightFileError};
 
@@ -140,6 +142,23 @@ impl RsCtx {
         k: &mut [f32],
     ) -> Result<(), RsError> {
         apply_rotary_emb(pos, q, k).map_err(|_| RsError::EvalFailed)
+    }
+
+    /// Scaled dot-product attention with sigmoid-gated output, single
+    /// query position. ULP-bounded against `mf_sdpa_cpu` (libm `expf`
+    /// in softmax + sigmoid sit in the same compiler-choice territory
+    /// as RoPE's trig calls).
+    pub fn sdpa_cpu(
+        &self,
+        kv_len: i32,
+        q: &[f32],
+        q_gate: &[f32],
+        k_cache: &[f32],
+        v_cache: &[f32],
+        out: &mut [f32],
+    ) -> Result<(), RsError> {
+        sdpa_cpu(kv_len, q, q_gate, k_cache, v_cache, out)
+            .map_err(|_| RsError::EvalFailed)
     }
 
     pub fn eval_prompt(

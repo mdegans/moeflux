@@ -161,6 +161,26 @@ int mf_rms_norm_per_head_cpu(mf_ctx *ctx, const char *weight_name,
                               int32_t num_heads, int32_t head_dim,
                               float *x_inout);
 
+// Scaled dot-product attention with sigmoid-gated output, computed on
+// the CPU. Single query position against `kv_len` cached positions.
+// Uses the active architecture's NUM_ATTN_HEADS / NUM_KV_HEADS / HEAD_DIM.
+// GQA: each group of (NUM_ATTN_HEADS / NUM_KV_HEADS) query heads
+// shares one kv head.
+//
+//   q:       [NUM_ATTN_HEADS * HEAD_DIM] post-RoPE query for this position.
+//   q_gate:  [NUM_ATTN_HEADS * HEAD_DIM] pre-sigmoid gate logits.
+//   k_cache: [kv_len * NUM_KV_HEADS * HEAD_DIM] post-RoPE K rows.
+//   v_cache: [kv_len * NUM_KV_HEADS * HEAD_DIM] V rows.
+//   out:     [NUM_ATTN_HEADS * HEAD_DIM] sigmoid-gated attention output.
+//
+// Output is `softmax(Q·K^T / sqrt(HEAD_DIM)) · V` per-head, then
+// elementwise multiplied by `sigmoid(q_gate)`. Returns 0 on success,
+// -1 on NULL args or `kv_len <= 0`. Read-only on `ctx`.
+int mf_sdpa_cpu(mf_ctx *ctx, int32_t kv_len,
+                const float *q, const float *q_gate,
+                const float *k_cache, const float *v_cache,
+                float *out);
+
 // ============================================================================
 // State snapshot / restore (Option B in NOTES.md)
 // ============================================================================

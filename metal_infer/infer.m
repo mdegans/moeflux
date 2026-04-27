@@ -739,6 +739,70 @@ static void cpu_rms_norm_per_head(float *x_inout, const uint16_t *w_bf16,
     }
 }
 
+// Forward decls for helpers defined later in this file.
+static void cpu_softmax(float *x, int dim);
+
+// Scaled dot-product attention with sigmoid-gated output, single query
+// position, multi-position KV cache. GQA via `num_attn_heads /
+// num_kv_heads`. K/V cache layout per position: `[num_kv_heads,
+// head_dim]` contiguous; cache stride between positions is
+// `num_kv_heads * head_dim`.
+//
+//   scores[p] = dot(Q[h], K[p, kv_h]) / sqrt(head_dim)
+//   weights   = softmax(scores)
+//   out[h]    = sum_p weights[p] * V[p, kv_h]
+//   out      *= sigmoid(q_gate)
+//
+// Buffers (all f32):
+//   q:       [num_attn_heads * head_dim]   query for this position
+//   q_gate:  [num_attn_heads * head_dim]   pre-sigmoid gate logits
+//   k_cache: [kv_len * num_kv_heads * head_dim]
+//   v_cache: [kv_len * num_kv_heads * head_dim]
+//   out:     [num_attn_heads * head_dim]   gated attention output
+static void cpu_sdpa(int kv_len,
+                     const float *q, const float *q_gate,
+                     const float *k_cache, const float *v_cache,
+                     int num_attn_heads, int num_kv_heads, int head_dim,
+                     float *out) {
+    int q_dim = num_attn_heads * head_dim;
+    int kv_dim = num_kv_heads * head_dim;
+    int heads_per_kv = num_attn_heads / num_kv_heads;
+    float scale = 1.0f / sqrtf((float)head_dim);
+
+    memset(out, 0, q_dim * sizeof(float));
+
+    for (int h = 0; h < num_attn_heads; h++) {
+        int kv_h = h / heads_per_kv;
+        const float *qh = q + h * head_dim;
+
+        float *scores = malloc(kv_len * sizeof(float));
+        for (int p = 0; p < kv_len; p++) {
+            const float *kp = k_cache + p * kv_dim + kv_h * head_dim;
+            float dot = 0.0f;
+            for (int d = 0; d < head_dim; d++) {
+                dot += qh[d] * kp[d];
+            }
+            scores[p] = dot * scale;
+        }
+
+        cpu_softmax(scores, kv_len);
+
+        float *oh = out + h * head_dim;
+        for (int p = 0; p < kv_len; p++) {
+            const float *vp = v_cache + p * kv_dim + kv_h * head_dim;
+            for (int d = 0; d < head_dim; d++) {
+                oh[d] += scores[p] * vp[d];
+            }
+        }
+        free(scores);
+    }
+
+    for (int i = 0; i < q_dim; i++) {
+        float g = 1.0f / (1.0f + expf(-q_gate[i]));
+        out[i] *= g;
+    }
+}
+
 // SwiGLU: out = silu(gate) * up
 static void cpu_swiglu(const float *gate, const float *up, float *out, int dim) {
     for (int i = 0; i < dim; i++) {
@@ -2405,51 +2469,12 @@ static void full_attention_forward(
     memcpy(kv->v_cache + cache_pos * kv_dim, v, kv_dim * sizeof(float));
     kv->len++;
 
-    // ---- Scaled dot-product attention ----
-    // GQA: NUM_ATTN_HEADS=32 heads, NUM_KV_HEADS=2 kv heads
-    // Each group of 16 query heads shares 1 kv head
-    int heads_per_kv = NUM_ATTN_HEADS / NUM_KV_HEADS;
-    float scale = 1.0f / sqrtf((float)HEAD_DIM);
-
+    // ---- Scaled dot-product attention + sigmoid gate ----
+    // GQA: each group of (NUM_ATTN_HEADS / NUM_KV_HEADS) query heads
+    // shares one kv head. Output is gated by sigmoid(q_gate).
     float *attn_out = calloc(q_dim, sizeof(float));
-
-    for (int h = 0; h < NUM_ATTN_HEADS; h++) {
-        int kv_h = h / heads_per_kv;
-        float *qh = q + h * HEAD_DIM;
-
-        // Compute attention scores for all cached positions
-        float *scores = malloc(kv->len * sizeof(float));
-        for (int p = 0; p < kv->len; p++) {
-            float *kp = kv->k_cache + p * kv_dim + kv_h * HEAD_DIM;
-            float dot = 0.0f;
-            for (int d = 0; d < HEAD_DIM; d++) {
-                dot += qh[d] * kp[d];
-            }
-            scores[p] = dot * scale;
-        }
-
-        // Softmax
-        cpu_softmax(scores, kv->len);
-
-        // Weighted sum of values
-        float *oh = attn_out + h * HEAD_DIM;
-        for (int p = 0; p < kv->len; p++) {
-            float *vp = kv->v_cache + p * kv_dim + kv_h * HEAD_DIM;
-            for (int d = 0; d < HEAD_DIM; d++) {
-                oh[d] += scores[p] * vp[d];
-            }
-        }
-        free(scores);
-    }
-
-
-    // ---- Apply sigmoid gate to attention output ----
-    // MLX: return self.o_proj(output * mx.sigmoid(gate))
-    // gate is reshaped to [B, L, num_heads*head_dim] = flat [q_dim]
-    for (int i = 0; i < q_dim; i++) {
-        float g = 1.0f / (1.0f + expf(-q_gate[i]));
-        attn_out[i] *= g;
-    }
+    cpu_sdpa(kv->len, q, q_gate, kv->k_cache, kv->v_cache,
+             NUM_ATTN_HEADS, NUM_KV_HEADS, HEAD_DIM, attn_out);
 
     // ---- Output projection ----
     float *attn_projected = calloc(HIDDEN_DIM, sizeof(float));
@@ -7803,6 +7828,18 @@ int mf_rms_norm_per_head_cpu(mf_ctx *ctx, const char *weight_name,
     uint16_t *w_bf16 = (uint16_t *)get_tensor_ptr(ctx->wf, weight_name);
     if (!w_bf16) return -1;
     cpu_rms_norm_per_head(x_inout, w_bf16, num_heads, head_dim, RMS_NORM_EPS);
+    return 0;
+}
+
+int mf_sdpa_cpu(mf_ctx *ctx, int32_t kv_len,
+                const float *q, const float *q_gate,
+                const float *k_cache, const float *v_cache,
+                float *out)
+{
+    if (!ctx || !q || !q_gate || !k_cache || !v_cache || !out) return -1;
+    if (kv_len <= 0) return -1;
+    cpu_sdpa((int)kv_len, q, q_gate, k_cache, v_cache,
+             NUM_ATTN_HEADS, NUM_KV_HEADS, HEAD_DIM, out);
     return 0;
 }
 

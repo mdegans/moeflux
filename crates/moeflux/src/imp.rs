@@ -291,6 +291,35 @@ impl Ctx {
         if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
     }
 
+    /// CPU scaled dot-product attention with sigmoid-gated output,
+    /// single query position against `kv_len` cached positions. Uses
+    /// the active variant's NUM_ATTN_HEADS / NUM_KV_HEADS / HEAD_DIM
+    /// (GQA: `num_attn_heads / num_kv_heads` query heads share one
+    /// kv head). `out` is overwritten. Diff-oracle dump point for
+    /// the SDPA core of full-attention layers.
+    pub fn sdpa_cpu(
+        &self,
+        kv_len: i32,
+        q: &[f32],
+        q_gate: &[f32],
+        k_cache: &[f32],
+        v_cache: &[f32],
+        out: &mut [f32],
+    ) -> Result<(), Error> {
+        let rc = unsafe {
+            sys::mf_sdpa_cpu(
+                self.inner.as_ptr(),
+                kv_len,
+                q.as_ptr(),
+                q_gate.as_ptr(),
+                k_cache.as_ptr(),
+                v_cache.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
+    }
+
     /// Reset the sequence to empty.
     pub fn memory_clear(&mut self) {
         unsafe { sys::mf_memory_clear(self.inner.as_ptr()) }
