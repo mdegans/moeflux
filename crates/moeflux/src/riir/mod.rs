@@ -30,6 +30,7 @@ pub mod expert_forward;
 pub mod expert_io;
 pub mod full_attn_forward;
 pub mod gpu_linear_attn;
+pub mod gpu_lm_head;
 pub mod gpu_matvec;
 pub mod gpu_norm;
 pub mod layer_weight_cache;
@@ -53,6 +54,7 @@ pub use expert_forward::{
     MoeBuffers, MAX_K,
 };
 pub use expert_io::{ExpertFiles, ExpertIoError};
+pub use gpu_lm_head::{GpuLmHead, GpuLmHeadError};
 pub use gpu_norm::{gpu_rms_norm_fused, GpuNormError};
 pub use linear_attn::{
     conv1d_step, gated_delta_recurrence, rms_norm_bare, rms_norm_gated,
@@ -136,6 +138,11 @@ pub struct RsCtx {
     /// `RsCtx` here is what eliminates the cross-Ctx NaN bug class
     /// (see [`deferred`] module docs).
     deferred: Option<DeferredState>,
+    /// Persistent GPU LM head dispatcher. Lazily built by
+    /// [`Self::ensure_linear_resources`] alongside the other GPU
+    /// resources. Replaces the per-token `lm_head_cpu` call (which
+    /// dominated the 2026-04-27 perf profile at 59% of CPU time).
+    lm_head_gpu: Option<GpuLmHead>,
     // Future phases populate: vocab.
 }
 
@@ -170,6 +177,7 @@ impl RsCtx {
             layer_caches: None,
             linear_buffers: None,
             deferred: None,
+            lm_head_gpu: None,
         })
     }
 
@@ -794,6 +802,14 @@ impl RsCtx {
                 self.metal.as_ref().expect("just-set").device().to_owned();
             self.moe_buffers = Some(MoeBuffers::new(&device));
         }
+        if self.lm_head_gpu.is_none() {
+            let metal = self.metal.as_mut().expect("just-set");
+            let wf_buf = self.wf_buf.as_ref().expect("just-set");
+            self.lm_head_gpu = Some(
+                GpuLmHead::new(metal, &self.wf, wf_buf)
+                    .map_err(|_| RsError::InitFailed)?,
+            );
+        }
         Ok(())
     }
 
@@ -888,6 +904,7 @@ impl RsCtx {
             layer_caches,
             linear_buffers,
             deferred,
+            lm_head_gpu,
             ..
         } = self;
         let metal = metal.as_mut().expect("ensure_linear_resources");
@@ -898,6 +915,8 @@ impl RsCtx {
             linear_buffers.as_mut().expect("ensure_linear_resources");
         let moe_buffers =
             moe_buffers.as_mut().expect("ensure_linear_resources");
+        let lm_head_gpu =
+            lm_head_gpu.as_ref().expect("ensure_linear_resources");
 
         // Defensive bracket — drain stale state from a buggy prior
         // call so re-entrancy holds.
@@ -1007,8 +1026,8 @@ impl RsCtx {
                 )
                 .map_err(|_| RsError::EvalFailed)?;
 
-                // Final RMSNorm (`model.norm.weight`) + LM head.
-                // CPU-side; bit-exact against C per slice 1 / 6.
+                // Final RMSNorm (`model.norm.weight`) is CPU — small
+                // (HIDDEN_DIM = 2048), bit-exact against C per slice 1.
                 let mut hidden_normed = vec![0.0f32; v.hidden_dim];
                 rms_norm_cpu(
                     wf,
@@ -1017,7 +1036,15 @@ impl RsCtx {
                     &mut hidden_normed,
                 )
                 .map_err(|_| RsError::EvalFailed)?;
-                lm_head_cpu(wf, &hidden_normed, logits)
+
+                // LM head is GPU — was 59% of CPU time per the
+                // 2026-04-27 profile. The C path's `lm_head_forward`
+                // (infer.m:3090) takes the same Metal route through
+                // `dequant_matvec_4bit_v3`; per-PSO bit-exactness
+                // (slice 9 finding) keeps the end-to-end logits
+                // bit-equal.
+                lm_head_gpu
+                    .forward(metal, wf_buf, &hidden_normed, logits)
                     .map_err(|_| RsError::EvalFailed)?;
             }
         }
