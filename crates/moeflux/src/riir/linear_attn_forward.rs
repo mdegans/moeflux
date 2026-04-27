@@ -252,9 +252,15 @@ fn zero_f32_buffer(b: &Buffer) {
 }
 
 /// `linear_layer_idx = layer_idx - (layer_idx + 1) / FULL_ATTN_INTERVAL`.
-/// Returns `None` if `layer_idx` is a full-attention layer.
+/// Returns `None` if `layer_idx` is a full-attention layer. The
+/// modulo arithmetic for the linear index is qwen3_5_moe-specific
+/// (full-attn layers are evenly spaced); the kind dispatch goes
+/// through [`Variant::layer_kind`] so a future variant can plug in a
+/// different layer-kind sequence without touching this helper's
+/// callers.
 pub fn linear_layer_idx_for(layer_idx: usize) -> Option<usize> {
-    if (layer_idx + 1) % VARIANT.full_attn_interval == 0 {
+    use super::variants::LayerKind;
+    if VARIANT.layer_kind(layer_idx) == LayerKind::FullAttn {
         None
     } else {
         Some(layer_idx - (layer_idx + 1) / VARIANT.full_attn_interval)

@@ -92,7 +92,7 @@ pub fn full_attn_layer_forward(
 
     // Reject linear-attn layers up front. Mirror the symmetric guard
     // in `linear_attn_layer_forward`.
-    if (layer_idx + 1) % v.full_attn_interval != 0 {
+    if v.layer_kind(layer_idx) != super::variants::LayerKind::FullAttn {
         return Err(LayerForwardError::MissingTensor {
             layer: layer_idx,
             tensor: "full_attn_layer_forward called on linear-attn layer",

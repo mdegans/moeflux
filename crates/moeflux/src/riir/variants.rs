@@ -23,6 +23,22 @@
 //! [`assert_matches_c`] (uses `mf_n_vocab` / `mf_n_ctx` / `mf_eos`
 //! / `mf_model_name`) and at test time by the diff oracle.
 
+/// Kind of a single transformer layer. The qwen3_5_moe family
+/// alternates linear-attention layers with periodic full-attention
+/// layers spaced by [`Variant::full_attn_interval`]; future variants
+/// (notably DeepSeek-V3 with MLA + dense early layers) will need
+/// per-layer dispatch that the modulo predicate can't express, so the
+/// dispatch goes through [`Variant::layer_kind`] from the start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerKind {
+    /// GatedDeltaNet linear-attention layer with conv1d + recurrence
+    /// state. Cheap per token; constant memory per layer.
+    LinearAttn,
+    /// Standard scaled-dot-product full-attention layer with a KV
+    /// cache. Memory grows linearly with sequence length.
+    FullAttn,
+}
+
 /// All shape parameters for one model variant. `usize` everywhere
 /// the C side uses an `int` macro so const arithmetic stays in one
 /// type; the [`Variant::eos_*`] / [`Variant::think_*`] tokens stay
@@ -82,6 +98,19 @@ impl Variant {
     /// family.
     pub const fn rotary_dim(&self) -> usize {
         self.head_dim / 4
+    }
+
+    /// Per-layer dispatch predicate. For the qwen3_5_moe family this
+    /// is the `(layer_idx + 1) % full_attn_interval == 0` test that
+    /// `infer.m:4695` uses inline; we name it so future variants
+    /// (notably DeepSeek-V3 with dense early layers + MLA + MoE) can
+    /// override the implementation without churning every callsite.
+    pub const fn layer_kind(&self, layer_idx: usize) -> LayerKind {
+        if (layer_idx + 1) % self.full_attn_interval == 0 {
+            LayerKind::FullAttn
+        } else {
+            LayerKind::LinearAttn
+        }
     }
 
     // --- 4-bit packed-expert layout (derived) ---------------------
@@ -326,5 +355,32 @@ mod tests {
         assert!(v.expert_size_2bit() < v.expert_size_4bit());
         // GQA: heads must group cleanly.
         assert_eq!(v.num_attn_heads % v.num_kv_heads, 0);
+    }
+
+    /// `layer_kind(i)` must agree with the legacy modulo predicate for
+    /// every layer index in the active variant. Catches drift if a
+    /// future variant's `layer_kind` impl diverges from the qwen3_5_moe
+    /// shape without the rest of the dispatch being updated.
+    #[test]
+    fn layer_kind_matches_legacy_modulo() {
+        let v = VARIANT;
+        for i in 0..v.num_layers {
+            let legacy_full = (i + 1) % v.full_attn_interval == 0;
+            let kind = v.layer_kind(i);
+            assert_eq!(
+                kind == LayerKind::FullAttn,
+                legacy_full,
+                "layer_kind({i}) disagrees with legacy modulo predicate \
+                 (full_attn_interval = {})",
+                v.full_attn_interval,
+            );
+        }
+        // Sanity: at least one full-attn layer exists in every variant
+        // we ship today.
+        let n_full = (0..v.num_layers)
+            .filter(|&i| v.layer_kind(i) == LayerKind::FullAttn)
+            .count();
+        assert!(n_full > 0, "every shipping variant has full-attn layers");
+        assert_eq!(n_full, v.num_layers / v.full_attn_interval);
     }
 }

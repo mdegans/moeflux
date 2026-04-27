@@ -549,7 +549,8 @@ impl RsCtx {
         }
 
         let layer_idx_us = layer_idx as usize;
-        let is_full = (layer_idx_us + 1) % v.full_attn_interval == 0;
+        let is_full =
+            v.layer_kind(layer_idx_us) == variants::LayerKind::FullAttn;
 
         // Ensure all lazy resources exist.
         self.ensure_linear_resources()?;

@@ -121,15 +121,15 @@ impl LayerState {
 }
 
 /// Allocate the per-layer state vector for the active variant.
-/// Layer index → [`LayerState::FullAttn`] when `(i + 1) %
-/// full_attn_interval == 0`, otherwise [`LayerState::LinearAttn`].
-/// Mirrors the C-side allocation in `mf_init_model` (infer.m:7511+).
+/// Dispatched via [`Variant::layer_kind`] — for qwen3_5_moe today
+/// that's the `(i + 1) % full_attn_interval == 0` predicate. Mirrors
+/// the C-side allocation in `mf_init_model` (infer.m:7511+).
 pub fn alloc_layer_states() -> Vec<LayerState> {
+    use super::variants::LayerKind;
     (0..VARIANT.num_layers)
-        .map(|i| {
-            if (i + 1) % VARIANT.full_attn_interval == 0 {
-                LayerState::FullAttn(KvCache::new())
-            } else {
+        .map(|i| match VARIANT.layer_kind(i) {
+            LayerKind::FullAttn => LayerState::FullAttn(KvCache::new()),
+            LayerKind::LinearAttn => {
                 LayerState::LinearAttn(LinearAttnState::new())
             }
         })
