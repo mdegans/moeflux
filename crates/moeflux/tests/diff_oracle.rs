@@ -3161,3 +3161,128 @@ fn harness_loads() {
     assert!((self_jac - 1.0).abs() < 1e-6, "self-jaccard != 1.0");
     assert!((self_cos - 1.0).abs() < 1e-4, "self-cosine != 1.0");
 }
+
+// ---------------------------------------------------------------------------
+// Phase 4f-6 — end-to-end eval_prompt / eval_token diff
+// ---------------------------------------------------------------------------
+//
+// The file-level "end-to-end logits NOT useful" note (lines 21..37)
+// is about *intra-Ctx* `memory_clear`-between calls — that path
+// reveals C's lossy `memory_clear` semantic and produces cosine
+// 0.65..0.76 for two C runs of the same prompt. The fresh-Ctx-per-
+// test pattern below sidesteps that: each backend gets its own
+// freshly-opened Ctx, runs one eval_prompt / eval_token, and we
+// compare logits across backends. Both paths are deterministic given
+// fresh state (Metal kernels are bit-exact per-PSO per the slice 9
+// finding); the only float drift is CPU swiglu / sigmoid in the
+// shared post-attention tail, which is identical word-by-word
+// between C and Rust.
+//
+// Floor: cosine ≥ 0.9999 + top-1 argmax match. If 0.9999 fails on
+// real runs, drop to 0.999 + Jaccard@20 ≥ 0.95 with a FIXME(riir):
+// note pinpointing the bisect-by-layer finding.
+
+const E2E_COSINE_FLOOR: f32 = 0.9999;
+
+fn assert_e2e_logits_close(label: &str, c_logits: &[f32], rs_logits: &[f32]) {
+    assert_eq!(c_logits.len(), rs_logits.len(), "[{label}] logits length");
+    assert!(
+        c_logits.iter().all(|x| x.is_finite()),
+        "[{label}] C logits contain NaN/Inf"
+    );
+    assert!(
+        rs_logits.iter().all(|x| x.is_finite()),
+        "[{label}] Rust logits contain NaN/Inf"
+    );
+
+    let c_arg = argmax(c_logits);
+    let rs_arg = argmax(rs_logits);
+    let cos = cosine_sim(c_logits, rs_logits);
+    let max_abs_c =
+        c_logits.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+    let max_abs_diff = c_logits
+        .iter()
+        .zip(rs_logits.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let rel = max_abs_diff / max_abs_c.max(f32::EPSILON);
+    let c_top = topk(c_logits, TOPK_K);
+    let rs_top = topk(rs_logits, TOPK_K);
+    let jac = jaccard(&c_top, &rs_top);
+
+    eprintln!(
+        "[diff:{label}] argmax c={c_arg} rs={rs_arg} cosine={cos:.7} \
+         max_abs_diff={max_abs_diff:.3e} max_abs_c={max_abs_c:.3e} \
+         rel={rel:.3e} top-{TOPK_K} jaccard={jac:.4}"
+    );
+
+    assert_eq!(
+        c_arg, rs_arg,
+        "[{label}] argmax mismatch (c={c_arg} rs={rs_arg})"
+    );
+    assert!(
+        cos >= E2E_COSINE_FLOOR,
+        "[{label}] cosine {cos:.7} below {E2E_COSINE_FLOOR}"
+    );
+}
+
+/// One-token decode against a 4-token synthetic prefill. Both
+/// backends open fresh, prefill `[1, 200, 600, 1100]` via
+/// `eval_prompt` (state-update only on the first 3 tokens, emit on
+/// the 4th — the per-step contract `mf_eval_prompt` advertises),
+/// then run `eval_token(7)` at `pos = 4` and compare logits.
+///
+/// Exercises both code paths in slice 4f-5: the prefix loop in
+/// `eval_prompt` (no-emit step_internal) and the single-step
+/// `eval_token`. Catches positional bugs (e.g. dropped `pos`),
+/// state-update vs emit divergence, and the final norm + lm_head
+/// path that only runs on the emitting step.
+#[test]
+#[ignore = "long running; needs moeflux artifacts"]
+fn eval_token_matches_c_single_step() {
+    let mut c: CBackend = open_backend();
+    let mut rs: RsBackend = open_backend();
+
+    // Prefill 4 synthetic tokens. eval_prompt emits logits for the
+    // 4th; we discard them — they're a separate diff from the one
+    // this test asserts.
+    let prefill: [i32; 4] = [1, 200, 600, 1100];
+    let _c_prefill_logits = c.eval_prompt(&prefill, 0);
+    let _rs_prefill_logits = rs.eval_prompt(&prefill, 0);
+
+    // Decode one more token at the next position.
+    let next_token = 7i32;
+    let next_pos = prefill.len();
+    let c_logits = c.eval_token(next_token, next_pos);
+    let rs_logits = rs.eval_token(next_token, next_pos);
+
+    assert_e2e_logits_close(
+        "eval_token_after_4tok_prefill",
+        &c_logits,
+        &rs_logits,
+    );
+}
+
+/// Multi-token prefill via `eval_prompt`. Both backends open fresh,
+/// run `eval_prompt` over `[1..=8]`, compare last-token logits.
+///
+/// Catches positional bugs in the prefill loop (each step advances
+/// `pos` by 1; if step_internal mishandles the position the per-
+/// layer KV append in full_attn_layer_forward writes to the wrong
+/// row and the final logits diverge).
+#[test]
+#[ignore = "long running; needs moeflux artifacts"]
+fn eval_prompt_matches_c_multi_token() {
+    let mut c: CBackend = open_backend();
+    let mut rs: RsBackend = open_backend();
+
+    let prompt: [i32; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+    let c_logits = c.eval_prompt(&prompt, 0);
+    let rs_logits = rs.eval_prompt(&prompt, 0);
+
+    assert_e2e_logits_close(
+        "eval_prompt_8tok",
+        &c_logits,
+        &rs_logits,
+    );
+}
