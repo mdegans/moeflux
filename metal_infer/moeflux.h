@@ -150,6 +150,17 @@ int mf_rms_norm_cpu(mf_ctx *ctx, const char *weight_name,
 // -1 on NULL args or `pos < 0`.
 int mf_apply_rotary_emb(mf_ctx *ctx, int32_t pos, float *q, float *k);
 
+// Per-head CPU RMS normalization, mutating in place. `x_inout` is
+// `num_heads * head_dim` floats laid out contiguously per head; each
+// head's `head_dim`-long slice is independently RMS-normalized and
+// scaled by the same shared bf16 weight tensor of length `head_dim`
+// loaded from `weight_name`. The active architecture's `RMS_NORM_EPS`
+// is used. Returns 0 on success, -1 on NULL args / non-positive shape
+// / missing tensor. Read-only on `ctx`.
+int mf_rms_norm_per_head_cpu(mf_ctx *ctx, const char *weight_name,
+                              int32_t num_heads, int32_t head_dim,
+                              float *x_inout);
+
 // ============================================================================
 // State snapshot / restore (Option B in NOTES.md)
 // ============================================================================

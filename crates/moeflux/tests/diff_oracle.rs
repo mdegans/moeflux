@@ -101,6 +101,17 @@ pub trait DiffBackend {
         k: &[f32],
     ) -> (Vec<f32>, Vec<f32>);
 
+    /// Per-head CPU RMSNorm against the bf16 weight tensor
+    /// `weight_name` (length `head_dim`). Returns the
+    /// `num_heads * head_dim`-long output; the input is not mutated.
+    fn rms_norm_per_head_cpu(
+        &self,
+        weight_name: &str,
+        num_heads: usize,
+        head_dim: usize,
+        x: &[f32],
+    ) -> Vec<f32>;
+
     /// Prefill `tokens` at `start_pos`. Returns the n_vocab-length
     /// logit vector for the position immediately after the last
     /// token in `tokens`.
@@ -182,6 +193,20 @@ impl DiffBackend for CBackend {
             .apply_rotary_emb(pos, &mut q_out, &mut k_out)
             .expect("CBackend apply_rotary_emb");
         (q_out, k_out)
+    }
+
+    fn rms_norm_per_head_cpu(
+        &self,
+        weight_name: &str,
+        num_heads: usize,
+        head_dim: usize,
+        x: &[f32],
+    ) -> Vec<f32> {
+        let mut out = x.to_vec();
+        self.0
+            .rms_norm_per_head_cpu(weight_name, num_heads, head_dim, &mut out)
+            .expect("CBackend rms_norm_per_head_cpu");
+        out
     }
 
     fn eval_prompt(&mut self, tokens: &[i32], start_pos: usize) -> Vec<f32> {
@@ -276,6 +301,20 @@ impl DiffBackend for RsBackend {
             .apply_rotary_emb(pos, &mut q_out, &mut k_out)
             .expect("RsBackend apply_rotary_emb");
         (q_out, k_out)
+    }
+
+    fn rms_norm_per_head_cpu(
+        &self,
+        weight_name: &str,
+        num_heads: usize,
+        head_dim: usize,
+        x: &[f32],
+    ) -> Vec<f32> {
+        let mut out = x.to_vec();
+        self.0
+            .rms_norm_per_head_cpu(weight_name, num_heads, head_dim, &mut out)
+            .expect("RsBackend rms_norm_per_head_cpu");
+        out
     }
 
     fn eval_prompt(&mut self, tokens: &[i32], start_pos: usize) -> Vec<f32> {
@@ -681,6 +720,103 @@ fn rms_norm_cpu_bit_exact_c_vs_rust() {
                 &c_out[..4],
             );
         }
+    }
+}
+
+/// Bit-exact diff for the per-head Q/K RMSNorm kernel (Phase 3, slice 4).
+///
+/// The per-head variant fires inside `full_attention_forward` after the
+/// QKV projection — each Q head's `head_dim`-long slice (and each K
+/// head's slice) gets RMS-normed independently against a shared
+/// `head_dim`-long bf16 weight. The arithmetic is the same shape as
+/// the whole-vector `cpu_rms_norm` (sequential sum-of-squares,
+/// `1/sqrt(.)`, multiply-by-bf16-weight), so we expect bit-exact
+/// agreement on the same hardware.
+///
+/// Two weight tensors exercised — Q and K norms for layer 0 (the only
+/// full-attention layer in the first interval; both are bf16 of length
+/// `HEAD_DIM`). Layer 0's norms are guaranteed present whether the
+/// model variant places its first full-attn layer at index 0 or later,
+/// since these tensors exist for every full-attention layer.
+#[test]
+#[ignore = "long running; needs moeflux artifacts"]
+fn rms_norm_per_head_cpu_bit_exact_c_vs_rust() {
+    use moeflux::riir::VARIANT;
+
+    let c: CBackend = open_backend();
+    let rs: RsBackend = open_backend();
+
+    let head_dim = VARIANT.head_dim;
+    let num_attn_heads = VARIANT.num_attn_heads;
+    let num_kv_heads = VARIANT.num_kv_heads;
+
+    // Find the first full-attention layer index. The variant's
+    // FULL_ATTN_INTERVAL determines this; layer i is full-attn iff
+    // (i+1) % FULL_ATTN_INTERVAL == 0. For Qwen3 MoE this is layer 3
+    // (interval 4) — i.e. the 4th, 8th, ... layers.
+    let mut fa_layer: Option<usize> = None;
+    for i in 0..VARIANT.num_layers {
+        if (i + 1) % VARIANT.full_attn_interval == 0 {
+            fa_layer = Some(i);
+            break;
+        }
+    }
+    let fa_layer = fa_layer.expect("at least one full-attention layer");
+    let q_norm_name =
+        format!("model.layers.{fa_layer}.self_attn.q_norm.weight");
+    let k_norm_name =
+        format!("model.layers.{fa_layer}.self_attn.k_norm.weight");
+
+    // Synthetic per-head input vectors — large enough to exercise the
+    // sum-of-squares reduction across all heads, with non-trivial
+    // magnitudes so the inv_rms term is interesting.
+    let q_in: Vec<f32> = (0..num_attn_heads * head_dim)
+        .map(|i| ((i as f32) * 0.011).sin() * 0.6 + 0.05)
+        .collect();
+    let k_in: Vec<f32> = (0..num_kv_heads * head_dim)
+        .map(|i| ((i as f32) * 0.023).cos() * 0.4 - 0.1)
+        .collect();
+
+    for (label, w_name, num_heads, x_in) in [
+        ("Q", q_norm_name.as_str(), num_attn_heads, &q_in),
+        ("K", k_norm_name.as_str(), num_kv_heads, &k_in),
+    ] {
+        let c_out = c.rms_norm_per_head_cpu(w_name, num_heads, head_dim, x_in);
+        let rs_out = rs.rms_norm_per_head_cpu(w_name, num_heads, head_dim, x_in);
+
+        let diffs: Vec<(usize, f32, f32)> = c_out
+            .iter()
+            .zip(rs_out.iter())
+            .enumerate()
+            .filter_map(|(i, (&a, &b))| {
+                if a.to_bits() != b.to_bits() {
+                    Some((i, a, b))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if !diffs.is_empty() {
+            let first = &diffs[0];
+            panic!(
+                "[diff:rms_norm_per_head_cpu {label} layer={fa_layer}] {} of {} elements differ; \
+                 first at index {} (c={} rs={})",
+                diffs.len(),
+                c_out.len(),
+                first.0,
+                first.1,
+                first.2,
+            );
+        }
+
+        eprintln!(
+            "[diff:rms_norm_per_head_cpu {label} layer={fa_layer} \
+             num_heads={num_heads} head_dim={head_dim}] {} elements bit-equal; \
+             first 4: {:?}",
+            c_out.len(),
+            &c_out[..4],
+        );
     }
 }
 

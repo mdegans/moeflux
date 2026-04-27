@@ -721,6 +721,24 @@ static void cpu_rms_norm(const float *x, const uint16_t *w_bf16, float *out, int
     }
 }
 
+// Per-head RMS norm. `x_inout` holds `num_heads * head_dim` floats laid
+// out contiguously per head; each head's `head_dim`-long slice is
+// independently RMS-normalized and scaled by the same `head_dim`-long
+// bf16 weight tensor. Mutates `x_inout` in place. Used for the per-head
+// Q/K norm in attention layers.
+static void cpu_rms_norm_per_head(float *x_inout, const uint16_t *w_bf16,
+                                   int num_heads, int head_dim, float eps) {
+    for (int h = 0; h < num_heads; h++) {
+        float *xh = x_inout + h * head_dim;
+        float sum_sq = 0.0f;
+        for (int i = 0; i < head_dim; i++) sum_sq += xh[i] * xh[i];
+        float inv_rms = 1.0f / sqrtf(sum_sq / (float)head_dim + eps);
+        for (int i = 0; i < head_dim; i++) {
+            xh[i] = xh[i] * inv_rms * bf16_to_f32(w_bf16[i]);
+        }
+    }
+}
+
 // SwiGLU: out = silu(gate) * up
 static void cpu_swiglu(const float *gate, const float *up, float *out, int dim) {
     for (int i = 0; i < dim; i++) {
@@ -2370,27 +2388,11 @@ static void full_attention_forward(
 
     // Apply per-head Q norm
     if (qnorm_w) {
-        for (int h = 0; h < NUM_ATTN_HEADS; h++) {
-            float *qh = q + h * HEAD_DIM;
-            float sum_sq = 0.0f;
-            for (int i = 0; i < HEAD_DIM; i++) sum_sq += qh[i] * qh[i];
-            float inv_rms = 1.0f / sqrtf(sum_sq / HEAD_DIM + RMS_NORM_EPS);
-            for (int i = 0; i < HEAD_DIM; i++) {
-                qh[i] = qh[i] * inv_rms * bf16_to_f32(qnorm_w[i]);
-            }
-        }
+        cpu_rms_norm_per_head(q, qnorm_w, NUM_ATTN_HEADS, HEAD_DIM, RMS_NORM_EPS);
     }
     // Apply per-head K norm
     if (knorm_w) {
-        for (int h = 0; h < NUM_KV_HEADS; h++) {
-            float *kh = k + h * HEAD_DIM;
-            float sum_sq = 0.0f;
-            for (int i = 0; i < HEAD_DIM; i++) sum_sq += kh[i] * kh[i];
-            float inv_rms = 1.0f / sqrtf(sum_sq / HEAD_DIM + RMS_NORM_EPS);
-            for (int i = 0; i < HEAD_DIM; i++) {
-                kh[i] = kh[i] * inv_rms * bf16_to_f32(knorm_w[i]);
-            }
-        }
+        cpu_rms_norm_per_head(k, knorm_w, NUM_KV_HEADS, HEAD_DIM, RMS_NORM_EPS);
     }
 
 
@@ -7789,6 +7791,18 @@ int mf_apply_rotary_emb(mf_ctx *ctx, int32_t pos, float *q, float *k) {
     if (!ctx || !q || !k || pos < 0) return -1;
     apply_rotary_emb(q, k, pos, NUM_ATTN_HEADS, NUM_KV_HEADS,
                      HEAD_DIM, ROTARY_DIM);
+    return 0;
+}
+
+int mf_rms_norm_per_head_cpu(mf_ctx *ctx, const char *weight_name,
+                              int32_t num_heads, int32_t head_dim,
+                              float *x_inout)
+{
+    if (!ctx || !weight_name || !x_inout) return -1;
+    if (num_heads <= 0 || head_dim <= 0) return -1;
+    uint16_t *w_bf16 = (uint16_t *)get_tensor_ptr(ctx->wf, weight_name);
+    if (!w_bf16) return -1;
+    cpu_rms_norm_per_head(x_inout, w_bf16, num_heads, head_dim, RMS_NORM_EPS);
     return 0;
 }
 

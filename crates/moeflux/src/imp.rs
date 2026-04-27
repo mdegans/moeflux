@@ -265,6 +265,32 @@ impl Ctx {
         if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
     }
 
+    /// Per-head CPU RMSNorm, mutating `x_inout` in place. Layout is
+    /// `num_heads` contiguous head slices of `head_dim` floats each;
+    /// the same `head_dim`-long bf16 weight (from `weight_name`) is
+    /// applied to every head. Diff-oracle dump point for the per-head
+    /// Q/K norm used inside attention layers.
+    pub fn rms_norm_per_head_cpu(
+        &self,
+        weight_name: &str,
+        num_heads: usize,
+        head_dim: usize,
+        x_inout: &mut [f32],
+    ) -> Result<(), Error> {
+        let cname =
+            std::ffi::CString::new(weight_name).map_err(|_| Error::PathHasNul)?;
+        let rc = unsafe {
+            sys::mf_rms_norm_per_head_cpu(
+                self.inner.as_ptr(),
+                cname.as_ptr(),
+                num_heads as i32,
+                head_dim as i32,
+                x_inout.as_mut_ptr(),
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
+    }
+
     /// Reset the sequence to empty.
     pub fn memory_clear(&mut self) {
         unsafe { sys::mf_memory_clear(self.inner.as_ptr()) }

@@ -31,7 +31,7 @@ pub mod variants;
 pub mod weight_file;
 pub use embedding::{bf16_to_f32, embed_lookup, EmbeddingError};
 pub use metal::{MetalBackend, MetalError, MtlBuffer};
-pub use rms_norm::{rms_norm_cpu, RmsNormError};
+pub use rms_norm::{rms_norm_cpu, rms_norm_per_head_cpu, RmsNormError};
 pub use rope::{apply_rotary_emb, RopeError};
 pub use variants::{Variant, VARIANT};
 pub use weight_file::{TensorInfo, WeightFile, WeightFileError};
@@ -110,6 +110,22 @@ impl RsCtx {
         out: &mut [f32],
     ) -> Result<(), RsError> {
         rms_norm_cpu(&self.wf, weight_name, x, out)
+            .map_err(|_| RsError::EvalFailed)
+    }
+
+    /// Per-head CPU RMSNorm, mutating `x_inout` in place. The buffer
+    /// holds `num_heads * head_dim` floats (contiguous per head); each
+    /// head's slice is RMS-normalized independently and scaled by the
+    /// same `head_dim`-long bf16 weight loaded from `weight_name`.
+    /// Bit-exact against `mf_rms_norm_per_head_cpu`.
+    pub fn rms_norm_per_head_cpu(
+        &self,
+        weight_name: &str,
+        num_heads: usize,
+        head_dim: usize,
+        x_inout: &mut [f32],
+    ) -> Result<(), RsError> {
+        rms_norm_per_head_cpu(&self.wf, weight_name, num_heads, head_dim, x_inout)
             .map_err(|_| RsError::EvalFailed)
     }
 
