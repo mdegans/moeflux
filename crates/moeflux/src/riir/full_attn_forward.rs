@@ -47,6 +47,7 @@ use metal::NSUInteger;
 use super::expert_forward::MoeBuffers;
 use super::expert_io::ExpertFiles;
 use super::gpu_matvec::{encode_matvec, MatvecPipelines, MatvecSpec};
+use super::gpu_norm::{encode_rms_norm_bf16_into, RmsNormBf16Pipelines};
 use super::layer_weight_cache::LayerWeightCache;
 use super::linear_attn_forward::{
     bits_of, post_attention_tail, read_buffer_to_vec,
@@ -54,7 +55,7 @@ use super::linear_attn_forward::{
 };
 use super::metal::MetalBackend;
 use super::mtl_weight_buf::MtlWeightBuf;
-use super::rms_norm::{rms_norm_cpu, rms_norm_per_head_cpu};
+use super::rms_norm::rms_norm_per_head_cpu;
 use super::rope::apply_rotary_emb;
 use super::sdpa::sdpa_cpu;
 use super::state::KvCache;
@@ -151,44 +152,30 @@ pub fn full_attn_layer_forward(
 
     // Pre-fetch the matvec pipelines.
     let mv = MatvecPipelines::fetch(metal)?;
+    let rms_pipes = RmsNormBf16Pipelines::fetch(metal)?;
 
-    // ── Snapshot residual + CPU input rms_norm ───────────────────
-    // Same shape as the linear-attn forward — keeps the post-norm
-    // bytes bit-for-bit aligned with the C side, which uses CPU
-    // rms_norm here too (infer.m:4492).
-    let input_host = read_buffer_to_vec(&buffers.input, v.hidden_dim);
-    {
-        let dst = buffers.residual.contents() as *mut f32;
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                input_host.as_ptr(),
-                dst,
-                v.hidden_dim,
-            );
-        }
-    }
-    {
-        let mut normed_host = vec![0.0f32; v.hidden_dim];
-        let weight_name =
-            format!("model.layers.{layer_idx}.input_layernorm.weight");
-        rms_norm_cpu(wf, &weight_name, &input_host, &mut normed_host)
-            .map_err(|_| LayerForwardError::MissingTensor {
-                layer: layer_idx,
-                tensor: "input_layernorm.weight (cpu rms_norm failed)",
-            })?;
-        let dst = buffers.normed.contents() as *mut f32;
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                normed_host.as_ptr(),
-                dst,
-                v.hidden_dim,
-            );
-        }
-    }
-
-    // ── CMD1: 3 batched projection matvecs (q, k, v) ─────────────
+    // ── CMD1: input rms_norm + 3 batched projection matvecs ──────
+    //
+    // Slice 5d-2: input rms_norm runs on the GPU as the prelude to
+    // CMD1. Same shape as the linear-attn forward; see that module
+    // for the rationale + bit-exactness against the C fast-path
+    // chain. `buffers.input` is the residual source consumed later
+    // by `post_attention_tail`'s `encode_residual_add`; it's not
+    // mutated within the layer's forward, so dual-use is safe.
     {
         let cmdbuf = metal.queue().new_command_buffer();
+
+        encode_rms_norm_bf16_into(
+            cmdbuf,
+            &rms_pipes,
+            &buffers.input,
+            wf_buf.buffer(),
+            layer_cache.input_layernorm_w,
+            &buffers.sum_sq,
+            &buffers.normed,
+            v.hidden_dim as u32,
+            super::variants::RMS_NORM_EPS,
+        );
 
         let specs = [
             MatvecSpec {

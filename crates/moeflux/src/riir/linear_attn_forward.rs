@@ -46,11 +46,11 @@ use super::gpu_linear_attn::{
     encode_gated_rms_norm, encode_rms_norm_qk, LinearAttnPipelines,
 };
 use super::gpu_matvec::{encode_matvec, MatvecPipelines, MatvecSpec};
+use super::gpu_norm::{encode_rms_norm_bf16_into, RmsNormBf16Pipelines};
 use super::layer_weight_cache::LayerWeightCache;
 use super::metal::{MetalBackend, MetalError};
 use super::moe_router::moe_router_cpu;
 use super::mtl_weight_buf::MtlWeightBuf;
-use super::rms_norm::rms_norm_cpu;
 use super::state::LinearAttnState;
 use super::variants::{Variant, RMS_NORM_EPS, VARIANT};
 use super::weight_file::WeightFile;
@@ -395,47 +395,41 @@ pub fn linear_attn_layer_forward(
     // Pre-fetch every pipeline.
     let lp = LinearAttnPipelines::fetch(metal)?;
     let mv = MatvecPipelines::fetch(metal)?;
+    let rms_pipes = RmsNormBf16Pipelines::fetch(metal)?;
 
-    // ── snapshot residual + CPU input norm ───────────────────────
-    // The C path uses `cpu_rms_norm` here (infer.m:4492) and memcpy's
-    // the result into `buf_input` (line 4498). Mirror that exactly so
-    // the post-norm bytes match bit-for-bit between sides; the GPU
-    // rms_norm chain (which slice 9e tested bit-exact GPU-vs-GPU)
-    // would still drift ~5 ULPs vs CPU rms_norm here. Compounded
-    // through the projection matvec that drift becomes substantial.
-    let input_host = read_buffer_to_vec(&buffers.input, v.hidden_dim);
-    {
-        let dst = buffers.residual.contents() as *mut f32;
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                input_host.as_ptr(),
-                dst,
-                v.hidden_dim,
-            );
-        }
-    }
-    {
-        let mut normed_host = vec![0.0f32; v.hidden_dim];
-        let weight_name =
-            format!("model.layers.{layer_idx}.input_layernorm.weight");
-        rms_norm_cpu(wf, &weight_name, &input_host, &mut normed_host)
-            .map_err(|_| LayerForwardError::MissingTensor {
-                layer: layer_idx,
-                tensor: "input_layernorm.weight (cpu rms_norm failed)",
-            })?;
-        let dst = buffers.normed.contents() as *mut f32;
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                normed_host.as_ptr(),
-                dst,
-                v.hidden_dim,
-            );
-        }
-    }
-
-    // ── CMD1: projections + linear-attn pipeline ─────────────────
+    // ── CMD1: input rms_norm + projections + linear-attn pipeline ─
+    //
+    // Slice 5d-2: input rms_norm runs on the GPU as the prelude to
+    // CMD1 (was CPU + 4 host↔GPU memcopies before). C path runs CPU
+    // rms_norm in the slow branch (`infer.m:4492`) but the fast branch
+    // chains a GPU rms_norm at the tail of the previous CMD3
+    // (`infer.m:5712..5744`); functionally we get the latter shape by
+    // running the same kernel pair as the first dispatches in CMD1.
+    // Slice 9e established that the `rms_norm_sum_sq` /
+    // `rms_norm_apply_bf16` pair is bit-exact per-PSO; agreement
+    // against the C fast path is bit-exact, agreement against the C
+    // slow path drifts by a few ULPs per layer (well within the
+    // existing diff floor `cosine ≥ 0.9999`).
+    //
+    // `buffers.input` is the residual source consumed by
+    // `post_attention_tail`'s `encode_residual_add` later this layer;
+    // nothing in this layer's forward writes to it (the next layer's
+    // top-of-forward `complete_deferred_experts_into` is the next
+    // mutation), so the dual-use is safe.
     {
         let cmdbuf = metal.queue().new_command_buffer();
+
+        encode_rms_norm_bf16_into(
+            cmdbuf,
+            &rms_pipes,
+            &buffers.input,
+            wf_buf.buffer(),
+            layer_cache.input_layernorm_w,
+            &buffers.sum_sq,
+            &buffers.normed,
+            v.hidden_dim as u32,
+            RMS_NORM_EPS,
+        );
 
         // 4 batched projections from buffers.normed:
         let specs = [
@@ -685,11 +679,17 @@ pub(super) fn post_attention_tail(
             },
         );
 
+        // Slice 5d-2: residual source is `buffers.input` directly —
+        // the per-layer staging into `buffers.residual` is gone now
+        // that GPU input rms_norm runs first in CMD1 without
+        // touching the host. `buffers.input` is read-only within the
+        // layer (next-layer drain is the next write), so reading it
+        // here for the residual add is safe.
         encode_residual_add(
             cmdbuf,
             &resid_add,
             &buffers.output,
-            &buffers.residual,
+            &buffers.input,
             &buffers.h_mid,
             v.hidden_dim as u32,
         );
