@@ -177,6 +177,17 @@ pub trait DiffBackend {
         ssm_state_in: Vec<f32>,
     ) -> (Vec<f32>, Vec<f32>);
 
+    /// Single-expert GPU FFN forward (slice 9a). `expert_data` is one
+    /// expert's `EXPERT_SIZE`-byte 4-bit blob; `h_post` is HIDDEN_DIM
+    /// floats. Returns the HIDDEN_DIM-float expert output. Takes
+    /// `&mut self` because the Rust backend builds the Metal device
+    /// lazily on first GPU call.
+    fn gpu_expert_forward(
+        &mut self,
+        expert_data: &[u8],
+        h_post: &[f32],
+    ) -> Vec<f32>;
+
     /// Prefill `tokens` at `start_pos`. Returns the n_vocab-length
     /// logit vector for the position immediately after the last
     /// token in `tokens`.
@@ -384,6 +395,18 @@ impl DiffBackend for CBackend {
             )
             .expect("CBackend gated_delta_recurrence_cpu");
         (state, out)
+    }
+
+    fn gpu_expert_forward(
+        &mut self,
+        expert_data: &[u8],
+        h_post: &[f32],
+    ) -> Vec<f32> {
+        let mut out = vec![0.0f32; moeflux::riir::VARIANT.hidden_dim];
+        self.0
+            .gpu_expert_forward(expert_data, h_post, &mut out)
+            .expect("CBackend gpu_expert_forward");
+        out
     }
 
     fn eval_prompt(&mut self, tokens: &[i32], start_pos: usize) -> Vec<f32> {
@@ -604,6 +627,18 @@ impl DiffBackend for RsBackend {
             )
             .expect("RsBackend gated_delta_recurrence_cpu");
         (state, out)
+    }
+
+    fn gpu_expert_forward(
+        &mut self,
+        expert_data: &[u8],
+        h_post: &[f32],
+    ) -> Vec<f32> {
+        let mut out = vec![0.0f32; moeflux::riir::VARIANT.hidden_dim];
+        self.0
+            .gpu_expert_forward(expert_data, h_post, &mut out)
+            .expect("RsBackend gpu_expert_forward");
+        out
     }
 
     fn eval_prompt(&mut self, tokens: &[i32], start_pos: usize) -> Vec<f32> {
@@ -1822,6 +1857,96 @@ fn gated_delta_recurrence_cpu_close_c_vs_rust() {
         out_max_ulp <= MAX_ULP_DRIFT,
         "[diff:gated_delta_recurrence] out max ULP drift \
          {out_max_ulp} > {MAX_ULP_DRIFT}"
+    );
+}
+
+/// Phase 3 slice 9a — single-expert GPU FFN forward.
+///
+/// Both backends consume identical synthetic bytes (PRNG-seeded 4-bit
+/// weights with BF16 0x3C00 scales / 0 biases per `expert_forward::synth`)
+/// and run the same four Metal pipelines (`dequant_matvec_4bit_v3` ×3
+/// + `swiglu_fused`). First GPU kernel under diff — Metal SIMD-reduce
+/// ordering is not specified to be deterministic across pipeline-state
+/// recompiles, so the tolerance regime is cosine/Jaccard rather than
+/// bit-exact / ULP-bounded.
+///
+/// Empirically tighter floors than the end-to-end `COSINE_SIM_MIN`
+/// because there's only one stage of nondeterminism stacked here, not
+/// 60 layers' worth.
+#[test]
+#[ignore = "long running; needs Metal device + moeflux artifacts"]
+fn gpu_expert_forward_close_c_vs_rust() {
+    use moeflux::riir::expert_forward::synth;
+    use moeflux::riir::VARIANT;
+
+    let mut c: CBackend = open_backend();
+    let mut rs: RsBackend = open_backend();
+
+    let expert_data = synth::expert_data_seeded();
+    let h_post = synth::h_post_seeded();
+    assert_eq!(expert_data.len(), VARIANT.expert_size_4bit());
+    assert_eq!(h_post.len(), VARIANT.hidden_dim);
+
+    let c_out = c.gpu_expert_forward(&expert_data, &h_post);
+    let rs_out = rs.gpu_expert_forward(&expert_data, &h_post);
+    assert_eq!(c_out.len(), VARIANT.hidden_dim);
+    assert_eq!(rs_out.len(), VARIANT.hidden_dim);
+
+    let cos = cosine_sim(&c_out, &rs_out);
+    let max_abs_out = c_out
+        .iter()
+        .chain(rs_out.iter())
+        .map(|x| x.abs())
+        .fold(0.0f32, f32::max);
+    let max_abs_diff = c_out
+        .iter()
+        .zip(rs_out.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let rel = if max_abs_out > 0.0 {
+        max_abs_diff / max_abs_out
+    } else {
+        0.0
+    };
+
+    eprintln!(
+        "[diff:gpu_expert_forward] cosine={cos:.7} \
+         max_abs_diff={max_abs_diff:.3e} max_abs_out={max_abs_out:.3e} \
+         relative={rel:.3e}"
+    );
+
+    // Sanity — outputs must be finite and not all-zero. If either side
+    // bombs we've got something more than nondeterminism going on.
+    assert!(
+        c_out.iter().all(|x| x.is_finite()),
+        "[diff:gpu_expert_forward] C output has NaN/Inf"
+    );
+    assert!(
+        rs_out.iter().all(|x| x.is_finite()),
+        "[diff:gpu_expert_forward] Rust output has NaN/Inf"
+    );
+    assert!(
+        c_out.iter().any(|&x| x != 0.0),
+        "[diff:gpu_expert_forward] C output is all zero"
+    );
+    assert!(
+        rs_out.iter().any(|&x| x != 0.0),
+        "[diff:gpu_expert_forward] Rust output is all zero"
+    );
+
+    // Tolerances: cosine 0.9999 floor (one stage of Metal SIMD-reduce
+    // nondeterminism); max_abs_diff scaled to 1e-3 of max output to
+    // accept reorder-induced drift on small-magnitude entries.
+    const COSINE_FLOOR: f32 = 0.9999;
+    const REL_DIFF_FLOOR: f32 = 1e-3;
+    assert!(
+        cos >= COSINE_FLOOR,
+        "[diff:gpu_expert_forward] cosine {cos:.7} below {COSINE_FLOOR}"
+    );
+    assert!(
+        rel <= REL_DIFF_FLOOR,
+        "[diff:gpu_expert_forward] relative max_abs_diff {rel:.3e} \
+         above {REL_DIFF_FLOOR:.3e}"
     );
 }
 

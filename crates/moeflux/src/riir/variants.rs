@@ -108,6 +108,44 @@ impl Variant {
         3 * self.expert_block_bytes_4bit()
     }
 
+    // --- 4-bit expert block offsets ------------------------------
+    // Mirror the GATE_*_OFF / UP_*_OFF / DOWN_*_OFF macros in
+    // `model_variant.h`. Each block is laid out as
+    // `[weights | scales | biases]`; gate is at offset 0, up follows,
+    // down follows up.
+
+    pub const fn gate_w_off_4bit(&self) -> usize {
+        0
+    }
+    pub const fn gate_s_off_4bit(&self) -> usize {
+        self.expert_weight_bytes_4bit()
+    }
+    pub const fn gate_b_off_4bit(&self) -> usize {
+        self.expert_weight_bytes_4bit() + self.expert_scale_bytes()
+    }
+    pub const fn up_w_off_4bit(&self) -> usize {
+        self.expert_block_bytes_4bit()
+    }
+    pub const fn up_s_off_4bit(&self) -> usize {
+        self.expert_block_bytes_4bit() + self.expert_weight_bytes_4bit()
+    }
+    pub const fn up_b_off_4bit(&self) -> usize {
+        self.expert_block_bytes_4bit()
+            + self.expert_weight_bytes_4bit()
+            + self.expert_scale_bytes()
+    }
+    pub const fn down_w_off_4bit(&self) -> usize {
+        2 * self.expert_block_bytes_4bit()
+    }
+    pub const fn down_s_off_4bit(&self) -> usize {
+        2 * self.expert_block_bytes_4bit() + self.expert_weight_bytes_4bit()
+    }
+    pub const fn down_b_off_4bit(&self) -> usize {
+        2 * self.expert_block_bytes_4bit()
+            + self.expert_weight_bytes_4bit()
+            + self.expert_scale_bytes()
+    }
+
     // --- 2-bit packed-expert layout (derived) ---------------------
 
     pub const fn expert_weight_bytes_2bit(&self) -> usize {

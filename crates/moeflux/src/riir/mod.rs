@@ -24,6 +24,7 @@
 use std::path::Path;
 
 pub mod embedding;
+pub mod expert_forward;
 pub mod linear_attn;
 pub mod lm_head;
 pub mod metal;
@@ -34,6 +35,7 @@ pub mod sdpa;
 pub mod variants;
 pub mod weight_file;
 pub use embedding::{bf16_to_f32, embed_lookup, EmbeddingError};
+pub use expert_forward::{gpu_expert_forward, ExpertForwardError};
 pub use linear_attn::{
     conv1d_step, gated_delta_recurrence, rms_norm_bare, rms_norm_gated,
     LinearAttnError,
@@ -60,8 +62,13 @@ pub use weight_file::{TensorInfo, WeightFile, WeightFileError};
 /// to the phase that will implement it.
 pub struct RsCtx {
     wf: WeightFile,
-    // Future phases populate: metal: MetalBackend, vocab,
-    // per-layer state, expert mmaps, working buffers.
+    /// Lazily-built Metal backend. CPU-only kernels skip the cost; GPU
+    /// kernels (`gpu_expert_forward` and friends) construct it on
+    /// first use via [`Self::metal_mut`]. Slice 9b will start populating
+    /// per-layer persistent buffers here.
+    metal: Option<MetalBackend>,
+    // Future phases populate: vocab, per-layer state, expert mmaps,
+    // multi-expert working buffers.
 }
 
 impl RsCtx {
@@ -80,7 +87,18 @@ impl RsCtx {
     ) -> Result<Self, RsError> {
         let wf = WeightFile::open(weights, manifest)
             .map_err(|_| RsError::InitFailed)?;
-        Ok(Self { wf })
+        Ok(Self { wf, metal: None })
+    }
+
+    /// Build (or return) the Metal backend on demand. CPU-only kernels
+    /// don't need it; GPU kernels go through this accessor so the
+    /// shader-compile cost is paid lazily on first GPU use.
+    fn metal_mut(&mut self) -> Result<&mut MetalBackend, RsError> {
+        if self.metal.is_none() {
+            self.metal =
+                Some(MetalBackend::new().map_err(|_| RsError::InitFailed)?);
+        }
+        Ok(self.metal.as_mut().expect("just-set"))
     }
 
     pub fn n_vocab(&self) -> usize {
@@ -312,6 +330,24 @@ impl RsCtx {
             out_values,
         )
         .map_err(|_| RsError::EvalFailed)
+    }
+
+    /// Single-expert GPU FFN forward (slice 9a). `expert_data` is one
+    /// expert's `EXPERT_SIZE`-byte 4-bit packed blob laid out as
+    /// `[gate | up | down]` per `model_variant.h`. `h_post` is the
+    /// post-attn-norm hidden state (HIDDEN_DIM floats); `expert_out`
+    /// receives the HIDDEN_DIM-float expert output. Cosine/Jaccard
+    /// territory against `mf_gpu_expert_forward` (Metal SIMD-reduce
+    /// nondeterminism).
+    pub fn gpu_expert_forward(
+        &mut self,
+        expert_data: &[u8],
+        h_post: &[f32],
+        expert_out: &mut [f32],
+    ) -> Result<(), RsError> {
+        let metal = self.metal_mut()?;
+        gpu_expert_forward(metal, expert_data, h_post, expert_out)
+            .map_err(|_| RsError::EvalFailed)
     }
 
     pub fn eval_prompt(

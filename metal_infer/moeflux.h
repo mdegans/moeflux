@@ -271,6 +271,30 @@ int mf_gated_delta_recurrence_cpu(mf_ctx *ctx, int32_t layer_idx,
                                    int32_t key_dim, int32_t value_dim,
                                    float *ssm_state, float *out_values);
 
+// Single-expert GPU FFN forward. Runs the same 4-dispatch sequence the
+// production decode uses for one expert (gate matvec → up matvec →
+// SwiGLU → down matvec) on the caller's bytes, then reads the result
+// back to the CPU buffer.
+//
+//   expert_data: [EXPERT_SIZE bytes] one expert's packed weights,
+//                gate / up / down blocks at GATE_*_OFF / UP_*_OFF /
+//                DOWN_*_OFF as defined in model_variant.h. The active
+//                4-bit layout is used (matches the decode path when
+//                `use_2bit` was zero at init); 2-bit experts are not
+//                yet exposed through this hook.
+//   expert_data_len: must equal EXPERT_SIZE for the active variant.
+//   h_post:      [HIDDEN_DIM] post-attn-norm hidden state.
+//   expert_out:  [HIDDEN_DIM] expert FFN output.
+//
+// Returns 0 on success, -1 on NULL args, wrong `expert_data_len`, or
+// when the ctx was initialized with `use_2bit != 0` (mismatch between
+// the layout the caller is providing and what the GPU pipelines expect).
+// Read-only on `ctx` apart from the transient internal Metal buffers.
+int mf_gpu_expert_forward(mf_ctx *ctx,
+                           const void *expert_data, size_t expert_data_len,
+                           const float *h_post,
+                           float *expert_out);
+
 // ============================================================================
 // State snapshot / restore (Option B in NOTES.md)
 // ============================================================================

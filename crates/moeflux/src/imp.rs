@@ -479,6 +479,30 @@ impl Ctx {
         if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
     }
 
+    /// Single-expert GPU FFN forward. Wraps the C-side
+    /// `mf_gpu_expert_forward` hook. `expert_data` must be exactly
+    /// `EXPERT_SIZE` bytes for the active 4-bit variant — the C path
+    /// rejects 2-bit ctxs (those use a different pipeline + layout).
+    /// `h_post` is HIDDEN_DIM floats; `expert_out` receives HIDDEN_DIM
+    /// floats. Diff-oracle dump point for the GPU expert FFN.
+    pub fn gpu_expert_forward(
+        &self,
+        expert_data: &[u8],
+        h_post: &[f32],
+        expert_out: &mut [f32],
+    ) -> Result<(), Error> {
+        let rc = unsafe {
+            sys::mf_gpu_expert_forward(
+                self.inner.as_ptr(),
+                expert_data.as_ptr().cast(),
+                expert_data.len(),
+                h_post.as_ptr(),
+                expert_out.as_mut_ptr(),
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
+    }
+
     /// Reset the sequence to empty.
     pub fn memory_clear(&mut self) {
         unsafe { sys::mf_memory_clear(self.inner.as_ptr()) }

@@ -8003,6 +8003,33 @@ int mf_gated_delta_recurrence_cpu(mf_ctx *ctx, int32_t layer_idx,
     return 0;
 }
 
+// Diff-oracle entry: single-expert GPU FFN forward. Wraps the internal
+// `gpu_expert_forward` so the Rust port can compare its
+// `riir::gpu_expert_forward` against the same Metal pipelines
+// (matvec_v3 / swiglu_fused) the production path uses.
+//
+// The active 4-bit layout is required: `g_use_2bit` must be zero. The
+// 2-bit path uses different pipeline state and a different expert
+// block layout; surfacing it through the diff oracle is a separate
+// slice. Returns -1 if the ctx was opened with `use_2bit != 0`.
+int mf_gpu_expert_forward(mf_ctx *ctx,
+                           const void *expert_data, size_t expert_data_len,
+                           const float *h_post,
+                           float *expert_out)
+{
+    if (!ctx || !expert_data || !h_post || !expert_out) return -1;
+    if (g_use_2bit) return -1;
+    if (expert_data_len != (size_t)EXPERT_SIZE) return -1;
+    if (!g_metal) return -1;
+
+    // gpu_expert_forward operates on the file-scope MetalCtx (which
+    // owns the buffers + pipelines), not on mf_ctx. Match the existing
+    // production callsite at infer.m:2922.
+    gpu_expert_forward(g_metal, expert_data, h_post, expert_out,
+                       /*expert_data_already_in_buffer=*/0);
+    return 0;
+}
+
 // ============================================================================
 // State snapshot / restore (Option B)
 // ============================================================================
