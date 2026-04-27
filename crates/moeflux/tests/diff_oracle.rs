@@ -2777,6 +2777,90 @@ fn layer_forward_dump_close_c_vs_rust() {
     );
 }
 
+/// Phase 4f-3 parity: five back-to-back `layer_forward_dump` calls
+/// on the Rust side must all succeed without leaking a deferred-
+/// experts dispatch across calls. After slice 4f-3,
+/// `post_attention_tail` leaves an in-flight K-expert dispatch in
+/// `RsCtx::deferred` instead of reading back inline.
+/// `RsCtx::layer_forward_dump` reconstitutes the synchronous single-
+/// step contract by draining the dispatch into `linear_buffers.input`
+/// post-call, with a defensive `discard_deferred_experts_in` bracket
+/// pre-call to guard against stale state.
+///
+/// Failure modes this test catches:
+/// - **Missing post-call drain**: iteration 2+ would see a `Some`
+///   deferred slot from iter 1 and hit
+///   `DeferredError::AlreadyActive` → `RsError::EvalFailed`.
+/// - **Missing pre-call discard**: a buggy caller leaving stale
+///   state would propagate the same way.
+/// - **Drain wrote into wrong buffer**: outputs would be all-zero or
+///   NaN, caught by the finite + magnitude assertions.
+///
+/// Numerical equivalence across iterations IS asserted: with
+/// `memory_clear` between calls (which slice 4f-3 extended to also
+/// reset GPU-side linear-attn recurrence), each iteration starts
+/// from the same state. Per-PSO Metal determinism (slice 9 finding)
+/// means the outputs must be byte-identical.
+#[test]
+#[ignore = "long running; needs moeflux artifacts"]
+fn layer_forward_dump_back_to_back_no_deferred_leak() {
+    let mut rs: RsBackend = open_backend();
+    let hidden_dim = moeflux::riir::VARIANT.hidden_dim;
+
+    let hidden_in = rs.embed(1);
+    assert_eq!(hidden_in.len(), hidden_dim);
+
+    let layer_idx = 0i32; // linear-attn
+    let pos = 0i32;
+    let n_iters = 5usize;
+
+    let mut outs: Vec<Vec<f32>> = Vec::with_capacity(n_iters);
+    for i in 0..n_iters {
+        // memory_clear resets both host LayerState and GPU recurrence
+        // (per slice 4f-3's RsCtx::memory_clear extension), so each
+        // iteration starts from the same state. Without the GPU
+        // reset, iterations 1..N would see stale conv_state /
+        // delta_state from iter 0 and diverge.
+        rs.memory_clear();
+        let out = rs.layer_forward_dump(layer_idx, pos, &hidden_in);
+        assert_eq!(out.len(), hidden_dim, "iter {i}: output length");
+        assert!(
+            out.iter().all(|x| x.is_finite()),
+            "iter {i}: output has NaN/Inf — likely stale deferred state"
+        );
+        let max_abs = out.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        assert!(
+            max_abs > 1e-6,
+            "iter {i}: output magnitude {max_abs:.3e} too small — drain \
+             likely reading from wrong buffer or hitting AlreadyActive"
+        );
+        outs.push(out);
+    }
+
+    // All five outputs must be byte-identical: same layer, same
+    // input, fully-reset state between calls. Drift here implies
+    // either the deferred bracketing is reading from a buffer that
+    // wasn't drained, or memory_clear failed to reset some piece of
+    // recurrence.
+    for i in 1..n_iters {
+        let drift_max = outs[0]
+            .iter()
+            .zip(outs[i].iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert_eq!(
+            drift_max, 0.0,
+            "iter 0 vs iter {i} differ by max_abs_diff={drift_max:.3e} — \
+             deferred-experts state leaked across calls or memory_clear \
+             did not reset all recurrence"
+        );
+    }
+    eprintln!(
+        "[diff:layer_forward_dump_back_to_back] {n_iters} iterations \
+         bit-identical (max_abs_diff=0)"
+    );
+}
+
 /// Phase 4d: end-to-end **full-attention** layer forward, C path vs
 /// Rust port, via the dump hook. Companion to the linear-attn test
 /// above. Same floors / shape; the only differences are

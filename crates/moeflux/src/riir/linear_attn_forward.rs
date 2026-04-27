@@ -38,7 +38,8 @@ use metal::{
     MTLResourceOptions, MTLSize, NSUInteger,
 };
 
-use super::expert_forward::{gpu_batched_experts_forward, MoeBuffers};
+use super::deferred::{gpu_batched_experts_begin, DeferredError, DeferredState};
+use super::expert_forward::MoeBuffers;
 use super::expert_io::ExpertFiles;
 use super::gpu_linear_attn::{
     encode_compute_decay_beta, encode_conv1d_step, encode_delta_net_step,
@@ -80,6 +81,8 @@ pub enum LayerForwardError {
     Sdpa(#[from] super::sdpa::SdpaError),
     #[error("RMSNorm: {0}")]
     RmsNorm(#[from] super::rms_norm::RmsNormError),
+    #[error("deferred experts: {0}")]
+    Deferred(#[from] DeferredError),
 }
 
 /// Backwards-compat alias. `LinearAttnForwardError` was the original
@@ -298,12 +301,19 @@ pub(super) struct OProj {
 /// Run one linear-attention layer's forward pass on the GPU.
 ///
 /// Pre: `buffers.input` holds the input hidden state (HIDDEN_DIM
-/// floats). Post: `buffers.input` holds the output hidden state. The
-/// targeted layer's `conv_state` / `delta_state` are mutated in place.
-/// `state` is the host-side mirror used for `memory_*` ops; for 4c we
-/// keep it in lockstep with the GPU buffers via reset only — partial
-/// truncation will resync GPU buffers via `reset_recurrence` (a
-/// faithful port of the lossy semantic).
+/// floats). The targeted layer's `conv_state` / `delta_state` are
+/// mutated in place. `state` is the host-side mirror used for
+/// `memory_*` ops; for 4c we keep it in lockstep with the GPU
+/// buffers via reset only — partial truncation will resync GPU
+/// buffers via `reset_recurrence` (a faithful port of the lossy
+/// semantic).
+///
+/// Post: `*deferred` holds an in-flight K-expert dispatch (committed
+/// without `wait`). The caller is responsible for draining it via
+/// `complete_deferred_experts_into` (writes the post-combine hidden
+/// into a host slice or the next layer's `buffers.input`) or
+/// `discard_deferred_experts_in` (drop without readback). `buffers.
+/// input` is **not** the output target after slice 4f-3.
 #[allow(clippy::too_many_arguments)]
 pub fn linear_attn_layer_forward(
     metal: &mut MetalBackend,
@@ -312,6 +322,7 @@ pub fn linear_attn_layer_forward(
     layer_cache: &LayerWeightCache,
     buffers: &mut LayerForwardBuffers,
     moe: &mut MoeBuffers,
+    deferred: &mut Option<DeferredState>,
     layer_idx: usize,
     k_active: usize,
     expert_files: &ExpertFiles,
@@ -537,7 +548,8 @@ pub fn linear_attn_layer_forward(
 
     // ── Hand off to the shared post-attention tail ───────────────
     // `batch_out[6]` already holds the `gated_rms_norm` output —
-    // exactly the o_proj input the tail consumes.
+    // exactly the o_proj input the tail consumes. The tail leaves an
+    // in-flight K-expert dispatch in `*deferred`.
     post_attention_tail(
         metal,
         wf,
@@ -545,6 +557,7 @@ pub fn linear_attn_layer_forward(
         layer_cache,
         buffers,
         moe,
+        deferred,
         layer_idx,
         k_active,
         expert_files,
@@ -570,9 +583,19 @@ pub fn linear_attn_layer_forward(
 /// 4. CMD3a-b: shared `down_proj` matvec.
 /// 5. CPU MoE router on the gate logits.
 /// 6. Load K expert blobs from disk via [`ExpertFiles::read_expert`].
-/// 7. CMD3b: K-expert FFN + combine via the slice 9b path.
+/// 7. CMD3b: K-expert FFN + combine — submits the dispatch via
+///    [`gpu_batched_experts_begin`] without waiting; ownership of the
+///    in-flight cmdbuf transfers to `*deferred`.
 ///
-/// Output: post-combine HIDDEN_DIM hidden state in `buffers.input`.
+/// On return, `*deferred` holds the in-flight K-expert dispatch. The
+/// caller is responsible for either `complete_deferred_experts_into`
+/// (drain into a host slice / next layer's `buffers.input`) or
+/// `discard_deferred_experts_in` (drop without readback) before the
+/// next `post_attention_tail` call. Slice 4f-3 wired this rewire;
+/// before, the synchronous `gpu_batched_experts_forward` ran inline
+/// and the result was written into `buffers.input` here. The async
+/// path matches the C-side `g_deferred` lifecycle and unlocks the
+/// fast/slow split landing in 4f-perf.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn post_attention_tail(
     metal: &mut MetalBackend,
@@ -581,6 +604,7 @@ pub(super) fn post_attention_tail(
     layer_cache: &LayerWeightCache,
     buffers: &mut LayerForwardBuffers,
     moe: &mut MoeBuffers,
+    deferred: &mut Option<DeferredState>,
     layer_idx: usize,
     k_active: usize,
     expert_files: &ExpertFiles,
@@ -826,16 +850,20 @@ pub(super) fn post_attention_tail(
         expert_files.read_expert(layer_idx, expert_idx, dst)?;
     }
 
-    // ── CMD3b: K-expert FFN + combine via slice 9b ───────────────
+    // ── CMD3b: K-expert FFN + combine via slice 9b — async ───────
+    // Stage host-side mirror copies of the three CMD3 inputs the
+    // expert encoders read. `gpu_batched_experts_encode` (called via
+    // `_begin`) memcpys these into its own per-call MtlBuffers, so
+    // we don't need to keep the host buffers alive past the call.
     let h_mid_host = read_buffer_to_vec(&buffers.h_mid, v.hidden_dim);
     let shared_out_host =
         read_buffer_to_vec(&buffers.shared_out, v.hidden_dim);
     let normed_host = read_buffer_to_vec(&buffers.normed, v.hidden_dim);
 
-    let mut hidden_out = vec![0f32; v.hidden_dim];
-    gpu_batched_experts_forward(
+    gpu_batched_experts_begin(
         metal,
         moe,
+        deferred,
         k as i32,
         &expert_data,
         &normed_host, // h_post (post-attn-norm); experts read this as their input
@@ -843,24 +871,13 @@ pub(super) fn post_attention_tail(
         &shared_out_host,
         &weights,
         shared_gate_score,
-        &mut hidden_out,
+        layer_idx as i32,
     )?;
 
-    // Write hidden_out back into buffers.input so the next layer (or
-    // caller's dump-hook readback) sees it there.
-    {
-        let dst = buffers.input.contents() as *mut f32;
-        // SAFETY: shared storage; no GPU work in flight (cmdbuf above
-        // committed and waited).
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                hidden_out.as_ptr(),
-                dst,
-                v.hidden_dim,
-            );
-        }
-    }
-
+    // No write to `buffers.input` here — the dispatch is in flight.
+    // The caller drains it (next layer's top-of-forward
+    // `complete_deferred_experts_into`, or `RsCtx::layer_forward_dump`'s
+    // post-dispatch drain).
     Ok(())
 }
 

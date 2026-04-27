@@ -566,6 +566,7 @@ impl RsCtx {
             wf_buf,
             layer_caches,
             linear_buffers,
+            deferred,
             ..
         } = self;
 
@@ -577,6 +578,15 @@ impl RsCtx {
             linear_buffers.as_mut().expect("ensure_linear_resources");
         let moe_buffers =
             moe_buffers.as_mut().expect("ensure_linear_resources");
+
+        // Defensive: drain any leaked deferred state from a prior
+        // failed call so this entry point stays safe to call
+        // back-to-back without `AlreadyActive` errors. After slice
+        // 4f-3 the layer forwards leave an in-flight dispatch on
+        // return, and a buggy caller might forget to drain — this
+        // bracketing guarantees the dump-hook contract (single
+        // synchronous layer step) holds regardless.
+        deferred::discard_deferred_experts_in(deferred);
 
         // Stage hidden_in into the persistent input buffer.
         unsafe {
@@ -601,6 +611,7 @@ impl RsCtx {
                 &layer_caches[layer_idx_us],
                 linear_buffers,
                 moe_buffers,
+                deferred,
                 layer_idx_us,
                 pos,
                 k_active,
@@ -622,6 +633,7 @@ impl RsCtx {
                 &layer_caches[layer_idx_us],
                 linear_buffers,
                 moe_buffers,
+                deferred,
                 layer_idx_us,
                 k_active,
                 experts,
@@ -629,6 +641,28 @@ impl RsCtx {
             )
             .map_err(|_| RsError::EvalFailed)?;
         }
+
+        // Drain the in-flight K-expert dispatch into `linear_buffers.
+        // input` so the existing readback below sees the post-combine
+        // hidden state. Slice 4f-3 made the layer forwards async; the
+        // dump hook reconstitutes the synchronous single-step contract
+        // by completing the dispatch right here.
+        // SAFETY: shared-storage buffer; the GPU work for this layer
+        // is the dispatch we're about to wait on, and `complete_*` is
+        // what does the wait. After it returns, no GPU work is in
+        // flight against `linear_buffers.input`.
+        let buf_input_slice = unsafe {
+            std::slice::from_raw_parts_mut(
+                linear_buffers.input.contents() as *mut f32,
+                v.hidden_dim,
+            )
+        };
+        deferred::complete_deferred_experts_into(
+            deferred,
+            moe_buffers,
+            buf_input_slice,
+        )
+        .map_err(|_| RsError::EvalFailed)?;
 
         // Read post-forward hidden state out of buffers.input.
         unsafe {
@@ -742,10 +776,25 @@ impl RsCtx {
     }
 
     /// Reset every layer's state to empty. Mirrors `mf_memory_clear`
-    /// (infer.m:7747). `seq_id` is unused — moeflux's sequence-id
-    /// argument is a no-op stub on the C side too; KV is single-stream.
+    /// (infer.m:7759 → `mf_state_clear_all` infer.m:2271). `seq_id`
+    /// is unused — moeflux's sequence-id argument is a no-op stub on
+    /// the C side too; KV is single-stream.
+    ///
+    /// Resets both the host-side per-layer state vector AND the
+    /// GPU-side linear-attn recurrence buffers
+    /// (`linear_buffers.conv_state` / `delta_state`). The GPU reset
+    /// is required because the Rust port treats the GPU buffers as
+    /// the canonical recurrence storage (kernels mutate in place,
+    /// never read back to host); the C side stores recurrence on the
+    /// host and pushes to GPU each call, so resetting host alone
+    /// suffices there. Without the GPU reset, back-to-back forwards
+    /// after `memory_clear` see stale recurrence and diverge from a
+    /// freshly-allocated Ctx.
     pub fn memory_clear(&mut self) {
         clear_all(&mut self.layer_states);
+        if let Some(bufs) = self.linear_buffers.as_mut() {
+            bufs.reset_recurrence();
+        }
     }
 
     /// Truncate every layer's state to positions `[0, p0)`. Linear-attn

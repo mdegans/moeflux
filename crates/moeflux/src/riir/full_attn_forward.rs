@@ -82,6 +82,7 @@ pub fn full_attn_layer_forward(
     layer_cache: &LayerWeightCache,
     buffers: &mut LayerForwardBuffers,
     moe: &mut MoeBuffers,
+    deferred: &mut Option<super::deferred::DeferredState>,
     layer_idx: usize,
     pos: i32,
     k_active: usize,
@@ -336,6 +337,8 @@ pub fn full_attn_layer_forward(
     }
 
     // ── Hand off to the shared post-attention tail ───────────────
+    // The tail leaves an in-flight K-expert dispatch in `*deferred`;
+    // caller drains.
     post_attention_tail(
         metal,
         wf,
@@ -343,6 +346,7 @@ pub fn full_attn_layer_forward(
         layer_cache,
         buffers,
         moe,
+        deferred,
         layer_idx,
         k_active,
         expert_files,
