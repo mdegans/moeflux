@@ -320,6 +320,22 @@ impl Ctx {
         if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
     }
 
+    /// CPU LM head matvec. `x` is `HIDDEN_DIM` floats, `out` is
+    /// `VOCAB_SIZE` floats. Diff-oracle dump point for the final
+    /// logits projection; routes through `cpu_dequant_matvec`
+    /// regardless of Metal availability so the diff harness compares
+    /// CPU outputs head-on.
+    pub fn lm_head_cpu(&self, x: &[f32], out: &mut [f32]) -> Result<(), Error> {
+        let rc = unsafe {
+            sys::mf_lm_head_cpu(
+                self.inner.as_ptr(),
+                x.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
+    }
+
     /// Reset the sequence to empty.
     pub fn memory_clear(&mut self) {
         unsafe { sys::mf_memory_clear(self.inner.as_ptr()) }

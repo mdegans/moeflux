@@ -7843,6 +7843,19 @@ int mf_sdpa_cpu(mf_ctx *ctx, int32_t kv_len,
     return 0;
 }
 
+int mf_lm_head_cpu(mf_ctx *ctx, const float *x, float *out) {
+    if (!ctx || !x || !out) return -1;
+    TensorInfo *w_info = get_tensor_info(ctx->wf, "lm_head.weight");
+    TensorInfo *s_info = get_tensor_info(ctx->wf, "lm_head.scales");
+    TensorInfo *b_info = get_tensor_info(ctx->wf, "lm_head.biases");
+    if (!w_info || !s_info || !b_info) return -1;
+    uint32_t *W = (uint32_t *)((char *)ctx->wf->data + w_info->offset);
+    uint16_t *S = (uint16_t *)((char *)ctx->wf->data + s_info->offset);
+    uint16_t *B = (uint16_t *)((char *)ctx->wf->data + b_info->offset);
+    cpu_dequant_matvec(W, S, B, x, out, VOCAB_SIZE, HIDDEN_DIM, GROUP_SIZE, 4);
+    return 0;
+}
+
 // ============================================================================
 // State snapshot / restore (Option B)
 // ============================================================================

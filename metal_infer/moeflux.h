@@ -181,6 +181,19 @@ int mf_sdpa_cpu(mf_ctx *ctx, int32_t kv_len,
                 const float *k_cache, const float *v_cache,
                 float *out);
 
+// CPU LM head matvec. Loads `lm_head.{weight,scales,biases}` and
+// computes `out[row] = Σ_i (dequant(W[row, i]) * x[i])` for each row in
+// `[0, VOCAB_SIZE)`. Routes through the deterministic `cpu_dequant_matvec`
+// path (not `fast_dequant_matvec`) so the diff oracle can compare CPU
+// outputs head-on regardless of Metal availability.
+//
+//   x:   [HIDDEN_DIM] post-final-norm hidden state.
+//   out: [VOCAB_SIZE] raw logits.
+//
+// Returns 0 on success, -1 on NULL args / missing tensor. Read-only on
+// `ctx`.
+int mf_lm_head_cpu(mf_ctx *ctx, const float *x, float *out);
+
 // ============================================================================
 // State snapshot / restore (Option B in NOTES.md)
 // ============================================================================

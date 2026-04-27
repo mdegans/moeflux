@@ -24,6 +24,7 @@
 use std::path::Path;
 
 pub mod embedding;
+pub mod lm_head;
 pub mod metal;
 pub mod rms_norm;
 pub mod rope;
@@ -31,6 +32,7 @@ pub mod sdpa;
 pub mod variants;
 pub mod weight_file;
 pub use embedding::{bf16_to_f32, embed_lookup, EmbeddingError};
+pub use lm_head::{lm_head_cpu, LmHeadError};
 pub use metal::{MetalBackend, MetalError, MtlBuffer};
 pub use rms_norm::{rms_norm_cpu, rms_norm_per_head_cpu, RmsNormError};
 pub use rope::{apply_rotary_emb, RopeError};
@@ -159,6 +161,17 @@ impl RsCtx {
     ) -> Result<(), RsError> {
         sdpa_cpu(kv_len, q, q_gate, k_cache, v_cache, out)
             .map_err(|_| RsError::EvalFailed)
+    }
+
+    /// CPU LM head matvec. `x` is `HIDDEN_DIM` floats (the post-final-
+    /// norm hidden state); `out` is `VOCAB_SIZE` floats (raw logits).
+    /// Bit-exact target against `mf_lm_head_cpu` on the same hardware.
+    pub fn lm_head_cpu(
+        &self,
+        x: &[f32],
+        out: &mut [f32],
+    ) -> Result<(), RsError> {
+        lm_head_cpu(&self.wf, x, out).map_err(|_| RsError::EvalFailed)
     }
 
     pub fn eval_prompt(

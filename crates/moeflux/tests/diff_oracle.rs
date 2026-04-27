@@ -124,6 +124,10 @@ pub trait DiffBackend {
         v_cache: &[f32],
     ) -> Vec<f32>;
 
+    /// CPU LM head matvec. `x` is `HIDDEN_DIM` floats; the returned
+    /// vector is `VOCAB_SIZE` floats (raw logits).
+    fn lm_head_cpu(&self, x: &[f32]) -> Vec<f32>;
+
     /// Prefill `tokens` at `start_pos`. Returns the n_vocab-length
     /// logit vector for the position immediately after the last
     /// token in `tokens`.
@@ -233,6 +237,14 @@ impl DiffBackend for CBackend {
         self.0
             .sdpa_cpu(kv_len, q, q_gate, k_cache, v_cache, &mut out)
             .expect("CBackend sdpa_cpu");
+        out
+    }
+
+    fn lm_head_cpu(&self, x: &[f32]) -> Vec<f32> {
+        let mut out = vec![0.0f32; self.0.n_vocab()];
+        self.0
+            .lm_head_cpu(x, &mut out)
+            .expect("CBackend lm_head_cpu");
         out
     }
 
@@ -356,6 +368,14 @@ impl DiffBackend for RsBackend {
         self.0
             .sdpa_cpu(kv_len, q, q_gate, k_cache, v_cache, &mut out)
             .expect("RsBackend sdpa_cpu");
+        out
+    }
+
+    fn lm_head_cpu(&self, x: &[f32]) -> Vec<f32> {
+        let mut out = vec![0.0f32; self.0.n_vocab()];
+        self.0
+            .lm_head_cpu(x, &mut out)
+            .expect("RsBackend lm_head_cpu");
         out
     }
 
@@ -1040,6 +1060,104 @@ fn embed_bit_exact_c_vs_rust() {
             "[diff:embed token={tok}] {} elements bit-equal; first 4: {:?}",
             c_emb.len(),
             &c_emb[..4],
+        );
+    }
+}
+
+/// Bit-exact diff for the LM head matvec (Phase 3, slice 6).
+///
+/// Symmetric to the embedding kernel: 4-bit dequant + per-group bf16
+/// scale/bias, but as a fused matvec rather than a single-row lookup.
+/// `mf_lm_head_cpu` routes through `cpu_dequant_matvec` regardless of
+/// Metal availability, so both backends do deterministic CPU work
+/// against the same mmap'd weight blob.
+///
+/// Two synthetic hidden vectors are run through the matvec — a
+/// trig-modulated wave (the same shape used by RoPE / SDPA tests) and
+/// a hidden state derived from the embedding-then-RMSNorm pipeline of
+/// a real token, so we exercise both adversarial and realistic input
+/// magnitudes. Bit-exactness is the target; the lazy-mode floor is
+/// "no diffs at all," and any drift falls back to the same per-element
+/// reporting the embedding test uses.
+#[test]
+#[ignore = "long running; needs moeflux artifacts"]
+fn lm_head_cpu_bit_exact_c_vs_rust() {
+    use moeflux::riir::VARIANT;
+
+    let c: CBackend = open_backend();
+    let rs: RsBackend = open_backend();
+
+    let hidden_dim = VARIANT.hidden_dim;
+
+    // Input 1: synthetic trig-modulated hidden vector, magnitudes
+    // similar to post-norm hidden states.
+    let x_synth: Vec<f32> = (0..hidden_dim)
+        .map(|i| ((i as f32) * 0.011).sin() * 0.6 + 0.05)
+        .collect();
+
+    // Input 2: realistic hidden derived from embedding(EOS) → final norm.
+    // Composes on top of slices 1 + 2, so a regression here is more
+    // likely to be in the LM head than upstream.
+    let emb = c.embed(VARIANT.eos_token_1);
+    let x_real = c.rms_norm_cpu("model.norm.weight", &emb);
+
+    for (label, x) in [("synth", &x_synth), ("real", &x_real)] {
+        let c_out = c.lm_head_cpu(x);
+        let rs_out = rs.lm_head_cpu(x);
+
+        assert_eq!(c_out.len(), VARIANT.vocab_size, "C output len");
+        assert_eq!(rs_out.len(), VARIANT.vocab_size, "Rust output len");
+
+        let diffs: Vec<(usize, f32, f32)> = c_out
+            .iter()
+            .zip(rs_out.iter())
+            .enumerate()
+            .filter_map(|(i, (&a, &b))| {
+                if a.to_bits() != b.to_bits() {
+                    Some((i, a, b))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if !diffs.is_empty() {
+            let max_ulp = c_out
+                .iter()
+                .zip(rs_out.iter())
+                .map(|(&a, &b)| ulp_diff(a, b))
+                .max()
+                .unwrap_or(0);
+            let max_abs_diff = c_out
+                .iter()
+                .zip(rs_out.iter())
+                .map(|(&a, &b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            let max_abs_out = c_out
+                .iter()
+                .map(|&a| a.abs())
+                .fold(0.0f32, f32::max);
+            let cos = cosine_sim(&c_out, &rs_out);
+            let first = &diffs[0];
+            panic!(
+                "[diff:lm_head {label}] {} of {} elements differ; \
+                 max_ulp={max_ulp} max_abs_diff={max_abs_diff:.3e} \
+                 max_abs_out={max_abs_out:.3e} cosine={cos:.6}; \
+                 first at index {} (c={} rs={})",
+                diffs.len(),
+                c_out.len(),
+                first.0,
+                first.1,
+                first.2,
+            );
+        }
+
+        eprintln!(
+            "[diff:lm_head {label}] {} elements bit-equal; \
+             argmax={} first 4: {:?}",
+            c_out.len(),
+            argmax(&c_out),
+            &c_out[..4],
         );
     }
 }
