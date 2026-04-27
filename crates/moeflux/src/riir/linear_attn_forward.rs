@@ -38,7 +38,10 @@ use metal::{
     MTLResourceOptions, MTLSize, NSUInteger,
 };
 
-use super::deferred::{gpu_batched_experts_begin, DeferredError, DeferredState};
+use super::deferred::{
+    gpu_batched_experts_begin, gpu_batched_experts_begin_buf, DeferredError,
+    DeferredState,
+};
 use super::expert_forward::MoeBuffers;
 use super::expert_io::ExpertFiles;
 use super::gpu_linear_attn::{
@@ -839,29 +842,55 @@ pub(super) fn post_attention_tail(
     }
 
     // ── CMD3b: K-expert FFN + combine via slice 9b — async ───────
-    // Stage host-side mirror copies of the three CMD3 inputs the
-    // expert encoders read. `gpu_batched_experts_encode` (called via
-    // `_begin`) memcpys these into its own per-call MtlBuffers, so
-    // we don't need to keep the host buffers alive past the call.
-    let h_mid_host = read_buffer_to_vec(&buffers.h_mid, v.hidden_dim);
-    let shared_out_host =
-        read_buffer_to_vec(&buffers.shared_out, v.hidden_dim);
-    let normed_host = read_buffer_to_vec(&buffers.normed, v.hidden_dim);
-
-    gpu_batched_experts_begin(
-        metal,
-        moe,
-        deferred,
-        k as i32,
-        &expert_data,
-        &normed_host, // h_post (post-attn-norm); experts read this as their input
-        &h_mid_host,
-        &shared_out_host,
-        &weights,
-        shared_gate_score,
-        layer_idx as i32,
-        gpu_combine,
-    )?;
+    //
+    // Slice 5d-4: production fast path (`gpu_combine = true`) hands
+    // GPU buffer refs to the K-expert dispatch — `buffers.normed` is
+    // the post-attn-norm hidden state the experts read as input,
+    // `buffers.h_mid` and `buffers.shared_out` are the residual and
+    // shared FFN output the combine kernel reads. Eliminates the 3 ×
+    // HIDDEN_DIM GPU↔host readback + matching host→GPU memcpys per
+    // layer (~2 MB / token round-tripped). Also kills the cache-flush
+    // overhead of the host reads (Tegra-style: shared-storage GPU
+    // pages need an L1/L2 invalidation before CPU sees the GPU's
+    // writes; eliminating the read eliminates that flush).
+    //
+    // CPU-combine fallback path (`gpu_combine = false`) still routes
+    // through the host-slice variant — `DeferredMode::Cpu` needs host
+    // snapshots of `h_mid` / `shared_out` for the finalize pass.
+    if gpu_combine {
+        gpu_batched_experts_begin_buf(
+            metal,
+            moe,
+            deferred,
+            k as i32,
+            &expert_data,
+            &buffers.normed,     // h_post (post-attn-norm input)
+            &buffers.h_mid,      // residual hidden (combine input)
+            &buffers.shared_out, // shared FFN output (combine input)
+            &weights,
+            shared_gate_score,
+            layer_idx as i32,
+        )?;
+    } else {
+        let h_mid_host = read_buffer_to_vec(&buffers.h_mid, v.hidden_dim);
+        let shared_out_host =
+            read_buffer_to_vec(&buffers.shared_out, v.hidden_dim);
+        let normed_host = read_buffer_to_vec(&buffers.normed, v.hidden_dim);
+        gpu_batched_experts_begin(
+            metal,
+            moe,
+            deferred,
+            k as i32,
+            &expert_data,
+            &normed_host,
+            &h_mid_host,
+            &shared_out_host,
+            &weights,
+            shared_gate_score,
+            layer_idx as i32,
+            /* gpu_combine = */ false,
+        )?;
+    }
 
     // No write to `buffers.input` here — the dispatch is in flight.
     // The caller drains it (next layer's top-of-forward

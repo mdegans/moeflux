@@ -42,7 +42,8 @@
 //! bug class is structurally absent in this port.
 
 use super::expert_forward::{
-    gpu_batched_experts_encode, ExpertForwardError, MoeBuffers,
+    gpu_batched_experts_encode, gpu_batched_experts_encode_buf,
+    ExpertForwardError, MoeBuffers,
 };
 use super::metal::MetalBackend;
 use super::variants::VARIANT;
@@ -182,6 +183,59 @@ pub(crate) fn gpu_batched_experts_begin(
     *slot = Some(DeferredState {
         cmd_buffer,
         mode,
+        layer_idx,
+        actual_k: actual_k as usize,
+    });
+    Ok(())
+}
+
+/// Buffer-ref variant — slice 5d-4. Production callers
+/// (`post_attention_tail`) pass GPU buffers (typically
+/// `LayerForwardBuffers.{normed, h_mid, shared_out}`) the post-attention
+/// path already wrote, eliminating the GPU↔host readback +
+/// host↔GPU memcpy that the host-slice variant pays. Diff oracle keeps
+/// the host-slice API ([`gpu_batched_experts_begin`] above) — it stages
+/// host inputs into MoeBuffers' shared slots which then get bound the
+/// same way at the kernel level.
+///
+/// Always uses GPU combine ([`DeferredMode::Gpu`]). The CPU-finalize
+/// path needs host snapshots of `h_mid` / `shared_out` for the
+/// finalize pass; if a caller needs that, it can read the buffers
+/// back to host first and route through the host-slice variant
+/// ([`gpu_batched_experts_begin`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gpu_batched_experts_begin_buf(
+    metal: &mut MetalBackend,
+    bufs: &mut MoeBuffers,
+    slot: &mut Option<DeferredState>,
+    actual_k: i32,
+    expert_data: &[u8],
+    input: &metal::BufferRef,
+    h_mid: &metal::BufferRef,
+    shared_out: &metal::BufferRef,
+    expert_weights: &[f32],
+    shared_gate_score: f32,
+    layer_idx: i32,
+) -> Result<(), DeferredError> {
+    if slot.is_some() {
+        return Err(DeferredError::AlreadyActive);
+    }
+    let cmd_buffer = gpu_batched_experts_encode_buf(
+        metal,
+        bufs,
+        actual_k,
+        expert_data,
+        input,
+        h_mid,
+        shared_out,
+        expert_weights,
+        shared_gate_score,
+        /* gpu_combine = */ true,
+    )?;
+    cmd_buffer.commit();
+    *slot = Some(DeferredState {
+        cmd_buffer,
+        mode: DeferredMode::Gpu,
         layer_idx,
         actual_k: actual_k as usize,
     });

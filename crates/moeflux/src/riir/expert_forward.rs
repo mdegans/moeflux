@@ -45,7 +45,9 @@
 //! consumer drops 2-bit support — `MoefluxEngine` currently exposes
 //! `use_2bit` so users can opt in.
 
-use metal::{MTLSize, NSUInteger};
+use metal::{
+    BufferRef, CommandBufferRef, ComputePipelineState, MTLSize, NSUInteger,
+};
 
 use super::metal::{MetalBackend, MetalError, MtlBuffer};
 use super::variants::{Variant, GROUP_SIZE, VARIANT};
@@ -449,20 +451,7 @@ pub(crate) fn gpu_batched_experts_encode(
     gpu_combine: bool,
 ) -> Result<metal::CommandBuffer, ExpertForwardError> {
     let v = VARIANT;
-    if actual_k < 1 || (actual_k as usize) > MAX_K {
-        return Err(ExpertForwardError::BadK {
-            actual: actual_k,
-            max: MAX_K,
-        });
-    }
-    let k = actual_k as usize;
-    let expected_data_len = k * v.expert_size_4bit();
-    if expert_data.len() != expected_data_len {
-        return Err(ExpertForwardError::BadExpertDataLen {
-            expected: expected_data_len,
-            actual: expert_data.len(),
-        });
-    }
+    validate_inputs(actual_k, expert_data, expert_weights)?;
     if h_post.len() != v.hidden_dim {
         return Err(ExpertForwardError::BadHPostLen {
             expected: v.hidden_dim,
@@ -481,15 +470,74 @@ pub(crate) fn gpu_batched_experts_encode(
             actual: shared_out.len(),
         });
     }
-    if expert_weights.len() != k {
-        return Err(ExpertForwardError::BadWeightsLen {
-            expected: k,
-            actual: expert_weights.len(),
-        });
-    }
 
-    // Compile/fetch every pipeline this dispatch chain needs first; no
-    // mid-encode borrow on `metal` afterwards.
+    // Stage host slices into bufs' shared input/h_mid/shared_out — this is
+    // the host-API contract. Production callers should prefer
+    // [`gpu_batched_experts_encode_buf`] which skips this and binds GPU
+    // buffers the post-attention path already wrote.
+    bufs.input.as_mut_slice().copy_from_slice(h_post);
+    bufs.h_mid.as_mut_slice().copy_from_slice(h_mid);
+    bufs.shared_out.as_mut_slice().copy_from_slice(shared_out);
+
+    // Hand off to the buf-ref encoder using bufs' own shared slots as the
+    // input buffers. Borrows are field-disjoint: the encode path mutates
+    // bufs.data / bufs.combine_params (both not aliased through input/
+    // h_mid/shared_out_buf), and the input buffer refs are derived from
+    // bufs after staging is complete.
+    let input_ref: *const BufferRef = bufs.input.raw();
+    let h_mid_ref: *const BufferRef = bufs.h_mid.raw();
+    let shared_out_ref: *const BufferRef = bufs.shared_out.raw();
+    // SAFETY: Buffer pointers stay valid as long as `bufs` is alive. The
+    // encode_buf call below mutates only `bufs.data` and
+    // `bufs.combine_params` — fields disjoint from `bufs.input`,
+    // `bufs.h_mid`, `bufs.shared_out`. Reborrowing immutable refs from
+    // these stable pointers across the &mut bufs call is sound.
+    unsafe {
+        gpu_batched_experts_encode_buf(
+            metal,
+            bufs,
+            actual_k,
+            expert_data,
+            &*input_ref,
+            &*h_mid_ref,
+            &*shared_out_ref,
+            expert_weights,
+            shared_gate_score,
+            gpu_combine,
+        )
+    }
+}
+
+/// Buffer-ref entry point — the production path. `input`, `h_mid`,
+/// `shared_out` are GPU buffer refs (typically `LayerForwardBuffers.
+/// {normed, h_mid, shared_out}`); the K expert blobs still come from
+/// host (`expert_data`) since they're freshly read from disk by
+/// [`crate::riir::expert_io::ExpertFiles::read_expert`].
+///
+/// Mirrors the C path's encoder shape: bindings reference whatever
+/// buffer the caller hands in, not a separate staging area. Eliminates
+/// the 3 × HIDDEN_DIM memcpys per layer that the host-slice variant
+/// does (and the matching readbacks the caller would otherwise need to
+/// do to materialize host slices).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gpu_batched_experts_encode_buf(
+    metal: &mut MetalBackend,
+    bufs: &mut MoeBuffers,
+    actual_k: i32,
+    expert_data: &[u8],
+    input: &BufferRef,
+    h_mid: &BufferRef,
+    shared_out: &BufferRef,
+    expert_weights: &[f32],
+    shared_gate_score: f32,
+    gpu_combine: bool,
+) -> Result<metal::CommandBuffer, ExpertForwardError> {
+    let v = VARIANT;
+    validate_inputs(actual_k, expert_data, expert_weights)?;
+    let k = actual_k as usize;
+
+    // Compile/fetch pipelines first so no `&mut metal` borrow holds across
+    // encoder construction.
     let matvec = metal.pipeline("dequant_matvec_4bit_v3")?.clone();
     let swiglu = metal.pipeline("swiglu_fused")?.clone();
     let combine = if gpu_combine {
@@ -498,17 +546,13 @@ pub(crate) fn gpu_batched_experts_encode(
         None
     };
 
-    // Stage CPU inputs into the persistent buffers. Per-call cost is K
-    // expert-blob memcpys (~1.7 MB each on A3B) plus three HIDDEN_DIM
-    // memcpys plus the 18-float params buffer fill.
+    // Stage K expert blobs (~1.7 MB each on A3B) and the 18-float combine
+    // params. These are the only bufs fields the encode path mutates.
     let expert_size = v.expert_size_4bit();
     for slot in 0..k {
         let src = &expert_data[slot * expert_size..(slot + 1) * expert_size];
         bufs.data[slot].as_mut_slice().copy_from_slice(src);
     }
-    bufs.input.as_mut_slice().copy_from_slice(h_post);
-    bufs.h_mid.as_mut_slice().copy_from_slice(h_mid);
-    bufs.shared_out.as_mut_slice().copy_from_slice(shared_out);
     {
         let params = bufs.combine_params.as_mut_slice();
         params.fill(0.0);
@@ -518,7 +562,68 @@ pub(crate) fn gpu_batched_experts_encode(
     }
 
     let cmdbuf = metal.queue().new_command_buffer();
+    emit_batched_experts(
+        cmdbuf,
+        &matvec,
+        &swiglu,
+        combine.as_ref(),
+        bufs,
+        input,
+        h_mid,
+        shared_out,
+        k,
+        v,
+    );
+    Ok(cmdbuf.to_owned())
+}
 
+/// Shared input validation for both encode entry points.
+fn validate_inputs(
+    actual_k: i32,
+    expert_data: &[u8],
+    expert_weights: &[f32],
+) -> Result<(), ExpertForwardError> {
+    let v = VARIANT;
+    if actual_k < 1 || (actual_k as usize) > MAX_K {
+        return Err(ExpertForwardError::BadK {
+            actual: actual_k,
+            max: MAX_K,
+        });
+    }
+    let k = actual_k as usize;
+    let expected_data_len = k * v.expert_size_4bit();
+    if expert_data.len() != expected_data_len {
+        return Err(ExpertForwardError::BadExpertDataLen {
+            expected: expected_data_len,
+            actual: expert_data.len(),
+        });
+    }
+    if expert_weights.len() != k {
+        return Err(ExpertForwardError::BadWeightsLen {
+            expected: k,
+            actual: expert_weights.len(),
+        });
+    }
+    Ok(())
+}
+
+/// Inner encoder helper — emits the K-expert FFN dispatches and
+/// (optionally) `moe_combine_residual` into `cmdbuf`. Takes the input
+/// buffers as explicit refs so the host-slice and buf-ref entry points
+/// can share this body.
+#[allow(clippy::too_many_arguments)]
+fn emit_batched_experts(
+    cmdbuf: &CommandBufferRef,
+    matvec: &ComputePipelineState,
+    swiglu: &ComputePipelineState,
+    combine: Option<&ComputePipelineState>,
+    bufs: &MoeBuffers,
+    input: &BufferRef,
+    h_mid: &BufferRef,
+    shared_out: &BufferRef,
+    k: usize,
+    v: Variant,
+) {
     // Per-expert: Encoder A (gate+up — both read the shared `input`),
     // Encoder B (SwiGLU then down). Two encoders per expert exposes
     // GPU parallelism across slots; within an encoder the dispatches
@@ -530,26 +635,26 @@ pub(crate) fn gpu_batched_experts_encode(
             // gate
             encode_matvec_into(
                 enc,
-                &matvec,
+                matvec,
                 &bufs.data[slot],
                 v.gate_w_off_4bit(),
                 v.gate_s_off_4bit(),
                 v.gate_b_off_4bit(),
-                &bufs.input,
-                &bufs.gate[slot],
+                input,
+                bufs.gate[slot].raw(),
                 v.moe_intermediate as u32,
                 v.hidden_dim as u32,
             );
             // up — same encoder, serialized after gate
             encode_matvec_into(
                 enc,
-                &matvec,
+                matvec,
                 &bufs.data[slot],
                 v.up_w_off_4bit(),
                 v.up_s_off_4bit(),
                 v.up_b_off_4bit(),
-                &bufs.input,
-                &bufs.up[slot],
+                input,
+                bufs.up[slot].raw(),
                 v.moe_intermediate as u32,
                 v.hidden_dim as u32,
             );
@@ -559,23 +664,23 @@ pub(crate) fn gpu_batched_experts_encode(
         // Encoder B — SwiGLU + down
         {
             let enc = cmdbuf.new_compute_command_encoder();
-            encode_swiglu_into(
+            encode_swiglu_into_buf(
                 enc,
-                &swiglu,
-                &bufs.gate[slot],
-                &bufs.up[slot],
-                &bufs.act[slot],
+                swiglu,
+                bufs.gate[slot].raw(),
+                bufs.up[slot].raw(),
+                bufs.act[slot].raw(),
                 v.moe_intermediate as u32,
             );
             encode_matvec_into(
                 enc,
-                &matvec,
+                matvec,
                 &bufs.data[slot],
                 v.down_w_off_4bit(),
                 v.down_s_off_4bit(),
                 v.down_b_off_4bit(),
-                &bufs.act[slot],
-                &bufs.out[slot],
+                bufs.act[slot].raw(),
+                bufs.out[slot].raw(),
                 v.hidden_dim as u32,
                 v.moe_intermediate as u32,
             );
@@ -588,11 +693,11 @@ pub(crate) fn gpu_batched_experts_encode(
     // MAX_K out buffers, weights via the params buffer. Skipped when
     // `gpu_combine == false` — caller will run the equivalent on the
     // CPU side after wait.
-    if let Some(combine) = combine.as_ref() {
+    if let Some(combine) = combine {
         let enc = cmdbuf.new_compute_command_encoder();
         enc.set_compute_pipeline_state(combine);
-        enc.set_buffer(0, Some(bufs.h_mid.raw()), 0);
-        enc.set_buffer(1, Some(bufs.shared_out.raw()), 0);
+        enc.set_buffer(0, Some(h_mid), 0);
+        enc.set_buffer(1, Some(shared_out), 0);
         enc.set_buffer(2, Some(bufs.moe_hidden.raw()), 0);
         for slot in 0..MAX_K {
             enc.set_buffer(
@@ -613,8 +718,6 @@ pub(crate) fn gpu_batched_experts_encode(
         );
         enc.end_encoding();
     }
-
-    Ok(cmdbuf.to_owned())
 }
 
 /// Inner-loop matvec encoder — same shape as [`encode_matvec`] but
@@ -628,8 +731,8 @@ fn encode_matvec_into(
     w_off: usize,
     s_off: usize,
     b_off: usize,
-    input: &MtlBuffer<f32>,
-    output: &MtlBuffer<f32>,
+    input: &BufferRef,
+    output: &BufferRef,
     out_dim: u32,
     in_dim: u32,
 ) {
@@ -638,8 +741,8 @@ fn encode_matvec_into(
     enc.set_buffer(0, Some(data.raw()), w_off as NSUInteger);
     enc.set_buffer(1, Some(data.raw()), s_off as NSUInteger);
     enc.set_buffer(2, Some(data.raw()), b_off as NSUInteger);
-    enc.set_buffer(3, Some(input.raw()), 0);
-    enc.set_buffer(4, Some(output.raw()), 0);
+    enc.set_buffer(3, Some(input), 0);
+    enc.set_buffer(4, Some(output), 0);
     enc.set_bytes(5, 4, (&out_dim as *const u32).cast());
     enc.set_bytes(6, 4, (&in_dim as *const u32).cast());
     enc.set_bytes(7, 4, (&group_size as *const u32).cast());
@@ -650,18 +753,18 @@ fn encode_matvec_into(
     );
 }
 
-fn encode_swiglu_into(
+fn encode_swiglu_into_buf(
     enc: &metal::ComputeCommandEncoderRef,
     pipeline: &metal::ComputePipelineState,
-    gate: &MtlBuffer<f32>,
-    up: &MtlBuffer<f32>,
-    act: &MtlBuffer<f32>,
+    gate: &BufferRef,
+    up: &BufferRef,
+    act: &BufferRef,
     dim: u32,
 ) {
     enc.set_compute_pipeline_state(pipeline);
-    enc.set_buffer(0, Some(gate.raw()), 0);
-    enc.set_buffer(1, Some(up.raw()), 0);
-    enc.set_buffer(2, Some(act.raw()), 0);
+    enc.set_buffer(0, Some(gate), 0);
+    enc.set_buffer(1, Some(up), 0);
+    enc.set_buffer(2, Some(act), 0);
     enc.set_bytes(3, 4, (&dim as *const u32).cast());
     let num_tgs = (dim + 255) / 256;
     enc.dispatch_thread_groups(
