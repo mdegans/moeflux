@@ -658,11 +658,33 @@ pub(super) fn post_attention_tail(
     let sum_sq = metal.pipeline("rms_norm_sum_sq")?.clone();
     let apply = metal.pipeline("rms_norm_apply_bf16")?.clone();
     let resid_add = metal.pipeline("residual_add")?.clone();
+    let swiglu = metal.pipeline("swiglu_fused")?.clone();
 
-    // ── CMD2: o_proj + residual_add + post-attn rms_norm ─────────
+    // ── CMD2+3: post-attn + shared FFN + gate logits, single cmdbuf ─
+    //
+    // Slice 5d-3: collapses the previous CMD2 / CMD3a / CMD3a-b
+    // commit+wait sequence into a single command buffer. The C path
+    // also fuses post-attn + routing + shared-FFN gate/up into ONE
+    // cmdbuf (`infer.m:5088..5258`, the `cmd_fused` block); we now
+    // additionally fold the shared-FFN swiglu (was CPU) and the
+    // shared_down matvec into the same buffer, eliminating the
+    // CPU-side swiglu loop and the separate `cmd_dn` shape.
+    //
+    // GPU swiglu replaces the CPU SiLU loop the C path uses for the
+    // shared FFN (`infer.m:2977 cpu_swiglu`). Per slice 9a's finding,
+    // `swiglu_fused` is bit-exact per-PSO; the drift against C's
+    // CPU swiglu here is small libm-precision territory and remains
+    // within the diff oracle's `cosine ≥ 0.9999` floor. The K-expert
+    // FFN already used GPU swiglu inside `gpu_batched_experts_*`, so
+    // this is the only remaining cpu_swiglu site outside the experts.
+    //
+    // Encoders within one cmdbuf serialize on Metal, so the data
+    // dependencies (o_proj → residual_add → rms_norm → projections →
+    // swiglu → shared_down) are honored without per-encoder waits.
     {
         let cmdbuf = metal.queue().new_command_buffer();
 
+        // o_proj + residual_add + post-attn rms_norm (was CMD2).
         encode_matvec(
             cmdbuf,
             &mv,
@@ -678,22 +700,14 @@ pub(super) fn post_attention_tail(
                 bits: o_proj.bits,
             },
         );
-
-        // Slice 5d-2: residual source is `buffers.input` directly —
-        // the per-layer staging into `buffers.residual` is gone now
-        // that GPU input rms_norm runs first in CMD1 without
-        // touching the host. `buffers.input` is read-only within the
-        // layer (next-layer drain is the next write), so reading it
-        // here for the residual add is safe.
         encode_residual_add(
             cmdbuf,
             &resid_add,
             &buffers.output,
-            &buffers.input,
+            &buffers.input, // residual source — see slice 5d-2 note
             &buffers.h_mid,
             v.hidden_dim as u32,
         );
-
         encode_rms_norm_pair(
             cmdbuf,
             &sum_sq,
@@ -701,20 +715,13 @@ pub(super) fn post_attention_tail(
             &buffers.h_mid,
             wf_buf.buffer(),
             post_attn_norm_w,
-            &buffers.normed, // post-attn-norm output
+            &buffers.normed,
             &buffers.sum_sq,
             v.hidden_dim as u32,
         );
 
-        cmdbuf.commit();
-        cmdbuf.wait_until_completed();
-    }
-
-    // ── CMD3a: gate logits + shared-gate score + shared FFN ──────
-    {
-        let cmdbuf = metal.queue().new_command_buffer();
-
-        // Gate logits: HIDDEN_DIM → NUM_EXPERTS.
+        // gate logits + shared-expert gate scalar + shared FFN
+        // gate/up matvecs (was CMD3a).
         encode_matvec(
             cmdbuf,
             &mv,
@@ -730,8 +737,6 @@ pub(super) fn post_attention_tail(
                 bits: gate_bits,
             },
         );
-
-        // Shared-expert gate scalar: HIDDEN_DIM → 1.
         encode_matvec(
             cmdbuf,
             &mv,
@@ -747,10 +752,6 @@ pub(super) fn post_attention_tail(
                 bits: seg_bits,
             },
         );
-
-        // Shared expert FFN: gate + up matvecs only — swiglu runs on
-        // CPU after readback to match the C path's cpu_swiglu
-        // (infer.m:2977). Then a final cmdbuf does shared_down on GPU.
         encode_matvec(
             cmdbuf,
             &mv,
@@ -782,34 +783,17 @@ pub(super) fn post_attention_tail(
             },
         );
 
-        cmdbuf.commit();
-        cmdbuf.wait_until_completed();
-    }
-
-    // ── CPU swiglu of shared_gate × shared_up → shared_act ───────
-    {
-        let g = read_buffer_to_vec(
+        // GPU swiglu — was the CPU loop between CMD3a and CMD3a-b.
+        encode_swiglu_buf(
+            cmdbuf,
+            &swiglu,
             &buffers.shared_gate_out,
-            v.shared_intermediate,
-        );
-        let u = read_buffer_to_vec(
             &buffers.shared_up_out,
-            v.shared_intermediate,
+            &buffers.shared_act,
+            v.shared_intermediate as u32,
         );
-        let act_dst = buffers.shared_act.contents() as *mut f32;
-        for i in 0..v.shared_intermediate {
-            // SiLU(g) * u, matching cpu_swiglu (infer.m:~2400):
-            // silu(x) = x / (1 + exp(-x))
-            let silu = g[i] / (1.0 + (-g[i]).exp());
-            unsafe {
-                *act_dst.add(i) = silu * u[i];
-            }
-        }
-    }
 
-    // ── CMD3a-b: shared_down matvec (separate cmdbuf to match C) ─
-    {
-        let cmdbuf = metal.queue().new_command_buffer();
+        // shared_down matvec (was CMD3a-b).
         encode_matvec(
             cmdbuf,
             &mv,
@@ -825,6 +809,7 @@ pub(super) fn post_attention_tail(
                 bits: s_down_bits,
             },
         );
+
         cmdbuf.commit();
         cmdbuf.wait_until_completed();
     }
@@ -933,6 +918,33 @@ fn encode_rms_norm_pair(
         );
         enc.end_encoding();
     }
+}
+
+/// One `swiglu_fused` dispatch into a fresh encoder. Mirrors the
+/// shared-expert-FFN swiglu (`infer.m` `cpu_swiglu` at the production
+/// path's `infer.m:2977`); replaces the CPU loop between the
+/// shared `gate`/`up` matvecs and `shared_down`. Same kernel the
+/// K-expert FFN uses (slice 9a — bit-exact per-PSO).
+fn encode_swiglu_buf(
+    cmdbuf: &CommandBufferRef,
+    pipeline: &ComputePipelineState,
+    gate: &Buffer,
+    up: &Buffer,
+    act: &Buffer,
+    dim: u32,
+) {
+    let enc = cmdbuf.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(pipeline);
+    enc.set_buffer(0, Some(gate), 0);
+    enc.set_buffer(1, Some(up), 0);
+    enc.set_buffer(2, Some(act), 0);
+    enc.set_bytes(3, 4, (&dim as *const u32).cast());
+    let num_tgs = (dim + 255) / 256;
+    enc.dispatch_thread_groups(
+        MTLSize::new(num_tgs as NSUInteger, 1, 1),
+        MTLSize::new(256, 1, 1),
+    );
+    enc.end_encoding();
 }
 
 fn encode_residual_add(
