@@ -157,6 +157,26 @@ pub trait DiffBackend {
         z: &[f32],
     ) -> Vec<f32>;
 
+    /// Gated-delta-net recurrence step. Returns the post-step
+    /// `(ssm_state, out_values)` pair — input state is consumed; the
+    /// trait surface clones it per call so the harness can run both
+    /// backends from identical starting states.
+    #[allow(clippy::too_many_arguments)]
+    fn gated_delta_recurrence_cpu(
+        &self,
+        layer_idx: usize,
+        alpha: &[f32],
+        beta: &[f32],
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        v_heads: usize,
+        k_heads: usize,
+        key_dim: usize,
+        value_dim: usize,
+        ssm_state_in: Vec<f32>,
+    ) -> (Vec<f32>, Vec<f32>);
+
     /// Prefill `tokens` at `start_pos`. Returns the n_vocab-length
     /// logit vector for the position immediately after the last
     /// token in `tokens`.
@@ -329,6 +349,41 @@ impl DiffBackend for CBackend {
             .rms_norm_gated_cpu(weight_name, eps, x, z, &mut out)
             .expect("CBackend rms_norm_gated_cpu");
         out
+    }
+
+    fn gated_delta_recurrence_cpu(
+        &self,
+        layer_idx: usize,
+        alpha: &[f32],
+        beta: &[f32],
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        v_heads: usize,
+        k_heads: usize,
+        key_dim: usize,
+        value_dim: usize,
+        ssm_state_in: Vec<f32>,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let mut state = ssm_state_in;
+        let mut out = vec![0.0f32; v_heads * value_dim];
+        self.0
+            .gated_delta_recurrence_cpu(
+                layer_idx,
+                alpha,
+                beta,
+                q,
+                k,
+                v,
+                v_heads,
+                k_heads,
+                key_dim,
+                value_dim,
+                &mut state,
+                &mut out,
+            )
+            .expect("CBackend gated_delta_recurrence_cpu");
+        (state, out)
     }
 
     fn eval_prompt(&mut self, tokens: &[i32], start_pos: usize) -> Vec<f32> {
@@ -514,6 +569,41 @@ impl DiffBackend for RsBackend {
             .rms_norm_gated_cpu(weight_name, eps, x, z, &mut out)
             .expect("RsBackend rms_norm_gated_cpu");
         out
+    }
+
+    fn gated_delta_recurrence_cpu(
+        &self,
+        layer_idx: usize,
+        alpha: &[f32],
+        beta: &[f32],
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        v_heads: usize,
+        k_heads: usize,
+        key_dim: usize,
+        value_dim: usize,
+        ssm_state_in: Vec<f32>,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let mut state = ssm_state_in;
+        let mut out = vec![0.0f32; v_heads * value_dim];
+        self.0
+            .gated_delta_recurrence_cpu(
+                layer_idx,
+                alpha,
+                beta,
+                q,
+                k,
+                v,
+                v_heads,
+                k_heads,
+                key_dim,
+                value_dim,
+                &mut state,
+                &mut out,
+            )
+            .expect("RsBackend gated_delta_recurrence_cpu");
+        (state, out)
     }
 
     fn eval_prompt(&mut self, tokens: &[i32], start_pos: usize) -> Vec<f32> {
@@ -1601,6 +1691,137 @@ fn rms_norm_gated_cpu_close_c_vs_rust() {
     assert!(
         max_ulp <= MAX_ULP_DRIFT,
         "[diff:rms_norm_gated] max ULP drift {max_ulp} > {MAX_ULP_DRIFT}"
+    );
+}
+
+/// ULP-bounded diff for the gated-delta-net recurrence (Phase 3, slice 8b).
+///
+/// The novel kernel inside `linear_attention_forward`. Arithmetic
+/// shape per v-head:
+///
+///   g       = exp(-exp(A_log) * softplus(alpha + dt_bias))
+///   b_gate  = sigmoid(beta)
+///   S      *= g
+///   for vi:
+///     kv_mem = Σ_ki S[vi,ki] * k[ki]
+///     delta  = (v[vi] - kv_mem) * b_gate
+///     S[vi]+= k * delta
+///   for vi:
+///     out[vi] = Σ_ki S[vi,ki] * q[ki]
+///
+/// Three FMA-shaped contractions in the per-vi inner loops; all use
+/// `mul_add` on the Rust side to match clang's AArch64 codegen
+/// (per the LM head finding). The per-head precomputation has libm
+/// `expf`/`logf`/`sigmoid` calls — same scalar-libm regime as the
+/// other linear-attn primitives.
+///
+/// Probe shape: layer 0 (linear-attn under FULL_ATTN_INTERVAL=4), one
+/// step from a zero initial state. Tests both the post-step state
+/// (the in-place mutation) and the per-head output values.
+///
+/// Compares both `ssm_state` and `out_values` element-wise. Tolerance:
+/// ULP-bounded with the shared `MAX_ULP_DRIFT = 128` budget; if it
+/// lands tighter (bit-exact, like the 8a primitives), the eprintln
+/// will say so.
+#[test]
+#[ignore = "long running; needs moeflux artifacts"]
+fn gated_delta_recurrence_cpu_close_c_vs_rust() {
+    use moeflux::riir::variants::Variant;
+    use moeflux::riir::VARIANT;
+
+    let c: CBackend = open_backend();
+    let rs: RsBackend = open_backend();
+
+    let v_heads = VARIANT.linear_num_v_heads;
+    let k_heads = VARIANT.linear_num_k_heads;
+    let key_dim = Variant::LINEAR_KEY_DIM;
+    let value_dim = Variant::LINEAR_VALUE_DIM;
+    let layer_idx = 0usize; // layer 0 is linear-attn (full_attn_interval=4)
+
+    // Synthetic per-step inputs, magnitudes matching post-conv-and-bare-norm
+    // statistics. alpha/beta land near zero so softplus and sigmoid have
+    // non-degenerate working ranges.
+    let alpha: Vec<f32> = (0..v_heads)
+        .map(|i| ((i as f32) * 0.013).sin() * 0.3)
+        .collect();
+    let beta: Vec<f32> = (0..v_heads)
+        .map(|i| ((i as f32) * 0.017).cos() * 0.5)
+        .collect();
+    let q: Vec<f32> = (0..k_heads * key_dim)
+        .map(|i| ((i as f32) * 0.011).sin() * 0.4 + 0.05)
+        .collect();
+    let k_in: Vec<f32> = (0..k_heads * key_dim)
+        .map(|i| ((i as f32) * 0.019).cos() * 0.5 - 0.1)
+        .collect();
+    let v_in: Vec<f32> = (0..v_heads * value_dim)
+        .map(|i| ((i as f32) * 0.023).sin() * 0.6 + 0.02)
+        .collect();
+    let ssm_state_in: Vec<f32> = vec![0.0f32; v_heads * value_dim * key_dim];
+
+    let (c_state, c_out) = c.gated_delta_recurrence_cpu(
+        layer_idx, &alpha, &beta, &q, &k_in, &v_in,
+        v_heads, k_heads, key_dim, value_dim, ssm_state_in.clone(),
+    );
+    let (rs_state, rs_out) = rs.gated_delta_recurrence_cpu(
+        layer_idx, &alpha, &beta, &q, &k_in, &v_in,
+        v_heads, k_heads, key_dim, value_dim, ssm_state_in,
+    );
+
+    let state_max_ulp = c_state
+        .iter()
+        .zip(rs_state.iter())
+        .map(|(&a, &b)| ulp_diff(a, b))
+        .max()
+        .unwrap_or(0);
+    let state_diff_count = c_state
+        .iter()
+        .zip(rs_state.iter())
+        .filter(|&(&a, &b)| a.to_bits() != b.to_bits())
+        .count();
+    let out_max_ulp = c_out
+        .iter()
+        .zip(rs_out.iter())
+        .map(|(&a, &b)| ulp_diff(a, b))
+        .max()
+        .unwrap_or(0);
+    let out_diff_count = c_out
+        .iter()
+        .zip(rs_out.iter())
+        .filter(|&(&a, &b)| a.to_bits() != b.to_bits())
+        .count();
+    let out_max_abs = c_out
+        .iter()
+        .map(|&a| a.abs())
+        .fold(0.0f32, f32::max);
+    let out_max_diff = c_out
+        .iter()
+        .zip(rs_out.iter())
+        .map(|(&a, &b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+
+    eprintln!(
+        "[diff:gated_delta_recurrence layer={layer_idx} v_heads={v_heads} \
+         k_heads={k_heads} key_dim={key_dim} value_dim={value_dim}] \
+         state max_ulp={state_max_ulp} ({}/{} differ); \
+         out max_ulp={out_max_ulp} max_abs_diff={:.3e} max_abs_out={:.3e} \
+         ({}/{} differ)",
+        state_diff_count,
+        c_state.len(),
+        out_max_diff,
+        out_max_abs,
+        out_diff_count,
+        c_out.len(),
+    );
+
+    assert!(
+        state_max_ulp <= MAX_ULP_DRIFT,
+        "[diff:gated_delta_recurrence] state max ULP drift \
+         {state_max_ulp} > {MAX_ULP_DRIFT}"
+    );
+    assert!(
+        out_max_ulp <= MAX_ULP_DRIFT,
+        "[diff:gated_delta_recurrence] out max ULP drift \
+         {out_max_ulp} > {MAX_ULP_DRIFT}"
     );
 }
 

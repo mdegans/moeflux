@@ -437,6 +437,48 @@ impl Ctx {
         if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
     }
 
+    /// CPU gated-delta-net recurrence step. Loads `A_log` and
+    /// `dt_bias` from the manifest for `layer_idx`. Diff-oracle dump
+    /// point for the heart of GatedDeltaNet — the production decode
+    /// path uses the GPU `gated_delta_net_step` shader; the diff
+    /// oracle exercises the parallel CPU helper that mirrors the same
+    /// arithmetic.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gated_delta_recurrence_cpu(
+        &self,
+        layer_idx: usize,
+        alpha: &[f32],
+        beta: &[f32],
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        v_heads: usize,
+        k_heads: usize,
+        key_dim: usize,
+        value_dim: usize,
+        ssm_state: &mut [f32],
+        out_values: &mut [f32],
+    ) -> Result<(), Error> {
+        let rc = unsafe {
+            sys::mf_gated_delta_recurrence_cpu(
+                self.inner.as_ptr(),
+                layer_idx as i32,
+                alpha.as_ptr(),
+                beta.as_ptr(),
+                q.as_ptr(),
+                k.as_ptr(),
+                v.as_ptr(),
+                v_heads as i32,
+                k_heads as i32,
+                key_dim as i32,
+                value_dim as i32,
+                ssm_state.as_mut_ptr(),
+                out_values.as_mut_ptr(),
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
+    }
+
     /// Reset the sequence to empty.
     pub fn memory_clear(&mut self) {
         unsafe { sys::mf_memory_clear(self.inner.as_ptr()) }

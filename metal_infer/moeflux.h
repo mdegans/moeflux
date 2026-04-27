@@ -248,6 +248,29 @@ int mf_rms_norm_gated_cpu(mf_ctx *ctx, const char *weight_name,
                            const float *x, const float *z,
                            float *out);
 
+// CPU gated-delta-net recurrence step. Loads `model.layers.<layer_idx>.linear_attn.A_log`
+// (f32) and `.dt_bias` (bf16) for the per-head decay precomputation,
+// then runs the per-v-head decay → kv_mem → delta → state update →
+// output sequence on `ssm_state` (mutated in place) and `out_values`
+// (written).
+//
+//   alpha, beta:  [v_heads] per-step gate inputs.
+//   q, k:         [k_heads * key_dim] post-conv-and-bare-norm Q, K.
+//   v:            [v_heads * value_dim] post-conv V.
+//   ssm_state:    [v_heads * value_dim * key_dim] in/out recurrence state.
+//   out_values:   [v_heads * value_dim] written.
+//
+// `v_heads` must be a multiple of `k_heads` (GQA). Returns 0 on success,
+// -1 on NULL args / non-positive shape / missing tensor / shape mismatch.
+// Read-only on `ctx` apart from the explicit `ssm_state` mutation.
+int mf_gated_delta_recurrence_cpu(mf_ctx *ctx, int32_t layer_idx,
+                                   const float *alpha, const float *beta,
+                                   const float *q, const float *k,
+                                   const float *v,
+                                   int32_t v_heads, int32_t k_heads,
+                                   int32_t key_dim, int32_t value_dim,
+                                   float *ssm_state, float *out_values);
+
 // ============================================================================
 // State snapshot / restore (Option B in NOTES.md)
 // ============================================================================

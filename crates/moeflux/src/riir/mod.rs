@@ -34,7 +34,10 @@ pub mod sdpa;
 pub mod variants;
 pub mod weight_file;
 pub use embedding::{bf16_to_f32, embed_lookup, EmbeddingError};
-pub use linear_attn::{conv1d_step, rms_norm_bare, rms_norm_gated, LinearAttnError};
+pub use linear_attn::{
+    conv1d_step, gated_delta_recurrence, rms_norm_bare, rms_norm_gated,
+    LinearAttnError,
+};
 pub use lm_head::{lm_head_cpu, LmHeadError};
 pub use metal::{MetalBackend, MetalError, MtlBuffer};
 pub use moe_router::{moe_router_cpu, MoeRouterError};
@@ -246,6 +249,69 @@ impl RsCtx {
     ) -> Result<(), RsError> {
         rms_norm_gated(&self.wf, weight_name, x, z, eps, out)
             .map_err(|_| RsError::EvalFailed)
+    }
+
+    /// Gated-delta-net recurrence step. Loads `A_log` (f32) and
+    /// `dt_bias` (bf16) for the named layer, then runs the per-v-head
+    /// decay → kv_mem → delta → state update → output sequence.
+    /// `ssm_state` is mutated in place; `out_values` is overwritten.
+    /// ULP-bounded against `mf_gated_delta_recurrence_cpu` (libm
+    /// `expf`/`logf` per head, `mul_add` matched to clang's FMA).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gated_delta_recurrence_cpu(
+        &self,
+        layer_idx: usize,
+        alpha: &[f32],
+        beta: &[f32],
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        v_heads: usize,
+        k_heads: usize,
+        key_dim: usize,
+        value_dim: usize,
+        ssm_state: &mut [f32],
+        out_values: &mut [f32],
+    ) -> Result<(), RsError> {
+        let a_log_name =
+            format!("model.layers.{layer_idx}.linear_attn.A_log");
+        let dt_bias_name =
+            format!("model.layers.{layer_idx}.linear_attn.dt_bias");
+        let a_log_bytes = self
+            .wf
+            .tensor_bytes(&a_log_name)
+            .ok_or(RsError::EvalFailed)?;
+        let dt_bias_bytes = self
+            .wf
+            .tensor_bytes(&dt_bias_name)
+            .ok_or(RsError::EvalFailed)?;
+
+        if a_log_bytes.len() != v_heads * 4 {
+            return Err(RsError::EvalFailed);
+        }
+        let mut a_log = vec![0.0f32; v_heads];
+        for (i, chunk) in a_log_bytes.chunks_exact(4).enumerate() {
+            a_log[i] = f32::from_le_bytes([
+                chunk[0], chunk[1], chunk[2], chunk[3],
+            ]);
+        }
+
+        gated_delta_recurrence(
+            &a_log,
+            dt_bias_bytes,
+            alpha,
+            beta,
+            q,
+            k,
+            v,
+            v_heads,
+            k_heads,
+            key_dim,
+            value_dim,
+            ssm_state,
+            out_values,
+        )
+        .map_err(|_| RsError::EvalFailed)
     }
 
     pub fn eval_prompt(

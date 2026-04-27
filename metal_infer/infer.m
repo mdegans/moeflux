@@ -7907,6 +7907,102 @@ int mf_rms_norm_gated_cpu(mf_ctx *ctx, const char *weight_name,
     return 0;
 }
 
+// CPU-only gated-delta-net recurrence helper. Mirrors the per-v-head
+// loop in `linear_attention_forward` (the GPU path skips this entirely
+// in production). Runs the same arithmetic shape so the diff oracle
+// can compare CPU outputs head-on against the Rust port.
+//
+// Standalone (not called by `linear_attention_forward`) so a refactor
+// during the port doesn't risk shifting the production code's
+// floating-point semantics; the diff harness asserts both compute the
+// same bytes.
+static void cpu_gated_delta_recurrence(
+    const float *A_log, const uint16_t *dt_bias_bf16,
+    const float *alpha, const float *beta,
+    const float *q, const float *k, const float *v,
+    int v_heads, int k_heads, int key_dim, int value_dim,
+    float *ssm_state, float *out_values)
+{
+    int k_heads_per_v = v_heads / k_heads;
+    int head_state_stride = value_dim * key_dim;
+
+    float *g_decay = (float *)malloc((size_t)v_heads * sizeof(float));
+    float *beta_gate = (float *)malloc((size_t)v_heads * sizeof(float));
+    for (int vh = 0; vh < v_heads; vh++) {
+        float a_val = alpha[vh];
+        float dt_b = bf16_to_f32(dt_bias_bf16[vh]);
+        float A_val = expf(A_log[vh]);
+        float softplus_val = logf(1.0f + expf(a_val + dt_b));
+        g_decay[vh] = expf(-A_val * softplus_val);
+        beta_gate[vh] = cpu_sigmoid(beta[vh]);
+    }
+
+    for (int vh = 0; vh < v_heads; vh++) {
+        int kh = vh / k_heads_per_v;
+        float g = g_decay[vh];
+        float b_gate = beta_gate[vh];
+        float *S = ssm_state + (size_t)vh * head_state_stride;
+        const float *v_h = v + (size_t)vh * value_dim;
+        const float *k_h = k + (size_t)kh * key_dim;
+        const float *q_h = q + (size_t)kh * key_dim;
+        float *o_h = out_values + (size_t)vh * value_dim;
+
+        for (int vi = 0; vi < value_dim; vi++) {
+            for (int ki = 0; ki < key_dim; ki++) {
+                S[vi * key_dim + ki] *= g;
+            }
+        }
+        for (int vi = 0; vi < value_dim; vi++) {
+            float kv_mem = 0.0f;
+            for (int ki = 0; ki < key_dim; ki++) {
+                kv_mem += S[vi * key_dim + ki] * k_h[ki];
+            }
+            float delta = (v_h[vi] - kv_mem) * b_gate;
+            for (int ki = 0; ki < key_dim; ki++) {
+                S[vi * key_dim + ki] += k_h[ki] * delta;
+            }
+        }
+        for (int vi = 0; vi < value_dim; vi++) {
+            float sum = 0.0f;
+            for (int ki = 0; ki < key_dim; ki++) {
+                sum += S[vi * key_dim + ki] * q_h[ki];
+            }
+            o_h[vi] = sum;
+        }
+    }
+
+    free(g_decay);
+    free(beta_gate);
+}
+
+int mf_gated_delta_recurrence_cpu(mf_ctx *ctx, int32_t layer_idx,
+                                   const float *alpha, const float *beta,
+                                   const float *q, const float *k,
+                                   const float *v,
+                                   int32_t v_heads, int32_t k_heads,
+                                   int32_t key_dim, int32_t value_dim,
+                                   float *ssm_state, float *out_values)
+{
+    if (!ctx || !alpha || !beta || !q || !k || !v || !ssm_state || !out_values)
+        return -1;
+    if (v_heads <= 0 || k_heads <= 0 || key_dim <= 0 || value_dim <= 0)
+        return -1;
+    if (v_heads % k_heads != 0) return -1;
+
+    char name[256];
+    snprintf(name, sizeof(name), "model.layers.%d.linear_attn.A_log", layer_idx);
+    float *A_log = get_tensor_ptr(ctx->wf, name);
+    snprintf(name, sizeof(name), "model.layers.%d.linear_attn.dt_bias", layer_idx);
+    uint16_t *dt_bias = get_tensor_ptr(ctx->wf, name);
+    if (!A_log || !dt_bias) return -1;
+
+    cpu_gated_delta_recurrence(A_log, dt_bias, alpha, beta, q, k, v,
+                                (int)v_heads, (int)k_heads,
+                                (int)key_dim, (int)value_dim,
+                                ssm_state, out_values);
+    return 0;
+}
+
 // ============================================================================
 // State snapshot / restore (Option B)
 // ============================================================================
