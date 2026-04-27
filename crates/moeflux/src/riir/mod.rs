@@ -26,11 +26,16 @@ use std::path::Path;
 pub mod embedding;
 pub mod expert_forward;
 pub mod expert_io;
+pub mod gpu_linear_attn;
+pub mod gpu_matvec;
 pub mod gpu_norm;
+pub mod layer_weight_cache;
 pub mod linear_attn;
+pub mod linear_attn_forward;
 pub mod lm_head;
 pub mod metal;
 pub mod moe_router;
+pub mod mtl_weight_buf;
 pub mod rms_norm;
 pub mod rope;
 pub mod sdpa;
@@ -53,6 +58,12 @@ pub use metal::{MetalBackend, MetalError, MtlBuffer};
 pub use moe_router::{moe_router_cpu, MoeRouterError};
 pub use rms_norm::{rms_norm_cpu, rms_norm_per_head_cpu, RmsNormError};
 pub use rope::{apply_rotary_emb, RopeError};
+pub use layer_weight_cache::LayerWeightCache;
+pub use linear_attn_forward::{
+    linear_attn_layer_forward, linear_layer_idx_for, LinearAttnBuffers,
+    LinearAttnForwardError,
+};
+pub use mtl_weight_buf::{MtlWeightBuf, MtlWeightBufError};
 pub use sdpa::{sdpa_cpu, SdpaError};
 pub use state::{
     alloc_layer_states, clear_all, pos_max, truncate, KvCache, LayerState,
@@ -87,12 +98,27 @@ pub struct RsCtx {
     /// files leave the slot empty per the C path's tolerance
     /// semantics.
     experts: ExpertFiles,
+    /// Active top-K (`experts_per_tok` from [`Self::open`]). Mirrors
+    /// `mf_ctx.K` — the runtime number of experts to route per
+    /// token. The variant's `num_experts_per_tok` is an architectural
+    /// MAX; this is the user-selected active value (typically
+    /// smaller, e.g. 4 for the dump-hook test even though A3B's
+    /// architectural max is 8).
+    k_active: usize,
     /// Per-layer KV / linear-attn recurrence state. One entry per
     /// layer; the variant tag matches the C-side
     /// `(i + 1) % FULL_ATTN_INTERVAL == 0` test. Allocated zeroed at
     /// [`Self::open`]; mutated in place by the forward pass and the
     /// `memory_*` ops.
     layer_states: Vec<LayerState>,
+    /// Lazily-built `MTLBuffer` wrapping the [`WeightFile`] mmap.
+    /// First GPU call constructs it via [`Self::weight_resources_mut`].
+    wf_buf: Option<MtlWeightBuf>,
+    /// Lazily-built per-layer tensor-offset cache. Per-Ctx (not file-
+    /// scope) — the Phase 4b cross-Ctx bug fix.
+    layer_caches: Option<Vec<LayerWeightCache>>,
+    /// Lazily-built persistent buffer set for the linear-attn forward.
+    linear_buffers: Option<LinearAttnBuffers>,
     // Future phases populate: vocab.
 }
 
@@ -107,7 +133,7 @@ impl RsCtx {
         manifest: &Path,
         _vocab: &Path,
         experts_dir: &Path,
-        _experts_per_tok: u32,
+        experts_per_tok: u32,
         _use_2bit: bool,
     ) -> Result<Self, RsError> {
         let wf = WeightFile::open(weights, manifest)
@@ -115,12 +141,17 @@ impl RsCtx {
         let experts = ExpertFiles::open(experts_dir)
             .map_err(|_| RsError::InitFailed)?;
         let layer_states = alloc_layer_states();
+        let k_active = (experts_per_tok as usize).clamp(1, VARIANT.num_experts_per_tok);
         Ok(Self {
             wf,
             metal: None,
             moe_buffers: None,
             experts,
             layer_states,
+            k_active,
+            wf_buf: None,
+            layer_caches: None,
+            linear_buffers: None,
         })
     }
 
@@ -478,17 +509,181 @@ impl RsCtx {
 
     /// Phase 4 layer-boundary checkpoint hook. Runs a single layer's
     /// forward pass starting from `hidden_in`, returning the post-
-    /// layer hidden state in `hidden_out`. The targeted layer's KV /
-    /// recurrence state is mutated in place. Lands in 4c (linear-attn)
-    /// / 4d (full-attn) once `fused_layer_forward` is ported.
+    /// layer hidden state in `hidden_out`. The targeted layer's
+    /// recurrence state is mutated in place. 4c routes the linear-
+    /// attn case; 4d will fill in the full-attn case.
     pub fn layer_forward_dump(
         &mut self,
-        _layer_idx: i32,
-        _pos: i32,
-        _hidden_in: &[f32],
-        _hidden_out: &mut [f32],
+        layer_idx: i32,
+        pos: i32,
+        hidden_in: &[f32],
+        hidden_out: &mut [f32],
     ) -> Result<(), RsError> {
-        todo!("RIIR Phase 4c/4d: fused_layer_forward")
+        let v = VARIANT;
+        if layer_idx < 0 || (layer_idx as usize) >= v.num_layers {
+            return Err(RsError::EvalFailed);
+        }
+        if pos < 0 {
+            return Err(RsError::EvalFailed);
+        }
+        if hidden_in.len() != v.hidden_dim || hidden_out.len() != v.hidden_dim
+        {
+            return Err(RsError::EvalFailed);
+        }
+
+        let layer_idx_us = layer_idx as usize;
+        let is_full = (layer_idx_us + 1) % v.full_attn_interval == 0;
+        if is_full {
+            // 4d wires this in.
+            return Err(RsError::EvalFailed);
+        }
+
+        // Ensure all lazy resources exist.
+        self.ensure_linear_resources()?;
+
+        // Field-disjoint mutable borrows for the forward call.
+        let k_active = self.k_active;
+        let Self {
+            wf,
+            metal,
+            moe_buffers,
+            experts,
+            layer_states,
+            wf_buf,
+            layer_caches,
+            linear_buffers,
+            ..
+        } = self;
+
+        let metal = metal.as_mut().expect("ensure_linear_resources");
+        let wf_buf = wf_buf.as_ref().expect("ensure_linear_resources");
+        let layer_caches =
+            layer_caches.as_ref().expect("ensure_linear_resources");
+        let linear_buffers =
+            linear_buffers.as_mut().expect("ensure_linear_resources");
+        let moe_buffers =
+            moe_buffers.as_mut().expect("ensure_linear_resources");
+
+        // Stage hidden_in into the persistent input buffer.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                hidden_in.as_ptr(),
+                linear_buffers.input.contents() as *mut f32,
+                v.hidden_dim,
+            );
+        }
+
+        // Get mutable layer state (linear-attn variant for this branch).
+        let layer_state = match &mut layer_states[layer_idx_us] {
+            LayerState::LinearAttn(la) => la,
+            LayerState::FullAttn(_) => {
+                return Err(RsError::EvalFailed);
+            }
+        };
+
+        linear_attn_layer_forward(
+            metal,
+            wf,
+            wf_buf,
+            &layer_caches[layer_idx_us],
+            linear_buffers,
+            moe_buffers,
+            layer_idx_us,
+            k_active,
+            experts,
+            layer_state,
+        )
+        .map_err(|_| RsError::EvalFailed)?;
+
+        // Read post-forward hidden state out of buffers.input.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                linear_buffers.input.contents() as *const f32,
+                hidden_out.as_mut_ptr(),
+                v.hidden_dim,
+            );
+        }
+        Ok(())
+    }
+
+    /// 4c diagnostic — runs `layer_forward_dump` and additionally
+    /// copies out the post-attn-norm hidden, the post-residual h_mid,
+    /// the pre-sigmoid-gate shared expert output, and the shared gate
+    /// score. Test-only.
+    #[allow(clippy::too_many_arguments)]
+    pub fn layer_forward_dump_intermediates(
+        &mut self,
+        layer_idx: i32,
+        pos: i32,
+        hidden_in: &[f32],
+        hidden_out: &mut [f32],
+        h_post_out: Option<&mut [f32]>,
+        h_mid_out: Option<&mut [f32]>,
+        shared_out_out: Option<&mut [f32]>,
+        gate_score_out: Option<&mut f32>,
+    ) -> Result<(), RsError> {
+        // Run the forward, then read the intermediates from the
+        // persistent buffers before the next layer (or the test) can
+        // overwrite them.
+        self.layer_forward_dump(layer_idx, pos, hidden_in, hidden_out)?;
+        let bufs = self
+            .linear_buffers
+            .as_ref()
+            .ok_or(RsError::EvalFailed)?;
+        let v = VARIANT;
+        let read_into = |buf: &::metal::Buffer, dst: Option<&mut [f32]>| {
+            if let Some(dst) = dst {
+                let n = dst.len();
+                let src = buf.contents() as *const f32;
+                // SAFETY: shared storage; no in-flight GPU work because
+                // layer_forward_dump waits internally.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src, dst.as_mut_ptr(), n);
+                }
+            }
+        };
+        read_into(&bufs.normed, h_post_out);
+        read_into(&bufs.h_mid, h_mid_out);
+        read_into(&bufs.shared_out, shared_out_out);
+        if let Some(gate_dst) = gate_score_out {
+            let s = bufs.batch_out[5].contents() as *const f32;
+            // SAFETY: shared storage.
+            *gate_dst = unsafe { *s };
+        }
+        let _ = v; // silence
+        Ok(())
+    }
+
+    /// Lazily build the Metal backend, weight buffer, layer caches,
+    /// linear-attn persistent buffers, and MoE buffer set. Idempotent
+    /// — subsequent calls are no-ops.
+    fn ensure_linear_resources(&mut self) -> Result<(), RsError> {
+        if self.metal.is_none() {
+            self.metal =
+                Some(MetalBackend::new().map_err(|_| RsError::InitFailed)?);
+        }
+        if self.wf_buf.is_none() {
+            let device =
+                self.metal.as_ref().expect("just-set").device().to_owned();
+            self.wf_buf = Some(MtlWeightBuf::wrap(&self.wf, &device));
+        }
+        if self.layer_caches.is_none() {
+            let wf_buf = self.wf_buf.as_ref().expect("just-set");
+            let caches = LayerWeightCache::build_all(&self.wf, wf_buf)
+                .map_err(|_| RsError::InitFailed)?;
+            self.layer_caches = Some(caches);
+        }
+        if self.linear_buffers.is_none() {
+            let device =
+                self.metal.as_ref().expect("just-set").device().to_owned();
+            self.linear_buffers = Some(LinearAttnBuffers::new(&device));
+        }
+        if self.moe_buffers.is_none() {
+            let device =
+                self.metal.as_ref().expect("just-set").device().to_owned();
+            self.moe_buffers = Some(MoeBuffers::new(&device));
+        }
+        Ok(())
     }
 
     pub fn eval_prompt(

@@ -7663,6 +7663,18 @@ void mf_free_model(mf_ctx *ctx) {
     if (ctx->logits) free(ctx->logits);
     // wf->data is mmap'd; upstream main() leaks it on exit. We match
     // that rather than inventing a free path. vocab similarly.
+    //
+    // Defensive: invalidate the file-scope `layer_cache` since its
+    // weight pointers were resolved against THIS ctx's `wf`. If a
+    // subsequent ctx is opened in the same process, the cache must be
+    // rebuilt against the new weight file. Without this, the second
+    // ctx's `fused_layer_forward` reads through freed pointers, an
+    // effective no-op when the OS has zeroed those pages. Bug class
+    // is the same as the documented `g_deferred` cross-Ctx issue;
+    // Phase 7 of the RIIR moves both onto Ctx in the Rust port and
+    // makes the C-side `static` not bug-prone. Until then this minimal
+    // reset keeps the cross-Ctx diff oracle honest.
+    layer_cache_built = 0;
     free(ctx);
 }
 
@@ -8263,6 +8275,73 @@ int mf_layer_forward_dump(mf_ctx *ctx,
         pos, mmap_base, ctx->K, ctx->layer_fds[layer_idx]);
 
     complete_deferred_experts();
+
+    memcpy(hidden_out, ctx->hidden, HIDDEN_DIM * sizeof(float));
+    return 0;
+}
+
+// 4c diagnostic — same as mf_layer_forward_dump but also returns the
+// post-attn-norm hidden, the post-residual h_mid, the pre-sigmoid-gate
+// shared expert output, and the shared gate score. Any `*_out` may be
+// NULL. NB: g_deferred is cleared by `complete_deferred_experts`, so
+// `shared_gate_score` is captured into a local before that call.
+int mf_layer_forward_dump_intermediates(mf_ctx *ctx,
+                                        int32_t layer_idx,
+                                        int32_t pos,
+                                        const float *hidden_in,
+                                        float *hidden_out,
+                                        float *h_post_out,
+                                        float *h_mid_out,
+                                        float *shared_out_out,
+                                        float *gate_score_out)
+{
+    if (!ctx || !hidden_in || !hidden_out) return -1;
+    if (layer_idx < 0 || layer_idx >= NUM_LAYERS) return -1;
+    if (pos < 0) return -1;
+
+    discard_deferred_experts();
+
+    memcpy(ctx->hidden, hidden_in, HIDDEN_DIM * sizeof(float));
+
+    int is_full = ((layer_idx + 1) % FULL_ATTN_INTERVAL == 0);
+    void *mmap_base =
+        (ctx->layer_mmaps[layer_idx] != MAP_FAILED)
+            ? ctx->layer_mmaps[layer_idx]
+            : NULL;
+    fused_layer_forward(
+        ctx->wf, layer_idx, ctx->hidden,
+        is_full ? ctx->kv_caches[layer_idx] : NULL,
+        is_full ? NULL : (LinearAttnState *)ctx->layer_states[layer_idx],
+        pos, mmap_base, ctx->K, ctx->layer_fds[layer_idx]);
+
+    // Capture deferred fields before complete_deferred_experts wipes
+    // them.
+    float captured_gate_score = g_deferred.shared_gate_score;
+
+    // h_post / h_mid are written synchronously by CMD2 (which has
+    // committed and waited by the time fused_layer_forward returns
+    // for the slow path); their buffers are valid right now.
+    if (h_post_out && g_metal && g_metal->buf_input) {
+        memcpy(h_post_out, [g_metal->buf_input contents],
+               HIDDEN_DIM * sizeof(float));
+    }
+    if (h_mid_out && g_metal && g_metal->buf_h_mid) {
+        memcpy(h_mid_out, [g_metal->buf_h_mid contents],
+               HIDDEN_DIM * sizeof(float));
+    }
+
+    // shared_out is written by CMD3's cmd_experts buffer, which is
+    // committed *async* and not yet waited. Read it AFTER
+    // complete_deferred_experts so we see the final shared FFN
+    // output.
+    complete_deferred_experts();
+
+    if (shared_out_out && g_metal && g_metal->buf_shared_out) {
+        memcpy(shared_out_out, [g_metal->buf_shared_out contents],
+               HIDDEN_DIM * sizeof(float));
+    }
+
+    if (gate_score_out) *gate_score_out = captured_gate_score;
 
     memcpy(hidden_out, ctx->hidden, HIDDEN_DIM * sizeof(float));
     return 0;

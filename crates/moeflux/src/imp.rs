@@ -611,6 +611,50 @@ impl Ctx {
         if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
     }
 
+    /// 4c diagnostic — same as [`Self::layer_forward_dump`] but also
+    /// copies out the layer's intermediate buffers so the test
+    /// harness can pinpoint where the C-vs-Rust divergence appears.
+    /// Pass `None` to skip a particular intermediate.
+    #[allow(clippy::too_many_arguments)]
+    pub fn layer_forward_dump_intermediates(
+        &mut self,
+        layer_idx: i32,
+        pos: i32,
+        hidden_in: &[f32],
+        hidden_out: &mut [f32],
+        h_post_out: Option<&mut [f32]>,
+        h_mid_out: Option<&mut [f32]>,
+        shared_out_out: Option<&mut [f32]>,
+        gate_score_out: Option<&mut f32>,
+    ) -> Result<(), Error> {
+        let h_post_ptr = h_post_out
+            .map(|b| b.as_mut_ptr())
+            .unwrap_or(std::ptr::null_mut());
+        let h_mid_ptr = h_mid_out
+            .map(|b| b.as_mut_ptr())
+            .unwrap_or(std::ptr::null_mut());
+        let shared_ptr = shared_out_out
+            .map(|b| b.as_mut_ptr())
+            .unwrap_or(std::ptr::null_mut());
+        let gate_ptr = gate_score_out
+            .map(|f| f as *mut f32)
+            .unwrap_or(std::ptr::null_mut());
+        let rc = unsafe {
+            sys::mf_layer_forward_dump_intermediates(
+                self.inner.as_ptr(),
+                layer_idx,
+                pos,
+                hidden_in.as_ptr(),
+                hidden_out.as_mut_ptr(),
+                h_post_ptr,
+                h_mid_ptr,
+                shared_ptr,
+                gate_ptr,
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
+    }
+
     /// Reset the sequence to empty.
     pub fn memory_clear(&mut self) {
         unsafe { sys::mf_memory_clear(self.inner.as_ptr()) }

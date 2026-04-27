@@ -408,6 +408,34 @@ int mf_layer_forward_dump(mf_ctx *ctx,
                           const float *hidden_in,
                           float *hidden_out);
 
+// 4c diagnostic: same as mf_layer_forward_dump, but also copies out
+// the intermediate Metal buffers so the differential test harness can
+// pinpoint where C-vs-Rust divergence appears. All `*_out` buffers are
+// written from GPU shared-storage state after
+// `complete_deferred_experts` finalizes the layer.
+//
+//   h_post_out:      HIDDEN_DIM floats — post-attn-norm hidden (the
+//                    input to the gate / shared / expert matvecs).
+//                    Read from `g_metal->buf_input`.
+//   h_mid_out:       HIDDEN_DIM floats — residual + o_proj output.
+//                    Read from `g_metal->buf_h_mid`.
+//   shared_out_out:  HIDDEN_DIM floats — pre-sigmoid-gate shared-
+//                    expert output. Read from `g_metal->buf_shared_out`.
+//   gate_score_out:  one float — pre-sigmoid shared-expert gate score.
+//                    Read from `g_deferred.shared_gate_score`.
+//
+// Any *_out may be NULL to skip that copy. The hook leaves the ctx in
+// the same post-call state as `mf_layer_forward_dump`.
+int mf_layer_forward_dump_intermediates(mf_ctx *ctx,
+                                        int32_t layer_idx,
+                                        int32_t pos,
+                                        const float *hidden_in,
+                                        float *hidden_out,
+                                        float *h_post_out,
+                                        float *h_mid_out,
+                                        float *shared_out_out,
+                                        float *gate_score_out);
+
 // ============================================================================
 // State snapshot / restore (Option B in NOTES.md)
 // ============================================================================

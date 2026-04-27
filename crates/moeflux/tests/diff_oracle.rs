@@ -2381,6 +2381,90 @@ fn gpu_batched_experts_forward_close_c_vs_rust() {
     );
 }
 
+/// Phase 4c: end-to-end linear-attention layer forward, C path vs
+/// Rust port, via the dump hook. Token 1 → embedding → layer 0
+/// (linear-attn) on both sides; cosine ≥ 0.9999 / max_abs_diff /
+/// max_abs_out ≤ 1e-3 floors per the strategy doc's Phase 3+ tolerance
+/// regime. The numerical signal that 4c was building toward.
+///
+/// Both sides reset their per-layer state via `memory_clear` before
+/// the call so the recurrence starts empty. The C side uses CPU
+/// rms_norm for the input norm + GPU upload to `buf_input`; the Rust
+/// side does GPU rms_norm directly. They differ on reduction order
+/// (CPU sequential vs GPU parallel simd_sum + threadgroup-shared
+/// second stage); per Phase 9e and the strategy doc that's at most
+/// ULP-bounded drift on the norm output, which composes through the
+/// rest of the pipeline staying inside the cosine floor.
+#[test]
+#[ignore = "long running; needs moeflux artifacts"]
+fn layer_forward_dump_close_c_vs_rust() {
+    let mut c: CBackend = open_backend();
+    let mut rs: RsBackend = open_backend();
+    let hidden_dim = moeflux::riir::VARIANT.hidden_dim;
+
+    c.memory_clear();
+    rs.memory_clear();
+
+    // Embed token 1 on the C side and use that as input on both. (We
+    // could embed on each side, but `embed` is bit-exact across them
+    // per slice 1, so a single source keeps the test focused on the
+    // layer forward.)
+    let hidden_in = c.embed(1);
+    assert_eq!(hidden_in.len(), hidden_dim);
+
+    let layer_idx = 0i32; // linear-attn (full_attn_interval = 4)
+    let pos = 0i32;
+
+    let c_out = c.layer_forward_dump(layer_idx, pos, &hidden_in);
+    let rs_out = rs.layer_forward_dump(layer_idx, pos, &hidden_in);
+    assert_eq!(c_out.len(), hidden_dim);
+    assert_eq!(rs_out.len(), hidden_dim);
+
+    assert!(
+        c_out.iter().all(|x| x.is_finite()),
+        "[diff:layer_forward_dump] C output has NaN/Inf"
+    );
+    assert!(
+        rs_out.iter().all(|x| x.is_finite()),
+        "[diff:layer_forward_dump] Rust output has NaN/Inf"
+    );
+
+    // Magnitude check — output isn't trivially all-zero.
+    let max_abs_out =
+        c_out.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+    assert!(
+        max_abs_out > 1e-6,
+        "[diff:layer_forward_dump] C output magnitude {max_abs_out:.3e} \
+         too small — production path likely no-op'd (cross-Ctx layer_cache?)"
+    );
+
+    let cos = cosine_sim(&c_out, &rs_out);
+    let max_abs_diff = c_out
+        .iter()
+        .zip(rs_out.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let rel = max_abs_diff / max_abs_out.max(f32::EPSILON);
+
+    eprintln!(
+        "[diff:layer_forward_dump layer=0] cosine={cos:.7} \
+         max_abs_diff={max_abs_diff:.3e} max_abs_out={max_abs_out:.3e} \
+         rel={rel:.3e}"
+    );
+
+    const COSINE_FLOOR: f32 = 0.9999;
+    const REL_DIFF_FLOOR: f32 = 1e-3;
+    assert!(
+        cos >= COSINE_FLOOR,
+        "[diff:layer_forward_dump] cosine {cos:.7} below {COSINE_FLOOR}"
+    );
+    assert!(
+        rel <= REL_DIFF_FLOOR,
+        "[diff:layer_forward_dump] relative max_abs_diff \
+         {rel:.3e} above {REL_DIFF_FLOOR:.3e}"
+    );
+}
+
 /// Phase 4b sanity: the C-side `mf_layer_forward_dump` hook is
 /// callable and returns finite output. The numerical-correctness
 /// signal lands in 4c when `RsCtx::layer_forward_dump` exists and
