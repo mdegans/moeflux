@@ -26,6 +26,7 @@ use std::path::Path;
 pub mod embedding;
 pub mod expert_forward;
 pub mod expert_io;
+pub mod full_attn_forward;
 pub mod gpu_linear_attn;
 pub mod gpu_matvec;
 pub mod gpu_norm;
@@ -59,6 +60,7 @@ pub use moe_router::{moe_router_cpu, MoeRouterError};
 pub use rms_norm::{rms_norm_cpu, rms_norm_per_head_cpu, RmsNormError};
 pub use rope::{apply_rotary_emb, RopeError};
 pub use layer_weight_cache::LayerWeightCache;
+pub use full_attn_forward::full_attn_layer_forward;
 pub use linear_attn_forward::{
     linear_attn_layer_forward, linear_layer_idx_for, LayerForwardBuffers,
     LayerForwardError,
@@ -513,8 +515,9 @@ impl RsCtx {
     /// Phase 4 layer-boundary checkpoint hook. Runs a single layer's
     /// forward pass starting from `hidden_in`, returning the post-
     /// layer hidden state in `hidden_out`. The targeted layer's
-    /// recurrence state is mutated in place. 4c routes the linear-
-    /// attn case; 4d will fill in the full-attn case.
+    /// recurrence state (KV cache for full-attn, conv/SSM state for
+    /// linear-attn) is mutated in place. 4c landed the linear-attn
+    /// path; 4d added the full-attn path via [`full_attn_layer_forward`].
     pub fn layer_forward_dump(
         &mut self,
         layer_idx: i32,
@@ -536,10 +539,6 @@ impl RsCtx {
 
         let layer_idx_us = layer_idx as usize;
         let is_full = (layer_idx_us + 1) % v.full_attn_interval == 0;
-        if is_full {
-            // 4d wires this in.
-            return Err(RsError::EvalFailed);
-        }
 
         // Ensure all lazy resources exist.
         self.ensure_linear_resources()?;
@@ -576,27 +575,48 @@ impl RsCtx {
             );
         }
 
-        // Get mutable layer state (linear-attn variant for this branch).
-        let layer_state = match &mut layer_states[layer_idx_us] {
-            LayerState::LinearAttn(la) => la,
-            LayerState::FullAttn(_) => {
-                return Err(RsError::EvalFailed);
-            }
-        };
-
-        linear_attn_layer_forward(
-            metal,
-            wf,
-            wf_buf,
-            &layer_caches[layer_idx_us],
-            linear_buffers,
-            moe_buffers,
-            layer_idx_us,
-            k_active,
-            experts,
-            layer_state,
-        )
-        .map_err(|_| RsError::EvalFailed)?;
+        if is_full {
+            let kv_state = match &mut layer_states[layer_idx_us] {
+                LayerState::FullAttn(kv) => kv,
+                LayerState::LinearAttn(_) => {
+                    return Err(RsError::EvalFailed);
+                }
+            };
+            full_attn_layer_forward(
+                metal,
+                wf,
+                wf_buf,
+                &layer_caches[layer_idx_us],
+                linear_buffers,
+                moe_buffers,
+                layer_idx_us,
+                pos,
+                k_active,
+                experts,
+                kv_state,
+            )
+            .map_err(|_| RsError::EvalFailed)?;
+        } else {
+            let layer_state = match &mut layer_states[layer_idx_us] {
+                LayerState::LinearAttn(la) => la,
+                LayerState::FullAttn(_) => {
+                    return Err(RsError::EvalFailed);
+                }
+            };
+            linear_attn_layer_forward(
+                metal,
+                wf,
+                wf_buf,
+                &layer_caches[layer_idx_us],
+                linear_buffers,
+                moe_buffers,
+                layer_idx_us,
+                k_active,
+                experts,
+                layer_state,
+            )
+            .map_err(|_| RsError::EvalFailed)?;
+        }
 
         // Read post-forward hidden state out of buffers.input.
         unsafe {

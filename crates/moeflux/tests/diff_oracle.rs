@@ -2465,6 +2465,88 @@ fn layer_forward_dump_close_c_vs_rust() {
     );
 }
 
+/// Phase 4d: end-to-end **full-attention** layer forward, C path vs
+/// Rust port, via the dump hook. Companion to the linear-attn test
+/// above. Same floors / shape; the only differences are
+/// `layer_idx = 3` (first full-attn layer when
+/// `full_attn_interval == 4`) and the eprintln tag.
+///
+/// The Rust path swaps the linear-attn pipeline (4 batched
+/// projections + 5 fused GPU kernels) for the full-attn pipeline
+/// (3 batched projections + per-head Q/K rms_norm + RoPE + KV append
+/// + SDPA), then hands off to the same shared `post_attention_tail`
+/// the linear-attn forward uses. So if 4c was green and 4d is red,
+/// the bug is somewhere in the swapped attention pipeline — not the
+/// shared tail.
+///
+/// `memory_clear` runs on both sides before the call so the KV cache
+/// starts at `len = 0` and the test runs at `pos = 0`. After the
+/// call `kv.len = 1`.
+#[test]
+#[ignore = "long running; needs moeflux artifacts"]
+fn layer_forward_dump_close_c_vs_rust_full_attn() {
+    let mut c: CBackend = open_backend();
+    let mut rs: RsBackend = open_backend();
+    let hidden_dim = moeflux::riir::VARIANT.hidden_dim;
+
+    c.memory_clear();
+    rs.memory_clear();
+
+    let hidden_in = c.embed(1);
+    assert_eq!(hidden_in.len(), hidden_dim);
+
+    let layer_idx = 3i32; // first full-attn layer (full_attn_interval = 4)
+    let pos = 0i32;
+
+    let c_out = c.layer_forward_dump(layer_idx, pos, &hidden_in);
+    let rs_out = rs.layer_forward_dump(layer_idx, pos, &hidden_in);
+    assert_eq!(c_out.len(), hidden_dim);
+    assert_eq!(rs_out.len(), hidden_dim);
+
+    assert!(
+        c_out.iter().all(|x| x.is_finite()),
+        "[diff:layer_forward_dump_full] C output has NaN/Inf"
+    );
+    assert!(
+        rs_out.iter().all(|x| x.is_finite()),
+        "[diff:layer_forward_dump_full] Rust output has NaN/Inf"
+    );
+
+    let max_abs_out =
+        c_out.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+    assert!(
+        max_abs_out > 1e-6,
+        "[diff:layer_forward_dump_full] C output magnitude {max_abs_out:.3e} \
+         too small — production path likely no-op'd (cross-Ctx layer_cache?)"
+    );
+
+    let cos = cosine_sim(&c_out, &rs_out);
+    let max_abs_diff = c_out
+        .iter()
+        .zip(rs_out.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let rel = max_abs_diff / max_abs_out.max(f32::EPSILON);
+
+    eprintln!(
+        "[diff:layer_forward_dump layer=3 (full-attn)] cosine={cos:.7} \
+         max_abs_diff={max_abs_diff:.3e} max_abs_out={max_abs_out:.3e} \
+         rel={rel:.3e}"
+    );
+
+    const COSINE_FLOOR: f32 = 0.9999;
+    const REL_DIFF_FLOOR: f32 = 1e-3;
+    assert!(
+        cos >= COSINE_FLOOR,
+        "[diff:layer_forward_dump_full] cosine {cos:.7} below {COSINE_FLOOR}"
+    );
+    assert!(
+        rel <= REL_DIFF_FLOOR,
+        "[diff:layer_forward_dump_full] relative max_abs_diff \
+         {rel:.3e} above {REL_DIFF_FLOOR:.3e}"
+    );
+}
+
 /// Phase 4b sanity: the C-side `mf_layer_forward_dump` hook is
 /// callable and returns finite output. The numerical-correctness
 /// signal lands in 4c when `RsCtx::layer_forward_dump` exists and
