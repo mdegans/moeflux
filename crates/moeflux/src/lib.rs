@@ -29,15 +29,25 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
+/// C-via-`moeflux-sys` implementation. Direct access kept public so
+/// the differential test harness can pin-import [`imp::Ctx`] without
+/// caring which backend the top-level [`Ctx`] alias resolves to.
 #[cfg(target_os = "macos")]
-mod imp;
+pub mod imp;
 
-#[cfg(target_os = "macos")]
-pub use imp::*;
-
-/// Pure-Rust port of the host-side dispatch (under construction —
-/// Phase 0 scaffold). Available when the `riir-port` Cargo feature
-/// is enabled. Runs alongside the C-via-`moeflux-sys` path so the
-/// differential test harness can compare them.
+/// Pure-Rust port of the host-side dispatch. Available when the
+/// `riir-port` Cargo feature is enabled. Runs alongside the C path so
+/// the differential test harness can compare them.
 #[cfg(all(target_os = "macos", feature = "riir-port"))]
 pub mod riir;
+
+/// Default backend re-export: when `riir-port` is on, `Ctx`/`Error`
+/// resolve to the Rust port (`riir::RsCtx`/`riir::RsError`); otherwise
+/// to the C wrapper (`imp::Ctx`/`imp::Error`). The Phase 6 cutover
+/// drops this alias and lifts the riir types to the crate root
+/// directly.
+#[cfg(all(target_os = "macos", not(feature = "riir-port")))]
+pub use imp::{Ctx, Error};
+
+#[cfg(all(target_os = "macos", feature = "riir-port"))]
+pub use riir::{RsCtx as Ctx, RsError as Error};

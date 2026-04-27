@@ -308,7 +308,7 @@ const _: () = {
 /// public C API. Those rely on [`assert_static_invariants`]'s
 /// compile-time checks plus the diff oracle's end-to-end behavioral
 /// agreement.
-pub fn assert_matches_c(ctx: &crate::Ctx) {
+pub fn assert_matches_c(ctx: &crate::imp::Ctx) {
     assert_eq!(
         ctx.n_vocab(),
         VARIANT.vocab_size,

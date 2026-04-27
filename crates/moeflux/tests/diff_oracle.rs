@@ -57,7 +57,7 @@
 
 use std::path::{Path, PathBuf};
 
-use moeflux::{riir::RsCtx, Ctx};
+use moeflux::{imp::Ctx, riir::RsCtx};
 
 // ---------------------------------------------------------------------------
 // Trait + impls

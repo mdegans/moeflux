@@ -1151,4 +1151,15 @@ pub enum RsError {
     EvalFailed,
     #[error("state save/load failed")]
     StateFailed,
+    /// Caller-supplied buffer too small for the snapshot. Variant kept
+    /// for API parity with [`crate::imp::Error`]; not yet emitted by
+    /// the Rust [`RsCtx::state_save`] (which still returns
+    /// `state_snapshot::StateSnapshotError`).
+    #[error("state buffer too small (have {have}, need {need})")]
+    StateBufferTooSmall {
+        /// Bytes the caller provided.
+        have: usize,
+        /// Bytes the snapshot requires.
+        need: usize,
+    },
 }
