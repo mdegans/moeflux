@@ -39,8 +39,8 @@ use metal::{
 };
 
 use super::deferred::{
-    gpu_batched_experts_begin, gpu_batched_experts_begin_buf, DeferredError,
-    DeferredState,
+    gpu_batched_experts_begin, gpu_batched_experts_begin_pre_staged,
+    DeferredError, DeferredState,
 };
 use super::expert_forward::MoeBuffers;
 use super::expert_io::ExpertFiles;
@@ -830,40 +830,36 @@ pub(super) fn post_attention_tail(
         s[0]
     };
 
-    // ── Load K expert blobs from disk ────────────────────────────
-    let k = k_active;
-    let expert_size = v.expert_size_4bit();
-    let mut expert_data = vec![0u8; k * expert_size];
-    for slot in 0..k {
-        let expert_idx = indices[slot] as usize;
-        let dst =
-            &mut expert_data[slot * expert_size..(slot + 1) * expert_size];
-        expert_files.read_expert(layer_idx, expert_idx, dst)?;
-    }
-
     // ── CMD3b: K-expert FFN + combine via slice 9b — async ───────
     //
-    // Slice 5d-4: production fast path (`gpu_combine = true`) hands
-    // GPU buffer refs to the K-expert dispatch — `buffers.normed` is
-    // the post-attn-norm hidden state the experts read as input,
-    // `buffers.h_mid` and `buffers.shared_out` are the residual and
-    // shared FFN output the combine kernel reads. Eliminates the 3 ×
-    // HIDDEN_DIM GPU↔host readback + matching host→GPU memcpys per
-    // layer (~2 MB / token round-tripped). Also kills the cache-flush
-    // overhead of the host reads (Tegra-style: shared-storage GPU
-    // pages need an L1/L2 invalidation before CPU sees the GPU's
-    // writes; eliminating the read eliminates that flush).
+    // Slice 5d-5 (production fast path, `gpu_combine = true`): pread
+    // K expert blobs DIRECTLY into `moe.data[slot]`'s shared-storage
+    // pages, then encode the dispatch with GPU buffer refs for the
+    // post-attn-norm/residual/shared-out inputs. Saves ~7 MB / layer
+    // of host memcpy (the intermediate `expert_data: Vec<u8>` is
+    // gone) on top of slice 5d-4's ~2 MB / layer of input
+    // round-tripping.
+    //
+    // The slot-reuse pattern is sound: each layer's K-expert dispatch
+    // is waited at the top of the next layer's
+    // `complete_deferred_experts_into`, so `moe.data[slot]` is GPU-
+    // quiescent by the time this layer preads new bytes into it.
     //
     // CPU-combine fallback path (`gpu_combine = false`) still routes
     // through the host-slice variant — `DeferredMode::Cpu` needs host
     // snapshots of `h_mid` / `shared_out` for the finalize pass.
+    let k = k_active;
     if gpu_combine {
-        gpu_batched_experts_begin_buf(
+        for slot in 0..k {
+            let expert_idx = indices[slot] as usize;
+            let dst = moe.data_slot_mut(slot);
+            expert_files.read_expert(layer_idx, expert_idx, dst)?;
+        }
+        gpu_batched_experts_begin_pre_staged(
             metal,
             moe,
             deferred,
             k as i32,
-            &expert_data,
             &buffers.normed,     // h_post (post-attn-norm input)
             &buffers.h_mid,      // residual hidden (combine input)
             &buffers.shared_out, // shared FFN output (combine input)
@@ -872,6 +868,14 @@ pub(super) fn post_attention_tail(
             layer_idx as i32,
         )?;
     } else {
+        let expert_size = v.expert_size_4bit();
+        let mut expert_data = vec![0u8; k * expert_size];
+        for slot in 0..k {
+            let expert_idx = indices[slot] as usize;
+            let dst = &mut expert_data
+                [slot * expert_size..(slot + 1) * expert_size];
+            expert_files.read_expert(layer_idx, expert_idx, dst)?;
+        }
         let h_mid_host = read_buffer_to_vec(&buffers.h_mid, v.hidden_dim);
         let shared_out_host =
             read_buffer_to_vec(&buffers.shared_out, v.hidden_dim);

@@ -42,7 +42,7 @@
 //! bug class is structurally absent in this port.
 
 use super::expert_forward::{
-    gpu_batched_experts_encode, gpu_batched_experts_encode_buf,
+    gpu_batched_experts_encode, gpu_batched_experts_encode_pre_staged,
     ExpertForwardError, MoeBuffers,
 };
 use super::metal::MetalBackend;
@@ -189,27 +189,24 @@ pub(crate) fn gpu_batched_experts_begin(
     Ok(())
 }
 
-/// Buffer-ref variant — slice 5d-4. Production callers
-/// (`post_attention_tail`) pass GPU buffers (typically
-/// `LayerForwardBuffers.{normed, h_mid, shared_out}`) the post-attention
-/// path already wrote, eliminating the GPU↔host readback +
-/// host↔GPU memcpy that the host-slice variant pays. Diff oracle keeps
-/// the host-slice API ([`gpu_batched_experts_begin`] above) — it stages
-/// host inputs into MoeBuffers' shared slots which then get bound the
-/// same way at the kernel level.
+/// Pre-staged variant — slice 5d-5. Caller has populated
+/// `bufs.data[0..actual_k]` already (typically via `pread` directly
+/// into [`MoeBuffers::data_slot_mut`]) AND the GPU input buffers are
+/// passed by reference (typically `LayerForwardBuffers.{normed, h_mid,
+/// shared_out}` the post-attention path already wrote). Eliminates
+/// both the K × EXPERT_SIZE host memcpy AND the 3 × HIDDEN_DIM
+/// host↔GPU round-trip that earlier variants paid.
 ///
 /// Always uses GPU combine ([`DeferredMode::Gpu`]). The CPU-finalize
 /// path needs host snapshots of `h_mid` / `shared_out` for the
-/// finalize pass; if a caller needs that, it can read the buffers
-/// back to host first and route through the host-slice variant
-/// ([`gpu_batched_experts_begin`]).
+/// finalize pass; if a caller needs that, it routes through the
+/// host-slice variant ([`gpu_batched_experts_begin`]).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn gpu_batched_experts_begin_buf(
+pub(crate) fn gpu_batched_experts_begin_pre_staged(
     metal: &mut MetalBackend,
     bufs: &mut MoeBuffers,
     slot: &mut Option<DeferredState>,
     actual_k: i32,
-    expert_data: &[u8],
     input: &metal::BufferRef,
     h_mid: &metal::BufferRef,
     shared_out: &metal::BufferRef,
@@ -220,17 +217,15 @@ pub(crate) fn gpu_batched_experts_begin_buf(
     if slot.is_some() {
         return Err(DeferredError::AlreadyActive);
     }
-    let cmd_buffer = gpu_batched_experts_encode_buf(
+    let cmd_buffer = gpu_batched_experts_encode_pre_staged(
         metal,
         bufs,
         actual_k,
-        expert_data,
         input,
         h_mid,
         shared_out,
         expert_weights,
         shared_gate_score,
-        /* gpu_combine = */ true,
     )?;
     cmd_buffer.commit();
     *slot = Some(DeferredState {

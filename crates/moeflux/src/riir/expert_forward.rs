@@ -337,6 +337,20 @@ impl MoeBuffers {
     pub(crate) fn out(&self, slot: usize) -> &MtlBuffer<f32> {
         &self.out[slot]
     }
+
+    /// Mutable byte view into the per-expert weight-blob slot. Slice
+    /// 5d-5 entry point: production callers `pread` directly into this
+    /// shared-storage buffer instead of staging through an
+    /// intermediate `Vec<u8>` and memcpying. Saves ~7 MB/layer of
+    /// memcpy on A3B (K=4 × ~1.77 MB).
+    ///
+    /// SAFETY/CORRECTNESS: caller must ensure no GPU dispatch reading
+    /// from `bufs.data[slot]` is in flight. The deferred-state
+    /// `complete_*` / `discard_*` calls at the top of each layer's
+    /// forward establish this invariant.
+    pub(crate) fn data_slot_mut(&mut self, slot: usize) -> &mut [u8] {
+        self.data[slot].as_mut_slice()
+    }
 }
 
 impl std::fmt::Debug for MoeBuffers {
@@ -452,6 +466,7 @@ pub(crate) fn gpu_batched_experts_encode(
 ) -> Result<metal::CommandBuffer, ExpertForwardError> {
     let v = VARIANT;
     validate_inputs(actual_k, expert_data, expert_weights)?;
+    let k = actual_k as usize;
     if h_post.len() != v.hidden_dim {
         return Err(ExpertForwardError::BadHPostLen {
             expected: v.hidden_dim,
@@ -471,71 +486,6 @@ pub(crate) fn gpu_batched_experts_encode(
         });
     }
 
-    // Stage host slices into bufs' shared input/h_mid/shared_out — this is
-    // the host-API contract. Production callers should prefer
-    // [`gpu_batched_experts_encode_buf`] which skips this and binds GPU
-    // buffers the post-attention path already wrote.
-    bufs.input.as_mut_slice().copy_from_slice(h_post);
-    bufs.h_mid.as_mut_slice().copy_from_slice(h_mid);
-    bufs.shared_out.as_mut_slice().copy_from_slice(shared_out);
-
-    // Hand off to the buf-ref encoder using bufs' own shared slots as the
-    // input buffers. Borrows are field-disjoint: the encode path mutates
-    // bufs.data / bufs.combine_params (both not aliased through input/
-    // h_mid/shared_out_buf), and the input buffer refs are derived from
-    // bufs after staging is complete.
-    let input_ref: *const BufferRef = bufs.input.raw();
-    let h_mid_ref: *const BufferRef = bufs.h_mid.raw();
-    let shared_out_ref: *const BufferRef = bufs.shared_out.raw();
-    // SAFETY: Buffer pointers stay valid as long as `bufs` is alive. The
-    // encode_buf call below mutates only `bufs.data` and
-    // `bufs.combine_params` — fields disjoint from `bufs.input`,
-    // `bufs.h_mid`, `bufs.shared_out`. Reborrowing immutable refs from
-    // these stable pointers across the &mut bufs call is sound.
-    unsafe {
-        gpu_batched_experts_encode_buf(
-            metal,
-            bufs,
-            actual_k,
-            expert_data,
-            &*input_ref,
-            &*h_mid_ref,
-            &*shared_out_ref,
-            expert_weights,
-            shared_gate_score,
-            gpu_combine,
-        )
-    }
-}
-
-/// Buffer-ref entry point — the production path. `input`, `h_mid`,
-/// `shared_out` are GPU buffer refs (typically `LayerForwardBuffers.
-/// {normed, h_mid, shared_out}`); the K expert blobs still come from
-/// host (`expert_data`) since they're freshly read from disk by
-/// [`crate::riir::expert_io::ExpertFiles::read_expert`].
-///
-/// Mirrors the C path's encoder shape: bindings reference whatever
-/// buffer the caller hands in, not a separate staging area. Eliminates
-/// the 3 × HIDDEN_DIM memcpys per layer that the host-slice variant
-/// does (and the matching readbacks the caller would otherwise need to
-/// do to materialize host slices).
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn gpu_batched_experts_encode_buf(
-    metal: &mut MetalBackend,
-    bufs: &mut MoeBuffers,
-    actual_k: i32,
-    expert_data: &[u8],
-    input: &BufferRef,
-    h_mid: &BufferRef,
-    shared_out: &BufferRef,
-    expert_weights: &[f32],
-    shared_gate_score: f32,
-    gpu_combine: bool,
-) -> Result<metal::CommandBuffer, ExpertForwardError> {
-    let v = VARIANT;
-    validate_inputs(actual_k, expert_data, expert_weights)?;
-    let k = actual_k as usize;
-
     // Compile/fetch pipelines first so no `&mut metal` borrow holds across
     // encoder construction.
     let matvec = metal.pipeline("dequant_matvec_4bit_v3")?.clone();
@@ -546,19 +496,95 @@ pub(crate) fn gpu_batched_experts_encode_buf(
         None
     };
 
-    // Stage K expert blobs (~1.7 MB each on A3B) and the 18-float combine
-    // params. These are the only bufs fields the encode path mutates.
+    // Stage K expert blobs, the 18-float combine params, and host
+    // inputs into bufs' own input/h_mid/shared_out — production skips
+    // the host-input staging via [`gpu_batched_experts_encode_pre_staged`].
     let expert_size = v.expert_size_4bit();
     for slot in 0..k {
         let src = &expert_data[slot * expert_size..(slot + 1) * expert_size];
         bufs.data[slot].as_mut_slice().copy_from_slice(src);
     }
+    bufs.input.as_mut_slice().copy_from_slice(h_post);
+    bufs.h_mid.as_mut_slice().copy_from_slice(h_mid);
+    bufs.shared_out.as_mut_slice().copy_from_slice(shared_out);
     {
         let params = bufs.combine_params.as_mut_slice();
         params.fill(0.0);
         params[..k].copy_from_slice(expert_weights);
         params[16] = shared_gate_score;
-        // params[17] stays zero (padding).
+    }
+
+    let cmdbuf = metal.queue().new_command_buffer();
+    // Bind bufs' own input/h_mid/shared_out — kernels read whatever we
+    // just staged. Field-disjoint borrows: bufs is borrowed shared via
+    // the bufs.input.raw() etc. derivations; emit_batched_experts only
+    // reads bufs (also shared). All consistent.
+    emit_batched_experts(
+        cmdbuf,
+        &matvec,
+        &swiglu,
+        combine.as_ref(),
+        bufs,
+        bufs.input.raw(),
+        bufs.h_mid.raw(),
+        bufs.shared_out.raw(),
+        k,
+        v,
+    );
+    Ok(cmdbuf.to_owned())
+}
+
+/// Pre-staged variant — slice 5d-5. Caller has already populated
+/// `bufs.data[0..actual_k]` (typically via `pread` directly into
+/// [`MoeBuffers::data_slot_mut`]). Skips the K × EXPERT_SIZE host
+/// memcpy that [`gpu_batched_experts_encode_buf`] does — saves ~7 MB
+/// of memcpy per layer on A3B (K=4 × ~1.77 MB), or ~280 MB / token
+/// at 40 layers. Eliminates the host-resident `expert_data` Vec
+/// entirely from the production hot path.
+///
+/// The slot reuse pattern is sound because every layer's K-expert
+/// dispatch is waited at the top of the next layer's
+/// [`super::deferred::complete_deferred_experts_into`] before that
+/// layer preads new data into `bufs.data[slot]`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gpu_batched_experts_encode_pre_staged(
+    metal: &mut MetalBackend,
+    bufs: &mut MoeBuffers,
+    actual_k: i32,
+    input: &BufferRef,
+    h_mid: &BufferRef,
+    shared_out: &BufferRef,
+    expert_weights: &[f32],
+    shared_gate_score: f32,
+) -> Result<metal::CommandBuffer, ExpertForwardError> {
+    let v = VARIANT;
+    if actual_k < 1 || (actual_k as usize) > MAX_K {
+        return Err(ExpertForwardError::BadK {
+            actual: actual_k,
+            max: MAX_K,
+        });
+    }
+    let k = actual_k as usize;
+    if expert_weights.len() != k {
+        return Err(ExpertForwardError::BadWeightsLen {
+            expected: k,
+            actual: expert_weights.len(),
+        });
+    }
+
+    // Pipelines first; no `&mut metal` borrow held across encoder
+    // construction.
+    let matvec = metal.pipeline("dequant_matvec_4bit_v3")?.clone();
+    let swiglu = metal.pipeline("swiglu_fused")?.clone();
+    let combine = metal.pipeline("moe_combine_residual")?.clone();
+
+    // Only stage the 18-float combine params — bufs.data is the
+    // caller's responsibility.
+    {
+        let params = bufs.combine_params.as_mut_slice();
+        params.fill(0.0);
+        params[..k].copy_from_slice(expert_weights);
+        params[16] = shared_gate_score;
     }
 
     let cmdbuf = metal.queue().new_command_buffer();
@@ -566,7 +592,7 @@ pub(crate) fn gpu_batched_experts_encode_buf(
         cmdbuf,
         &matvec,
         &swiglu,
-        combine.as_ref(),
+        Some(&combine),
         bufs,
         input,
         h_mid,
