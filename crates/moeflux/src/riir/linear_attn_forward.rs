@@ -2,18 +2,21 @@
 //!
 //! Composes:
 //!
-//! 1. **Pre-attn input norm** (`rms_norm_sum_sq` + `rms_norm_apply_bf16`)
-//! 2. **4 batched projection matvecs** (qkv → 12288, z → 8192, beta → 64,
-//!    alpha → 64) — `dequant_matvec_4bit_v3` against `wf_buf` at offsets
+//! 1. **Pre-attn input norm** (CPU `rms_norm`)
+//! 2. **4 batched projection matvecs** (qkv → 12288, z → 8192, beta →
+//!    64, alpha → 64) — `dequant_matvec_4bit_v3` against `wf_buf` at
+//!    offsets
 //! 3. **5 linear-attn fused kernels**: conv1d_step → rms_norm_qk →
 //!    compute_decay_beta → gated_delta_net_step → gated_rms_norm
-//! 4. **o_proj** (matvec from `value_dim * num_v_heads` → HIDDEN_DIM)
-//! 5. **Residual add + post-attn RMSNorm**
-//! 6. **MoE router** (gate matvec → CPU softmax/topK/normalize) +
-//!    shared-expert gate score matvec
-//! 7. **Shared expert FFN** (gate / up / SwiGLU / down)
-//! 8. **K-expert MoE dispatch + combine** via the 9b path
-//!    (`gpu_batched_experts_forward`)
+//!    (output staged into `buffers.batch_out[6]`)
+//! 4. Hand-off to [`post_attention_tail`] which runs:
+//!    - **o_proj** (matvec from `linear_total_value` → HIDDEN_DIM)
+//!    - **Residual add + post-attn RMSNorm**
+//!    - **MoE router** (gate matvec → CPU softmax/topK/normalize)
+//!      + shared-expert gate score matvec
+//!    - **Shared expert FFN** (gate / up / SwiGLU / down)
+//!    - **K-expert MoE dispatch + combine** via the 9b path
+//!      (`gpu_batched_experts_forward`)
 //!
 //! Output: post-combine HIDDEN_DIM hidden state in `buffers.input`.
 //!
@@ -31,12 +34,12 @@
 //! markers (`// ── step N: …`) make it scannable.
 
 use metal::{
-    Buffer, ComputePipelineState, Device, MTLResourceOptions, MTLSize,
-    NSUInteger,
+    Buffer, CommandBufferRef, ComputePipelineState, Device,
+    MTLResourceOptions, MTLSize, NSUInteger,
 };
 
 use super::expert_forward::{gpu_batched_experts_forward, MoeBuffers};
-use super::rms_norm::rms_norm_cpu;
+use super::expert_io::ExpertFiles;
 use super::gpu_linear_attn::{
     encode_compute_decay_beta, encode_conv1d_step, encode_delta_net_step,
     encode_gated_rms_norm, encode_rms_norm_qk, LinearAttnPipelines,
@@ -46,13 +49,16 @@ use super::layer_weight_cache::LayerWeightCache;
 use super::metal::{MetalBackend, MetalError};
 use super::moe_router::moe_router_cpu;
 use super::mtl_weight_buf::MtlWeightBuf;
+use super::rms_norm::rms_norm_cpu;
 use super::state::LinearAttnState;
 use super::variants::{Variant, RMS_NORM_EPS, VARIANT};
 use super::weight_file::WeightFile;
 
-/// Errors that can surface during the linear-attn layer forward.
+/// Errors that can surface during a layer forward (linear or full
+/// attention). 4d renamed from `LinearAttnForwardError` once
+/// [`post_attention_tail`] became shared between the two paths.
 #[derive(Debug, thiserror::Error)]
-pub enum LinearAttnForwardError {
+pub enum LayerForwardError {
     #[error("missing tensor for layer {layer}: {tensor}")]
     MissingTensor {
         layer: usize,
@@ -68,29 +74,55 @@ pub enum LinearAttnForwardError {
     Expert(#[from] super::expert_forward::ExpertForwardError),
     #[error("expert I/O: {0}")]
     ExpertIo(#[from] super::expert_io::ExpertIoError),
+    #[error("RoPE: {0}")]
+    Rope(#[from] super::rope::RopeError),
+    #[error("SDPA: {0}")]
+    Sdpa(#[from] super::sdpa::SdpaError),
+    #[error("RMSNorm: {0}")]
+    RmsNorm(#[from] super::rms_norm::RmsNormError),
 }
 
+/// Backwards-compat alias. `LinearAttnForwardError` was the original
+/// name in 4c; 4d generalised it.
+pub type LinearAttnForwardError = LayerForwardError;
+
 /// Persistent GPU scratch + recurrence-state buffers needed by the
-/// linear-attention layer forward. Allocated once per [`crate::riir::RsCtx`].
-pub struct LinearAttnBuffers {
+/// per-layer forward (linear and full attention). Allocated once per
+/// [`crate::riir::RsCtx`].
+///
+/// Renamed from `LinearAttnBuffers` in 4d. Hosts buffers shared across
+/// the two attention paths (input/normed/residual/h_mid/output, the
+/// 7-slot batch_out, MoE shared FFN scratch) plus path-specific
+/// recurrence/cache:
+///
+/// - Linear-attn: `conv_state`, `delta_state`, `conv_output`,
+///   `delta_g_decay`, `delta_beta`, `delta_output`.
+/// - Full-attn: `q_proj_out`, `k_out`, `v_out` (the 3 projection
+///   outputs read back to host for CPU per-head norm + RoPE + KV
+///   append + SDPA).
+pub struct LayerForwardBuffers {
     pub input: Buffer,
     pub normed: Buffer,
     pub residual: Buffer,
     pub h_mid: Buffer,
     pub output: Buffer,
     /// 7 batch-output slots. Sized per slot:
-    /// - [0]: LINEAR_CONV_DIM (qkv)
-    /// - [1]: LINEAR_TOTAL_VALUE (z)
-    /// - [2]: LINEAR_NUM_V_HEADS (beta)
-    /// - [3]: LINEAR_NUM_V_HEADS (alpha)
-    /// - [4]: NUM_EXPERTS (router gate logits)
-    /// - [5]: 1 (shared-expert gate scalar)
-    /// - [6]: LINEAR_TOTAL_VALUE (gated-norm output / o_proj input)
+    /// - [0]: LINEAR_CONV_DIM (qkv) — only used by linear-attn
+    /// - [1]: LINEAR_TOTAL_VALUE (z) — only used by linear-attn
+    /// - [2]: LINEAR_NUM_V_HEADS (beta) — only used by linear-attn
+    /// - [3]: LINEAR_NUM_V_HEADS (alpha) — only used by linear-attn
+    /// - [4]: NUM_EXPERTS (router gate logits) — both paths
+    /// - [5]: 1 (shared-expert gate scalar) — both paths
+    /// - [6]: max(LINEAR_TOTAL_VALUE, NUM_ATTN_HEADS * HEAD_DIM) —
+    ///   o_proj input staging slot for both paths. On qwen3_5_moe
+    ///   variants these two values match exactly (linear: 32*128 =
+    ///   4096 for A3B; full: 16*256 = 4096), so the slot is reused.
     pub batch_out: [Buffer; 7],
     /// Per-linear-layer recurrence state.
     pub conv_state: Vec<Buffer>,
     pub delta_state: Vec<Buffer>,
-    /// Scratch for one layer's linear-attn pipeline (reused across layers).
+    /// Scratch for one layer's linear-attn pipeline (reused across
+    /// layers).
     pub conv_output: Buffer,
     pub delta_g_decay: Buffer,
     pub delta_beta: Buffer,
@@ -101,9 +133,19 @@ pub struct LinearAttnBuffers {
     pub shared_up_out: Buffer,
     pub shared_act: Buffer,
     pub shared_out: Buffer,
+    /// Full-attn projection outputs. `q_proj_out` carries the raw
+    /// per-head `(q, gate)` interleave (`num_attn_heads * head_dim *
+    /// 2` floats); `k_out` / `v_out` carry the `kv_dim` raw outputs
+    /// before per-head norm + RoPE + KV append.
+    pub q_proj_out: Buffer,
+    pub k_out: Buffer,
+    pub v_out: Buffer,
 }
 
-impl LinearAttnBuffers {
+/// Backwards-compat alias for the original 4c name.
+pub type LinearAttnBuffers = LayerForwardBuffers;
+
+impl LayerForwardBuffers {
     pub fn new(device: &Device) -> Self {
         let v = VARIANT;
         // Allocate + zero. `device.new_buffer` doesn't guarantee
@@ -127,6 +169,13 @@ impl LinearAttnBuffers {
             }
             b
         };
+        let q_dim_full = v.num_attn_heads * v.head_dim;
+        let q_proj_dim_full = q_dim_full * 2;
+        let kv_dim_full = v.num_kv_heads * v.head_dim;
+        // batch_out[6] is the o_proj input. Both paths land their
+        // attention output here. Linear: linear_total_value; full:
+        // q_dim_full. Pick max so either fits.
+        let oproj_in_max = v.linear_total_value().max(q_dim_full);
         let batch_sizes = [
             v.linear_conv_dim(),
             v.linear_total_value(),
@@ -134,19 +183,22 @@ impl LinearAttnBuffers {
             v.linear_num_v_heads,
             v.num_experts,
             1,
-            v.linear_total_value(),
+            oproj_in_max,
         ];
-        let batch_out: [Buffer; 7] = std::array::from_fn(|i| f32_buf(batch_sizes[i]));
+        let batch_out: [Buffer; 7] =
+            std::array::from_fn(|i| f32_buf(batch_sizes[i]));
 
-        let num_linear =
-            v.num_layers - num_full_attn_layers(&v);
+        let num_linear = v.num_layers - num_full_attn_layers(&v);
         let conv_state = (0..num_linear)
-            .map(|_| f32_buf((Variant::CONV_KERNEL_SIZE - 1) * v.linear_conv_dim()))
+            .map(|_| {
+                f32_buf((Variant::CONV_KERNEL_SIZE - 1) * v.linear_conv_dim())
+            })
             .collect();
         let delta_state = (0..num_linear)
             .map(|_| {
                 f32_buf(
-                    v.linear_num_v_heads * Variant::LINEAR_VALUE_DIM
+                    v.linear_num_v_heads
+                        * Variant::LINEAR_VALUE_DIM
                         * Variant::LINEAR_KEY_DIM,
                 )
             })
@@ -170,6 +222,9 @@ impl LinearAttnBuffers {
             shared_up_out: f32_buf(v.shared_intermediate),
             shared_act: f32_buf(v.shared_intermediate),
             shared_out: f32_buf(v.hidden_dim),
+            q_proj_out: f32_buf(q_proj_dim_full),
+            k_out: f32_buf(kv_dim_full),
+            v_out: f32_buf(kv_dim_full),
         }
     }
 
@@ -210,128 +265,150 @@ fn num_full_attn_layers(v: &Variant) -> usize {
     v.num_layers / v.full_attn_interval
 }
 
+/// Per-tensor bit-width lookup for the matvec dispatcher. Defaults to
+/// 4-bit for tensors not in the manifest; the dispatcher's max(_, 4)
+/// floor guards against misreads.
+pub(super) fn bits_of(wf: &WeightFile, name: &str) -> u32 {
+    wf.tensor_info(name)
+        .map(|i| i.bits as u32)
+        .unwrap_or(4)
+        .max(4)
+}
+
+/// Adapter naming the o_proj weights + input shape to use for one
+/// call into [`post_attention_tail`]. Linear-attn fills with
+/// `linear_o_proj_*`; full-attn fills with `full_o_proj_*`.
+pub(super) struct OProj {
+    pub w_off: u64,
+    pub s_off: u64,
+    pub b_off: u64,
+    pub bits: u32,
+    /// Number of input floats the matvec reads from
+    /// `buffers.batch_out[6]`. Linear: `linear_total_value`. Full:
+    /// `num_attn_heads * head_dim`. Equal on qwen3_5_moe variants.
+    pub in_dim: u32,
+}
+
 /// Run one linear-attention layer's forward pass on the GPU.
 ///
 /// Pre: `buffers.input` holds the input hidden state (HIDDEN_DIM
-/// floats). Post: `buffers.input` holds the output hidden state.
-/// The targeted layer's `conv_state` / `delta_state` are mutated in
-/// place. `state` is the host-side mirror used for `memory_*` ops;
-/// for 4c we keep it in lockstep with the GPU buffers via reset
-/// only — partial truncation will resync GPU buffers via
-/// `reset_recurrence` (a faithful port of the lossy semantic).
+/// floats). Post: `buffers.input` holds the output hidden state. The
+/// targeted layer's `conv_state` / `delta_state` are mutated in place.
+/// `state` is the host-side mirror used for `memory_*` ops; for 4c we
+/// keep it in lockstep with the GPU buffers via reset only — partial
+/// truncation will resync GPU buffers via `reset_recurrence` (a
+/// faithful port of the lossy semantic).
 #[allow(clippy::too_many_arguments)]
 pub fn linear_attn_layer_forward(
     metal: &mut MetalBackend,
     wf: &WeightFile,
     wf_buf: &MtlWeightBuf,
     layer_cache: &LayerWeightCache,
-    buffers: &mut LinearAttnBuffers,
+    buffers: &mut LayerForwardBuffers,
     moe: &mut MoeBuffers,
     layer_idx: usize,
     k_active: usize,
-    expert_files: &super::expert_io::ExpertFiles,
+    expert_files: &ExpertFiles,
     _layer_state: &mut LinearAttnState,
-) -> Result<(), LinearAttnForwardError> {
+) -> Result<(), LayerForwardError> {
     let v = VARIANT;
-    let linear_layer_idx = linear_layer_idx_for(layer_idx).ok_or_else(|| {
-        LinearAttnForwardError::MissingTensor {
+    let linear_layer_idx = linear_layer_idx_for(layer_idx).ok_or(
+        LayerForwardError::MissingTensor {
             layer: layer_idx,
             tensor: "linear_layer_idx (called on full-attn layer)",
-        }
-    })?;
+        },
+    )?;
 
     // Per-tensor bit width lookup. 4-bit is the default; A3B uses
     // 8-bit for `mlp.gate.weight` and `mlp.shared_expert_gate.weight`.
-    let bits_of = |name: &str| -> u32 {
-        wf.tensor_info(name).map(|i| i.bits as u32).unwrap_or(4).max(4)
-    };
-    let qkv_bits = bits_of(&format!(
-        "model.layers.{layer_idx}.linear_attn.in_proj_qkv.weight"
-    ));
-    let z_bits = bits_of(&format!(
-        "model.layers.{layer_idx}.linear_attn.in_proj_z.weight"
-    ));
-    let alpha_bits = bits_of(&format!(
-        "model.layers.{layer_idx}.linear_attn.in_proj_a.weight"
-    ));
-    let beta_bits = bits_of(&format!(
-        "model.layers.{layer_idx}.linear_attn.in_proj_b.weight"
-    ));
-    let o_bits = bits_of(&format!(
-        "model.layers.{layer_idx}.linear_attn.out_proj.weight"
-    ));
-    let gate_bits =
-        bits_of(&format!("model.layers.{layer_idx}.mlp.gate.weight"));
-    let seg_bits = bits_of(&format!(
-        "model.layers.{layer_idx}.mlp.shared_expert_gate.weight"
-    ));
-    let s_gate_bits = bits_of(&format!(
-        "model.layers.{layer_idx}.mlp.shared_expert.gate_proj.weight"
-    ));
-    let s_up_bits = bits_of(&format!(
-        "model.layers.{layer_idx}.mlp.shared_expert.up_proj.weight"
-    ));
-    let s_down_bits = bits_of(&format!(
-        "model.layers.{layer_idx}.mlp.shared_expert.down_proj.weight"
-    ));
+    let qkv_bits = bits_of(
+        wf,
+        &format!("model.layers.{layer_idx}.linear_attn.in_proj_qkv.weight"),
+    );
+    let z_bits = bits_of(
+        wf,
+        &format!("model.layers.{layer_idx}.linear_attn.in_proj_z.weight"),
+    );
+    let alpha_bits = bits_of(
+        wf,
+        &format!("model.layers.{layer_idx}.linear_attn.in_proj_a.weight"),
+    );
+    let beta_bits = bits_of(
+        wf,
+        &format!("model.layers.{layer_idx}.linear_attn.in_proj_b.weight"),
+    );
+    let o_bits = bits_of(
+        wf,
+        &format!("model.layers.{layer_idx}.linear_attn.out_proj.weight"),
+    );
 
     // Resolve required offsets up front so we error early if anything
     // is missing.
     // input_layernorm.weight is read indirectly via `rms_norm_cpu`
     // below, but require it up front for fail-fast behavior.
     let _input_norm_w = layer_cache.input_layernorm_w.ok_or(
-        LinearAttnForwardError::MissingTensor {
+        LayerForwardError::MissingTensor {
             layer: layer_idx,
             tensor: "input_layernorm.weight",
         },
     )?;
-    let post_attn_norm_w = layer_cache.post_attention_layernorm_w.ok_or(
-        LinearAttnForwardError::MissingTensor {
-            layer: layer_idx,
-            tensor: "post_attention_layernorm.weight",
-        },
-    )?;
-    let qkv_w = require(layer_cache.qkv_w, layer_idx, "qkv_proj.weight")?;
-    let qkv_s = require(layer_cache.qkv_s, layer_idx, "qkv_proj.scales")?;
-    let qkv_b = require(layer_cache.qkv_b, layer_idx, "qkv_proj.biases")?;
+    let qkv_w =
+        require(layer_cache.qkv_w, layer_idx, "qkv_proj.weight")?;
+    let qkv_s =
+        require(layer_cache.qkv_s, layer_idx, "qkv_proj.scales")?;
+    let qkv_b =
+        require(layer_cache.qkv_b, layer_idx, "qkv_proj.biases")?;
     let z_w = require(layer_cache.z_w, layer_idx, "z_proj.weight")?;
     let z_s = require(layer_cache.z_s, layer_idx, "z_proj.scales")?;
     let z_b = require(layer_cache.z_b, layer_idx, "z_proj.biases")?;
-    let beta_w = require(layer_cache.beta_w, layer_idx, "beta_proj.weight")?;
-    let beta_s = require(layer_cache.beta_s, layer_idx, "beta_proj.scales")?;
-    let beta_b = require(layer_cache.beta_b, layer_idx, "beta_proj.biases")?;
-    let alpha_w = require(layer_cache.alpha_w, layer_idx, "alpha_proj.weight")?;
-    let alpha_s = require(layer_cache.alpha_s, layer_idx, "alpha_proj.scales")?;
-    let alpha_b = require(layer_cache.alpha_b, layer_idx, "alpha_proj.biases")?;
-    let conv1d_w = require(layer_cache.conv1d_w, layer_idx, "linear_attn.conv1d.weight")?;
-    let a_log = require(layer_cache.a_log, layer_idx, "linear_attn.A_log")?;
-    let dt_bias = require(layer_cache.dt_bias, layer_idx, "linear_attn.dt_bias")?;
-    let gnorm_w = require(layer_cache.gated_norm_w, layer_idx, "linear_attn.g_norm.weight")?;
-    let o_w = require(layer_cache.linear_o_proj_w, layer_idx, "linear_attn.o_proj.weight")?;
-    let o_s = require(layer_cache.linear_o_proj_s, layer_idx, "linear_attn.o_proj.scales")?;
-    let o_b = require(layer_cache.linear_o_proj_b, layer_idx, "linear_attn.o_proj.biases")?;
-    let gate_w = require(layer_cache.gate_w, layer_idx, "mlp.gate.weight")?;
-    let gate_s = require(layer_cache.gate_s, layer_idx, "mlp.gate.scales")?;
-    let gate_b = require(layer_cache.gate_b, layer_idx, "mlp.gate.biases")?;
-    let shared_up_w = require(layer_cache.shared_up_w, layer_idx, "shared.up_proj.w")?;
-    let shared_up_s = require(layer_cache.shared_up_s, layer_idx, "shared.up_proj.s")?;
-    let shared_up_b = require(layer_cache.shared_up_b, layer_idx, "shared.up_proj.b")?;
-    let shared_gate_w = require(layer_cache.shared_gate_w, layer_idx, "shared.gate_proj.w")?;
-    let shared_gate_s = require(layer_cache.shared_gate_s, layer_idx, "shared.gate_proj.s")?;
-    let shared_gate_b = require(layer_cache.shared_gate_b, layer_idx, "shared.gate_proj.b")?;
-    let shared_down_w = require(layer_cache.shared_down_w, layer_idx, "shared.down_proj.w")?;
-    let shared_down_s = require(layer_cache.shared_down_s, layer_idx, "shared.down_proj.s")?;
-    let shared_down_b = require(layer_cache.shared_down_b, layer_idx, "shared.down_proj.b")?;
-    let seg_w = require(layer_cache.seg_w, layer_idx, "shared_expert_gate.w")?;
-    let seg_s = require(layer_cache.seg_s, layer_idx, "shared_expert_gate.s")?;
-    let seg_b = require(layer_cache.seg_b, layer_idx, "shared_expert_gate.b")?;
+    let beta_w =
+        require(layer_cache.beta_w, layer_idx, "beta_proj.weight")?;
+    let beta_s =
+        require(layer_cache.beta_s, layer_idx, "beta_proj.scales")?;
+    let beta_b =
+        require(layer_cache.beta_b, layer_idx, "beta_proj.biases")?;
+    let alpha_w =
+        require(layer_cache.alpha_w, layer_idx, "alpha_proj.weight")?;
+    let alpha_s =
+        require(layer_cache.alpha_s, layer_idx, "alpha_proj.scales")?;
+    let alpha_b =
+        require(layer_cache.alpha_b, layer_idx, "alpha_proj.biases")?;
+    let conv1d_w = require(
+        layer_cache.conv1d_w,
+        layer_idx,
+        "linear_attn.conv1d.weight",
+    )?;
+    let a_log =
+        require(layer_cache.a_log, layer_idx, "linear_attn.A_log")?;
+    let dt_bias = require(
+        layer_cache.dt_bias,
+        layer_idx,
+        "linear_attn.dt_bias",
+    )?;
+    let gnorm_w = require(
+        layer_cache.gated_norm_w,
+        layer_idx,
+        "linear_attn.g_norm.weight",
+    )?;
+    let o_w = require(
+        layer_cache.linear_o_proj_w,
+        layer_idx,
+        "linear_attn.o_proj.weight",
+    )?;
+    let o_s = require(
+        layer_cache.linear_o_proj_s,
+        layer_idx,
+        "linear_attn.o_proj.scales",
+    )?;
+    let o_b = require(
+        layer_cache.linear_o_proj_b,
+        layer_idx,
+        "linear_attn.o_proj.biases",
+    )?;
 
     // Pre-fetch every pipeline.
     let lp = LinearAttnPipelines::fetch(metal)?;
     let mv = MatvecPipelines::fetch(metal)?;
-    let sum_sq = metal.pipeline("rms_norm_sum_sq")?.clone();
-    let apply = metal.pipeline("rms_norm_apply_bf16")?.clone();
-    let resid_add = metal.pipeline("residual_add")?.clone();
 
     // ── snapshot residual + CPU input norm ───────────────────────
     // The C path uses `cpu_rms_norm` here (infer.m:4492) and memcpy's
@@ -356,7 +433,7 @@ pub fn linear_attn_layer_forward(
         let weight_name =
             format!("model.layers.{layer_idx}.input_layernorm.weight");
         rms_norm_cpu(wf, &weight_name, &input_host, &mut normed_host)
-            .map_err(|_| LinearAttnForwardError::MissingTensor {
+            .map_err(|_| LayerForwardError::MissingTensor {
                 layer: layer_idx,
                 tensor: "input_layernorm.weight (cpu rms_norm failed)",
             })?;
@@ -484,6 +561,147 @@ pub fn linear_attn_layer_forward(
         cmdbuf.wait_until_completed();
     }
 
+    // ── Hand off to the shared post-attention tail ───────────────
+    // `batch_out[6]` already holds the `gated_rms_norm` output —
+    // exactly the o_proj input the tail consumes.
+    post_attention_tail(
+        metal,
+        wf,
+        wf_buf,
+        layer_cache,
+        buffers,
+        moe,
+        layer_idx,
+        k_active,
+        expert_files,
+        OProj {
+            w_off: o_w,
+            s_off: o_s,
+            b_off: o_b,
+            bits: o_bits,
+            in_dim: v.linear_total_value() as u32,
+        },
+    )
+}
+
+/// Shared post-attention tail used by both linear- and full-attention
+/// layer forwards. Reads the attention output from
+/// `buffers.batch_out[6]` (caller-staged) and runs the rest of
+/// `fused_layer_forward`:
+///
+/// 1. CMD2: o_proj matvec → residual_add → post-attn rms_norm.
+/// 2. CMD3a: gate logits + shared-expert gate scalar + shared FFN
+///    `gate_proj` + `up_proj`.
+/// 3. CPU swiglu of shared_gate × shared_up → `shared_act`.
+/// 4. CMD3a-b: shared `down_proj` matvec.
+/// 5. CPU MoE router on the gate logits.
+/// 6. Load K expert blobs from disk via [`ExpertFiles::read_expert`].
+/// 7. CMD3b: K-expert FFN + combine via the slice 9b path.
+///
+/// Output: post-combine HIDDEN_DIM hidden state in `buffers.input`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn post_attention_tail(
+    metal: &mut MetalBackend,
+    wf: &WeightFile,
+    wf_buf: &MtlWeightBuf,
+    layer_cache: &LayerWeightCache,
+    buffers: &mut LayerForwardBuffers,
+    moe: &mut MoeBuffers,
+    layer_idx: usize,
+    k_active: usize,
+    expert_files: &ExpertFiles,
+    o_proj: OProj,
+) -> Result<(), LayerForwardError> {
+    let v = VARIANT;
+
+    // Per-tensor bit widths for the MoE-side matvecs.
+    let gate_bits =
+        bits_of(wf, &format!("model.layers.{layer_idx}.mlp.gate.weight"));
+    let seg_bits = bits_of(
+        wf,
+        &format!(
+            "model.layers.{layer_idx}.mlp.shared_expert_gate.weight"
+        ),
+    );
+    let s_gate_bits = bits_of(
+        wf,
+        &format!(
+            "model.layers.{layer_idx}.mlp.shared_expert.gate_proj.weight"
+        ),
+    );
+    let s_up_bits = bits_of(
+        wf,
+        &format!(
+            "model.layers.{layer_idx}.mlp.shared_expert.up_proj.weight"
+        ),
+    );
+    let s_down_bits = bits_of(
+        wf,
+        &format!(
+            "model.layers.{layer_idx}.mlp.shared_expert.down_proj.weight"
+        ),
+    );
+
+    let post_attn_norm_w = layer_cache.post_attention_layernorm_w.ok_or(
+        LayerForwardError::MissingTensor {
+            layer: layer_idx,
+            tensor: "post_attention_layernorm.weight",
+        },
+    )?;
+    let gate_w =
+        require(layer_cache.gate_w, layer_idx, "mlp.gate.weight")?;
+    let gate_s =
+        require(layer_cache.gate_s, layer_idx, "mlp.gate.scales")?;
+    let gate_b =
+        require(layer_cache.gate_b, layer_idx, "mlp.gate.biases")?;
+    let shared_up_w =
+        require(layer_cache.shared_up_w, layer_idx, "shared.up_proj.w")?;
+    let shared_up_s =
+        require(layer_cache.shared_up_s, layer_idx, "shared.up_proj.s")?;
+    let shared_up_b =
+        require(layer_cache.shared_up_b, layer_idx, "shared.up_proj.b")?;
+    let shared_gate_w = require(
+        layer_cache.shared_gate_w,
+        layer_idx,
+        "shared.gate_proj.w",
+    )?;
+    let shared_gate_s = require(
+        layer_cache.shared_gate_s,
+        layer_idx,
+        "shared.gate_proj.s",
+    )?;
+    let shared_gate_b = require(
+        layer_cache.shared_gate_b,
+        layer_idx,
+        "shared.gate_proj.b",
+    )?;
+    let shared_down_w = require(
+        layer_cache.shared_down_w,
+        layer_idx,
+        "shared.down_proj.w",
+    )?;
+    let shared_down_s = require(
+        layer_cache.shared_down_s,
+        layer_idx,
+        "shared.down_proj.s",
+    )?;
+    let shared_down_b = require(
+        layer_cache.shared_down_b,
+        layer_idx,
+        "shared.down_proj.b",
+    )?;
+    let seg_w =
+        require(layer_cache.seg_w, layer_idx, "shared_expert_gate.w")?;
+    let seg_s =
+        require(layer_cache.seg_s, layer_idx, "shared_expert_gate.s")?;
+    let seg_b =
+        require(layer_cache.seg_b, layer_idx, "shared_expert_gate.b")?;
+
+    let mv = MatvecPipelines::fetch(metal)?;
+    let sum_sq = metal.pipeline("rms_norm_sum_sq")?.clone();
+    let apply = metal.pipeline("rms_norm_apply_bf16")?.clone();
+    let resid_add = metal.pipeline("residual_add")?.clone();
+
     // ── CMD2: o_proj + residual_add + post-attn rms_norm ─────────
     {
         let cmdbuf = metal.queue().new_command_buffer();
@@ -493,14 +711,14 @@ pub fn linear_attn_layer_forward(
             &mv,
             wf_buf,
             &MatvecSpec {
-                w_off: o_w,
-                s_off: o_s,
-                b_off: o_b,
+                w_off: o_proj.w_off,
+                s_off: o_proj.s_off,
+                b_off: o_proj.b_off,
                 input: &buffers.batch_out[6],
                 output: &buffers.output,
                 out_dim: v.hidden_dim as u32,
-                in_dim: v.linear_total_value() as u32,
-                bits: o_bits,
+                in_dim: o_proj.in_dim,
+                bits: o_proj.bits,
             },
         );
 
@@ -611,8 +829,10 @@ pub fn linear_attn_layer_forward(
             &buffers.shared_gate_out,
             v.shared_intermediate,
         );
-        let u =
-            read_buffer_to_vec(&buffers.shared_up_out, v.shared_intermediate);
+        let u = read_buffer_to_vec(
+            &buffers.shared_up_out,
+            v.shared_intermediate,
+        );
         let act_dst = buffers.shared_act.contents() as *mut f32;
         for i in 0..v.shared_intermediate {
             // SiLU(g) * u, matching cpu_swiglu (infer.m:~2400):
@@ -647,7 +867,8 @@ pub fn linear_attn_layer_forward(
     }
 
     // ── CPU: MoE router on the gate logits ───────────────────────
-    let mut scores = read_buffer_to_vec(&buffers.batch_out[4], v.num_experts);
+    let mut scores =
+        read_buffer_to_vec(&buffers.batch_out[4], v.num_experts);
     let mut indices = vec![0i32; k_active];
     let mut weights = vec![0f32; k_active];
     moe_router_cpu(&mut scores, k_active, &mut indices, &mut weights)?;
@@ -664,13 +885,15 @@ pub fn linear_attn_layer_forward(
     let mut expert_data = vec![0u8; k * expert_size];
     for slot in 0..k {
         let expert_idx = indices[slot] as usize;
-        let dst = &mut expert_data[slot * expert_size..(slot + 1) * expert_size];
+        let dst =
+            &mut expert_data[slot * expert_size..(slot + 1) * expert_size];
         expert_files.read_expert(layer_idx, expert_idx, dst)?;
     }
 
     // ── CMD3b: K-expert FFN + combine via slice 9b ───────────────
     let h_mid_host = read_buffer_to_vec(&buffers.h_mid, v.hidden_dim);
-    let shared_out_host = read_buffer_to_vec(&buffers.shared_out, v.hidden_dim);
+    let shared_out_host =
+        read_buffer_to_vec(&buffers.shared_out, v.hidden_dim);
     let normed_host = read_buffer_to_vec(&buffers.normed, v.hidden_dim);
 
     let mut hidden_out = vec![0f32; v.hidden_dim];
@@ -705,15 +928,15 @@ pub fn linear_attn_layer_forward(
     Ok(())
 }
 
-fn require(
+pub(super) fn require(
     val: Option<u64>,
     layer: usize,
     tensor: &'static str,
-) -> Result<u64, LinearAttnForwardError> {
-    val.ok_or(LinearAttnForwardError::MissingTensor { layer, tensor })
+) -> Result<u64, LayerForwardError> {
+    val.ok_or(LayerForwardError::MissingTensor { layer, tensor })
 }
 
-fn read_buffer_to_vec(b: &Buffer, len: usize) -> Vec<f32> {
+pub(super) fn read_buffer_to_vec(b: &Buffer, len: usize) -> Vec<f32> {
     let ptr = b.contents() as *const f32;
     // SAFETY: caller ensures no GPU work in flight on `b`.
     unsafe { std::slice::from_raw_parts(ptr, len).to_vec() }
@@ -721,7 +944,7 @@ fn read_buffer_to_vec(b: &Buffer, len: usize) -> Vec<f32> {
 
 #[allow(clippy::too_many_arguments)]
 fn encode_rms_norm_pair(
-    cmdbuf: &metal::CommandBufferRef,
+    cmdbuf: &CommandBufferRef,
     sum_pipe: &ComputePipelineState,
     apply_pipe: &ComputePipelineState,
     input: &Buffer,
@@ -763,7 +986,7 @@ fn encode_rms_norm_pair(
 }
 
 fn encode_residual_add(
-    cmdbuf: &metal::CommandBufferRef,
+    cmdbuf: &CommandBufferRef,
     pipeline: &ComputePipelineState,
     a: &Buffer,
     b: &Buffer,
@@ -783,4 +1006,3 @@ fn encode_residual_add(
     );
     enc.end_encoding();
 }
-

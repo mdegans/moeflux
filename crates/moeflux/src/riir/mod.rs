@@ -60,9 +60,12 @@ pub use rms_norm::{rms_norm_cpu, rms_norm_per_head_cpu, RmsNormError};
 pub use rope::{apply_rotary_emb, RopeError};
 pub use layer_weight_cache::LayerWeightCache;
 pub use linear_attn_forward::{
-    linear_attn_layer_forward, linear_layer_idx_for, LinearAttnBuffers,
-    LinearAttnForwardError,
+    linear_attn_layer_forward, linear_layer_idx_for, LayerForwardBuffers,
+    LayerForwardError,
 };
+// Backwards-compat aliases — 4d renamed the buffer struct + error.
+#[allow(deprecated)]
+pub use linear_attn_forward::{LinearAttnBuffers, LinearAttnForwardError};
 pub use mtl_weight_buf::{MtlWeightBuf, MtlWeightBufError};
 pub use sdpa::{sdpa_cpu, SdpaError};
 pub use state::{
