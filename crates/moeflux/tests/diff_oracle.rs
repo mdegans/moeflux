@@ -177,6 +177,10 @@ pub trait DiffBackend {
         ssm_state_in: Vec<f32>,
     ) -> (Vec<f32>, Vec<f32>);
 
+    /// Read one expert's `EXPERT_SIZE`-byte 4-bit blob from disk
+    /// (slice 9c). Returns the raw on-disk bytes.
+    fn load_expert_bytes(&self, layer_idx: i32, expert_idx: i32) -> Vec<u8>;
+
     /// Single-expert GPU FFN forward (slice 9a). `expert_data` is one
     /// expert's `EXPERT_SIZE`-byte 4-bit blob; `h_post` is HIDDEN_DIM
     /// floats. Returns the HIDDEN_DIM-float expert output. Takes
@@ -410,6 +414,14 @@ impl DiffBackend for CBackend {
             )
             .expect("CBackend gated_delta_recurrence_cpu");
         (state, out)
+    }
+
+    fn load_expert_bytes(&self, layer_idx: i32, expert_idx: i32) -> Vec<u8> {
+        let mut out = vec![0u8; moeflux::riir::VARIANT.expert_size_4bit()];
+        self.0
+            .load_expert_bytes(layer_idx, expert_idx, &mut out)
+            .expect("CBackend load_expert_bytes");
+        out
     }
 
     fn gpu_expert_forward(
@@ -668,6 +680,18 @@ impl DiffBackend for RsBackend {
             )
             .expect("RsBackend gated_delta_recurrence_cpu");
         (state, out)
+    }
+
+    fn load_expert_bytes(&self, layer_idx: i32, expert_idx: i32) -> Vec<u8> {
+        let mut out = vec![0u8; moeflux::riir::VARIANT.expert_size_4bit()];
+        self.0
+            .load_expert_bytes(
+                layer_idx as usize,
+                expert_idx as usize,
+                &mut out,
+            )
+            .expect("RsBackend load_expert_bytes");
+        out
     }
 
     fn gpu_expert_forward(
@@ -2015,6 +2039,62 @@ fn gpu_expert_forward_close_c_vs_rust() {
         "[diff:gpu_expert_forward] relative max_abs_diff {rel:.3e} \
          above {REL_DIFF_FLOOR:.3e}"
     );
+}
+
+/// Phase 3 slice 9c — expert blob I/O.
+///
+/// Reads a few (layer, expert) pairs through both backends and
+/// asserts byte-for-byte equality. The C path uses
+/// `pread(ctx->layer_fds[layer_idx], …)`; the Rust path uses
+/// `File::read_at(self.layers[layer_idx], …)`. Both end up issuing
+/// a `pread64` against the same file at the same offset, so the
+/// expected outcome is bit-exact.
+///
+/// Fixed sample of probe pairs — covers a full-attn layer (idx 3,
+/// `(i+1) % 4 == 0`), a linear-attn layer (idx 0), and a couple of
+/// mid-stack layers. Expert indices 0, 7, 255 stress the
+/// first-block / mid-block / last-block byte regions of the file.
+#[test]
+#[ignore = "long running; needs moeflux artifacts"]
+fn load_expert_bytes_byte_exact_c_vs_rust() {
+    use moeflux::riir::VARIANT;
+
+    let c: CBackend = open_backend();
+    let rs: RsBackend = open_backend();
+
+    let v = VARIANT;
+    let probes: &[(i32, i32)] = &[
+        (0, 0),
+        (0, 7),
+        (3, 0),
+        (3, 255),
+        ((v.num_layers / 2) as i32, 42),
+        ((v.num_layers - 1) as i32, (v.num_experts - 1) as i32),
+    ];
+
+    for &(layer, expert) in probes {
+        let c_bytes = c.load_expert_bytes(layer, expert);
+        let rs_bytes = rs.load_expert_bytes(layer, expert);
+        assert_eq!(c_bytes.len(), v.expert_size_4bit());
+        assert_eq!(rs_bytes.len(), v.expert_size_4bit());
+
+        let first_diff =
+            c_bytes.iter().zip(rs_bytes.iter()).position(|(a, b)| a != b);
+        eprintln!(
+            "[diff:load_expert_bytes layer={layer} expert={expert}] \
+             {} bytes; first_diff={first_diff:?}",
+            c_bytes.len(),
+        );
+
+        assert!(
+            first_diff.is_none(),
+            "[diff:load_expert_bytes layer={layer} expert={expert}] \
+             byte mismatch at offset {first_diff:?} \
+             (c=0x{:02x} rs=0x{:02x})",
+            first_diff.map(|i| c_bytes[i]).unwrap_or(0),
+            first_diff.map(|i| rs_bytes[i]).unwrap_or(0),
+        );
+    }
 }
 
 /// Phase 3 slice 9b — batched K-expert FFN + GPU combine.

@@ -341,6 +341,26 @@ int mf_gpu_batched_experts_forward(mf_ctx *ctx,
                                     float shared_gate_score,
                                     float *hidden_out);
 
+// Load one expert's packed bytes (`EXPERT_SIZE` for the active 4-bit
+// variant) from disk. Reads via `pread(ctx->layer_fds[layer_idx],
+// out, EXPERT_SIZE, expert_idx * EXPERT_SIZE)` — same path the cold
+// expert-load uses internally, no LRU cache lookup, no LZ4
+// decompression. Bypasses every caching layer so the diff oracle gets
+// raw on-disk bytes.
+//
+//   layer_idx, expert_idx: integers in valid range for the active
+//                          variant; -1 if out of range.
+//   out:                   `out_len` >= EXPERT_SIZE bytes.
+//
+// Returns 0 on success; -1 on NULL args / out-of-range index /
+// missing layer file / wrong `out_len` / 2-bit ctx (the 4-bit
+// `EXPERT_SIZE` is hard-coded; 2-bit is a separate slice).
+int mf_load_expert_bytes(mf_ctx *ctx,
+                          int32_t layer_idx,
+                          int32_t expert_idx,
+                          void *out,
+                          size_t out_len);
+
 // ============================================================================
 // State snapshot / restore (Option B in NOTES.md)
 // ============================================================================

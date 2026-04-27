@@ -8122,6 +8122,31 @@ int mf_gpu_batched_experts_forward(mf_ctx *ctx,
     return 0;
 }
 
+// Diff-oracle entry: read one expert's bytes straight from disk via
+// the per-layer fd opened in `mf_init_model`. Bypasses every cache
+// layer (`g_expert_cache`, `g_malloc_cache`, the LRU layers) so the
+// Rust port's expert-loader can be diffed against raw on-disk bytes.
+int mf_load_expert_bytes(mf_ctx *ctx,
+                          int32_t layer_idx,
+                          int32_t expert_idx,
+                          void *out,
+                          size_t out_len)
+{
+    if (!ctx || !out) return -1;
+    if (g_use_2bit) return -1;
+    if (out_len != (size_t)EXPERT_SIZE) return -1;
+    if (layer_idx < 0 || layer_idx >= NUM_LAYERS) return -1;
+    if (expert_idx < 0 || expert_idx >= NUM_EXPERTS) return -1;
+    if (!ctx->layer_fds) return -1;
+    int fd = ctx->layer_fds[layer_idx];
+    if (fd < 0) return -1;
+
+    off_t off = (off_t)expert_idx * (off_t)EXPERT_SIZE;
+    ssize_t n = pread(fd, out, (size_t)EXPERT_SIZE, off);
+    if (n != (ssize_t)EXPERT_SIZE) return -1;
+    return 0;
+}
+
 // ============================================================================
 // State snapshot / restore (Option B)
 // ============================================================================

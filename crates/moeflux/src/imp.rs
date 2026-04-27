@@ -479,6 +479,29 @@ impl Ctx {
         if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
     }
 
+    /// Read one expert's `EXPERT_SIZE`-byte 4-bit blob from the
+    /// per-layer packed-expert file. Bypasses every cache. Wraps
+    /// `mf_load_expert_bytes`; rejects 2-bit ctxs and any
+    /// out-of-range layer/expert index. `out` must be exactly
+    /// `EXPERT_SIZE` bytes.
+    pub fn load_expert_bytes(
+        &self,
+        layer_idx: i32,
+        expert_idx: i32,
+        out: &mut [u8],
+    ) -> Result<(), Error> {
+        let rc = unsafe {
+            sys::mf_load_expert_bytes(
+                self.inner.as_ptr(),
+                layer_idx,
+                expert_idx,
+                out.as_mut_ptr().cast(),
+                out.len(),
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
+    }
+
     /// Single-expert GPU FFN forward. Wraps the C-side
     /// `mf_gpu_expert_forward` hook. `expert_data` must be exactly
     /// `EXPERT_SIZE` bytes for the active 4-bit variant — the C path

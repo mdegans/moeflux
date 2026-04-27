@@ -25,6 +25,7 @@ use std::path::Path;
 
 pub mod embedding;
 pub mod expert_forward;
+pub mod expert_io;
 pub mod linear_attn;
 pub mod lm_head;
 pub mod metal;
@@ -39,6 +40,7 @@ pub use expert_forward::{
     gpu_batched_experts_forward, gpu_expert_forward, ExpertForwardError,
     MoeBuffers, MAX_K,
 };
+pub use expert_io::{ExpertFiles, ExpertIoError};
 pub use linear_attn::{
     conv1d_step, gated_delta_recurrence, rms_norm_bare, rms_norm_gated,
     LinearAttnError,
@@ -73,7 +75,12 @@ pub struct RsCtx {
     /// Allocated on first [`Self::gpu_batched_experts_forward`] call;
     /// reused thereafter. ~28 MB on A3B.
     moe_buffers: Option<MoeBuffers>,
-    // Future phases populate: vocab, per-layer state, expert mmaps.
+    /// Per-layer expert-file handles. Opened eagerly at
+    /// [`Self::open`] from `experts_dir/packed_experts/`. Missing
+    /// files leave the slot empty per the C path's tolerance
+    /// semantics.
+    experts: ExpertFiles,
+    // Future phases populate: vocab, per-layer state.
 }
 
 impl RsCtx {
@@ -86,16 +93,19 @@ impl RsCtx {
         weights: &Path,
         manifest: &Path,
         _vocab: &Path,
-        _experts_dir: &Path,
+        experts_dir: &Path,
         _experts_per_tok: u32,
         _use_2bit: bool,
     ) -> Result<Self, RsError> {
         let wf = WeightFile::open(weights, manifest)
             .map_err(|_| RsError::InitFailed)?;
+        let experts = ExpertFiles::open(experts_dir)
+            .map_err(|_| RsError::InitFailed)?;
         Ok(Self {
             wf,
             metal: None,
             moe_buffers: None,
+            experts,
         })
     }
 
@@ -364,6 +374,21 @@ impl RsCtx {
             out_values,
         )
         .map_err(|_| RsError::EvalFailed)
+    }
+
+    /// Read one expert's `EXPERT_SIZE`-byte 4-bit blob from disk
+    /// (slice 9c). Bypasses every cache; equivalent to a cold pread
+    /// against `packed_experts/layer_NN.bin`. Diff-oracle dump point
+    /// for the expert-loader.
+    pub fn load_expert_bytes(
+        &self,
+        layer_idx: usize,
+        expert_idx: usize,
+        out: &mut [u8],
+    ) -> Result<(), RsError> {
+        self.experts
+            .read_expert(layer_idx, expert_idx, out)
+            .map_err(|_| RsError::EvalFailed)
     }
 
     /// Single-expert GPU FFN forward (slice 9a). `expert_data` is one
