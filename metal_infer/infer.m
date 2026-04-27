@@ -7870,6 +7870,43 @@ int mf_moe_router_cpu(mf_ctx *ctx,
     return 0;
 }
 
+int mf_conv1d_step_cpu(mf_ctx *ctx, const char *weight_name,
+                        int32_t channels, int32_t kernel_size,
+                        const float *conv_state,
+                        const float *new_input,
+                        float *out)
+{
+    if (!ctx || !weight_name || !conv_state || !new_input || !out) return -1;
+    if (channels <= 0 || kernel_size <= 0) return -1;
+    uint16_t *w_bf16 = (uint16_t *)get_tensor_ptr(ctx->wf, weight_name);
+    if (!w_bf16) return -1;
+    cpu_conv1d_step(conv_state, new_input, w_bf16, out,
+                    (int)channels, (int)kernel_size);
+    return 0;
+}
+
+int mf_rms_norm_bare_cpu(mf_ctx *ctx, int32_t dim, float eps,
+                          const float *x, float *out)
+{
+    if (!ctx || !x || !out) return -1;
+    if (dim <= 0) return -1;
+    cpu_rms_norm_bare(x, out, (int)dim, eps);
+    return 0;
+}
+
+int mf_rms_norm_gated_cpu(mf_ctx *ctx, const char *weight_name,
+                           int32_t dim, float eps,
+                           const float *x, const float *z,
+                           float *out)
+{
+    if (!ctx || !weight_name || !x || !z || !out) return -1;
+    if (dim <= 0) return -1;
+    uint16_t *w_bf16 = (uint16_t *)get_tensor_ptr(ctx->wf, weight_name);
+    if (!w_bf16) return -1;
+    cpu_rms_norm_gated(x, z, w_bf16, out, (int)dim, eps);
+    return 0;
+}
+
 // ============================================================================
 // State snapshot / restore (Option B)
 // ============================================================================

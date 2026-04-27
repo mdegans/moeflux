@@ -209,6 +209,45 @@ int mf_moe_router_cpu(mf_ctx *ctx,
                       int32_t *indices_out,
                       float *weights_out);
 
+// CPU depthwise 1D conv step + SiLU tail. For each channel `c`,
+// computes a dot product over `[conv_state..., new_input]` against
+// `weight_name`'s `c`-th row, then applies SiLU.
+//
+//   conv_state: [(kernel_size-1) * channels] row-major (time, channel).
+//   new_input:  [channels].
+//   out:        [channels], written from scratch.
+//
+// `weight_name` must reference a bf16 tensor of length
+// `channels * kernel_size`. Returns 0 on success, -1 on NULL args /
+// missing tensor / non-positive shape. Caller is responsible for
+// shifting the conv state after this call. Read-only on `ctx`.
+int mf_conv1d_step_cpu(mf_ctx *ctx, const char *weight_name,
+                        int32_t channels, int32_t kernel_size,
+                        const float *conv_state,
+                        const float *new_input,
+                        float *out);
+
+// CPU bare RMS norm (no weight). `out[i] = x[i] / sqrt(mean(x*x) + eps)`.
+// `dim` must be positive; `x` and `out` must both be `dim` floats.
+// Returns 0 on success, -1 on NULL args / non-positive dim. Read-only
+// on `ctx`.
+int mf_rms_norm_bare_cpu(mf_ctx *ctx, int32_t dim, float eps,
+                          const float *x, float *out);
+
+// CPU RMSNormGated: `out[i] = rms_norm(x)[i] * w[i] * silu(z[i])`.
+// Loads `weight_name` (bf16, length `dim`).
+//
+//   x:   [dim] post-recurrence per-head output values.
+//   z:   [dim] gate-input values (pre-SiLU).
+//   out: [dim], written from scratch.
+//
+// Returns 0 on success, -1 on NULL args / missing tensor /
+// non-positive dim. Read-only on `ctx`.
+int mf_rms_norm_gated_cpu(mf_ctx *ctx, const char *weight_name,
+                           int32_t dim, float eps,
+                           const float *x, const float *z,
+                           float *out);
+
 // ============================================================================
 // State snapshot / restore (Option B in NOTES.md)
 // ============================================================================

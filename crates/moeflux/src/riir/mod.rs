@@ -24,6 +24,7 @@
 use std::path::Path;
 
 pub mod embedding;
+pub mod linear_attn;
 pub mod lm_head;
 pub mod metal;
 pub mod moe_router;
@@ -33,6 +34,7 @@ pub mod sdpa;
 pub mod variants;
 pub mod weight_file;
 pub use embedding::{bf16_to_f32, embed_lookup, EmbeddingError};
+pub use linear_attn::{conv1d_step, rms_norm_bare, rms_norm_gated, LinearAttnError};
 pub use lm_head::{lm_head_cpu, LmHeadError};
 pub use metal::{MetalBackend, MetalError, MtlBuffer};
 pub use moe_router::{moe_router_cpu, MoeRouterError};
@@ -190,6 +192,59 @@ impl RsCtx {
         weights: &mut [f32],
     ) -> Result<(), RsError> {
         moe_router_cpu(scores, k, indices, weights)
+            .map_err(|_| RsError::EvalFailed)
+    }
+
+    /// Depthwise 1D conv step + SiLU. `weight_name` references a bf16
+    /// tensor of length `channels * kernel_size`. ULP-bounded against
+    /// `mf_conv1d_step_cpu` (one libm `expf` per channel in the SiLU
+    /// tail; dot product matches clang via `mul_add`).
+    pub fn conv1d_step_cpu(
+        &self,
+        weight_name: &str,
+        channels: usize,
+        kernel_size: usize,
+        conv_state: &[f32],
+        new_input: &[f32],
+        out: &mut [f32],
+    ) -> Result<(), RsError> {
+        let bytes = self
+            .wf
+            .tensor_bytes(weight_name)
+            .ok_or(RsError::EvalFailed)?;
+        conv1d_step(
+            conv_state,
+            new_input,
+            bytes,
+            channels,
+            kernel_size,
+            out,
+        )
+        .map_err(|_| RsError::EvalFailed)
+    }
+
+    /// Bare CPU RMSNorm (no weight). Bit-exact against
+    /// `mf_rms_norm_bare_cpu` on the same hardware.
+    pub fn rms_norm_bare_cpu(
+        &self,
+        eps: f32,
+        x: &[f32],
+        out: &mut [f32],
+    ) -> Result<(), RsError> {
+        rms_norm_bare(x, eps, out).map_err(|_| RsError::EvalFailed)
+    }
+
+    /// CPU RMSNormGated: `out[i] = rms_norm(x)[i] * w[i] * silu(z[i])`.
+    /// ULP-bounded against `mf_rms_norm_gated_cpu` (libm `expf` in SiLU).
+    pub fn rms_norm_gated_cpu(
+        &self,
+        weight_name: &str,
+        eps: f32,
+        x: &[f32],
+        z: &[f32],
+        out: &mut [f32],
+    ) -> Result<(), RsError> {
+        rms_norm_gated(&self.wf, weight_name, x, z, eps, out)
             .map_err(|_| RsError::EvalFailed)
     }
 

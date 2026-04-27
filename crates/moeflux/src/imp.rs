@@ -362,6 +362,81 @@ impl Ctx {
         if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
     }
 
+    /// Depthwise 1D conv step + SiLU. `weight_name` is a bf16 tensor of
+    /// length `channels * kernel_size`. Diff-oracle dump point for the
+    /// linear-attention conv1d primitive.
+    pub fn conv1d_step_cpu(
+        &self,
+        weight_name: &str,
+        channels: usize,
+        kernel_size: usize,
+        conv_state: &[f32],
+        new_input: &[f32],
+        out: &mut [f32],
+    ) -> Result<(), Error> {
+        let cname =
+            std::ffi::CString::new(weight_name).map_err(|_| Error::PathHasNul)?;
+        let rc = unsafe {
+            sys::mf_conv1d_step_cpu(
+                self.inner.as_ptr(),
+                cname.as_ptr(),
+                channels as i32,
+                kernel_size as i32,
+                conv_state.as_ptr(),
+                new_input.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
+    }
+
+    /// CPU bare RMSNorm (no weight). Diff-oracle dump point for the
+    /// per-head Q/K bare-norm inside linear-attention layers.
+    pub fn rms_norm_bare_cpu(
+        &self,
+        eps: f32,
+        x: &[f32],
+        out: &mut [f32],
+    ) -> Result<(), Error> {
+        let rc = unsafe {
+            sys::mf_rms_norm_bare_cpu(
+                self.inner.as_ptr(),
+                x.len() as i32,
+                eps,
+                x.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
+    }
+
+    /// CPU RMSNormGated: rms_norm(x) × weight × silu(z). Diff-oracle
+    /// dump point for the gated-norm tail of the linear-attention
+    /// recurrence output.
+    pub fn rms_norm_gated_cpu(
+        &self,
+        weight_name: &str,
+        eps: f32,
+        x: &[f32],
+        z: &[f32],
+        out: &mut [f32],
+    ) -> Result<(), Error> {
+        let cname =
+            std::ffi::CString::new(weight_name).map_err(|_| Error::PathHasNul)?;
+        let rc = unsafe {
+            sys::mf_rms_norm_gated_cpu(
+                self.inner.as_ptr(),
+                cname.as_ptr(),
+                x.len() as i32,
+                eps,
+                x.as_ptr(),
+                z.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
+    }
+
     /// Reset the sequence to empty.
     pub fn memory_clear(&mut self) {
         unsafe { sys::mf_memory_clear(self.inner.as_ptr()) }

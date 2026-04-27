@@ -134,6 +134,29 @@ pub trait DiffBackend {
     /// place but the trait surface hands over an owned copy each call.
     fn moe_router_cpu(&self, scores: Vec<f32>, k: usize) -> (Vec<i32>, Vec<f32>);
 
+    /// Depthwise 1D conv step + SiLU. `weight_name` is a bf16 tensor
+    /// of length `channels * kernel_size`. Returns `channels` floats.
+    fn conv1d_step_cpu(
+        &self,
+        weight_name: &str,
+        channels: usize,
+        kernel_size: usize,
+        conv_state: &[f32],
+        new_input: &[f32],
+    ) -> Vec<f32>;
+
+    /// Bare CPU RMSNorm (no weight). Returns `x.len()` floats.
+    fn rms_norm_bare_cpu(&self, eps: f32, x: &[f32]) -> Vec<f32>;
+
+    /// CPU RMSNormGated. Returns `x.len()` floats.
+    fn rms_norm_gated_cpu(
+        &self,
+        weight_name: &str,
+        eps: f32,
+        x: &[f32],
+        z: &[f32],
+    ) -> Vec<f32>;
+
     /// Prefill `tokens` at `start_pos`. Returns the n_vocab-length
     /// logit vector for the position immediately after the last
     /// token in `tokens`.
@@ -262,6 +285,50 @@ impl DiffBackend for CBackend {
             .moe_router_cpu(&mut s, k, &mut idx, &mut w)
             .expect("CBackend moe_router_cpu");
         (idx, w)
+    }
+
+    fn conv1d_step_cpu(
+        &self,
+        weight_name: &str,
+        channels: usize,
+        kernel_size: usize,
+        conv_state: &[f32],
+        new_input: &[f32],
+    ) -> Vec<f32> {
+        let mut out = vec![0.0f32; channels];
+        self.0
+            .conv1d_step_cpu(
+                weight_name,
+                channels,
+                kernel_size,
+                conv_state,
+                new_input,
+                &mut out,
+            )
+            .expect("CBackend conv1d_step_cpu");
+        out
+    }
+
+    fn rms_norm_bare_cpu(&self, eps: f32, x: &[f32]) -> Vec<f32> {
+        let mut out = vec![0.0f32; x.len()];
+        self.0
+            .rms_norm_bare_cpu(eps, x, &mut out)
+            .expect("CBackend rms_norm_bare_cpu");
+        out
+    }
+
+    fn rms_norm_gated_cpu(
+        &self,
+        weight_name: &str,
+        eps: f32,
+        x: &[f32],
+        z: &[f32],
+    ) -> Vec<f32> {
+        let mut out = vec![0.0f32; x.len()];
+        self.0
+            .rms_norm_gated_cpu(weight_name, eps, x, z, &mut out)
+            .expect("CBackend rms_norm_gated_cpu");
+        out
     }
 
     fn eval_prompt(&mut self, tokens: &[i32], start_pos: usize) -> Vec<f32> {
@@ -403,6 +470,50 @@ impl DiffBackend for RsBackend {
             .moe_router_cpu(&mut s, k, &mut idx, &mut w)
             .expect("RsBackend moe_router_cpu");
         (idx, w)
+    }
+
+    fn conv1d_step_cpu(
+        &self,
+        weight_name: &str,
+        channels: usize,
+        kernel_size: usize,
+        conv_state: &[f32],
+        new_input: &[f32],
+    ) -> Vec<f32> {
+        let mut out = vec![0.0f32; channels];
+        self.0
+            .conv1d_step_cpu(
+                weight_name,
+                channels,
+                kernel_size,
+                conv_state,
+                new_input,
+                &mut out,
+            )
+            .expect("RsBackend conv1d_step_cpu");
+        out
+    }
+
+    fn rms_norm_bare_cpu(&self, eps: f32, x: &[f32]) -> Vec<f32> {
+        let mut out = vec![0.0f32; x.len()];
+        self.0
+            .rms_norm_bare_cpu(eps, x, &mut out)
+            .expect("RsBackend rms_norm_bare_cpu");
+        out
+    }
+
+    fn rms_norm_gated_cpu(
+        &self,
+        weight_name: &str,
+        eps: f32,
+        x: &[f32],
+        z: &[f32],
+    ) -> Vec<f32> {
+        let mut out = vec![0.0f32; x.len()];
+        self.0
+            .rms_norm_gated_cpu(weight_name, eps, x, z, &mut out)
+            .expect("RsBackend rms_norm_gated_cpu");
+        out
     }
 
     fn eval_prompt(&mut self, tokens: &[i32], start_pos: usize) -> Vec<f32> {
@@ -1298,6 +1409,199 @@ fn moe_router_cpu_close_c_vs_rust() {
             "[diff:moe_router {label}] Rust weights don't sum to 1 ({weight_sum_rs})"
         );
     }
+}
+
+/// Bit-exact diff for bare RMSNorm (Phase 3, slice 8a-1).
+///
+/// Used inside `linear_attention_forward` to RMS-normalize each head
+/// of Q and K (with no learned weight tensor — just a plain
+/// normalization). Same arithmetic shape as the existing weighted
+/// `cpu_rms_norm`, just without the bf16-multiply step. CPU,
+/// deterministic, bit-exact territory.
+///
+/// Probe shape: a `LINEAR_KEY_DIM`-long head, since that's the
+/// production callsite. Mid-magnitude trig input.
+#[test]
+#[ignore = "long running; needs moeflux artifacts"]
+fn rms_norm_bare_cpu_bit_exact_c_vs_rust() {
+    use moeflux::riir::variants::Variant;
+
+    let c: CBackend = open_backend();
+    let rs: RsBackend = open_backend();
+
+    let dim = Variant::LINEAR_KEY_DIM;
+    let x: Vec<f32> = (0..dim)
+        .map(|i| ((i as f32) * 0.011).sin() * 0.6 + 0.05)
+        .collect();
+    let eps = 1e-6f32;
+
+    let c_out = c.rms_norm_bare_cpu(eps, &x);
+    let rs_out = rs.rms_norm_bare_cpu(eps, &x);
+
+    let diffs: Vec<(usize, f32, f32)> = c_out
+        .iter()
+        .zip(rs_out.iter())
+        .enumerate()
+        .filter_map(|(i, (&a, &b))| {
+            if a.to_bits() != b.to_bits() {
+                Some((i, a, b))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if !diffs.is_empty() {
+        let first = &diffs[0];
+        panic!(
+            "[diff:rms_norm_bare] {} of {} elements differ; \
+             first at index {} (c={} rs={})",
+            diffs.len(),
+            c_out.len(),
+            first.0,
+            first.1,
+            first.2,
+        );
+    }
+
+    eprintln!(
+        "[diff:rms_norm_bare dim={dim}] {} elements bit-equal; first 4: {:?}",
+        c_out.len(),
+        &c_out[..4],
+    );
+}
+
+/// ULP-bounded diff for the conv1d step + SiLU (Phase 3, slice 8a-2).
+///
+/// Used inside `linear_attention_forward` to do the depthwise 1D conv
+/// over the linear-attention (Q|K|V) channels with the previous
+/// `(kernel_size-1)` time-steps of state. Tested against layer-0's
+/// real `conv1d.weight` tensor so the bf16 decode path is exercised.
+///
+/// The dot-product half is bit-exact (matched via `mul_add` to clang's
+/// FMA contraction) but the SiLU tail introduces one `expf` per
+/// channel — same compiler-choice ULP territory as the rest of the
+/// libm-bearing kernels. Tolerance: ULP-bounded with the same
+/// `MAX_ULP_DRIFT = 128` budget RoPE uses.
+#[test]
+#[ignore = "long running; needs moeflux artifacts"]
+fn conv1d_step_cpu_close_c_vs_rust() {
+    use moeflux::riir::variants::Variant;
+    use moeflux::riir::VARIANT;
+
+    let c: CBackend = open_backend();
+    let rs: RsBackend = open_backend();
+
+    let channels = VARIANT.linear_conv_dim();
+    let kernel_size = Variant::CONV_KERNEL_SIZE;
+    let weight_name = "model.layers.0.linear_attn.conv1d.weight";
+
+    // (kernel_size-1) past time-steps × channels values.
+    let conv_state: Vec<f32> = (0..(kernel_size - 1) * channels)
+        .map(|i| ((i as f32) * 0.013).sin() * 0.4 + 0.02)
+        .collect();
+    let new_input: Vec<f32> = (0..channels)
+        .map(|i| ((i as f32) * 0.019).cos() * 0.5 - 0.1)
+        .collect();
+
+    let c_out =
+        c.conv1d_step_cpu(weight_name, channels, kernel_size, &conv_state, &new_input);
+    let rs_out =
+        rs.conv1d_step_cpu(weight_name, channels, kernel_size, &conv_state, &new_input);
+
+    let max_ulp = c_out
+        .iter()
+        .zip(rs_out.iter())
+        .map(|(&a, &b)| ulp_diff(a, b))
+        .max()
+        .unwrap_or(0);
+    let diff_count = c_out
+        .iter()
+        .zip(rs_out.iter())
+        .filter(|&(&a, &b)| a.to_bits() != b.to_bits())
+        .count();
+    let max_abs_diff = c_out
+        .iter()
+        .zip(rs_out.iter())
+        .map(|(&a, &b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let max_abs_out =
+        c_out.iter().map(|&a| a.abs()).fold(0.0f32, f32::max);
+
+    eprintln!(
+        "[diff:conv1d_step channels={channels} kernel={kernel_size}] \
+         max_ulp={max_ulp} max_abs_diff={max_abs_diff:.3e} \
+         max_abs_out={max_abs_out:.3e} ({diff_count}/{} differ)",
+        c_out.len(),
+    );
+
+    assert!(
+        max_ulp <= MAX_ULP_DRIFT,
+        "[diff:conv1d_step] max ULP drift {max_ulp} > {MAX_ULP_DRIFT}"
+    );
+}
+
+/// ULP-bounded diff for RMSNormGated (Phase 3, slice 8a-3).
+///
+/// Used inside `linear_attention_forward` to apply `rms_norm × silu × weight`
+/// to each per-head output of the gate-delta-net recurrence. Tested
+/// against layer-0's real `linear_attn.norm.weight` tensor.
+///
+/// One libm `expf` per element via SiLU, plus the bf16 weight decode
+/// the existing weighted RMSNorm already exercises. Same ULP budget
+/// as the other libm-bearing kernels.
+#[test]
+#[ignore = "long running; needs moeflux artifacts"]
+fn rms_norm_gated_cpu_close_c_vs_rust() {
+    use moeflux::riir::variants::Variant;
+
+    let c: CBackend = open_backend();
+    let rs: RsBackend = open_backend();
+
+    let dim = Variant::LINEAR_VALUE_DIM;
+    let weight_name = "model.layers.0.linear_attn.norm.weight";
+    let eps = 1e-6f32;
+
+    let x: Vec<f32> = (0..dim)
+        .map(|i| ((i as f32) * 0.011).sin() * 0.6 + 0.05)
+        .collect();
+    let z: Vec<f32> = (0..dim)
+        .map(|i| ((i as f32) * 0.017).cos() * 1.2 - 0.1)
+        .collect();
+
+    let c_out = c.rms_norm_gated_cpu(weight_name, eps, &x, &z);
+    let rs_out = rs.rms_norm_gated_cpu(weight_name, eps, &x, &z);
+
+    let max_ulp = c_out
+        .iter()
+        .zip(rs_out.iter())
+        .map(|(&a, &b)| ulp_diff(a, b))
+        .max()
+        .unwrap_or(0);
+    let diff_count = c_out
+        .iter()
+        .zip(rs_out.iter())
+        .filter(|&(&a, &b)| a.to_bits() != b.to_bits())
+        .count();
+    let max_abs_diff = c_out
+        .iter()
+        .zip(rs_out.iter())
+        .map(|(&a, &b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let max_abs_out =
+        c_out.iter().map(|&a| a.abs()).fold(0.0f32, f32::max);
+
+    eprintln!(
+        "[diff:rms_norm_gated dim={dim}] max_ulp={max_ulp} \
+         max_abs_diff={max_abs_diff:.3e} max_abs_out={max_abs_out:.3e} \
+         ({diff_count}/{} differ)",
+        c_out.len(),
+    );
+
+    assert!(
+        max_ulp <= MAX_ULP_DRIFT,
+        "[diff:rms_norm_gated] max ULP drift {max_ulp} > {MAX_ULP_DRIFT}"
+    );
 }
 
 #[test]
