@@ -88,6 +88,7 @@ pub fn full_attn_layer_forward(
     k_active: usize,
     expert_files: &ExpertFiles,
     kv_state: &mut KvCache,
+    gpu_combine: bool,
 ) -> Result<(), LayerForwardError> {
     let v = VARIANT;
 
@@ -357,5 +358,6 @@ pub fn full_attn_layer_forward(
             bits: o_bits,
             in_dim: q_dim as u32,
         },
+        gpu_combine,
     )
 }

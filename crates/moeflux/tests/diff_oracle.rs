@@ -2777,6 +2777,91 @@ fn layer_forward_dump_close_c_vs_rust() {
     );
 }
 
+/// Phase 4f-4: CPU-combine path matches the C side. Forces the Rust
+/// port to take the `gpu_combine = false` branch (CMD3 omits
+/// `moe_combine_residual`; the K per-expert outputs are read back to
+/// host and combined CPU-side per `infer.m:4106..4129`). The C side
+/// always picks `gpu_combine = true` for layer 0 with all pipelines
+/// available — but the **arithmetic** of CPU combine is identical
+/// (`hidden = h_mid + Σ weights[k] × out[k] + sigmoid(gate) ×
+/// shared_out`), so the two paths must agree at the cosine floor.
+///
+/// Catches porting drift in the CPU-combine code path itself
+/// (cpu_vec_madd / cpu_sigmoid_scalar / final fold) — the GPU-combine
+/// path is exercised by every other layer-forward diff test, so this
+/// is the only test that hits the CPU branch.
+#[test]
+#[ignore = "long running; needs moeflux artifacts"]
+fn layer_forward_dump_close_c_vs_rust_cpu_combine() {
+    let mut c: CBackend = open_backend();
+    let mut rs: RsBackend = open_backend();
+    let hidden_dim = moeflux::riir::VARIANT.hidden_dim;
+
+    c.memory_clear();
+    rs.memory_clear();
+
+    let hidden_in = c.embed(1);
+    assert_eq!(hidden_in.len(), hidden_dim);
+
+    let layer_idx = 0i32;
+    let pos = 0i32;
+
+    let c_out = c.layer_forward_dump(layer_idx, pos, &hidden_in);
+    let mut rs_out = vec![0.0f32; hidden_dim];
+    rs.0.layer_forward_dump_with_gpu_combine(
+        layer_idx,
+        pos,
+        &hidden_in,
+        &mut rs_out,
+        /* gpu_combine = */ false,
+    )
+    .expect("RsBackend layer_forward_dump_with_gpu_combine");
+
+    assert!(
+        c_out.iter().all(|x| x.is_finite()),
+        "[diff:layer_forward_dump_cpu_combine] C output has NaN/Inf"
+    );
+    assert!(
+        rs_out.iter().all(|x| x.is_finite()),
+        "[diff:layer_forward_dump_cpu_combine] Rust output has NaN/Inf"
+    );
+
+    let max_abs_out =
+        c_out.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+    assert!(
+        max_abs_out > 1e-6,
+        "[diff:layer_forward_dump_cpu_combine] C output magnitude \
+         {max_abs_out:.3e} too small"
+    );
+
+    let cos = cosine_sim(&c_out, &rs_out);
+    let max_abs_diff = c_out
+        .iter()
+        .zip(rs_out.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let rel = max_abs_diff / max_abs_out.max(f32::EPSILON);
+
+    eprintln!(
+        "[diff:layer_forward_dump_cpu_combine layer=0] cosine={cos:.7} \
+         max_abs_diff={max_abs_diff:.3e} max_abs_out={max_abs_out:.3e} \
+         rel={rel:.3e}"
+    );
+
+    const COSINE_FLOOR: f32 = 0.9999;
+    const REL_DIFF_FLOOR: f32 = 1e-3;
+    assert!(
+        cos >= COSINE_FLOOR,
+        "[diff:layer_forward_dump_cpu_combine] cosine {cos:.7} below \
+         {COSINE_FLOOR}"
+    );
+    assert!(
+        rel <= REL_DIFF_FLOOR,
+        "[diff:layer_forward_dump_cpu_combine] relative max_abs_diff \
+         {rel:.3e} above {REL_DIFF_FLOOR:.3e}"
+    );
+}
+
 /// Phase 4f-3 parity: five back-to-back `layer_forward_dump` calls
 /// on the Rust side must all succeed without leaking a deferred-
 /// experts dispatch across calls. After slice 4f-3,

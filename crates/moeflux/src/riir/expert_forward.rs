@@ -327,6 +327,14 @@ impl MoeBuffers {
     pub(crate) fn moe_hidden(&self) -> &MtlBuffer<f32> {
         &self.moe_hidden
     }
+
+    /// One per-expert output slot — the readback source for the CPU-
+    /// combine path. `slot` must be `< actual_k` (caller-checked
+    /// against the dispatch's `actual_k`); slots `[actual_k, MAX_K)`
+    /// hold stale data and must not be read.
+    pub(crate) fn out(&self, slot: usize) -> &MtlBuffer<f32> {
+        &self.out[slot]
+    }
 }
 
 impl std::fmt::Debug for MoeBuffers {
@@ -392,6 +400,7 @@ pub fn gpu_batched_experts_forward(
         shared_out,
         expert_weights,
         shared_gate_score,
+        /* gpu_combine = */ true,
     )?;
     cmdbuf.commit();
     cmdbuf.wait_until_completed();
@@ -399,9 +408,22 @@ pub fn gpu_batched_experts_forward(
     Ok(())
 }
 
-/// Encode the K-expert FFN + `moe_combine_residual` into a fresh
-/// command buffer. Stages caller inputs into `bufs`, returns the
-/// (uncommitted) owned command buffer.
+/// Encode the K-expert FFN (and optionally `moe_combine_residual`)
+/// into a fresh command buffer. Stages caller inputs into `bufs`,
+/// returns the (uncommitted) owned command buffer.
+///
+/// `gpu_combine`:
+/// - `true` — encode the combine kernel as the final dispatch;
+///   `bufs.moe_hidden` holds the post-combine hidden state on
+///   completion. This is the slice 9b shape and the default for
+///   `post_attention_tail`.
+/// - `false` — omit the combine kernel; the per-expert outputs
+///   remain in `bufs.out[0..k]` for a CPU-side combine in
+///   [`super::deferred::complete_deferred_experts_into`]. Mirrors C
+///   `gpu_combine = 0` (`infer.m:5668..5673` decision; finalize at
+///   `infer.m:4106..4129`). Used by the slice 4f-4 CPU-combine path
+///   when next layer's `input_layernorm_w` is missing or the
+///   pipelines aren't available.
 ///
 /// Callers decide commit + wait policy:
 ///
@@ -424,6 +446,7 @@ pub(crate) fn gpu_batched_experts_encode(
     shared_out: &[f32],
     expert_weights: &[f32],
     shared_gate_score: f32,
+    gpu_combine: bool,
 ) -> Result<metal::CommandBuffer, ExpertForwardError> {
     let v = VARIANT;
     if actual_k < 1 || (actual_k as usize) > MAX_K {
@@ -469,7 +492,11 @@ pub(crate) fn gpu_batched_experts_encode(
     // mid-encode borrow on `metal` afterwards.
     let matvec = metal.pipeline("dequant_matvec_4bit_v3")?.clone();
     let swiglu = metal.pipeline("swiglu_fused")?.clone();
-    let combine = metal.pipeline("moe_combine_residual")?.clone();
+    let combine = if gpu_combine {
+        Some(metal.pipeline("moe_combine_residual")?.clone())
+    } else {
+        None
+    };
 
     // Stage CPU inputs into the persistent buffers. Per-call cost is K
     // expert-blob memcpys (~1.7 MB each on A3B) plus three HIDDEN_DIM
@@ -558,10 +585,12 @@ pub(crate) fn gpu_batched_experts_encode(
 
     // moe_combine_residual: 16 expert-output bindings regardless of K
     // (kernel branches on K, unused slots have weight=0). Bind all
-    // MAX_K out buffers, weights via the params buffer.
-    {
+    // MAX_K out buffers, weights via the params buffer. Skipped when
+    // `gpu_combine == false` — caller will run the equivalent on the
+    // CPU side after wait.
+    if let Some(combine) = combine.as_ref() {
         let enc = cmdbuf.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&combine);
+        enc.set_compute_pipeline_state(combine);
         enc.set_buffer(0, Some(bufs.h_mid.raw()), 0);
         enc.set_buffer(1, Some(bufs.shared_out.raw()), 0);
         enc.set_buffer(2, Some(bufs.moe_hidden.raw()), 0);

@@ -48,26 +48,50 @@ use super::metal::MetalBackend;
 use super::variants::VARIANT;
 use super::{RsCtx, RsError};
 
+/// Finalize-policy for a deferred K-expert dispatch. Slice 4f-3
+/// shipped only [`Self::Gpu`] (CMD3 includes
+/// `moe_combine_residual`; `complete` reads from `bufs.moe_hidden`);
+/// slice 4f-4 added [`Self::Cpu`] (CMD3 stops after the per-expert
+/// FFNs; `complete` reads K outputs from `bufs.out[..k]` and runs
+/// the CPU-side combine — sum + sigmoid-gated shared + residual).
+///
+/// Mirrors the C `g_deferred.gpu_combined` boolean
+/// (`infer.m:4015..4030`); the CPU branch carries the inputs the
+/// finalize loop needs because they're not stored in any other
+/// long-lived buffer between `begin` and `complete`.
+pub enum DeferredMode {
+    /// `bufs.moe_hidden` is the readback target. Set when the
+    /// encode chain included `moe_combine_residual`.
+    Gpu,
+    /// CPU-side finalize: `complete_deferred_experts_into` reads
+    /// `bufs.out[0..k]` plus the host snapshots below and produces
+    /// `hidden = h_mid + Σ_k weights[k] * out[k] + sigmoid(gate) *
+    /// shared_out`. Mirrors `infer.m:4106..4129`.
+    Cpu {
+        h_mid: Vec<f32>,
+        shared_out: Vec<f32>,
+        expert_weights: Vec<f32>,
+        shared_gate_score: f32,
+    },
+}
+
 /// State carried between [`RsCtx::begin_deferred_experts`] and the
 /// matching `complete` / `discard`. Mirrors C
-/// `DeferredExpertState` (`infer.m:4015..4030`) for the
-/// `gpu_combined = 1` mode — the `h_mid` / `expert_weights` /
-/// `valid` / `shared_gate_score` fields used by the CPU-combine
-/// branch are omitted; FIXME(riir): port that mode when slice 4f
-/// integrates the production fast/slow split.
+/// `DeferredExpertState` (`infer.m:4015..4030`).
 pub struct DeferredState {
     /// The committed but un-awaited command buffer holding the
-    /// per-expert encoders + `moe_combine_residual` dispatch.
+    /// per-expert encoders (and optionally `moe_combine_residual`
+    /// when `mode = Gpu`).
     cmd_buffer: metal::CommandBuffer,
+    /// Finalize policy — see [`DeferredMode`].
+    mode: DeferredMode,
     /// Diagnostic only — for parity with C `g_deferred.layer_idx`.
     /// `-1` denotes a synthetic dispatch with no associated layer
     /// (the diff oracle path).
     #[allow(dead_code)]
     layer_idx: i32,
-    /// Diagnostic only — number of experts in the active dispatch.
-    /// Stored for parity with C's debug-dump path; not used by
-    /// `complete` (which reads from `bufs.moe_hidden`, GPU-combined).
-    #[allow(dead_code)]
+    /// Number of experts in the active dispatch. Read by the CPU-
+    /// combine path to know how many `bufs.out[k]` slots to read.
     actual_k: usize,
 }
 
@@ -101,6 +125,12 @@ impl From<RsError> for DeferredError {
 /// like `post_attention_tail` and `RsCtx::layer_forward_dump` can use
 /// it without holding a `&mut RsCtx`. Slice 4f-3 wires this into the
 /// per-layer forward.
+///
+/// `gpu_combine` selects the finalize policy (see [`DeferredMode`]).
+/// Slice 4f-4 plumbed the parameter through; today every production
+/// caller passes `true` (slice 4f-perf will flip per-layer based on
+/// `should_gpu_combine`'s C-mirrored conditions). The CPU-combine
+/// path is reached only via the diff-oracle test that forces it on.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gpu_batched_experts_begin(
     metal: &mut MetalBackend,
@@ -114,6 +144,7 @@ pub(crate) fn gpu_batched_experts_begin(
     expert_weights: &[f32],
     shared_gate_score: f32,
     layer_idx: i32,
+    gpu_combine: bool,
 ) -> Result<(), DeferredError> {
     if slot.is_some() {
         return Err(DeferredError::AlreadyActive);
@@ -128,10 +159,29 @@ pub(crate) fn gpu_batched_experts_begin(
         shared_out,
         expert_weights,
         shared_gate_score,
+        gpu_combine,
     )?;
     cmd_buffer.commit();
+    let mode = if gpu_combine {
+        DeferredMode::Gpu
+    } else {
+        // Snapshot the CPU-finalize inputs that the per-expert FFN
+        // dispatch doesn't preserve in any long-lived buffer. We
+        // could read `bufs.h_mid` / `bufs.shared_out` back at
+        // complete-time (they were just staged at begin-time), but
+        // a between-call begin/discard could overwrite them — owning
+        // the host snapshots keeps complete deterministic. Mirrors
+        // C's `g_deferred.h_mid[HIDDEN_DIM]` field.
+        DeferredMode::Cpu {
+            h_mid: h_mid.to_vec(),
+            shared_out: shared_out.to_vec(),
+            expert_weights: expert_weights.to_vec(),
+            shared_gate_score,
+        }
+    };
     *slot = Some(DeferredState {
         cmd_buffer,
+        mode,
         layer_idx,
         actual_k: actual_k as usize,
     });
@@ -139,8 +189,14 @@ pub(crate) fn gpu_batched_experts_begin(
 }
 
 /// Free-function variant of [`RsCtx::complete_deferred_experts`].
-/// Reads back the post-combine hidden from `bufs.moe_hidden()` into
-/// `hidden_out` and clears `slot`. No-op if `slot` is `None`.
+/// Drains the in-flight dispatch into `hidden_out` and clears
+/// `slot`. No-op if `slot` is `None`.
+///
+/// In [`DeferredMode::Gpu`] mode, the readback target is
+/// `bufs.moe_hidden`. In [`DeferredMode::Cpu`] mode, the K per-
+/// expert outputs are read back from `bufs.out[..k]` and combined
+/// CPU-side per `infer.m:4106..4129`:
+/// `hidden = h_mid + Σ_k weights[k] × out[k] + sigmoid(gate) × shared_out`.
 pub(crate) fn complete_deferred_experts_into(
     slot: &mut Option<DeferredState>,
     bufs: &MoeBuffers,
@@ -156,8 +212,79 @@ pub(crate) fn complete_deferred_experts_into(
         return Ok(());
     };
     state.cmd_buffer.wait_until_completed();
-    hidden_out.copy_from_slice(&bufs.moe_hidden().to_vec());
+    match state.mode {
+        DeferredMode::Gpu => {
+            hidden_out.copy_from_slice(&bufs.moe_hidden().to_vec());
+        }
+        DeferredMode::Cpu {
+            h_mid,
+            shared_out,
+            expert_weights,
+            shared_gate_score,
+        } => {
+            cpu_combine(
+                bufs,
+                state.actual_k,
+                &h_mid,
+                &shared_out,
+                &expert_weights,
+                shared_gate_score,
+                hidden_out,
+            );
+        }
+    }
     Ok(())
+}
+
+/// CPU-side equivalent of `moe_combine_residual` —
+/// `infer.m:4106..4129`. Reads K per-expert outputs from
+/// `bufs.out[0..k]`, accumulates the weighted sum into `hidden_out`,
+/// adds the sigmoid-gated shared expert and the residual. Bit-
+/// identical to the C path modulo `mul_add` contraction (which both
+/// sides use; see slice 6 / cpu_ops.rs for the FMA rationale).
+fn cpu_combine(
+    bufs: &MoeBuffers,
+    actual_k: usize,
+    h_mid: &[f32],
+    shared_out: &[f32],
+    expert_weights: &[f32],
+    shared_gate_score: f32,
+    hidden_out: &mut [f32],
+) {
+    let dim = VARIANT.hidden_dim;
+    debug_assert_eq!(h_mid.len(), dim);
+    debug_assert_eq!(shared_out.len(), dim);
+    debug_assert_eq!(expert_weights.len(), actual_k);
+    debug_assert_eq!(hidden_out.len(), dim);
+
+    // Start with the routed-experts weighted sum. Per-expert
+    // readback into a host scratch then a single fmadd pass keeps
+    // the inner loop branch-free. C path's order is the same:
+    // moe_out[i] starts at 0, accumulates K experts.
+    let mut moe_out = vec![0.0f32; dim];
+    for k in 0..actual_k {
+        let expert_k = bufs.out(k).to_vec();
+        debug_assert_eq!(expert_k.len(), dim);
+        super::cpu_ops::cpu_vec_madd(
+            &mut moe_out,
+            &expert_k,
+            expert_weights[k],
+        );
+    }
+
+    // Apply sigmoid gate to shared expert output (in place into a
+    // local `gated_shared` so we don't mutate the caller's
+    // snapshot). Mirrors `infer.m:4117..4124`.
+    let shared_weight = super::cpu_ops::cpu_sigmoid_scalar(shared_gate_score);
+
+    // Final fold: hidden[i] = h_mid[i] + moe_out[i] + shared_weight
+    // * shared_out[i]. Single sequential pass — `mul_add` to match
+    // clang's likely FMA contraction (per the slice 6 LM-head
+    // finding).
+    for i in 0..dim {
+        let s = shared_out[i].mul_add(shared_weight, moe_out[i]);
+        hidden_out[i] = h_mid[i] + s;
+    }
 }
 
 /// Free-function variant of [`RsCtx::discard_deferred_experts`]. Used
@@ -224,6 +351,7 @@ impl RsCtx {
             expert_weights,
             shared_gate_score,
             layer_idx,
+            /* gpu_combine = */ true,
         )
     }
 

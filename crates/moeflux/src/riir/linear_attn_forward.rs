@@ -327,6 +327,7 @@ pub fn linear_attn_layer_forward(
     k_active: usize,
     expert_files: &ExpertFiles,
     _layer_state: &mut LinearAttnState,
+    gpu_combine: bool,
 ) -> Result<(), LayerForwardError> {
     let v = VARIANT;
     let linear_layer_idx = linear_layer_idx_for(layer_idx).ok_or(
@@ -568,6 +569,7 @@ pub fn linear_attn_layer_forward(
             bits: o_bits,
             in_dim: v.linear_total_value() as u32,
         },
+        gpu_combine,
     )
 }
 
@@ -609,6 +611,7 @@ pub(super) fn post_attention_tail(
     k_active: usize,
     expert_files: &ExpertFiles,
     o_proj: OProj,
+    gpu_combine: bool,
 ) -> Result<(), LayerForwardError> {
     let v = VARIANT;
 
@@ -872,6 +875,7 @@ pub(super) fn post_attention_tail(
         &weights,
         shared_gate_score,
         layer_idx as i32,
+        gpu_combine,
     )?;
 
     // No write to `buffers.input` here — the dispatch is in flight.

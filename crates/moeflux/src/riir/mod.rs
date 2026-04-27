@@ -23,6 +23,7 @@
 
 use std::path::Path;
 
+pub mod cpu_ops;
 pub mod deferred;
 pub mod embedding;
 pub mod expert_forward;
@@ -529,12 +530,50 @@ impl RsCtx {
     /// recurrence state (KV cache for full-attn, conv/SSM state for
     /// linear-attn) is mutated in place. 4c landed the linear-attn
     /// path; 4d added the full-attn path via [`full_attn_layer_forward`].
+    ///
+    /// Default `gpu_combine = true` (slice 4f-3 production behavior).
+    /// Use [`Self::layer_forward_dump_with_gpu_combine`] to exercise
+    /// the slice 4f-4 CPU-combine path.
     pub fn layer_forward_dump(
         &mut self,
         layer_idx: i32,
         pos: i32,
         hidden_in: &[f32],
         hidden_out: &mut [f32],
+    ) -> Result<(), RsError> {
+        self.layer_forward_dump_inner(
+            layer_idx, pos, hidden_in, hidden_out, true,
+        )
+    }
+
+    /// As [`Self::layer_forward_dump`] but lets the caller select
+    /// `gpu_combine`. Slice 4f-4 added this entry point so the diff
+    /// oracle can exercise the CPU-combine fallback (the path the C
+    /// side takes when the next layer's `input_layernorm_w` is
+    /// unavailable, or the combine pipelines failed to compile). In
+    /// production today every caller uses `true`; slice 4f-perf will
+    /// thread the C-mirrored `should_gpu_combine` predicate through
+    /// `step_internal`.
+    pub fn layer_forward_dump_with_gpu_combine(
+        &mut self,
+        layer_idx: i32,
+        pos: i32,
+        hidden_in: &[f32],
+        hidden_out: &mut [f32],
+        gpu_combine: bool,
+    ) -> Result<(), RsError> {
+        self.layer_forward_dump_inner(
+            layer_idx, pos, hidden_in, hidden_out, gpu_combine,
+        )
+    }
+
+    fn layer_forward_dump_inner(
+        &mut self,
+        layer_idx: i32,
+        pos: i32,
+        hidden_in: &[f32],
+        hidden_out: &mut [f32],
+        gpu_combine: bool,
     ) -> Result<(), RsError> {
         let v = VARIANT;
         if layer_idx < 0 || (layer_idx as usize) >= v.num_layers {
@@ -617,6 +656,7 @@ impl RsCtx {
                 k_active,
                 experts,
                 kv_state,
+                gpu_combine,
             )
             .map_err(|_| RsError::EvalFailed)?;
         } else {
@@ -638,6 +678,7 @@ impl RsCtx {
                 k_active,
                 experts,
                 layer_state,
+                gpu_combine,
             )
             .map_err(|_| RsError::EvalFailed)?;
         }
