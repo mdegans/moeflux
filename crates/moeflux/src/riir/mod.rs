@@ -796,24 +796,232 @@ impl RsCtx {
         Ok(())
     }
 
+    /// Process `tokens.len()` tokens at positions `[start_pos,
+    /// start_pos + tokens.len())`. Only the final token emits logits
+    /// into `logits` (the prefix is state-update-only). Mirrors C
+    /// `mf_eval_prompt` (infer.m:7723..7744).
+    ///
+    /// `seq_id` is accepted for signature parity with the C API and
+    /// ignored — moeflux is single-stream.
+    ///
+    /// Empty `tokens`: returns `Ok(())` without writing `logits` (the
+    /// loop body never runs, matching the C-side empty-loop case).
     pub fn eval_prompt(
         &mut self,
-        _tokens: &[i32],
-        _start_pos: usize,
+        tokens: &[i32],
+        start_pos: usize,
         _seq_id: i32,
-        _logits: &mut [f32],
+        logits: &mut [f32],
     ) -> Result<(), RsError> {
-        todo!("RIIR Phase 4: forward-pass top-level")
+        if logits.len() != VARIANT.vocab_size {
+            return Err(RsError::EvalFailed);
+        }
+        for (i, &tok) in tokens.iter().enumerate() {
+            let pos = (start_pos + i) as i32;
+            let last = i + 1 == tokens.len();
+            let logits_arg: Option<&mut [f32]> =
+                if last { Some(&mut logits[..]) } else { None };
+            self.step_internal(tok, pos, logits_arg)?;
+        }
+        Ok(())
     }
 
+    /// Decode-style single-token step. Always emits logits. Mirrors C
+    /// `mf_eval_token` (infer.m:7746..7757).
     pub fn eval_token(
         &mut self,
-        _token: i32,
-        _pos: usize,
+        token: i32,
+        pos: usize,
         _seq_id: i32,
-        _logits: &mut [f32],
+        logits: &mut [f32],
     ) -> Result<(), RsError> {
-        todo!("RIIR Phase 4: forward-pass top-level")
+        if logits.len() != VARIANT.vocab_size {
+            return Err(RsError::EvalFailed);
+        }
+        self.step_internal(token, pos as i32, Some(logits))
+    }
+
+    /// Per-token forward orchestrator. Mirrors C `mf_step_internal`
+    /// (infer.m:7687..7721): embed → layer loop → optional drain +
+    /// final norm + lm_head. If `logits_out` is `Some`, the deferred
+    /// dispatch from the final layer is drained, the result is
+    /// `model.norm`-normalized CPU-side, and the LM head writes the
+    /// vocabulary-size logits buffer. If `None`, the deferred
+    /// dispatch is discarded and no logits are produced.
+    ///
+    /// Slice 4f-3 made `post_attention_tail` async; this orchestrator
+    /// drains the previous layer's dispatch at the top of each
+    /// iteration (no-op on iteration 0). Drain target is
+    /// `linear_buffers.input` so the next layer's CPU input rms_norm
+    /// reads the correct hidden state. The final drain (after the
+    /// loop) writes into a host scratch so the model.norm + lm_head
+    /// pair don't have to share the GPU buffer.
+    fn step_internal(
+        &mut self,
+        token: i32,
+        pos: i32,
+        logits_out: Option<&mut [f32]>,
+    ) -> Result<(), RsError> {
+        let v = VARIANT;
+        if pos < 0 {
+            return Err(RsError::EvalFailed);
+        }
+        if let Some(ref l) = logits_out {
+            if l.len() != v.vocab_size {
+                return Err(RsError::EvalFailed);
+            }
+        }
+
+        self.ensure_linear_resources()?;
+        let k_active = self.k_active;
+
+        // Field-disjoint mutable borrows for the layer loop. Same
+        // pattern as `layer_forward_dump_inner`.
+        let Self {
+            wf,
+            metal,
+            moe_buffers,
+            experts,
+            layer_states,
+            wf_buf,
+            layer_caches,
+            linear_buffers,
+            deferred,
+            ..
+        } = self;
+        let metal = metal.as_mut().expect("ensure_linear_resources");
+        let wf_buf = wf_buf.as_ref().expect("ensure_linear_resources");
+        let layer_caches =
+            layer_caches.as_ref().expect("ensure_linear_resources");
+        let linear_buffers =
+            linear_buffers.as_mut().expect("ensure_linear_resources");
+        let moe_buffers =
+            moe_buffers.as_mut().expect("ensure_linear_resources");
+
+        // Defensive bracket — drain stale state from a buggy prior
+        // call so re-entrancy holds.
+        deferred::discard_deferred_experts_in(deferred);
+
+        // Embed token into the persistent input buffer in-place.
+        // SAFETY: shared-storage buffer; no GPU work is in flight
+        // because we just discarded any deferred state.
+        {
+            let buf_input_slice = unsafe {
+                std::slice::from_raw_parts_mut(
+                    linear_buffers.input.contents() as *mut f32,
+                    v.hidden_dim,
+                )
+            };
+            embedding::embed_lookup(wf, token, buf_input_slice)
+                .map_err(|_| RsError::EvalFailed)?;
+        }
+
+        // Per-layer loop. Each layer leaves a deferred K-expert
+        // dispatch active; the next iteration drains it into
+        // `linear_buffers.input` before running its own forward.
+        // gpu_combine = true everywhere preserves the slice 4f-3
+        // production behavior; slice 4f-perf will gate this on
+        // `should_gpu_combine`'s C-mirrored conditions.
+        for layer_idx in 0..v.num_layers {
+            if layer_idx > 0 {
+                // Drain previous layer's deferred dispatch into
+                // linear_buffers.input. SAFETY: shared-storage
+                // buffer; complete_* waits before reading.
+                let buf_input_slice = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        linear_buffers.input.contents() as *mut f32,
+                        v.hidden_dim,
+                    )
+                };
+                deferred::complete_deferred_experts_into(
+                    deferred,
+                    moe_buffers,
+                    buf_input_slice,
+                )
+                .map_err(|_| RsError::EvalFailed)?;
+            }
+
+            let is_full = v.layer_kind(layer_idx)
+                == variants::LayerKind::FullAttn;
+            if is_full {
+                let kv_state = match &mut layer_states[layer_idx] {
+                    LayerState::FullAttn(kv) => kv,
+                    LayerState::LinearAttn(_) => {
+                        return Err(RsError::EvalFailed);
+                    }
+                };
+                full_attn_layer_forward(
+                    metal,
+                    wf,
+                    wf_buf,
+                    &layer_caches[layer_idx],
+                    linear_buffers,
+                    moe_buffers,
+                    deferred,
+                    layer_idx,
+                    pos,
+                    k_active,
+                    experts,
+                    kv_state,
+                    /* gpu_combine = */ true,
+                )
+                .map_err(|_| RsError::EvalFailed)?;
+            } else {
+                let layer_state = match &mut layer_states[layer_idx] {
+                    LayerState::LinearAttn(la) => la,
+                    LayerState::FullAttn(_) => {
+                        return Err(RsError::EvalFailed);
+                    }
+                };
+                linear_attn_layer_forward(
+                    metal,
+                    wf,
+                    wf_buf,
+                    &layer_caches[layer_idx],
+                    linear_buffers,
+                    moe_buffers,
+                    deferred,
+                    layer_idx,
+                    k_active,
+                    experts,
+                    layer_state,
+                    /* gpu_combine = */ true,
+                )
+                .map_err(|_| RsError::EvalFailed)?;
+            }
+        }
+
+        // Final layer left a deferred dispatch active. Drain (or
+        // discard) based on emit policy.
+        match logits_out {
+            None => {
+                deferred::discard_deferred_experts_in(deferred);
+            }
+            Some(logits) => {
+                let mut hidden_final = vec![0.0f32; v.hidden_dim];
+                deferred::complete_deferred_experts_into(
+                    deferred,
+                    moe_buffers,
+                    &mut hidden_final,
+                )
+                .map_err(|_| RsError::EvalFailed)?;
+
+                // Final RMSNorm (`model.norm.weight`) + LM head.
+                // CPU-side; bit-exact against C per slice 1 / 6.
+                let mut hidden_normed = vec![0.0f32; v.hidden_dim];
+                rms_norm_cpu(
+                    wf,
+                    "model.norm.weight",
+                    &hidden_final,
+                    &mut hidden_normed,
+                )
+                .map_err(|_| RsError::EvalFailed)?;
+                lm_head_cpu(wf, &hidden_normed, logits)
+                    .map_err(|_| RsError::EvalFailed)?;
+            }
+        }
+
+        Ok(())
     }
 
     /// Reset every layer's state to empty. Mirrors `mf_memory_clear`
