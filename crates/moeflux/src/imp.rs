@@ -584,6 +584,65 @@ impl Ctx {
         if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
     }
 
+    /// Slice 4e — begin a deferred K-expert dispatch. Encodes the same
+    /// pipeline as [`Self::gpu_batched_experts_forward`] but commits
+    /// async (without `waitUntilCompleted`) and stashes the cmdbuf in
+    /// `g_deferred`. Pair with [`Self::complete_deferred_experts`] (to
+    /// wait + read back) or [`Self::discard_deferred_experts`] (to wait
+    /// + clear without readback). Mirrors `mf_begin_deferred_experts`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_deferred_experts(
+        &mut self,
+        actual_k: i32,
+        expert_data: &[u8],
+        h_post: &[f32],
+        h_mid: &[f32],
+        shared_out: &[f32],
+        expert_weights: &[f32],
+        shared_gate_score: f32,
+    ) -> Result<(), Error> {
+        let rc = unsafe {
+            sys::mf_begin_deferred_experts(
+                self.inner.as_ptr(),
+                actual_k,
+                expert_data.as_ptr().cast(),
+                expert_data.len(),
+                h_post.as_ptr(),
+                h_mid.as_ptr(),
+                shared_out.as_ptr(),
+                expert_weights.as_ptr(),
+                shared_gate_score,
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
+    }
+
+    /// Slice 4e — wait for the deferred GPU dispatch, read back the
+    /// post-combine hidden state into `hidden_out`, clear `g_deferred`.
+    /// No-op if no deferred dispatch is active. `hidden_out` is
+    /// `HIDDEN_DIM` floats.
+    pub fn complete_deferred_experts(
+        &mut self,
+        hidden_out: &mut [f32],
+    ) -> Result<(), Error> {
+        let rc = unsafe {
+            sys::mf_complete_deferred_experts(
+                self.inner.as_ptr(),
+                hidden_out.as_mut_ptr(),
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
+    }
+
+    /// Slice 4e — wait for the deferred GPU dispatch (so the persistent
+    /// MoE buffers are no longer in use) and clear `g_deferred` without
+    /// reading back. No-op if no deferred dispatch is active.
+    pub fn discard_deferred_experts(&mut self) -> Result<(), Error> {
+        let rc =
+            unsafe { sys::mf_discard_deferred_experts(self.inner.as_ptr()) };
+        if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
+    }
+
     /// Run a single layer's forward pass starting from `hidden_in`,
     /// returning the post-layer hidden state in `hidden_out`. Phase 4
     /// layer-boundary checkpoint hook — the diff-oracle dump point for

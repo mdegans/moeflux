@@ -23,6 +23,7 @@
 
 use std::path::Path;
 
+pub mod deferred;
 pub mod embedding;
 pub mod expert_forward;
 pub mod expert_io;
@@ -43,6 +44,7 @@ pub mod sdpa;
 pub mod state;
 pub mod variants;
 pub mod weight_file;
+pub use deferred::{DeferredError, DeferredState};
 pub use embedding::{bf16_to_f32, embed_lookup, EmbeddingError};
 pub use expert_forward::{
     gpu_batched_experts_forward, gpu_expert_forward, ExpertForwardError,
@@ -124,6 +126,14 @@ pub struct RsCtx {
     layer_caches: Option<Vec<LayerWeightCache>>,
     /// Lazily-built persistent buffer set for the linear-attn forward.
     linear_buffers: Option<LinearAttnBuffers>,
+    /// Slice 4e — pending deferred-experts state. `Some` ↔ a
+    /// `begin_deferred_experts` call has committed a cmdbuf without
+    /// waiting; the matching `complete_deferred_experts` /
+    /// `discard_deferred_experts` consumes it. C-side analogue is
+    /// the file-scope `g_deferred` global; lifetime-binding to
+    /// `RsCtx` here is what eliminates the cross-Ctx NaN bug class
+    /// (see [`deferred`] module docs).
+    deferred: Option<DeferredState>,
     // Future phases populate: vocab.
 }
 
@@ -157,6 +167,7 @@ impl RsCtx {
             wf_buf: None,
             layer_caches: None,
             linear_buffers: None,
+            deferred: None,
         })
     }
 

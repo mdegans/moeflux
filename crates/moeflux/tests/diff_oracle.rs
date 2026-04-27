@@ -216,6 +216,32 @@ pub trait DiffBackend {
         shared_gate_score: f32,
     ) -> Vec<f32>;
 
+    /// Slice 4e — begin a deferred K-expert dispatch (commits async,
+    /// no readback). Pair with [`Self::complete_deferred_experts`] or
+    /// [`Self::discard_deferred_experts`].
+    #[allow(clippy::too_many_arguments)]
+    fn begin_deferred_experts(
+        &mut self,
+        actual_k: i32,
+        expert_data: &[u8],
+        h_post: &[f32],
+        h_mid: &[f32],
+        shared_out: &[f32],
+        expert_weights: &[f32],
+        shared_gate_score: f32,
+    );
+
+    /// Slice 4e — wait for the deferred dispatch and read back the
+    /// post-combine hidden state. Returns HIDDEN_DIM floats; an
+    /// all-zero vector if no deferred dispatch was active (matches the
+    /// C-side no-op semantics).
+    fn complete_deferred_experts(&mut self) -> Vec<f32>;
+
+    /// Slice 4e — wait for the deferred dispatch and clear state
+    /// without readback. Used in production for prefill tokens whose
+    /// hidden state is overwritten by the next token's embedding.
+    fn discard_deferred_experts(&mut self);
+
     /// Phase 4 layer-boundary diff checkpoint. Runs one layer's
     /// forward starting from `hidden_in` and returns the post-layer
     /// HIDDEN_DIM state. Drives the layer's per-layer state in place
@@ -496,6 +522,43 @@ impl DiffBackend for CBackend {
             )
             .expect("CBackend gpu_batched_experts_forward");
         out
+    }
+
+    fn begin_deferred_experts(
+        &mut self,
+        actual_k: i32,
+        expert_data: &[u8],
+        h_post: &[f32],
+        h_mid: &[f32],
+        shared_out: &[f32],
+        expert_weights: &[f32],
+        shared_gate_score: f32,
+    ) {
+        self.0
+            .begin_deferred_experts(
+                actual_k,
+                expert_data,
+                h_post,
+                h_mid,
+                shared_out,
+                expert_weights,
+                shared_gate_score,
+            )
+            .expect("CBackend begin_deferred_experts");
+    }
+
+    fn complete_deferred_experts(&mut self) -> Vec<f32> {
+        let mut out = vec![0.0f32; moeflux::riir::VARIANT.hidden_dim];
+        self.0
+            .complete_deferred_experts(&mut out)
+            .expect("CBackend complete_deferred_experts");
+        out
+    }
+
+    fn discard_deferred_experts(&mut self) {
+        self.0
+            .discard_deferred_experts()
+            .expect("CBackend discard_deferred_experts");
     }
 
     fn layer_forward_dump(
@@ -791,6 +854,43 @@ impl DiffBackend for RsBackend {
             )
             .expect("RsBackend gpu_batched_experts_forward");
         out
+    }
+
+    fn begin_deferred_experts(
+        &mut self,
+        actual_k: i32,
+        expert_data: &[u8],
+        h_post: &[f32],
+        h_mid: &[f32],
+        shared_out: &[f32],
+        expert_weights: &[f32],
+        shared_gate_score: f32,
+    ) {
+        // layer_idx = -1 mirrors the C hook (synthetic / no real layer).
+        self.0
+            .begin_deferred_experts(
+                actual_k,
+                expert_data,
+                h_post,
+                h_mid,
+                shared_out,
+                expert_weights,
+                shared_gate_score,
+                -1,
+            )
+            .expect("RsBackend begin_deferred_experts");
+    }
+
+    fn complete_deferred_experts(&mut self) -> Vec<f32> {
+        let mut out = vec![0.0f32; moeflux::riir::VARIANT.hidden_dim];
+        self.0
+            .complete_deferred_experts(&mut out)
+            .expect("RsBackend complete_deferred_experts");
+        out
+    }
+
+    fn discard_deferred_experts(&mut self) {
+        self.0.discard_deferred_experts();
     }
 
     fn layer_forward_dump(
@@ -2377,6 +2477,218 @@ fn gpu_batched_experts_forward_close_c_vs_rust() {
     assert!(
         rel <= REL_DIFF_FLOOR,
         "[diff:gpu_batched_experts_forward] relative max_abs_diff \
+         {rel:.3e} above {REL_DIFF_FLOOR:.3e}"
+    );
+}
+
+/// Phase 4e: paired begin → complete via the deferred-experts state
+/// machine, C path vs Rust port. Same kernels as 9b
+/// (`gpu_batched_experts_forward`) split across an async commit and
+/// a separate wait + readback. Confirms the begin/complete pair
+/// produces the same final hidden state as the synchronous
+/// single-call path.
+///
+/// Same tolerance regime as 9b (cosine ≥ 0.9999, rel ≤ 1e-3 — likely
+/// bit-exact in practice; the underlying kernels are unchanged).
+/// `layer_idx = -1` on both sides (synthetic dispatch — see the C
+/// hook's invariant in `mf_begin_deferred_experts`).
+#[test]
+#[ignore = "long running; needs Metal device + moeflux artifacts"]
+fn deferred_experts_begin_complete_close_c_vs_rust() {
+    use moeflux::riir::expert_forward::synth;
+    use moeflux::riir::VARIANT;
+
+    let mut c: CBackend = open_backend();
+    let mut rs: RsBackend = open_backend();
+
+    let k: usize = 4;
+    let expert_data = synth::k_expert_data_seeded(k);
+    let h_post = synth::h_post_seeded();
+    let h_mid = synth::h_mid_seeded();
+    let shared_out = synth::shared_out_seeded();
+    let weights = synth::expert_weights_seeded(k);
+    let shared_gate_score: f32 = -1.0;
+
+    assert_eq!(expert_data.len(), k * VARIANT.expert_size_4bit());
+    assert_eq!(weights.len(), k);
+
+    c.begin_deferred_experts(
+        k as i32, &expert_data, &h_post, &h_mid, &shared_out, &weights,
+        shared_gate_score,
+    );
+    let c_out = c.complete_deferred_experts();
+
+    rs.begin_deferred_experts(
+        k as i32, &expert_data, &h_post, &h_mid, &shared_out, &weights,
+        shared_gate_score,
+    );
+    let rs_out = rs.complete_deferred_experts();
+
+    assert_eq!(c_out.len(), VARIANT.hidden_dim);
+    assert_eq!(rs_out.len(), VARIANT.hidden_dim);
+
+    let cos = cosine_sim(&c_out, &rs_out);
+    let max_abs_out = c_out
+        .iter()
+        .chain(rs_out.iter())
+        .map(|x| x.abs())
+        .fold(0.0f32, f32::max);
+    let max_abs_diff = c_out
+        .iter()
+        .zip(rs_out.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let rel = if max_abs_out > 0.0 {
+        max_abs_diff / max_abs_out
+    } else {
+        0.0
+    };
+
+    eprintln!(
+        "[diff:deferred_experts_begin_complete k={k}] cosine={cos:.7} \
+         max_abs_diff={max_abs_diff:.3e} max_abs_out={max_abs_out:.3e} \
+         relative={rel:.3e}"
+    );
+
+    assert!(
+        c_out.iter().all(|x| x.is_finite()),
+        "[diff:deferred_experts_begin_complete] C output has NaN/Inf"
+    );
+    assert!(
+        rs_out.iter().all(|x| x.is_finite()),
+        "[diff:deferred_experts_begin_complete] Rust output has NaN/Inf"
+    );
+    assert!(
+        c_out.iter().any(|&x| x != 0.0),
+        "[diff:deferred_experts_begin_complete] C output is all zero"
+    );
+    assert!(
+        rs_out.iter().any(|&x| x != 0.0),
+        "[diff:deferred_experts_begin_complete] Rust output is all zero"
+    );
+
+    const COSINE_FLOOR: f32 = 0.9999;
+    const REL_DIFF_FLOOR: f32 = 1e-3;
+    assert!(
+        cos >= COSINE_FLOOR,
+        "[diff:deferred_experts_begin_complete] cosine {cos:.7} below {COSINE_FLOOR}"
+    );
+    assert!(
+        rel <= REL_DIFF_FLOOR,
+        "[diff:deferred_experts_begin_complete] relative max_abs_diff \
+         {rel:.3e} above {REL_DIFF_FLOOR:.3e}"
+    );
+}
+
+/// Phase 4e: discard semantics. Asserts that on each backend, a
+/// `discard` between two begins doesn't taint the second dispatch's
+/// output — i.e. the wait-then-clear actually clears state, and the
+/// next begin starts from a clean slate. Performs the discard cycle
+/// on both backends and compares the second dispatch's hidden state
+/// across C vs Rust.
+///
+/// The first (discarded) dispatch uses K=2 with one set of synthetic
+/// inputs; the second (kept) dispatch uses K=4 with a different set.
+/// The cross-backend comparison confirms both impls handle the
+/// discard-then-begin sequence identically.
+#[test]
+#[ignore = "long running; needs Metal device + moeflux artifacts"]
+fn deferred_experts_discard_clears_state_c_vs_rust() {
+    use moeflux::riir::expert_forward::synth;
+    use moeflux::riir::VARIANT;
+
+    let mut c: CBackend = open_backend();
+    let mut rs: RsBackend = open_backend();
+
+    // First dispatch (will be discarded): K=2.
+    let k1: usize = 2;
+    let data1 = synth::k_expert_data_seeded(k1);
+    let h_post1 = synth::h_post_seeded();
+    let h_mid1 = synth::h_mid_seeded();
+    let shared_out1 = synth::shared_out_seeded();
+    let weights1 = synth::expert_weights_seeded(k1);
+
+    // Second dispatch (will be completed and compared): K=4 with a
+    // different set of inputs derived by reseeding through K.
+    let k2: usize = 4;
+    let data2 = synth::k_expert_data_seeded(k2);
+    let h_post2 = synth::h_post_seeded();
+    let h_mid2 = synth::h_mid_seeded();
+    let shared_out2 = synth::shared_out_seeded();
+    let weights2 = synth::expert_weights_seeded(k2);
+
+    // C side.
+    c.begin_deferred_experts(
+        k1 as i32, &data1, &h_post1, &h_mid1, &shared_out1, &weights1, -1.0,
+    );
+    c.discard_deferred_experts();
+    c.begin_deferred_experts(
+        k2 as i32, &data2, &h_post2, &h_mid2, &shared_out2, &weights2, -1.0,
+    );
+    let c_out = c.complete_deferred_experts();
+
+    // Rust side.
+    rs.begin_deferred_experts(
+        k1 as i32, &data1, &h_post1, &h_mid1, &shared_out1, &weights1, -1.0,
+    );
+    rs.discard_deferred_experts();
+    rs.begin_deferred_experts(
+        k2 as i32, &data2, &h_post2, &h_mid2, &shared_out2, &weights2, -1.0,
+    );
+    let rs_out = rs.complete_deferred_experts();
+
+    assert_eq!(c_out.len(), VARIANT.hidden_dim);
+    assert_eq!(rs_out.len(), VARIANT.hidden_dim);
+
+    let cos = cosine_sim(&c_out, &rs_out);
+    let max_abs_out = c_out
+        .iter()
+        .chain(rs_out.iter())
+        .map(|x| x.abs())
+        .fold(0.0f32, f32::max);
+    let max_abs_diff = c_out
+        .iter()
+        .zip(rs_out.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let rel = if max_abs_out > 0.0 {
+        max_abs_diff / max_abs_out
+    } else {
+        0.0
+    };
+
+    eprintln!(
+        "[diff:deferred_experts_discard k1={k1} k2={k2}] cosine={cos:.7} \
+         max_abs_diff={max_abs_diff:.3e} max_abs_out={max_abs_out:.3e} \
+         relative={rel:.3e}"
+    );
+
+    assert!(
+        c_out.iter().all(|x| x.is_finite()),
+        "[diff:deferred_experts_discard] C output has NaN/Inf"
+    );
+    assert!(
+        rs_out.iter().all(|x| x.is_finite()),
+        "[diff:deferred_experts_discard] Rust output has NaN/Inf"
+    );
+    assert!(
+        c_out.iter().any(|&x| x != 0.0),
+        "[diff:deferred_experts_discard] C output is all zero"
+    );
+    assert!(
+        rs_out.iter().any(|&x| x != 0.0),
+        "[diff:deferred_experts_discard] Rust output is all zero"
+    );
+
+    const COSINE_FLOOR: f32 = 0.9999;
+    const REL_DIFF_FLOOR: f32 = 1e-3;
+    assert!(
+        cos >= COSINE_FLOOR,
+        "[diff:deferred_experts_discard] cosine {cos:.7} below {COSINE_FLOOR}"
+    );
+    assert!(
+        rel <= REL_DIFF_FLOOR,
+        "[diff:deferred_experts_discard] relative max_abs_diff \
          {rel:.3e} above {REL_DIFF_FLOOR:.3e}"
     );
 }

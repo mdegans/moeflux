@@ -341,6 +341,57 @@ int mf_gpu_batched_experts_forward(mf_ctx *ctx,
                                     float shared_gate_score,
                                     float *hidden_out);
 
+// Slice 4e — deferred-experts state machine, three-call API.
+//
+// Mirrors the production async path inside `fused_layer_forward`
+// (`infer.m:5747..5776`). Where `mf_gpu_batched_experts_forward`
+// commits + waits + reads back in one call, this trio splits the
+// commit-without-wait into `_begin` and the wait+readback into
+// `_complete` (or `_discard`). The diff oracle exercises the same
+// async state machine that drives layer-to-layer GPU/CPU overlap.
+//
+// Begin: stages inputs, encodes K-expert FFN + `moe_combine_residual`
+// into one cmdbuf, commits async (no wait), saves cmdbuf + per-expert
+// metadata in `g_deferred`. Brackets entry with
+// `discard_deferred_experts()` so a previous test's leaked state is
+// cleared first — same invariant `mf_layer_forward_dump` keeps.
+//
+// Returns 0 on success; -1 on NULL args, wrong `expert_data_len`,
+// `actual_K` out of range, ctx initialized with `use_2bit != 0`,
+// missing Metal pipelines, or already-active deferred state. Args
+// match `mf_gpu_batched_experts_forward` minus `hidden_out` (caller
+// provides that to `_complete` later).
+int mf_begin_deferred_experts(mf_ctx *ctx,
+                               int32_t actual_K,
+                               const void *expert_data,
+                               size_t expert_data_len,
+                               const float *h_post,
+                               const float *h_mid,
+                               const float *shared_out,
+                               const float *expert_weights,
+                               float shared_gate_score);
+
+// Complete: waits for the deferred GPU work, reads back from
+// `buf_moe_hidden` into the caller-supplied `hidden_out`, clears
+// `g_deferred`. No-op (returns 0) when no deferred state is active —
+// mirrors C-internal `complete_deferred_experts`'s
+// `if (!g_deferred.active) return;` guard.
+//
+//   hidden_out: HIDDEN_DIM floats — receives the post-combine hidden.
+//
+// Returns 0 on success / no-op; -1 on NULL args.
+int mf_complete_deferred_experts(mf_ctx *ctx, float *hidden_out);
+
+// Discard: waits for the deferred GPU work (so the persistent
+// `MoeBuffers` are no longer in use by the GPU) and clears
+// `g_deferred` without reading back. Mirrors C-internal
+// `discard_deferred_experts` — used in production for prefill tokens
+// where the hidden state is immediately overwritten by the next
+// token's embedding.
+//
+// Returns 0 on success / no-op; -1 on NULL ctx.
+int mf_discard_deferred_experts(mf_ctx *ctx);
+
 // Load one expert's packed bytes (`EXPERT_SIZE` for the active 4-bit
 // variant) from disk. Reads via `pread(ctx->layer_fds[layer_idx],
 // out, EXPERT_SIZE, expert_idx * EXPERT_SIZE)` — same path the cold

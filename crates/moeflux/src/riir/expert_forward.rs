@@ -319,6 +319,14 @@ impl MoeBuffers {
             combine_params: MtlBuffer::with_len(device, 18),
         }
     }
+
+    /// The post-combine hidden buffer (`buf_moe_hidden` in C). The
+    /// destination for `moe_combine_residual` and the readback target
+    /// for the deferred-experts state machine
+    /// ([`super::deferred::RsCtx::complete_deferred_experts`]).
+    pub(crate) fn moe_hidden(&self) -> &MtlBuffer<f32> {
+        &self.moe_hidden
+    }
 }
 
 impl std::fmt::Debug for MoeBuffers {
@@ -368,6 +376,56 @@ pub fn gpu_batched_experts_forward(
     hidden_out: &mut [f32],
 ) -> Result<(), ExpertForwardError> {
     let v = VARIANT;
+    if hidden_out.len() != v.hidden_dim {
+        return Err(ExpertForwardError::BadHiddenOutLen {
+            expected: v.hidden_dim,
+            actual: hidden_out.len(),
+        });
+    }
+    let cmdbuf = gpu_batched_experts_encode(
+        metal,
+        bufs,
+        actual_k,
+        expert_data,
+        h_post,
+        h_mid,
+        shared_out,
+        expert_weights,
+        shared_gate_score,
+    )?;
+    cmdbuf.commit();
+    cmdbuf.wait_until_completed();
+    hidden_out.copy_from_slice(&bufs.moe_hidden.to_vec());
+    Ok(())
+}
+
+/// Encode the K-expert FFN + `moe_combine_residual` into a fresh
+/// command buffer. Stages caller inputs into `bufs`, returns the
+/// (uncommitted) owned command buffer.
+///
+/// Callers decide commit + wait policy:
+///
+/// - [`gpu_batched_experts_forward`] commits + waits + reads back
+///   from `bufs.moe_hidden` synchronously.
+/// - The slice 4e deferred-experts state machine (see
+///   [`super::deferred`]) commits async and stashes the cmdbuf in
+///   `RsCtx::deferred` for a later `complete` / `discard` call.
+///
+/// Mirrors C `oracle_batched_experts_encode` (`infer.m` slice 4e
+/// refactor).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gpu_batched_experts_encode(
+    metal: &mut MetalBackend,
+    bufs: &mut MoeBuffers,
+    actual_k: i32,
+    expert_data: &[u8],
+    h_post: &[f32],
+    h_mid: &[f32],
+    shared_out: &[f32],
+    expert_weights: &[f32],
+    shared_gate_score: f32,
+) -> Result<metal::CommandBuffer, ExpertForwardError> {
+    let v = VARIANT;
     if actual_k < 1 || (actual_k as usize) > MAX_K {
         return Err(ExpertForwardError::BadK {
             actual: actual_k,
@@ -398,12 +456,6 @@ pub fn gpu_batched_experts_forward(
         return Err(ExpertForwardError::BadSharedOutLen {
             expected: v.hidden_dim,
             actual: shared_out.len(),
-        });
-    }
-    if hidden_out.len() != v.hidden_dim {
-        return Err(ExpertForwardError::BadHiddenOutLen {
-            expected: v.hidden_dim,
-            actual: hidden_out.len(),
         });
     }
     if expert_weights.len() != k {
@@ -533,11 +585,7 @@ pub fn gpu_batched_experts_forward(
         enc.end_encoding();
     }
 
-    cmdbuf.commit();
-    cmdbuf.wait_until_completed();
-
-    hidden_out.copy_from_slice(&bufs.moe_hidden.to_vec());
-    Ok(())
+    Ok(cmdbuf.to_owned())
 }
 
 /// Inner-loop matvec encoder — same shape as [`encode_matvec`] but

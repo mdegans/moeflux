@@ -8042,26 +8042,30 @@ int mf_gpu_expert_forward(mf_ctx *ctx,
     return 0;
 }
 
-// Diff-oracle entry: batched K-expert FFN forward + GPU combine.
-// Stages caller-provided inputs into the file-scope `g_metal`'s
-// pre-allocated multi-expert buffers, encodes the same per-expert
-// pipeline `gpu_encode_experts_batched` uses in production, then
-// `moe_combine_residual`, commits, waits, and reads back. Mirrors
-// the production callsite at infer.m:5680..5710 minus the RMSNorm
-// fusion (slice 9e) and the deferred-state plumbing (slice 9d).
-int mf_gpu_batched_experts_forward(mf_ctx *ctx,
-                                    int32_t actual_K,
-                                    const void *expert_data,
-                                    size_t expert_data_len,
-                                    const float *h_post,
-                                    const float *h_mid,
-                                    const float *shared_out,
-                                    const float *expert_weights,
-                                    float shared_gate_score,
-                                    float *hidden_out)
+// Stage caller inputs into the file-scope `g_metal` multi-expert
+// buffers and encode K-expert FFN + `moe_combine_residual` into the
+// supplied cmdbuf. Caller owns the cmdbuf and decides commit/wait
+// policy: the synchronous diff hook commits + waits + reads back, the
+// deferred hook commits async and stashes for later wait. Mirrors the
+// production callsite at infer.m:5628..5710 minus the RMSNorm fusion
+// (slice 9e) and the shared-expert SwiGLU+down (caller pre-computes
+// `shared_out`).
+//
+// Returns 0 on success; -1 on bad args, 2-bit ctx, or missing
+// pipelines. Does NOT commit `cmdbuf`.
+static int oracle_batched_experts_encode(
+    id<MTLCommandBuffer> cmdbuf,
+    int32_t actual_K,
+    const void *expert_data,
+    size_t expert_data_len,
+    const float *h_post,
+    const float *h_mid,
+    const float *shared_out,
+    const float *expert_weights,
+    float shared_gate_score)
 {
-    if (!ctx || !expert_data || !h_post || !h_mid || !shared_out
-        || !expert_weights || !hidden_out) return -1;
+    if (!cmdbuf || !expert_data || !h_post || !h_mid || !shared_out
+        || !expert_weights) return -1;
     if (g_use_2bit) return -1;
     if (actual_K < 1 || actual_K > MAX_K) return -1;
     if (expert_data_len != (size_t)EXPERT_SIZE * (size_t)actual_K) return -1;
@@ -8092,8 +8096,6 @@ int mf_gpu_batched_experts_forward(mf_ctx *ctx,
     }
     int valid[MAX_K];
     for (int k = 0; k < MAX_K; k++) valid[k] = (k < actual_K) ? 1 : 0;
-
-    id<MTLCommandBuffer> cmdbuf = [g_metal->queue commandBuffer];
 
     // Per-expert: 2 encoders (gate+up, then SwiGLU+down). Same path
     // as production — `gpu_encode_experts_batched` reads the staged
@@ -8126,11 +8128,119 @@ int mf_gpu_batched_experts_forward(mf_ctx *ctx,
         [enc endEncoding];
     }
 
+    return 0;
+}
+
+// Diff-oracle entry: batched K-expert FFN forward + GPU combine.
+// Synchronous wrapper around `oracle_batched_experts_encode`: encodes,
+// commits, waits, reads back. Mirrors the production callsite at
+// infer.m:5680..5710 minus the RMSNorm fusion (slice 9e) and the
+// deferred-state plumbing (slice 4e — see `mf_begin_deferred_experts`
+// for the async variant).
+int mf_gpu_batched_experts_forward(mf_ctx *ctx,
+                                    int32_t actual_K,
+                                    const void *expert_data,
+                                    size_t expert_data_len,
+                                    const float *h_post,
+                                    const float *h_mid,
+                                    const float *shared_out,
+                                    const float *expert_weights,
+                                    float shared_gate_score,
+                                    float *hidden_out)
+{
+    if (!ctx || !hidden_out) return -1;
+    if (!g_metal) return -1;
+
+    id<MTLCommandBuffer> cmdbuf = [g_metal->queue commandBuffer];
+    int rc = oracle_batched_experts_encode(
+        cmdbuf, actual_K, expert_data, expert_data_len,
+        h_post, h_mid, shared_out, expert_weights, shared_gate_score);
+    if (rc != 0) return rc;
+
     [cmdbuf commit];
     [cmdbuf waitUntilCompleted];
 
     memcpy(hidden_out, [g_metal->buf_moe_hidden contents],
            (size_t)HIDDEN_DIM * sizeof(float));
+    return 0;
+}
+
+// Slice 4e — deferred-experts state machine, three-call API.
+//
+// `mf_begin_deferred_experts` encodes the same K-expert + combine
+// pipeline as the synchronous hook, commits async, and stashes
+// cmdbuf + metadata in `g_deferred` matching the production async
+// path at infer.m:5747..5776. `mf_complete_deferred_experts` waits +
+// reads back via the existing static `complete_deferred_experts`
+// (which routes through `finalize_deferred_experts`'s
+// `gpu_combined=1` branch — that branch reads from `buf_moe_hidden`
+// into `g_deferred.hidden`, late-bound here to caller's
+// `hidden_out`). `mf_discard_deferred_experts` waits + clears
+// without readback.
+//
+// The hook always operates in `gpu_combined=1` mode: the encode
+// helper appends `moe_combine_residual` so the GPU produces the
+// final hidden in `buf_moe_hidden`. The `gpu_combined=0` (CPU
+// readback + per-expert madd + sigmoid gate + final combine) path
+// is exercised in production by `fused_layer_forward` when the next
+// layer's input-norm weight isn't cacheable; FIXME(riir): port that
+// mode when slice 4f integrates the production fast/slow split.
+int mf_begin_deferred_experts(mf_ctx *ctx,
+                               int32_t actual_K,
+                               const void *expert_data,
+                               size_t expert_data_len,
+                               const float *h_post,
+                               const float *h_mid,
+                               const float *shared_out,
+                               const float *expert_weights,
+                               float shared_gate_score)
+{
+    if (!ctx) return -1;
+    if (!g_metal) return -1;
+    if (g_deferred.active) return -1; // single-active-buffer invariant
+
+    // Bracket the entry like `mf_layer_forward_dump` (infer.m:8262):
+    // a no-op when nothing's pending, but defends against a previous
+    // test having returned without explicit `_complete` / `_discard`.
+    discard_deferred_experts();
+
+    id<MTLCommandBuffer> cmd = [g_metal->queue commandBuffer];
+    int rc = oracle_batched_experts_encode(
+        cmd, actual_K, expert_data, expert_data_len,
+        h_post, h_mid, shared_out, expert_weights, shared_gate_score);
+    if (rc != 0) return rc;
+
+    [cmd commit];
+
+    g_deferred.active = 1;
+    g_deferred.gpu_combined = 1;
+    g_deferred.cmd_experts = cmd;
+    g_deferred.actual_K = actual_K;
+    g_deferred.shared_gate_score = shared_gate_score;
+    g_deferred.hidden = NULL; // late-bound by `mf_complete_deferred_experts`
+    g_deferred.layer_idx = -1; // synthetic — no real layer
+    for (int k = 0; k < actual_K; k++) {
+        g_deferred.expert_weights[k] = expert_weights[k];
+        g_deferred.valid[k] = 1;
+    }
+    // h_mid is unused under gpu_combined=1 (finalize reads from
+    // buf_moe_hidden, not g_deferred.h_mid).
+    return 0;
+}
+
+int mf_complete_deferred_experts(mf_ctx *ctx, float *hidden_out)
+{
+    if (!ctx || !hidden_out) return -1;
+    if (!g_deferred.active) return 0; // mirrors C internal no-op
+    g_deferred.hidden = hidden_out;   // late-bind destination
+    complete_deferred_experts();      // wait + finalize (memcpy from buf_moe_hidden)
+    return 0;
+}
+
+int mf_discard_deferred_experts(mf_ctx *ctx)
+{
+    if (!ctx) return -1;
+    discard_deferred_experts(); // wait + clear without readback
     return 0;
 }
 
