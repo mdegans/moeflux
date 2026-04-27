@@ -216,6 +216,21 @@ pub trait DiffBackend {
         shared_gate_score: f32,
     ) -> Vec<f32>;
 
+    /// Phase 4 layer-boundary diff checkpoint. Runs one layer's
+    /// forward starting from `hidden_in` and returns the post-layer
+    /// HIDDEN_DIM state. Drives the layer's per-layer state in place
+    /// (callers are expected to `memory_clear` between independent
+    /// trials so the KV / recurrence start state matches across
+    /// backends). Tests land in 4c (linear-attn) / 4d (full-attn);
+    /// the trait method is here in 4b so both backend impls can be
+    /// wired ahead of the kernel landing.
+    fn layer_forward_dump(
+        &mut self,
+        layer_idx: i32,
+        pos: i32,
+        hidden_in: &[f32],
+    ) -> Vec<f32>;
+
     /// Prefill `tokens` at `start_pos`. Returns the n_vocab-length
     /// logit vector for the position immediately after the last
     /// token in `tokens`.
@@ -480,6 +495,19 @@ impl DiffBackend for CBackend {
                 &mut out,
             )
             .expect("CBackend gpu_batched_experts_forward");
+        out
+    }
+
+    fn layer_forward_dump(
+        &mut self,
+        layer_idx: i32,
+        pos: i32,
+        hidden_in: &[f32],
+    ) -> Vec<f32> {
+        let mut out = vec![0.0f32; moeflux::riir::VARIANT.hidden_dim];
+        self.0
+            .layer_forward_dump(layer_idx, pos, hidden_in, &mut out)
+            .expect("CBackend layer_forward_dump");
         out
     }
 
@@ -762,6 +790,19 @@ impl DiffBackend for RsBackend {
                 &mut out,
             )
             .expect("RsBackend gpu_batched_experts_forward");
+        out
+    }
+
+    fn layer_forward_dump(
+        &mut self,
+        layer_idx: i32,
+        pos: i32,
+        hidden_in: &[f32],
+    ) -> Vec<f32> {
+        let mut out = vec![0.0f32; moeflux::riir::VARIANT.hidden_dim];
+        self.0
+            .layer_forward_dump(layer_idx, pos, hidden_in, &mut out)
+            .expect("RsBackend layer_forward_dump");
         out
     }
 
@@ -2337,6 +2378,57 @@ fn gpu_batched_experts_forward_close_c_vs_rust() {
         rel <= REL_DIFF_FLOOR,
         "[diff:gpu_batched_experts_forward] relative max_abs_diff \
          {rel:.3e} above {REL_DIFF_FLOOR:.3e}"
+    );
+}
+
+/// Phase 4b sanity: the C-side `mf_layer_forward_dump` hook is
+/// callable and returns finite output. The numerical-correctness
+/// signal lands in 4c when `RsCtx::layer_forward_dump` exists and
+/// the diff oracle compares per-layer outputs head-on.
+///
+/// Permissive on purpose: 4b discovered a third cross-Ctx state bug
+/// in addition to the two captured during the bisect. The C side has
+/// a process-global `layer_cache` (host-side weight-pointer cache,
+/// `infer.m:~3960`) that's populated on first call to
+/// `fused_layer_forward` from whichever ctx ran first. When that ctx
+/// is freed and a later test opens a fresh ctx, the cache's
+/// `layer_cache_built` flag stays 1 so the cache is never rebuilt —
+/// its pointers now reference freed memory. On this M2 Max with
+/// these tests run serially, those pages typically come back zeroed,
+/// making `fused_layer_forward` for the second ctx an effective
+/// no-op (`hidden_out == hidden_in`). This is the same bug class as
+/// the documented `g_deferred` cross-Ctx NaN finding; the Phase 7
+/// fix lifts both into Ctx-owned state.
+///
+/// FIXME(riir): `layer_cache` cross-Ctx state pollution. Phase 7 fix
+/// alongside the typed-`memory_seq_rm` work. Recorded in the
+/// drama_llama in-repo `blallama_session_state_pollution.md`.
+#[test]
+#[ignore = "long running; needs moeflux artifacts"]
+fn layer_forward_dump_c_self_sanity() {
+    let mut c: CBackend = open_backend();
+    let hidden_dim = moeflux::riir::VARIANT.hidden_dim;
+
+    c.memory_clear();
+    let hidden_in = c.embed(/* token_id */ 1);
+    assert_eq!(hidden_in.len(), hidden_dim);
+
+    let hidden_out = c.layer_forward_dump(/* layer_idx */ 0, /* pos */ 0, &hidden_in);
+    assert_eq!(hidden_out.len(), hidden_dim);
+
+    // The only assertion we can make order-independently — finite
+    // output. NaN/Inf would indicate uninitialized state being read or
+    // a corrupted weight tensor.
+    assert!(
+        hidden_out.iter().all(|x| x.is_finite()),
+        "[diff:layer_forward_dump_c] hidden_out contains NaN/Inf"
+    );
+
+    eprintln!(
+        "[diff:layer_forward_dump_c] layer=0 hidden_dim={hidden_dim} \
+         first 4 in={:?} out={:?}",
+        &hidden_in[..4],
+        &hidden_out[..4],
     );
 }
 

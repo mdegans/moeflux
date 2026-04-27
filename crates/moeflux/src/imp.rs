@@ -584,6 +584,33 @@ impl Ctx {
         if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
     }
 
+    /// Run a single layer's forward pass starting from `hidden_in`,
+    /// returning the post-layer hidden state in `hidden_out`. Phase 4
+    /// layer-boundary checkpoint hook — the diff-oracle dump point for
+    /// `fused_layer_forward`. Drives the targeted layer's per-layer
+    /// state in place; the deferred-expert pipeline is flushed before
+    /// return so `g_deferred.active` is 0 on both entry and exit.
+    ///
+    /// `hidden_in` and `hidden_out` are both `HIDDEN_DIM` floats.
+    pub fn layer_forward_dump(
+        &mut self,
+        layer_idx: i32,
+        pos: i32,
+        hidden_in: &[f32],
+        hidden_out: &mut [f32],
+    ) -> Result<(), Error> {
+        let rc = unsafe {
+            sys::mf_layer_forward_dump(
+                self.inner.as_ptr(),
+                layer_idx,
+                pos,
+                hidden_in.as_ptr(),
+                hidden_out.as_mut_ptr(),
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
+    }
+
     /// Reset the sequence to empty.
     pub fn memory_clear(&mut self) {
         unsafe { sys::mf_memory_clear(self.inner.as_ptr()) }

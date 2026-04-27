@@ -8228,6 +8228,46 @@ int mf_gpu_rms_norm_fused(mf_ctx *ctx,
     return 0;
 }
 
+// Phase 4 layer-boundary checkpoint hook. Loads `hidden_in` into the
+// ctx's hidden buffer, runs `fused_layer_forward` for one layer using
+// the ctx's existing per-layer state arrays, flushes the deferred-
+// expert pipeline, then copies the resulting hidden state to
+// `hidden_out`. Brackets the call with `discard_deferred_experts` /
+// `complete_deferred_experts` so `g_deferred.active` is 0 on both
+// entry and exit — repeated hook calls don't bleed deferred state
+// between layers (or between Ctx instances; that bug class is the
+// Phase 7 cross-Ctx NaN that 4e captures structurally).
+int mf_layer_forward_dump(mf_ctx *ctx,
+                          int32_t layer_idx,
+                          int32_t pos,
+                          const float *hidden_in,
+                          float *hidden_out)
+{
+    if (!ctx || !hidden_in || !hidden_out) return -1;
+    if (layer_idx < 0 || layer_idx >= NUM_LAYERS) return -1;
+    if (pos < 0) return -1;
+
+    discard_deferred_experts();
+
+    memcpy(ctx->hidden, hidden_in, HIDDEN_DIM * sizeof(float));
+
+    int is_full = ((layer_idx + 1) % FULL_ATTN_INTERVAL == 0);
+    void *mmap_base =
+        (ctx->layer_mmaps[layer_idx] != MAP_FAILED)
+            ? ctx->layer_mmaps[layer_idx]
+            : NULL;
+    fused_layer_forward(
+        ctx->wf, layer_idx, ctx->hidden,
+        is_full ? ctx->kv_caches[layer_idx] : NULL,
+        is_full ? NULL : (LinearAttnState *)ctx->layer_states[layer_idx],
+        pos, mmap_base, ctx->K, ctx->layer_fds[layer_idx]);
+
+    complete_deferred_experts();
+
+    memcpy(hidden_out, ctx->hidden, HIDDEN_DIM * sizeof(float));
+    return 0;
+}
+
 // ============================================================================
 // State snapshot / restore (Option B)
 // ============================================================================

@@ -381,6 +381,33 @@ int mf_gpu_rms_norm_fused(mf_ctx *ctx,
                            size_t weight_bf16_len,
                            float *out);
 
+// Run a single layer's forward pass starting from the supplied hidden
+// state and return the post-layer hidden state. Phase 4 diff-oracle
+// dump point — the layer-boundary checkpoint shape that lets the
+// per-kernel diffs (which already match) compose into a per-layer
+// signal as the Rust port wires up `fused_layer_forward`.
+//
+// Drives the targeted layer's per-layer state (KV cache for full-
+// attention layers, GatedDeltaNet recurrence for linear-attention
+// layers) using the ctx's existing arrays. The dump path flushes any
+// pending deferred-expert work before returning, leaving
+// `g_deferred.active` at 0 on both entry and exit so consecutive calls
+// don't bleed state into each other.
+//
+//   ctx:        the moeflux context.
+//   layer_idx:  0 ≤ layer_idx < NUM_LAYERS for the active variant.
+//   pos:        position in the sequence (0 = first token).
+//               Updates the layer's KV / recurrence state in place.
+//   hidden_in:  HIDDEN_DIM floats — the post-layer-(N-1) hidden state.
+//   hidden_out: HIDDEN_DIM floats — receives the post-layer-N hidden.
+//
+// Returns 0 on success, -1 on NULL args / out-of-range layer / pos<0.
+int mf_layer_forward_dump(mf_ctx *ctx,
+                          int32_t layer_idx,
+                          int32_t pos,
+                          const float *hidden_in,
+                          float *hidden_out);
+
 // ============================================================================
 // State snapshot / restore (Option B in NOTES.md)
 // ============================================================================

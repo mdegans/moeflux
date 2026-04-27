@@ -476,6 +476,21 @@ impl RsCtx {
         .map_err(|_| RsError::EvalFailed)
     }
 
+    /// Phase 4 layer-boundary checkpoint hook. Runs a single layer's
+    /// forward pass starting from `hidden_in`, returning the post-
+    /// layer hidden state in `hidden_out`. The targeted layer's KV /
+    /// recurrence state is mutated in place. Lands in 4c (linear-attn)
+    /// / 4d (full-attn) once `fused_layer_forward` is ported.
+    pub fn layer_forward_dump(
+        &mut self,
+        _layer_idx: i32,
+        _pos: i32,
+        _hidden_in: &[f32],
+        _hidden_out: &mut [f32],
+    ) -> Result<(), RsError> {
+        todo!("RIIR Phase 4c/4d: fused_layer_forward")
+    }
+
     pub fn eval_prompt(
         &mut self,
         _tokens: &[i32],
