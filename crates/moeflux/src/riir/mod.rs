@@ -43,6 +43,7 @@ pub mod rms_norm;
 pub mod rope;
 pub mod sdpa;
 pub mod state;
+pub mod state_snapshot;
 pub mod variants;
 pub mod weight_file;
 pub use deferred::{DeferredError, DeferredState};
@@ -1062,6 +1063,69 @@ impl RsCtx {
     /// (infer.m:7759).
     pub fn memory_seq_pos_max(&self, _seq_id: i32) -> i32 {
         pos_max(&self.layer_states)
+    }
+
+    /// Bytes the caller must allocate to hold a snapshot of the
+    /// current state. Mirrors C `mf_state_size` (infer.m:8505). Grows
+    /// linearly with the largest KV length across full-attn layers;
+    /// re-query after each evaluation if the state has changed.
+    pub fn state_size(&self) -> usize {
+        state_snapshot::state_size(&self.layer_states)
+    }
+
+    /// Serialize the current state into `buf`. Returns the number of
+    /// bytes written. Mirrors C `mf_state_save` (infer.m:8525).
+    ///
+    /// Drains any pending deferred K-expert dispatch first (the
+    /// moeflux.h:481 contract — call only at token boundaries).
+    /// Errors if `buf.len() < self.state_size()` or if `linear_
+    /// buffers` aren't initialized yet (call `eval_prompt` /
+    /// `eval_token` / `memory_clear` once before the first save).
+    pub fn state_save(
+        &mut self,
+        buf: &mut [u8],
+    ) -> Result<usize, state_snapshot::StateSnapshotError> {
+        // Drain deferred state so the snapshot reflects post-token
+        // state, not mid-flight.
+        state_snapshot::drain_deferred(&mut self.deferred);
+        let linear_buffers = self
+            .linear_buffers
+            .as_ref()
+            .ok_or(state_snapshot::StateSnapshotError::BuffersNotReady)?;
+        state_snapshot::state_save(buf, &self.layer_states, linear_buffers)
+    }
+
+    /// Replace current state with the one encoded in `buf`. Mirrors
+    /// C `mf_state_load` (infer.m:8599). Two-pass: header + per-
+    /// layer length preflight before any state is mutated; restore
+    /// then memcpys into KV caches and pushes into the GPU
+    /// recurrence buffers.
+    ///
+    /// On error the ctx state is left unchanged (preflight rejects
+    /// before the destructive write).
+    pub fn state_load(
+        &mut self,
+        buf: &[u8],
+    ) -> Result<(), state_snapshot::StateSnapshotError> {
+        // Drain any pending dispatch — load overwrites the state the
+        // dispatch was producing for.
+        state_snapshot::drain_deferred(&mut self.deferred);
+        // Ensure linear_buffers exist so we have somewhere to push
+        // the linear-attn recurrence into. Fresh-Ctx state_load
+        // before any eval would otherwise hit BuffersNotReady; load
+        // is supposed to be a stand-alone restoration primitive.
+        self.ensure_linear_resources().map_err(|_| {
+            state_snapshot::StateSnapshotError::BuffersNotReady
+        })?;
+        let Self {
+            layer_states,
+            linear_buffers,
+            ..
+        } = self;
+        let linear_buffers = linear_buffers
+            .as_mut()
+            .expect("ensure_linear_resources just ran");
+        state_snapshot::state_load(buf, layer_states, linear_buffers)
     }
 }
 

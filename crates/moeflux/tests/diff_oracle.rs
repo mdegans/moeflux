@@ -3263,6 +3263,168 @@ fn eval_token_matches_c_single_step() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Phase 4g — state_save / state_load
+// ---------------------------------------------------------------------------
+
+/// `state_size()` on Rust must match `state_size()` on C after the
+/// same prefill. The header is fixed-size and shape-driven; the body
+/// scales with KV length on full-attn layers (15 of 40 on A3B) and
+/// is fixed-size on linear-attn layers (45 of 40 on A3B). If sizes
+/// disagree it means the wire-format math diverged from C.
+#[test]
+#[ignore = "long running; needs moeflux artifacts"]
+fn state_size_matches_c_after_prefill() {
+    let mut c: CBackend = open_backend();
+    let mut rs: RsBackend = open_backend();
+
+    let prompt: [i32; 4] = [1, 200, 600, 1100];
+    let _ = c.eval_prompt(&prompt, 0);
+    let _ = rs.eval_prompt(&prompt, 0);
+
+    let c_size = c.0.state_size();
+    let rs_size = rs.0.state_size();
+
+    eprintln!(
+        "[diff:state_size_after_4tok] c={c_size} rs={rs_size}"
+    );
+    assert_eq!(
+        c_size, rs_size,
+        "state_size mismatch: c={c_size} rs={rs_size}"
+    );
+
+    // Sanity: should be > header bytes; KV grows with len.
+    assert!(c_size > 32, "state_size {c_size} suspiciously small");
+}
+
+/// Rust↔Rust round-trip: prefill → save → memory_clear → load →
+/// eval_token → compare to a fresh Rust eval that prefills + eval_
+/// tokens without the save/load cycle. Both should produce
+/// bit-identical logits since save/load preserves all per-layer
+/// state and per-PSO Metal kernels are deterministic.
+#[test]
+#[ignore = "long running; needs moeflux artifacts"]
+fn state_round_trip_rust() {
+    // Reference: fresh Ctx, prefill + eval_token without save/load.
+    let mut rs_ref: RsBackend = open_backend();
+    let prompt: [i32; 4] = [1, 200, 600, 1100];
+    let next_token = 7i32;
+    let next_pos = prompt.len();
+    let _ = rs_ref.eval_prompt(&prompt, 0);
+    let ref_logits = rs_ref.eval_token(next_token, next_pos);
+
+    // Test path: fresh Ctx, prefill, save, memory_clear, load,
+    // eval_token. Should match `ref_logits` exactly.
+    let mut rs: RsBackend = open_backend();
+    let _ = rs.eval_prompt(&prompt, 0);
+
+    let snap_size = rs.0.state_size();
+    let mut snap = vec![0u8; snap_size];
+    let written = rs.0.state_save(&mut snap).expect("Rust state_save");
+    assert_eq!(written, snap_size, "state_save wrote unexpected length");
+
+    rs.memory_clear();
+    rs.0.state_load(&snap).expect("Rust state_load");
+
+    let test_logits = rs.eval_token(next_token, next_pos);
+
+    assert_eq!(test_logits.len(), ref_logits.len());
+    let drift_max = ref_logits
+        .iter()
+        .zip(test_logits.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let cos = cosine_sim(&ref_logits, &test_logits);
+    eprintln!(
+        "[diff:state_round_trip_rust] snap_bytes={snap_size} \
+         max_abs_diff={drift_max:.3e} cosine={cos:.7}"
+    );
+    assert_eq!(
+        argmax(&ref_logits),
+        argmax(&test_logits),
+        "round-trip changed argmax"
+    );
+    assert!(
+        cos >= 0.9999,
+        "round-trip cosine {cos:.7} below 0.9999"
+    );
+}
+
+/// Wire compat (Rust → C): Rust prefills, saves; a fresh C Ctx
+/// loads the snapshot and decodes one more token. The resulting
+/// logits must match Rust's direct-eval continuation at the same
+/// position. Confirms the Rust port writes bytes the C side can
+/// read.
+#[test]
+#[ignore = "long running; needs moeflux artifacts"]
+fn state_load_c_from_rust_save() {
+    let mut rs: RsBackend = open_backend();
+    let prompt: [i32; 4] = [1, 200, 600, 1100];
+    let next_token = 7i32;
+    let next_pos = prompt.len();
+
+    let _ = rs.eval_prompt(&prompt, 0);
+
+    let snap_size = rs.0.state_size();
+    let mut snap = vec![0u8; snap_size];
+    rs.0.state_save(&mut snap).expect("Rust state_save");
+
+    // Reference: Rust direct continuation.
+    let rs_logits = rs.eval_token(next_token, next_pos);
+
+    // Test: fresh C Ctx, load Rust snapshot, eval_token.
+    let mut c: CBackend = open_backend();
+    c.memory_clear();
+    c.0.state_load(&snap).expect("C state_load(rust_snap)");
+    let mut c_logits = vec![0.0f32; c.0.n_vocab()];
+    c.0
+        .eval_token(next_token, next_pos, 0, &mut c_logits)
+        .expect("C eval_token after Rust state_load");
+
+    assert_e2e_logits_close(
+        "state_load_c_from_rust_save",
+        &c_logits,
+        &rs_logits,
+    );
+}
+
+/// Wire compat (C → Rust): C prefills, saves; a fresh Rust Ctx
+/// loads the snapshot and decodes one more token. The resulting
+/// logits must match C's direct-eval continuation. Confirms the
+/// Rust port reads C-produced snapshot bytes correctly.
+#[test]
+#[ignore = "long running; needs moeflux artifacts"]
+fn state_load_rust_from_c_save() {
+    let mut c: CBackend = open_backend();
+    let prompt: [i32; 4] = [1, 200, 600, 1100];
+    let next_token = 7i32;
+    let next_pos = prompt.len();
+
+    let _ = c.eval_prompt(&prompt, 0);
+
+    let snap_size = c.0.state_size();
+    let mut snap = vec![0u8; snap_size];
+    c.0.state_save(&mut snap).expect("C state_save");
+
+    // Reference: C direct continuation.
+    let mut c_logits = vec![0.0f32; c.0.n_vocab()];
+    c.0
+        .eval_token(next_token, next_pos, 0, &mut c_logits)
+        .expect("C eval_token reference");
+
+    // Test: fresh Rust Ctx, load C snapshot, eval_token.
+    let mut rs: RsBackend = open_backend();
+    rs.memory_clear();
+    rs.0.state_load(&snap).expect("Rust state_load(c_snap)");
+    let rs_logits = rs.eval_token(next_token, next_pos);
+
+    assert_e2e_logits_close(
+        "state_load_rust_from_c_save",
+        &c_logits,
+        &rs_logits,
+    );
+}
+
 /// Multi-token prefill via `eval_prompt`. Both backends open fresh,
 /// run `eval_prompt` over `[1..=8]`, compare last-token logits.
 ///
