@@ -49,7 +49,7 @@ use super::expert_io::ExpertFiles;
 use super::gpu_matvec::{encode_matvec, MatvecPipelines, MatvecSpec};
 use super::layer_weight_cache::LayerWeightCache;
 use super::linear_attn_forward::{
-    bits_of, post_attention_tail, read_buffer_to_vec, require,
+    bits_of, post_attention_tail, read_buffer_to_vec,
     LayerForwardBuffers, LayerForwardError, OProj,
 };
 use super::metal::MetalBackend;
@@ -117,52 +117,31 @@ pub fn full_attn_layer_forward(
         &format!("model.layers.{layer_idx}.self_attn.o_proj.weight"),
     );
 
-    // Resolve required offsets up front so we error early if any are
-    // missing.
-    let _input_norm_w = layer_cache.input_layernorm_w.ok_or(
+    // Pull the full-attn-specific offsets out of the tagged-enum
+    // cache. Every slot is required at `LayerWeightCache::build` time
+    // for full-attn layers, so this is a single match instead of a
+    // require-ladder.
+    let attn = layer_cache.attn.full().ok_or(
         LayerForwardError::MissingTensor {
             layer: layer_idx,
-            tensor: "input_layernorm.weight",
+            tensor: "full_attn weights (called on linear-attn layer)",
         },
     )?;
-    let q_w = require(layer_cache.q_proj_w, layer_idx, "q_proj.weight")?;
-    let q_s = require(layer_cache.q_proj_s, layer_idx, "q_proj.scales")?;
-    let q_b = require(layer_cache.q_proj_b, layer_idx, "q_proj.biases")?;
-    let k_w = require(layer_cache.k_proj_w, layer_idx, "k_proj.weight")?;
-    let k_s = require(layer_cache.k_proj_s, layer_idx, "k_proj.scales")?;
-    let k_b = require(layer_cache.k_proj_b, layer_idx, "k_proj.biases")?;
-    let v_w = require(layer_cache.v_proj_w, layer_idx, "v_proj.weight")?;
-    let v_s = require(layer_cache.v_proj_s, layer_idx, "v_proj.scales")?;
-    let v_b = require(layer_cache.v_proj_b, layer_idx, "v_proj.biases")?;
-    let o_w = require(
-        layer_cache.full_o_proj_w,
-        layer_idx,
-        "self_attn.o_proj.weight",
-    )?;
-    let o_s = require(
-        layer_cache.full_o_proj_s,
-        layer_idx,
-        "self_attn.o_proj.scales",
-    )?;
-    let o_b = require(
-        layer_cache.full_o_proj_b,
-        layer_idx,
-        "self_attn.o_proj.biases",
-    )?;
-    // q_norm / k_norm are loaded by name inside rms_norm_per_head_cpu;
-    // require them up front to fail-fast if missing.
-    let _q_norm_w = layer_cache.q_norm_w.ok_or(
-        LayerForwardError::MissingTensor {
-            layer: layer_idx,
-            tensor: "self_attn.q_norm.weight",
-        },
-    )?;
-    let _k_norm_w = layer_cache.k_norm_w.ok_or(
-        LayerForwardError::MissingTensor {
-            layer: layer_idx,
-            tensor: "self_attn.k_norm.weight",
-        },
-    )?;
+    let q_w = attn.q_proj_w;
+    let q_s = attn.q_proj_s;
+    let q_b = attn.q_proj_b;
+    let k_w = attn.k_proj_w;
+    let k_s = attn.k_proj_s;
+    let k_b = attn.k_proj_b;
+    let v_w = attn.v_proj_w;
+    let v_s = attn.v_proj_s;
+    let v_b = attn.v_proj_b;
+    let o_w = attn.o_proj_w;
+    let o_s = attn.o_proj_s;
+    let o_b = attn.o_proj_b;
+    // q_norm / k_norm are loaded by name inside `rms_norm_per_head_cpu`;
+    // they're guaranteed present here because `LayerWeightCache::build`
+    // populated `attn.q_norm_w` / `attn.k_norm_w` as required slots.
 
     let q_dim = v.num_attn_heads * v.head_dim; // total Q channels
     let q_proj_dim = q_dim * 2; // q + per-head sigmoid gate

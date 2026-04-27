@@ -30,6 +30,12 @@ pub enum MtlWeightBufError {
     /// re-checked at offset compute time as defense in depth.
     #[error("tensor '{name}' bytes outside mmap region")]
     TensorOutOfBounds { name: String },
+    /// A tensor required by the layer-weight cache build path was not
+    /// present in the manifest. Catches truncated / partial weight
+    /// files at `LayerWeightCache::build` time instead of at the per-
+    /// layer forward call.
+    #[error("required tensor '{name}' missing from weight manifest")]
+    MissingTensor { name: String },
 }
 
 /// `MTLBuffer` wrapping a [`WeightFile`]'s mmap region. Constructed

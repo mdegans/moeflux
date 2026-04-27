@@ -7,187 +7,249 @@
 //! instances read freed pointers. Per-Ctx storage in the Rust port
 //! makes that bug class uncompilable.
 //!
-//! For the linear-attn forward (4c) we need the byte offsets of
-//! every tensor a single layer's pipeline reads. The struct holds
-//! `Option<u64>` so layers that don't carry a particular tensor
-//! (e.g., full-attn layers don't have linear-attn-specific weights)
-//! leave those slots `None`. The cache is built once per layer at
-//! [`LayerWeightCache::build`] and stays immutable thereafter.
+//! ## Shape (slice 4f-2)
+//!
+//! Originally a single struct with every linear-attn / full-attn /
+//! MoE / norm slot side-by-side as `Option<u64>`. Slice 4f-2 split it
+//! into a nested form so attention-kind-specific slots live in a
+//! tagged enum [`LayerAttnW`] — Mike's "future-arch openings" note in
+//! the RIIR strategy doc, motivated by the eventual DeepSeek-V3 port
+//! whose third attention shape (MLA) doesn't fit the linear/full
+//! dichotomy. Common slots (input + post-attn norms, MoE router,
+//! shared expert) stay flat on [`LayerWeightCache`]; consumers no
+//! longer carry the per-slot `require()` ladder that 4c's flat shape
+//! forced.
 
 use super::mtl_weight_buf::{MtlWeightBuf, MtlWeightBufError};
-use super::variants::VARIANT;
+use super::variants::{LayerKind, VARIANT};
 use super::weight_file::WeightFile;
 
+/// Tensor offsets specific to a linear-attention (GatedDeltaNet)
+/// layer. Every slot is required for layers of this kind; missing
+/// tensors fail at [`LayerWeightCache::build`] time.
+#[derive(Debug, Clone)]
+pub struct LinearAttnW {
+    pub qkv_w: u64,
+    pub qkv_s: u64,
+    pub qkv_b: u64,
+    pub z_w: u64,
+    pub z_s: u64,
+    pub z_b: u64,
+    pub alpha_w: u64,
+    pub alpha_s: u64,
+    pub alpha_b: u64,
+    pub beta_w: u64,
+    pub beta_s: u64,
+    pub beta_b: u64,
+    pub conv1d_w: u64,
+    pub a_log: u64,
+    pub dt_bias: u64,
+    pub gated_norm_w: u64,
+    pub o_proj_w: u64,
+    pub o_proj_s: u64,
+    pub o_proj_b: u64,
+}
+
+/// Tensor offsets specific to a standard full-attention (SDPA + per-
+/// head Q/K norms) layer.
+#[derive(Debug, Clone)]
+pub struct FullAttnW {
+    pub q_proj_w: u64,
+    pub q_proj_s: u64,
+    pub q_proj_b: u64,
+    pub k_proj_w: u64,
+    pub k_proj_s: u64,
+    pub k_proj_b: u64,
+    pub v_proj_w: u64,
+    pub v_proj_s: u64,
+    pub v_proj_b: u64,
+    pub q_norm_w: u64,
+    pub k_norm_w: u64,
+    pub o_proj_w: u64,
+    pub o_proj_s: u64,
+    pub o_proj_b: u64,
+}
+
+/// Attention-kind-specific weight offsets for one layer. The variant
+/// matches [`LayerKind`] for the layer's index in the active variant.
+#[derive(Debug, Clone)]
+pub enum LayerAttnW {
+    LinearAttn(LinearAttnW),
+    FullAttn(FullAttnW),
+}
+
+impl LayerAttnW {
+    /// Returns the inner [`LinearAttnW`] if this is a linear-attn
+    /// layer, otherwise `None`. Consumers in
+    /// `linear_attn_layer_forward` use this to fail-fast with a
+    /// clearer error than a `match` arm could give.
+    pub fn linear(&self) -> Option<&LinearAttnW> {
+        match self {
+            Self::LinearAttn(la) => Some(la),
+            Self::FullAttn(_) => None,
+        }
+    }
+
+    /// Returns the inner [`FullAttnW`] if this is a full-attn layer.
+    pub fn full(&self) -> Option<&FullAttnW> {
+        match self {
+            Self::FullAttn(fa) => Some(fa),
+            Self::LinearAttn(_) => None,
+        }
+    }
+}
+
+/// MoE routing gate weights — produces the per-expert logits that the
+/// CPU router (`moe_router_cpu`) reads. `bias` is `None` for variants
+/// whose manifest folds the per-output bias into `gate.biases` (the
+/// per-group dequant bias) rather than carrying a separate
+/// `gate.bias` tensor — true for every variant we ship today.
+#[derive(Debug, Clone)]
+pub struct GateW {
+    pub w: u64,
+    pub s: u64,
+    pub b: u64,
+    pub bias: Option<u64>,
+}
+
+/// Shared-expert FFN + scoring gate — runs alongside the routed
+/// experts every layer. `seg_*` is the scalar gate that produces the
+/// shared expert's mixing weight; `gate/up/down` are its FFN matvecs.
+#[derive(Debug, Clone)]
+pub struct SharedExpertW {
+    pub seg_w: u64,
+    pub seg_s: u64,
+    pub seg_b: u64,
+    pub gate_w: u64,
+    pub gate_s: u64,
+    pub gate_b: u64,
+    pub up_w: u64,
+    pub up_s: u64,
+    pub up_b: u64,
+    pub down_w: u64,
+    pub down_s: u64,
+    pub down_b: u64,
+}
+
 /// Pre-computed tensor byte offsets within an [`MtlWeightBuf`] for
-/// one layer of the model. Linear-attn-specific fields are `Some`
-/// for linear-attn layers and `None` for full-attn layers, and vice
-/// versa for the attention-projection fields. Norm + MoE
-/// fields are populated for every layer.
-#[derive(Debug, Default, Clone)]
+/// one layer of the model.
+#[derive(Debug, Clone)]
 pub struct LayerWeightCache {
-    // --- Layer-wide norms (every layer) -------------------------
-    pub input_layernorm_w: Option<u64>,
-    pub post_attention_layernorm_w: Option<u64>,
-
-    // --- Linear-attn (`!is_full` layers) ------------------------
-    pub qkv_w: Option<u64>,
-    pub qkv_s: Option<u64>,
-    pub qkv_b: Option<u64>,
-    pub z_w: Option<u64>,
-    pub z_s: Option<u64>,
-    pub z_b: Option<u64>,
-    pub alpha_w: Option<u64>,
-    pub alpha_s: Option<u64>,
-    pub alpha_b: Option<u64>,
-    pub beta_w: Option<u64>,
-    pub beta_s: Option<u64>,
-    pub beta_b: Option<u64>,
-    pub conv1d_w: Option<u64>,
-    pub a_log: Option<u64>,
-    pub dt_bias: Option<u64>,
-    pub gated_norm_w: Option<u64>,
-    pub linear_o_proj_w: Option<u64>,
-    pub linear_o_proj_s: Option<u64>,
-    pub linear_o_proj_b: Option<u64>,
-
-    // --- Full-attn (`is_full` layers) ---------------------------
-    // 4d will populate these. Listed here so the struct shape stays
-    // stable across 4c → 4d.
-    pub q_proj_w: Option<u64>,
-    pub q_proj_s: Option<u64>,
-    pub q_proj_b: Option<u64>,
-    pub k_proj_w: Option<u64>,
-    pub k_proj_s: Option<u64>,
-    pub k_proj_b: Option<u64>,
-    pub v_proj_w: Option<u64>,
-    pub v_proj_s: Option<u64>,
-    pub v_proj_b: Option<u64>,
-    pub q_norm_w: Option<u64>,
-    pub k_norm_w: Option<u64>,
-    pub full_o_proj_w: Option<u64>,
-    pub full_o_proj_s: Option<u64>,
-    pub full_o_proj_b: Option<u64>,
-
-    // --- MoE router + shared (every layer) ----------------------
-    /// `mlp.gate.weight/scales/biases` — routing gate logits matvec.
-    pub gate_w: Option<u64>,
-    pub gate_s: Option<u64>,
-    pub gate_b: Option<u64>,
-    pub gate_bias: Option<u64>,
-    /// `mlp.shared_expert_gate.weight/scales/biases` — scoring gate
-    /// for the shared-expert mixing weight (`seg_*` in the C side,
-    /// infer.m:2879).
-    pub seg_w: Option<u64>,
-    pub seg_s: Option<u64>,
-    pub seg_b: Option<u64>,
-    /// `mlp.shared_experts.gate_proj.*` — shared expert FFN gate.
-    pub shared_gate_w: Option<u64>,
-    pub shared_gate_s: Option<u64>,
-    pub shared_gate_b: Option<u64>,
-    /// `mlp.shared_experts.up_proj.*` — shared expert FFN up.
-    pub shared_up_w: Option<u64>,
-    pub shared_up_s: Option<u64>,
-    pub shared_up_b: Option<u64>,
-    /// `mlp.shared_experts.down_proj.*` — shared expert FFN down.
-    pub shared_down_w: Option<u64>,
-    pub shared_down_s: Option<u64>,
-    pub shared_down_b: Option<u64>,
+    pub input_layernorm_w: u64,
+    pub post_attention_layernorm_w: u64,
+    pub attn: LayerAttnW,
+    pub gate: GateW,
+    pub shared: SharedExpertW,
 }
 
 impl LayerWeightCache {
     /// Resolve every tensor offset for layer `layer_idx`. Returns a
-    /// fully-populated cache for that layer; tensors that don't
-    /// exist for this layer's type leave their slots `None`. Tensor
-    /// names match the manifest exported by `extract_weights.py`.
+    /// fully-populated cache; tensors that the active layer kind
+    /// doesn't carry are simply absent from the matching enum
+    /// variant. Tensor names match the manifest exported by
+    /// `extract_weights.py`. Errors with
+    /// [`MtlWeightBufError::MissingTensor`] if any required slot for
+    /// the layer kind is missing.
     pub fn build(
         layer_idx: usize,
         wf: &WeightFile,
         wf_buf: &MtlWeightBuf,
     ) -> Result<Self, MtlWeightBufError> {
-        let mut c = Self::default();
-
-        // Helper closure capturing wf + wf_buf so each tensor lookup
-        // is one line.
-        let off = |name: &str| -> Result<Option<u64>, MtlWeightBufError> {
-            wf_buf.tensor_offset(wf, name)
+        let need = |name: String| -> Result<u64, MtlWeightBufError> {
+            wf_buf
+                .tensor_offset(wf, &name)?
+                .ok_or(MtlWeightBufError::MissingTensor { name })
         };
 
-        // Layer-wide norms.
-        c.input_layernorm_w =
-            off(&format!("model.layers.{layer_idx}.input_layernorm.weight"))?;
-        c.post_attention_layernorm_w = off(&format!(
+        let input_layernorm_w =
+            need(format!("model.layers.{layer_idx}.input_layernorm.weight"))?;
+        let post_attention_layernorm_w = need(format!(
             "model.layers.{layer_idx}.post_attention_layernorm.weight"
         ))?;
 
-        // Linear-attn projections + recurrence weights. Manifest
-        // names follow `linear_attn.in_proj_{qkv,z,a,b}` and
-        // `linear_attn.out_proj`; `linear_attn.norm` is the gated-
-        // norm weight.
-        let p = |suffix: &str| {
-            format!("model.layers.{layer_idx}.linear_attn.{suffix}")
+        let attn = match VARIANT.layer_kind(layer_idx) {
+            LayerKind::LinearAttn => {
+                let p = |suffix: &str| {
+                    format!("model.layers.{layer_idx}.linear_attn.{suffix}")
+                };
+                LayerAttnW::LinearAttn(LinearAttnW {
+                    qkv_w: need(p("in_proj_qkv.weight"))?,
+                    qkv_s: need(p("in_proj_qkv.scales"))?,
+                    qkv_b: need(p("in_proj_qkv.biases"))?,
+                    z_w: need(p("in_proj_z.weight"))?,
+                    z_s: need(p("in_proj_z.scales"))?,
+                    z_b: need(p("in_proj_z.biases"))?,
+                    alpha_w: need(p("in_proj_a.weight"))?,
+                    alpha_s: need(p("in_proj_a.scales"))?,
+                    alpha_b: need(p("in_proj_a.biases"))?,
+                    beta_w: need(p("in_proj_b.weight"))?,
+                    beta_s: need(p("in_proj_b.scales"))?,
+                    beta_b: need(p("in_proj_b.biases"))?,
+                    conv1d_w: need(p("conv1d.weight"))?,
+                    a_log: need(p("A_log"))?,
+                    dt_bias: need(p("dt_bias"))?,
+                    gated_norm_w: need(p("norm.weight"))?,
+                    o_proj_w: need(p("out_proj.weight"))?,
+                    o_proj_s: need(p("out_proj.scales"))?,
+                    o_proj_b: need(p("out_proj.biases"))?,
+                })
+            }
+            LayerKind::FullAttn => {
+                let s = |suffix: &str| {
+                    format!("model.layers.{layer_idx}.self_attn.{suffix}")
+                };
+                LayerAttnW::FullAttn(FullAttnW {
+                    q_proj_w: need(s("q_proj.weight"))?,
+                    q_proj_s: need(s("q_proj.scales"))?,
+                    q_proj_b: need(s("q_proj.biases"))?,
+                    k_proj_w: need(s("k_proj.weight"))?,
+                    k_proj_s: need(s("k_proj.scales"))?,
+                    k_proj_b: need(s("k_proj.biases"))?,
+                    v_proj_w: need(s("v_proj.weight"))?,
+                    v_proj_s: need(s("v_proj.scales"))?,
+                    v_proj_b: need(s("v_proj.biases"))?,
+                    q_norm_w: need(s("q_norm.weight"))?,
+                    k_norm_w: need(s("k_norm.weight"))?,
+                    o_proj_w: need(s("o_proj.weight"))?,
+                    o_proj_s: need(s("o_proj.scales"))?,
+                    o_proj_b: need(s("o_proj.biases"))?,
+                })
+            }
         };
-        c.qkv_w = off(&p("in_proj_qkv.weight"))?;
-        c.qkv_s = off(&p("in_proj_qkv.scales"))?;
-        c.qkv_b = off(&p("in_proj_qkv.biases"))?;
-        c.z_w = off(&p("in_proj_z.weight"))?;
-        c.z_s = off(&p("in_proj_z.scales"))?;
-        c.z_b = off(&p("in_proj_z.biases"))?;
-        c.alpha_w = off(&p("in_proj_a.weight"))?;
-        c.alpha_s = off(&p("in_proj_a.scales"))?;
-        c.alpha_b = off(&p("in_proj_a.biases"))?;
-        c.beta_w = off(&p("in_proj_b.weight"))?;
-        c.beta_s = off(&p("in_proj_b.scales"))?;
-        c.beta_b = off(&p("in_proj_b.biases"))?;
-        c.conv1d_w = off(&p("conv1d.weight"))?;
-        c.a_log = off(&p("A_log"))?;
-        c.dt_bias = off(&p("dt_bias"))?;
-        c.gated_norm_w = off(&p("norm.weight"))?;
-        c.linear_o_proj_w = off(&p("out_proj.weight"))?;
-        c.linear_o_proj_s = off(&p("out_proj.scales"))?;
-        c.linear_o_proj_b = off(&p("out_proj.biases"))?;
 
-        // Full-attn projections (4d will populate; listed here so the
-        // build path is uniform across layer types).
-        let s = |suffix: &str| {
-            format!("model.layers.{layer_idx}.self_attn.{suffix}")
+        let m =
+            |suffix: &str| format!("model.layers.{layer_idx}.mlp.{suffix}");
+        let gate = GateW {
+            w: need(m("gate.weight"))?,
+            s: need(m("gate.scales"))?,
+            b: need(m("gate.biases"))?,
+            // No separate `gate.bias` in the manifest for the
+            // qwen3_5_moe family — `gate.biases` (above) carries the
+            // per-group dequant bias.
+            bias: None,
         };
-        c.q_proj_w = off(&s("q_proj.weight"))?;
-        c.q_proj_s = off(&s("q_proj.scales"))?;
-        c.q_proj_b = off(&s("q_proj.biases"))?;
-        c.k_proj_w = off(&s("k_proj.weight"))?;
-        c.k_proj_s = off(&s("k_proj.scales"))?;
-        c.k_proj_b = off(&s("k_proj.biases"))?;
-        c.v_proj_w = off(&s("v_proj.weight"))?;
-        c.v_proj_s = off(&s("v_proj.scales"))?;
-        c.v_proj_b = off(&s("v_proj.biases"))?;
-        c.q_norm_w = off(&s("q_norm.weight"))?;
-        c.k_norm_w = off(&s("k_norm.weight"))?;
-        c.full_o_proj_w = off(&s("o_proj.weight"))?;
-        c.full_o_proj_s = off(&s("o_proj.scales"))?;
-        c.full_o_proj_b = off(&s("o_proj.biases"))?;
+        let shared = SharedExpertW {
+            seg_w: need(m("shared_expert_gate.weight"))?,
+            seg_s: need(m("shared_expert_gate.scales"))?,
+            seg_b: need(m("shared_expert_gate.biases"))?,
+            gate_w: need(m("shared_expert.gate_proj.weight"))?,
+            gate_s: need(m("shared_expert.gate_proj.scales"))?,
+            gate_b: need(m("shared_expert.gate_proj.biases"))?,
+            up_w: need(m("shared_expert.up_proj.weight"))?,
+            up_s: need(m("shared_expert.up_proj.scales"))?,
+            up_b: need(m("shared_expert.up_proj.biases"))?,
+            down_w: need(m("shared_expert.down_proj.weight"))?,
+            down_s: need(m("shared_expert.down_proj.scales"))?,
+            down_b: need(m("shared_expert.down_proj.biases"))?,
+        };
 
-        // MoE router + shared.
-        let m = |suffix: &str| format!("model.layers.{layer_idx}.mlp.{suffix}");
-        c.gate_w = off(&m("gate.weight"))?;
-        c.gate_s = off(&m("gate.scales"))?;
-        c.gate_b = off(&m("gate.biases"))?;
-        // No separate `gate.bias` in the manifest — `gate.biases` (above)
-        // already carries the per-group dequant bias for the matvec.
-        c.gate_bias = None;
-        c.shared_gate_w = off(&m("shared_expert.gate_proj.weight"))?;
-        c.shared_gate_s = off(&m("shared_expert.gate_proj.scales"))?;
-        c.shared_gate_b = off(&m("shared_expert.gate_proj.biases"))?;
-        c.seg_w = off(&m("shared_expert_gate.weight"))?;
-        c.seg_s = off(&m("shared_expert_gate.scales"))?;
-        c.seg_b = off(&m("shared_expert_gate.biases"))?;
-        c.shared_up_w = off(&m("shared_expert.up_proj.weight"))?;
-        c.shared_up_s = off(&m("shared_expert.up_proj.scales"))?;
-        c.shared_up_b = off(&m("shared_expert.up_proj.biases"))?;
-        c.shared_down_w = off(&m("shared_expert.down_proj.weight"))?;
-        c.shared_down_s = off(&m("shared_expert.down_proj.scales"))?;
-        c.shared_down_b = off(&m("shared_expert.down_proj.biases"))?;
-
-        Ok(c)
+        Ok(Self {
+            input_layernorm_w,
+            post_attention_layernorm_w,
+            attn,
+            gate,
+            shared,
+        })
     }
 
     /// Build a cache for every layer in the active variant.

@@ -348,69 +348,37 @@ pub fn linear_attn_layer_forward(
         &format!("model.layers.{layer_idx}.linear_attn.out_proj.weight"),
     );
 
-    // Resolve required offsets up front so we error early if anything
-    // is missing.
-    // input_layernorm.weight is read indirectly via `rms_norm_cpu`
-    // below, but require it up front for fail-fast behavior.
-    let _input_norm_w = layer_cache.input_layernorm_w.ok_or(
+    // Pull the linear-attn-specific offsets out of the tagged-enum
+    // cache. Returning early with `MissingTensor` here also guards
+    // against accidentally calling this function on a full-attn layer
+    // (the dispatcher in `layer_forward_dump` already filters; this
+    // is defense in depth and matches the symmetric guard in
+    // `full_attn_layer_forward`).
+    let attn = layer_cache.attn.linear().ok_or(
         LayerForwardError::MissingTensor {
             layer: layer_idx,
-            tensor: "input_layernorm.weight",
+            tensor: "linear_attn weights (called on full-attn layer)",
         },
     )?;
-    let qkv_w =
-        require(layer_cache.qkv_w, layer_idx, "qkv_proj.weight")?;
-    let qkv_s =
-        require(layer_cache.qkv_s, layer_idx, "qkv_proj.scales")?;
-    let qkv_b =
-        require(layer_cache.qkv_b, layer_idx, "qkv_proj.biases")?;
-    let z_w = require(layer_cache.z_w, layer_idx, "z_proj.weight")?;
-    let z_s = require(layer_cache.z_s, layer_idx, "z_proj.scales")?;
-    let z_b = require(layer_cache.z_b, layer_idx, "z_proj.biases")?;
-    let beta_w =
-        require(layer_cache.beta_w, layer_idx, "beta_proj.weight")?;
-    let beta_s =
-        require(layer_cache.beta_s, layer_idx, "beta_proj.scales")?;
-    let beta_b =
-        require(layer_cache.beta_b, layer_idx, "beta_proj.biases")?;
-    let alpha_w =
-        require(layer_cache.alpha_w, layer_idx, "alpha_proj.weight")?;
-    let alpha_s =
-        require(layer_cache.alpha_s, layer_idx, "alpha_proj.scales")?;
-    let alpha_b =
-        require(layer_cache.alpha_b, layer_idx, "alpha_proj.biases")?;
-    let conv1d_w = require(
-        layer_cache.conv1d_w,
-        layer_idx,
-        "linear_attn.conv1d.weight",
-    )?;
-    let a_log =
-        require(layer_cache.a_log, layer_idx, "linear_attn.A_log")?;
-    let dt_bias = require(
-        layer_cache.dt_bias,
-        layer_idx,
-        "linear_attn.dt_bias",
-    )?;
-    let gnorm_w = require(
-        layer_cache.gated_norm_w,
-        layer_idx,
-        "linear_attn.g_norm.weight",
-    )?;
-    let o_w = require(
-        layer_cache.linear_o_proj_w,
-        layer_idx,
-        "linear_attn.o_proj.weight",
-    )?;
-    let o_s = require(
-        layer_cache.linear_o_proj_s,
-        layer_idx,
-        "linear_attn.o_proj.scales",
-    )?;
-    let o_b = require(
-        layer_cache.linear_o_proj_b,
-        layer_idx,
-        "linear_attn.o_proj.biases",
-    )?;
+    let qkv_w = attn.qkv_w;
+    let qkv_s = attn.qkv_s;
+    let qkv_b = attn.qkv_b;
+    let z_w = attn.z_w;
+    let z_s = attn.z_s;
+    let z_b = attn.z_b;
+    let beta_w = attn.beta_w;
+    let beta_s = attn.beta_s;
+    let beta_b = attn.beta_b;
+    let alpha_w = attn.alpha_w;
+    let alpha_s = attn.alpha_s;
+    let alpha_b = attn.alpha_b;
+    let conv1d_w = attn.conv1d_w;
+    let a_log = attn.a_log;
+    let dt_bias = attn.dt_bias;
+    let gnorm_w = attn.gated_norm_w;
+    let o_w = attn.o_proj_w;
+    let o_s = attn.o_proj_s;
+    let o_b = attn.o_proj_b;
 
     // Pre-fetch every pipeline.
     let lp = LinearAttnPipelines::fetch(metal)?;
@@ -648,60 +616,22 @@ pub(super) fn post_attention_tail(
         ),
     );
 
-    let post_attn_norm_w = layer_cache.post_attention_layernorm_w.ok_or(
-        LayerForwardError::MissingTensor {
-            layer: layer_idx,
-            tensor: "post_attention_layernorm.weight",
-        },
-    )?;
-    let gate_w =
-        require(layer_cache.gate_w, layer_idx, "mlp.gate.weight")?;
-    let gate_s =
-        require(layer_cache.gate_s, layer_idx, "mlp.gate.scales")?;
-    let gate_b =
-        require(layer_cache.gate_b, layer_idx, "mlp.gate.biases")?;
-    let shared_up_w =
-        require(layer_cache.shared_up_w, layer_idx, "shared.up_proj.w")?;
-    let shared_up_s =
-        require(layer_cache.shared_up_s, layer_idx, "shared.up_proj.s")?;
-    let shared_up_b =
-        require(layer_cache.shared_up_b, layer_idx, "shared.up_proj.b")?;
-    let shared_gate_w = require(
-        layer_cache.shared_gate_w,
-        layer_idx,
-        "shared.gate_proj.w",
-    )?;
-    let shared_gate_s = require(
-        layer_cache.shared_gate_s,
-        layer_idx,
-        "shared.gate_proj.s",
-    )?;
-    let shared_gate_b = require(
-        layer_cache.shared_gate_b,
-        layer_idx,
-        "shared.gate_proj.b",
-    )?;
-    let shared_down_w = require(
-        layer_cache.shared_down_w,
-        layer_idx,
-        "shared.down_proj.w",
-    )?;
-    let shared_down_s = require(
-        layer_cache.shared_down_s,
-        layer_idx,
-        "shared.down_proj.s",
-    )?;
-    let shared_down_b = require(
-        layer_cache.shared_down_b,
-        layer_idx,
-        "shared.down_proj.b",
-    )?;
-    let seg_w =
-        require(layer_cache.seg_w, layer_idx, "shared_expert_gate.w")?;
-    let seg_s =
-        require(layer_cache.seg_s, layer_idx, "shared_expert_gate.s")?;
-    let seg_b =
-        require(layer_cache.seg_b, layer_idx, "shared_expert_gate.b")?;
+    let post_attn_norm_w = layer_cache.post_attention_layernorm_w;
+    let gate_w = layer_cache.gate.w;
+    let gate_s = layer_cache.gate.s;
+    let gate_b = layer_cache.gate.b;
+    let shared_up_w = layer_cache.shared.up_w;
+    let shared_up_s = layer_cache.shared.up_s;
+    let shared_up_b = layer_cache.shared.up_b;
+    let shared_gate_w = layer_cache.shared.gate_w;
+    let shared_gate_s = layer_cache.shared.gate_s;
+    let shared_gate_b = layer_cache.shared.gate_b;
+    let shared_down_w = layer_cache.shared.down_w;
+    let shared_down_s = layer_cache.shared.down_s;
+    let shared_down_b = layer_cache.shared.down_b;
+    let seg_w = layer_cache.shared.seg_w;
+    let seg_s = layer_cache.shared.seg_s;
+    let seg_b = layer_cache.shared.seg_b;
 
     let mv = MatvecPipelines::fetch(metal)?;
     let sum_sq = metal.pipeline("rms_norm_sum_sq")?.clone();
@@ -934,13 +864,6 @@ pub(super) fn post_attention_tail(
     Ok(())
 }
 
-pub(super) fn require(
-    val: Option<u64>,
-    layer: usize,
-    tensor: &'static str,
-) -> Result<u64, LayerForwardError> {
-    val.ok_or(LayerForwardError::MissingTensor { layer, tensor })
-}
 
 pub(super) fn read_buffer_to_vec(b: &Buffer, len: usize) -> Vec<f32> {
     let ptr = b.contents() as *const f32;
