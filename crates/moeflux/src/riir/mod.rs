@@ -34,6 +34,7 @@ pub mod moe_router;
 pub mod rms_norm;
 pub mod rope;
 pub mod sdpa;
+pub mod state;
 pub mod variants;
 pub mod weight_file;
 pub use embedding::{bf16_to_f32, embed_lookup, EmbeddingError};
@@ -53,6 +54,10 @@ pub use moe_router::{moe_router_cpu, MoeRouterError};
 pub use rms_norm::{rms_norm_cpu, rms_norm_per_head_cpu, RmsNormError};
 pub use rope::{apply_rotary_emb, RopeError};
 pub use sdpa::{sdpa_cpu, SdpaError};
+pub use state::{
+    alloc_layer_states, clear_all, pos_max, truncate, KvCache, LayerState,
+    LinearAttnState,
+};
 pub use variants::{Variant, VARIANT};
 pub use weight_file::{TensorInfo, WeightFile, WeightFileError};
 
@@ -82,7 +87,13 @@ pub struct RsCtx {
     /// files leave the slot empty per the C path's tolerance
     /// semantics.
     experts: ExpertFiles,
-    // Future phases populate: vocab, per-layer state.
+    /// Per-layer KV / linear-attn recurrence state. One entry per
+    /// layer; the variant tag matches the C-side
+    /// `(i + 1) % FULL_ATTN_INTERVAL == 0` test. Allocated zeroed at
+    /// [`Self::open`]; mutated in place by the forward pass and the
+    /// `memory_*` ops.
+    layer_states: Vec<LayerState>,
+    // Future phases populate: vocab.
 }
 
 impl RsCtx {
@@ -103,11 +114,13 @@ impl RsCtx {
             .map_err(|_| RsError::InitFailed)?;
         let experts = ExpertFiles::open(experts_dir)
             .map_err(|_| RsError::InitFailed)?;
+        let layer_states = alloc_layer_states();
         Ok(Self {
             wf,
             metal: None,
             moe_buffers: None,
             experts,
+            layer_states,
         })
     }
 
@@ -483,16 +496,29 @@ impl RsCtx {
         todo!("RIIR Phase 4: forward-pass top-level")
     }
 
+    /// Reset every layer's state to empty. Mirrors `mf_memory_clear`
+    /// (infer.m:7747). `seq_id` is unused — moeflux's sequence-id
+    /// argument is a no-op stub on the C side too; KV is single-stream.
     pub fn memory_clear(&mut self) {
-        todo!("RIIR Phase 4: state management")
+        clear_all(&mut self.layer_states);
     }
 
-    pub fn memory_seq_rm(&mut self, _seq_id: i32, _p0: i32, _p1: i32) -> bool {
-        todo!("RIIR Phase 4: state management")
+    /// Truncate every layer's state to positions `[0, p0)`. Linear-attn
+    /// layers reset to empty (lossy — see `state` module docs and the
+    /// FIXME for the Phase 7 typed-error fix). Mirrors
+    /// `mf_memory_seq_rm` (infer.m:7752): always returns `true` if the
+    /// ctx is valid, since the truncation primitive itself is
+    /// infallible.
+    pub fn memory_seq_rm(&mut self, _seq_id: i32, p0: i32, p1: i32) -> bool {
+        truncate(&mut self.layer_states, p0, p1);
+        true
     }
 
+    /// Largest occupied position across full-attn layers, or `-1` if
+    /// none has any entries. Mirrors `mf_memory_seq_pos_max`
+    /// (infer.m:7759).
     pub fn memory_seq_pos_max(&self, _seq_id: i32) -> i32 {
-        todo!("RIIR Phase 4: state management")
+        pos_max(&self.layer_states)
     }
 }
 

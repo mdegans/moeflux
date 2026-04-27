@@ -2340,6 +2340,58 @@ fn gpu_batched_experts_forward_close_c_vs_rust() {
     );
 }
 
+/// Phase 4a: validate the Rust port's `memory_*` ops against the C
+/// path on fresh state. End-to-end forward isn't ported yet, so the
+/// diff is structural — empty-state queries and truncation arguments
+/// must produce matching `pos_max` readings on both sides.
+///
+/// When 4f lands and `eval_prompt` is real, this test grows a
+/// "prefill, truncate, compare pos_max" body that exercises a
+/// non-empty cache. Today it's a structural-equivalence guard against
+/// the layer-state allocation drifting out of sync with the C side.
+#[test]
+#[ignore = "long running; needs moeflux artifacts"]
+fn memory_ops_match_c_on_empty_state() {
+    let mut c: CBackend = open_backend();
+    let mut rs: RsBackend = open_backend();
+
+    eprintln!(
+        "[diff:memory_ops] model={} num_layers reachable via VARIANT",
+        c.model_name(),
+    );
+
+    // Fresh ctx: pos_max equals 0 on both sides for every supported
+    // variant (each has at least one full-attn layer, so the -1 sentinel
+    // never fires).
+    assert_eq!(c.memory_seq_pos_max(), rs.memory_seq_pos_max());
+    assert_eq!(c.memory_seq_pos_max(), 0);
+
+    // memory_clear is a no-op on empty state and must stay matched.
+    c.memory_clear();
+    rs.memory_clear();
+    assert_eq!(c.memory_seq_pos_max(), rs.memory_seq_pos_max());
+
+    // Several truncation argument shapes — empty state stays empty in
+    // every case, but exercises the (p0, p1) argument plumbing on both
+    // sides.
+    for (p0, p1) in [(0, -1), (5, 10), (-1, -1), (100, 50), (0, 0)] {
+        let c_ok = c.memory_seq_rm(p0, p1);
+        let rs_ok = rs.memory_seq_rm(p0, p1);
+        assert_eq!(
+            c_ok, rs_ok,
+            "[diff:memory_ops] memory_seq_rm({p0}, {p1}) return mismatch \
+             (c={c_ok} rs={rs_ok})"
+        );
+        assert_eq!(
+            c.memory_seq_pos_max(),
+            rs.memory_seq_pos_max(),
+            "[diff:memory_ops] pos_max mismatch after memory_seq_rm({p0}, {p1})"
+        );
+    }
+
+    eprintln!("[diff:memory_ops] structural equivalence on empty state: OK");
+}
+
 #[test]
 #[ignore = "long running; needs moeflux artifacts"]
 fn harness_loads() {
