@@ -1,17 +1,28 @@
-//! Single-expert GPU FFN forward pass — slice 9a.
+//! GPU MoE expert FFN dispatch — slices 9a + 9b.
 //!
-//! Mirrors `gpu_expert_forward` in `metal_infer/infer.m`: four GPU
-//! dispatches encoded into one command buffer, then a CPU read-back.
+//! Two entry points:
+//!
+//! - [`gpu_expert_forward`] (slice 9a) runs one expert end-to-end with
+//!   transient `MtlBuffer` allocation per call. Used for diff-oracle
+//!   bring-up of the four-dispatch sequence.
+//! - [`gpu_batched_experts_forward`] (slice 9b) runs K experts in
+//!   parallel across one command buffer, then a `moe_combine_residual`
+//!   dispatch that adds h_mid + Σ weights × expert_out + sigmoid(gate)
+//!   × shared_out. Uses persistent buffers ([`MoeBuffers`]) sized for
+//!   the architectural max `K = 16`.
+//!
+//! The single-expert path mirrors `gpu_expert_forward` in
+//! `metal_infer/infer.m`:
 //!
 //! 1. `dequant_matvec_4bit_v3` over `gate` → `gate_out` `[MOE_INTERMEDIATE]`
 //! 2. `dequant_matvec_4bit_v3` over `up`   → `up_out`   `[MOE_INTERMEDIATE]`
 //! 3. `swiglu_fused(gate_out, up_out)`     → `act`      `[MOE_INTERMEDIATE]`
 //! 4. `dequant_matvec_4bit_v3` over `down` → `expert_out` `[HIDDEN_DIM]`
 //!
-//! All transient buffers are allocated fresh per call. The C path
-//! reuses pre-allocated buffers on the model context; persistent
-//! per-`RsCtx` buffers come in slice 9b alongside the batched K-expert
-//! dispatch where reuse actually matters.
+//! The batched path mirrors `gpu_encode_experts_batched` followed by
+//! the production `moe_combine_residual` dispatch (the path that
+//! `fused_layer_forward` takes when GPU combine is on, minus the
+//! RMSNorm fusion — that's slice 9e).
 //!
 //! ## Tolerance regime
 //!
@@ -39,7 +50,13 @@ use metal::{MTLSize, NSUInteger};
 use super::metal::{MetalBackend, MetalError, MtlBuffer};
 use super::variants::{Variant, GROUP_SIZE, VARIANT};
 
-/// Errors from single-expert GPU FFN forward.
+/// Architectural maximum top-K. Mirrors `MAX_K` in `infer.m` (16).
+/// Sets the slot count of [`MoeBuffers`] and the binding-table width
+/// of `moe_combine_residual` (which expects 16 expert-output buffers
+/// regardless of the active `K`).
+pub const MAX_K: usize = 16;
+
+/// Errors from GPU expert FFN dispatch (slice 9a + 9b).
 #[derive(Debug, thiserror::Error)]
 pub enum ExpertForwardError {
     #[error(
@@ -51,6 +68,18 @@ pub enum ExpertForwardError {
     BadHPostLen { expected: usize, actual: usize },
     #[error("expert_out must be HIDDEN_DIM={expected} floats, got {actual}")]
     BadExpertOutLen { expected: usize, actual: usize },
+    #[error("h_mid must be HIDDEN_DIM={expected} floats, got {actual}")]
+    BadHMidLen { expected: usize, actual: usize },
+    #[error("shared_out must be HIDDEN_DIM={expected} floats, got {actual}")]
+    BadSharedOutLen { expected: usize, actual: usize },
+    #[error("hidden_out must be HIDDEN_DIM={expected} floats, got {actual}")]
+    BadHiddenOutLen { expected: usize, actual: usize },
+    #[error(
+        "actual_K out of range: must be 1..={max}, got {actual}"
+    )]
+    BadK { actual: i32, max: usize },
+    #[error("expert_weights must be {expected} floats, got {actual}")]
+    BadWeightsLen { expected: usize, actual: usize },
     #[error("Metal backend: {0}")]
     Metal(#[from] MetalError),
 }
@@ -223,6 +252,347 @@ fn encode_swiglu(
     enc.end_encoding();
 }
 
+// ---------------------------------------------------------------------------
+// Slice 9b — persistent multi-expert buffers + batched dispatch
+// ---------------------------------------------------------------------------
+
+/// Persistent GPU buffer set for the batched K-expert path. Mirrors
+/// the multi-expert + combine buffers on `MetalCtx` in `infer.m`:
+///
+/// - `data[k]`  — one expert's `EXPERT_SIZE` packed bytes, slot k.
+/// - `gate[k]`  — slot k's gate matvec output, `MOE_INTERMEDIATE` floats.
+/// - `up[k]`    — slot k's up matvec output, `MOE_INTERMEDIATE` floats.
+/// - `act[k]`   — slot k's SwiGLU activation, `MOE_INTERMEDIATE` floats.
+/// - `out[k]`   — slot k's down matvec output, `HIDDEN_DIM` floats.
+/// - `input`    — shared post-attn-norm hidden (`HIDDEN_DIM` floats).
+/// - `h_mid`, `shared_out`, `moe_hidden` — combine inputs / output.
+/// - `combine_params` — 18-float buffer for `moe_combine_residual`:
+///   layout `[weights[0..16], shared_gate_score, padding]`.
+///
+/// Allocated once and reused across every batched call. Total ~28 MB
+/// for A3B (dominated by `MAX_K × EXPERT_SIZE` ≈ 27 MB).
+pub struct MoeBuffers {
+    data: [MtlBuffer<u8>; MAX_K],
+    gate: [MtlBuffer<f32>; MAX_K],
+    up: [MtlBuffer<f32>; MAX_K],
+    act: [MtlBuffer<f32>; MAX_K],
+    out: [MtlBuffer<f32>; MAX_K],
+    input: MtlBuffer<f32>,
+    h_mid: MtlBuffer<f32>,
+    shared_out: MtlBuffer<f32>,
+    moe_hidden: MtlBuffer<f32>,
+    combine_params: MtlBuffer<f32>,
+}
+
+impl MoeBuffers {
+    /// Allocate the full multi-expert + combine buffer set on
+    /// `device`. Sizes come from the active [`Variant`] and architectural
+    /// `MAX_K`. Buffers are uninitialized — every call to
+    /// [`gpu_batched_experts_forward`] writes the slots it uses before
+    /// dispatch.
+    pub fn new(device: &metal::Device) -> Self {
+        let v: Variant = VARIANT;
+        // Build arrays without requiring Default on MtlBuffer.
+        let data = std::array::from_fn(|_| {
+            MtlBuffer::<u8>::with_len(device, v.expert_size_4bit())
+        });
+        let gate =
+            std::array::from_fn(|_| MtlBuffer::<f32>::with_len(device, v.moe_intermediate));
+        let up = std::array::from_fn(|_| {
+            MtlBuffer::<f32>::with_len(device, v.moe_intermediate)
+        });
+        let act = std::array::from_fn(|_| {
+            MtlBuffer::<f32>::with_len(device, v.moe_intermediate)
+        });
+        let out =
+            std::array::from_fn(|_| MtlBuffer::<f32>::with_len(device, v.hidden_dim));
+        Self {
+            data,
+            gate,
+            up,
+            act,
+            out,
+            input: MtlBuffer::with_len(device, v.hidden_dim),
+            h_mid: MtlBuffer::with_len(device, v.hidden_dim),
+            shared_out: MtlBuffer::with_len(device, v.hidden_dim),
+            moe_hidden: MtlBuffer::with_len(device, v.hidden_dim),
+            combine_params: MtlBuffer::with_len(device, 18),
+        }
+    }
+}
+
+impl std::fmt::Debug for MoeBuffers {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MoeBuffers")
+            .field("max_k", &MAX_K)
+            .field("hidden_dim", &VARIANT.hidden_dim)
+            .field("moe_intermediate", &VARIANT.moe_intermediate)
+            .field("expert_size_4bit", &VARIANT.expert_size_4bit())
+            .finish()
+    }
+}
+
+/// Batched K-expert FFN forward + GPU combine. Single command buffer:
+/// 2K expert encoders ([`gpu_encode_experts_batched`'s shape]) followed
+/// by one `moe_combine_residual` dispatch. Reads back the
+/// `HIDDEN_DIM`-float post-combine hidden state.
+///
+/// Inputs:
+///
+/// - `expert_data` — `actual_K * EXPERT_SIZE` bytes, K expert blobs in
+///   slot order.
+/// - `h_post` — `[HIDDEN_DIM]` shared input to every expert's matvec.
+/// - `h_mid` — `[HIDDEN_DIM]` residual added by the combine.
+/// - `shared_out` — `[HIDDEN_DIM]` shared expert's output.
+/// - `expert_weights` — `[actual_K]` routing weights.
+/// - `shared_gate_score` — pre-sigmoid gate logit for the shared
+///   expert.
+/// - `hidden_out` — `[HIDDEN_DIM]` post-combine hidden state.
+///
+/// Cosine/Jaccard tolerance regime against the C-side
+/// `mf_gpu_batched_experts_forward`. Floor placeholders today —
+/// empirically this kernel pair lacks atomic ops (`weighted_sum` / the
+/// combine kernel's `Σ_k weights[k] * expert_out_k[tid]` loop are both
+/// per-thread sequential), so it may also land bit-exact like 9a.
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_batched_experts_forward(
+    metal: &mut MetalBackend,
+    bufs: &mut MoeBuffers,
+    actual_k: i32,
+    expert_data: &[u8],
+    h_post: &[f32],
+    h_mid: &[f32],
+    shared_out: &[f32],
+    expert_weights: &[f32],
+    shared_gate_score: f32,
+    hidden_out: &mut [f32],
+) -> Result<(), ExpertForwardError> {
+    let v = VARIANT;
+    if actual_k < 1 || (actual_k as usize) > MAX_K {
+        return Err(ExpertForwardError::BadK {
+            actual: actual_k,
+            max: MAX_K,
+        });
+    }
+    let k = actual_k as usize;
+    let expected_data_len = k * v.expert_size_4bit();
+    if expert_data.len() != expected_data_len {
+        return Err(ExpertForwardError::BadExpertDataLen {
+            expected: expected_data_len,
+            actual: expert_data.len(),
+        });
+    }
+    if h_post.len() != v.hidden_dim {
+        return Err(ExpertForwardError::BadHPostLen {
+            expected: v.hidden_dim,
+            actual: h_post.len(),
+        });
+    }
+    if h_mid.len() != v.hidden_dim {
+        return Err(ExpertForwardError::BadHMidLen {
+            expected: v.hidden_dim,
+            actual: h_mid.len(),
+        });
+    }
+    if shared_out.len() != v.hidden_dim {
+        return Err(ExpertForwardError::BadSharedOutLen {
+            expected: v.hidden_dim,
+            actual: shared_out.len(),
+        });
+    }
+    if hidden_out.len() != v.hidden_dim {
+        return Err(ExpertForwardError::BadHiddenOutLen {
+            expected: v.hidden_dim,
+            actual: hidden_out.len(),
+        });
+    }
+    if expert_weights.len() != k {
+        return Err(ExpertForwardError::BadWeightsLen {
+            expected: k,
+            actual: expert_weights.len(),
+        });
+    }
+
+    // Compile/fetch every pipeline this dispatch chain needs first; no
+    // mid-encode borrow on `metal` afterwards.
+    let matvec = metal.pipeline("dequant_matvec_4bit_v3")?.clone();
+    let swiglu = metal.pipeline("swiglu_fused")?.clone();
+    let combine = metal.pipeline("moe_combine_residual")?.clone();
+
+    // Stage CPU inputs into the persistent buffers. Per-call cost is K
+    // expert-blob memcpys (~1.7 MB each on A3B) plus three HIDDEN_DIM
+    // memcpys plus the 18-float params buffer fill.
+    let expert_size = v.expert_size_4bit();
+    for slot in 0..k {
+        let src = &expert_data[slot * expert_size..(slot + 1) * expert_size];
+        bufs.data[slot].as_mut_slice().copy_from_slice(src);
+    }
+    bufs.input.as_mut_slice().copy_from_slice(h_post);
+    bufs.h_mid.as_mut_slice().copy_from_slice(h_mid);
+    bufs.shared_out.as_mut_slice().copy_from_slice(shared_out);
+    {
+        let params = bufs.combine_params.as_mut_slice();
+        params.fill(0.0);
+        params[..k].copy_from_slice(expert_weights);
+        params[16] = shared_gate_score;
+        // params[17] stays zero (padding).
+    }
+
+    let cmdbuf = metal.queue().new_command_buffer();
+
+    // Per-expert: Encoder A (gate+up — both read the shared `input`),
+    // Encoder B (SwiGLU then down). Two encoders per expert exposes
+    // GPU parallelism across slots; within an encoder the dispatches
+    // serialize by Metal's encoder-internal ordering.
+    for slot in 0..k {
+        // Encoder A — gate + up
+        {
+            let enc = cmdbuf.new_compute_command_encoder();
+            // gate
+            encode_matvec_into(
+                enc,
+                &matvec,
+                &bufs.data[slot],
+                v.gate_w_off_4bit(),
+                v.gate_s_off_4bit(),
+                v.gate_b_off_4bit(),
+                &bufs.input,
+                &bufs.gate[slot],
+                v.moe_intermediate as u32,
+                v.hidden_dim as u32,
+            );
+            // up — same encoder, serialized after gate
+            encode_matvec_into(
+                enc,
+                &matvec,
+                &bufs.data[slot],
+                v.up_w_off_4bit(),
+                v.up_s_off_4bit(),
+                v.up_b_off_4bit(),
+                &bufs.input,
+                &bufs.up[slot],
+                v.moe_intermediate as u32,
+                v.hidden_dim as u32,
+            );
+            enc.end_encoding();
+        }
+
+        // Encoder B — SwiGLU + down
+        {
+            let enc = cmdbuf.new_compute_command_encoder();
+            encode_swiglu_into(
+                enc,
+                &swiglu,
+                &bufs.gate[slot],
+                &bufs.up[slot],
+                &bufs.act[slot],
+                v.moe_intermediate as u32,
+            );
+            encode_matvec_into(
+                enc,
+                &matvec,
+                &bufs.data[slot],
+                v.down_w_off_4bit(),
+                v.down_s_off_4bit(),
+                v.down_b_off_4bit(),
+                &bufs.act[slot],
+                &bufs.out[slot],
+                v.hidden_dim as u32,
+                v.moe_intermediate as u32,
+            );
+            enc.end_encoding();
+        }
+    }
+
+    // moe_combine_residual: 16 expert-output bindings regardless of K
+    // (kernel branches on K, unused slots have weight=0). Bind all
+    // MAX_K out buffers, weights via the params buffer.
+    {
+        let enc = cmdbuf.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&combine);
+        enc.set_buffer(0, Some(bufs.h_mid.raw()), 0);
+        enc.set_buffer(1, Some(bufs.shared_out.raw()), 0);
+        enc.set_buffer(2, Some(bufs.moe_hidden.raw()), 0);
+        for slot in 0..MAX_K {
+            enc.set_buffer(
+                3 + slot as NSUInteger,
+                Some(bufs.out[slot].raw()),
+                0,
+            );
+        }
+        enc.set_buffer(19, Some(bufs.combine_params.raw()), 0);
+        let dim = v.hidden_dim as u32;
+        let k_val = k as u32;
+        enc.set_bytes(20, 4, (&dim as *const u32).cast());
+        enc.set_bytes(21, 4, (&k_val as *const u32).cast());
+        let tgs = (dim + 255) / 256;
+        enc.dispatch_thread_groups(
+            MTLSize::new(tgs as NSUInteger, 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
+        enc.end_encoding();
+    }
+
+    cmdbuf.commit();
+    cmdbuf.wait_until_completed();
+
+    hidden_out.copy_from_slice(&bufs.moe_hidden.to_vec());
+    Ok(())
+}
+
+/// Inner-loop matvec encoder — same shape as [`encode_matvec`] but
+/// takes a pre-existing encoder so the caller can fold multiple
+/// dispatches into one encoder (matches the C path's
+/// `gpu_encode_experts_batched` 2-encoder-per-expert layout).
+fn encode_matvec_into(
+    enc: &metal::ComputeCommandEncoderRef,
+    pipeline: &metal::ComputePipelineState,
+    data: &MtlBuffer<u8>,
+    w_off: usize,
+    s_off: usize,
+    b_off: usize,
+    input: &MtlBuffer<f32>,
+    output: &MtlBuffer<f32>,
+    out_dim: u32,
+    in_dim: u32,
+) {
+    let group_size = GROUP_SIZE as u32;
+    enc.set_compute_pipeline_state(pipeline);
+    enc.set_buffer(0, Some(data.raw()), w_off as NSUInteger);
+    enc.set_buffer(1, Some(data.raw()), s_off as NSUInteger);
+    enc.set_buffer(2, Some(data.raw()), b_off as NSUInteger);
+    enc.set_buffer(3, Some(input.raw()), 0);
+    enc.set_buffer(4, Some(output.raw()), 0);
+    enc.set_bytes(5, 4, (&out_dim as *const u32).cast());
+    enc.set_bytes(6, 4, (&in_dim as *const u32).cast());
+    enc.set_bytes(7, 4, (&group_size as *const u32).cast());
+    let num_tgs = (out_dim + 7) / 8;
+    enc.dispatch_thread_groups(
+        MTLSize::new(num_tgs as NSUInteger, 1, 1),
+        MTLSize::new(256, 1, 1),
+    );
+}
+
+fn encode_swiglu_into(
+    enc: &metal::ComputeCommandEncoderRef,
+    pipeline: &metal::ComputePipelineState,
+    gate: &MtlBuffer<f32>,
+    up: &MtlBuffer<f32>,
+    act: &MtlBuffer<f32>,
+    dim: u32,
+) {
+    enc.set_compute_pipeline_state(pipeline);
+    enc.set_buffer(0, Some(gate.raw()), 0);
+    enc.set_buffer(1, Some(up.raw()), 0);
+    enc.set_buffer(2, Some(act.raw()), 0);
+    enc.set_bytes(3, 4, (&dim as *const u32).cast());
+    let num_tgs = (dim + 255) / 256;
+    enc.dispatch_thread_groups(
+        MTLSize::new(num_tgs as NSUInteger, 1, 1),
+        MTLSize::new(256, 1, 1),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,5 +658,64 @@ pub mod synth {
                     / v.hidden_dim as f32
             })
             .collect()
+    }
+
+    /// `k * EXPERT_SIZE` bytes of synthetic expert blobs, slot-major.
+    /// Each slot uses a different PRNG seed so the K experts produce
+    /// distinct outputs through the kernels.
+    pub fn k_expert_data_seeded(k: usize) -> Vec<u8> {
+        let v: Variant = VARIANT;
+        let per_expert = v.expert_size_4bit();
+        let mut data = vec![0u8; k * per_expert];
+        for slot in 0..k {
+            let dst = &mut data[slot * per_expert..(slot + 1) * per_expert];
+            for block in 0..3 {
+                let block_off = block * v.expert_block_bytes_4bit();
+                let w_end = block_off + v.expert_weight_bytes_4bit();
+                let mut state: u64 = 0xCAFE_BEEF
+                    ^ ((slot as u64) << 32)
+                    ^ (block as u64);
+                for byte in &mut dst[block_off..w_end] {
+                    state = state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    *byte = (state >> 32) as u8;
+                }
+                let s_end = w_end + v.expert_scale_bytes();
+                for chunk in dst[w_end..s_end].chunks_exact_mut(2) {
+                    chunk[0] = 0x00;
+                    chunk[1] = 0x3C;
+                }
+            }
+        }
+        data
+    }
+
+    /// Deterministic synthetic h_mid (residual). Slightly different
+    /// shape from `h_post_seeded` so the combine pulls in distinct
+    /// values rather than the same vector twice.
+    pub fn h_mid_seeded() -> Vec<f32> {
+        let v = VARIANT;
+        (0..v.hidden_dim)
+            .map(|i| (i as f32 * 0.0007 - 0.05).sin() * 0.001)
+            .collect()
+    }
+
+    /// Deterministic synthetic shared expert output.
+    pub fn shared_out_seeded() -> Vec<f32> {
+        let v = VARIANT;
+        (0..v.hidden_dim)
+            .map(|i| (i as f32 * 0.0011 + 0.03).cos() * 0.001)
+            .collect()
+    }
+
+    /// Sum-to-1 routing weights for K experts. Mirrors what the MoE
+    /// router would emit after softmax + top-K + normalize.
+    pub fn expert_weights_seeded(k: usize) -> Vec<f32> {
+        let raw: Vec<f32> = (0..k)
+            .map(|i| ((i as f32) * 0.37 + 1.0).abs())
+            .collect();
+        let total: f32 = raw.iter().sum();
+        raw.iter().map(|w| w / total).collect()
     }
 }

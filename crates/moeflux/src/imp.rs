@@ -503,6 +503,42 @@ impl Ctx {
         if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
     }
 
+    /// Batched K-expert FFN forward + GPU combine. Wraps
+    /// `mf_gpu_batched_experts_forward`. `expert_data` is K expert
+    /// blobs concatenated in slot order (K × `EXPERT_SIZE` bytes).
+    /// `h_post`, `h_mid`, `shared_out`, `hidden_out` are HIDDEN_DIM
+    /// floats; `expert_weights` is K floats. `actual_k` must satisfy
+    /// `1 ≤ actual_k ≤ MAX_K=16`. Diff-oracle dump point for the
+    /// production MoE expert + combine path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gpu_batched_experts_forward(
+        &self,
+        actual_k: i32,
+        expert_data: &[u8],
+        h_post: &[f32],
+        h_mid: &[f32],
+        shared_out: &[f32],
+        expert_weights: &[f32],
+        shared_gate_score: f32,
+        hidden_out: &mut [f32],
+    ) -> Result<(), Error> {
+        let rc = unsafe {
+            sys::mf_gpu_batched_experts_forward(
+                self.inner.as_ptr(),
+                actual_k,
+                expert_data.as_ptr().cast(),
+                expert_data.len(),
+                h_post.as_ptr(),
+                h_mid.as_ptr(),
+                shared_out.as_ptr(),
+                expert_weights.as_ptr(),
+                shared_gate_score,
+                hidden_out.as_mut_ptr(),
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
+    }
+
     /// Reset the sequence to empty.
     pub fn memory_clear(&mut self) {
         unsafe { sys::mf_memory_clear(self.inner.as_ptr()) }

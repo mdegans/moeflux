@@ -35,7 +35,10 @@ pub mod sdpa;
 pub mod variants;
 pub mod weight_file;
 pub use embedding::{bf16_to_f32, embed_lookup, EmbeddingError};
-pub use expert_forward::{gpu_expert_forward, ExpertForwardError};
+pub use expert_forward::{
+    gpu_batched_experts_forward, gpu_expert_forward, ExpertForwardError,
+    MoeBuffers, MAX_K,
+};
 pub use linear_attn::{
     conv1d_step, gated_delta_recurrence, rms_norm_bare, rms_norm_gated,
     LinearAttnError,
@@ -64,11 +67,13 @@ pub struct RsCtx {
     wf: WeightFile,
     /// Lazily-built Metal backend. CPU-only kernels skip the cost; GPU
     /// kernels (`gpu_expert_forward` and friends) construct it on
-    /// first use via [`Self::metal_mut`]. Slice 9b will start populating
-    /// per-layer persistent buffers here.
+    /// first use via [`Self::metal_mut`].
     metal: Option<MetalBackend>,
-    // Future phases populate: vocab, per-layer state, expert mmaps,
-    // multi-expert working buffers.
+    /// Lazily-built persistent multi-expert + combine buffer set.
+    /// Allocated on first [`Self::gpu_batched_experts_forward`] call;
+    /// reused thereafter. ~28 MB on A3B.
+    moe_buffers: Option<MoeBuffers>,
+    // Future phases populate: vocab, per-layer state, expert mmaps.
 }
 
 impl RsCtx {
@@ -87,7 +92,11 @@ impl RsCtx {
     ) -> Result<Self, RsError> {
         let wf = WeightFile::open(weights, manifest)
             .map_err(|_| RsError::InitFailed)?;
-        Ok(Self { wf, metal: None })
+        Ok(Self {
+            wf,
+            metal: None,
+            moe_buffers: None,
+        })
     }
 
     /// Build (or return) the Metal backend on demand. CPU-only kernels
@@ -99,6 +108,31 @@ impl RsCtx {
                 Some(MetalBackend::new().map_err(|_| RsError::InitFailed)?);
         }
         Ok(self.metal.as_mut().expect("just-set"))
+    }
+
+    /// Ensure both the Metal backend and the persistent multi-expert
+    /// buffer set exist, then return mutable refs to both.
+    /// Field-disjoint borrows so two `&mut`s on the same `&mut self`
+    /// are valid.
+    fn metal_and_moe_mut(
+        &mut self,
+    ) -> Result<(&mut MetalBackend, &mut MoeBuffers), RsError> {
+        if self.metal.is_none() {
+            self.metal =
+                Some(MetalBackend::new().map_err(|_| RsError::InitFailed)?);
+        }
+        if self.moe_buffers.is_none() {
+            let device =
+                self.metal.as_ref().expect("just-set").device().to_owned();
+            self.moe_buffers = Some(MoeBuffers::new(&device));
+        }
+        let Self {
+            metal, moe_buffers, ..
+        } = self;
+        Ok((
+            metal.as_mut().expect("just-set"),
+            moe_buffers.as_mut().expect("just-set"),
+        ))
     }
 
     pub fn n_vocab(&self) -> usize {
@@ -348,6 +382,40 @@ impl RsCtx {
         let metal = self.metal_mut()?;
         gpu_expert_forward(metal, expert_data, h_post, expert_out)
             .map_err(|_| RsError::EvalFailed)
+    }
+
+    /// Batched K-expert FFN forward + GPU combine (slice 9b). Encodes
+    /// `actual_K` parallel expert FFNs (`gate matvec → up matvec →
+    /// SwiGLU → down matvec`) followed by `moe_combine_residual` into
+    /// one command buffer. The combine yields
+    /// `h_mid + Σ weights[k] × expert_out[k] + sigmoid(gate) × shared_out`.
+    /// Cosine/Jaccard territory against `mf_gpu_batched_experts_forward`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gpu_batched_experts_forward(
+        &mut self,
+        actual_k: i32,
+        expert_data: &[u8],
+        h_post: &[f32],
+        h_mid: &[f32],
+        shared_out: &[f32],
+        expert_weights: &[f32],
+        shared_gate_score: f32,
+        hidden_out: &mut [f32],
+    ) -> Result<(), RsError> {
+        let (metal, bufs) = self.metal_and_moe_mut()?;
+        gpu_batched_experts_forward(
+            metal,
+            bufs,
+            actual_k,
+            expert_data,
+            h_post,
+            h_mid,
+            shared_out,
+            expert_weights,
+            shared_gate_score,
+            hidden_out,
+        )
+        .map_err(|_| RsError::EvalFailed)
     }
 
     pub fn eval_prompt(

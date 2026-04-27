@@ -188,6 +188,21 @@ pub trait DiffBackend {
         h_post: &[f32],
     ) -> Vec<f32>;
 
+    /// Batched K-expert FFN forward + GPU combine (slice 9b).
+    /// `expert_data` is `actual_k * EXPERT_SIZE` bytes (K blobs in slot
+    /// order). Returns the HIDDEN_DIM-float post-combine hidden state.
+    #[allow(clippy::too_many_arguments)]
+    fn gpu_batched_experts_forward(
+        &mut self,
+        actual_k: i32,
+        expert_data: &[u8],
+        h_post: &[f32],
+        h_mid: &[f32],
+        shared_out: &[f32],
+        expert_weights: &[f32],
+        shared_gate_score: f32,
+    ) -> Vec<f32>;
+
     /// Prefill `tokens` at `start_pos`. Returns the n_vocab-length
     /// logit vector for the position immediately after the last
     /// token in `tokens`.
@@ -406,6 +421,32 @@ impl DiffBackend for CBackend {
         self.0
             .gpu_expert_forward(expert_data, h_post, &mut out)
             .expect("CBackend gpu_expert_forward");
+        out
+    }
+
+    fn gpu_batched_experts_forward(
+        &mut self,
+        actual_k: i32,
+        expert_data: &[u8],
+        h_post: &[f32],
+        h_mid: &[f32],
+        shared_out: &[f32],
+        expert_weights: &[f32],
+        shared_gate_score: f32,
+    ) -> Vec<f32> {
+        let mut out = vec![0.0f32; moeflux::riir::VARIANT.hidden_dim];
+        self.0
+            .gpu_batched_experts_forward(
+                actual_k,
+                expert_data,
+                h_post,
+                h_mid,
+                shared_out,
+                expert_weights,
+                shared_gate_score,
+                &mut out,
+            )
+            .expect("CBackend gpu_batched_experts_forward");
         out
     }
 
@@ -638,6 +679,32 @@ impl DiffBackend for RsBackend {
         self.0
             .gpu_expert_forward(expert_data, h_post, &mut out)
             .expect("RsBackend gpu_expert_forward");
+        out
+    }
+
+    fn gpu_batched_experts_forward(
+        &mut self,
+        actual_k: i32,
+        expert_data: &[u8],
+        h_post: &[f32],
+        h_mid: &[f32],
+        shared_out: &[f32],
+        expert_weights: &[f32],
+        shared_gate_score: f32,
+    ) -> Vec<f32> {
+        let mut out = vec![0.0f32; moeflux::riir::VARIANT.hidden_dim];
+        self.0
+            .gpu_batched_experts_forward(
+                actual_k,
+                expert_data,
+                h_post,
+                h_mid,
+                shared_out,
+                expert_weights,
+                shared_gate_score,
+                &mut out,
+            )
+            .expect("RsBackend gpu_batched_experts_forward");
         out
     }
 
@@ -1947,6 +2014,119 @@ fn gpu_expert_forward_close_c_vs_rust() {
         rel <= REL_DIFF_FLOOR,
         "[diff:gpu_expert_forward] relative max_abs_diff {rel:.3e} \
          above {REL_DIFF_FLOOR:.3e}"
+    );
+}
+
+/// Phase 3 slice 9b — batched K-expert FFN + GPU combine.
+///
+/// K=4 synthetic experts (distinct PRNG seeds per slot), normalized
+/// random weights, deterministic h_post / h_mid / shared_out, and
+/// `shared_gate_score = -1.0` so `sigmoid(-1) ≈ 0.269` brings a
+/// non-trivial fraction of `shared_out` into the combine.
+///
+/// Both backends consume identical bytes; the only difference is the
+/// host-side encoding path (which buffers, which encoders, which
+/// dispatch helper). `weighted_sum`/`moe_combine_residual` per-thread
+/// loops have no atomic ops, so empirically this *might* land
+/// bit-exact like 9a — but the cosine ≥ 0.9999 / rel ≤ 1e-3 floors
+/// stay loose to absorb any genuine SIMD-reduce nondeterminism that
+/// would surface here before it matters in 9c+.
+#[test]
+#[ignore = "long running; needs Metal device + moeflux artifacts"]
+fn gpu_batched_experts_forward_close_c_vs_rust() {
+    use moeflux::riir::expert_forward::synth;
+    use moeflux::riir::VARIANT;
+
+    let mut c: CBackend = open_backend();
+    let mut rs: RsBackend = open_backend();
+
+    let k: usize = 4;
+    let expert_data = synth::k_expert_data_seeded(k);
+    let h_post = synth::h_post_seeded();
+    let h_mid = synth::h_mid_seeded();
+    let shared_out = synth::shared_out_seeded();
+    let weights = synth::expert_weights_seeded(k);
+    let shared_gate_score: f32 = -1.0;
+
+    assert_eq!(expert_data.len(), k * VARIANT.expert_size_4bit());
+    assert_eq!(weights.len(), k);
+    let weight_sum: f32 = weights.iter().sum();
+    assert!(
+        (weight_sum - 1.0).abs() < 1e-5,
+        "synth weights don't sum to 1: {weight_sum}"
+    );
+
+    let c_out = c.gpu_batched_experts_forward(
+        k as i32,
+        &expert_data,
+        &h_post,
+        &h_mid,
+        &shared_out,
+        &weights,
+        shared_gate_score,
+    );
+    let rs_out = rs.gpu_batched_experts_forward(
+        k as i32,
+        &expert_data,
+        &h_post,
+        &h_mid,
+        &shared_out,
+        &weights,
+        shared_gate_score,
+    );
+    assert_eq!(c_out.len(), VARIANT.hidden_dim);
+    assert_eq!(rs_out.len(), VARIANT.hidden_dim);
+
+    let cos = cosine_sim(&c_out, &rs_out);
+    let max_abs_out = c_out
+        .iter()
+        .chain(rs_out.iter())
+        .map(|x| x.abs())
+        .fold(0.0f32, f32::max);
+    let max_abs_diff = c_out
+        .iter()
+        .zip(rs_out.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let rel = if max_abs_out > 0.0 {
+        max_abs_diff / max_abs_out
+    } else {
+        0.0
+    };
+
+    eprintln!(
+        "[diff:gpu_batched_experts_forward k={k}] cosine={cos:.7} \
+         max_abs_diff={max_abs_diff:.3e} max_abs_out={max_abs_out:.3e} \
+         relative={rel:.3e}"
+    );
+
+    assert!(
+        c_out.iter().all(|x| x.is_finite()),
+        "[diff:gpu_batched_experts_forward] C output has NaN/Inf"
+    );
+    assert!(
+        rs_out.iter().all(|x| x.is_finite()),
+        "[diff:gpu_batched_experts_forward] Rust output has NaN/Inf"
+    );
+    assert!(
+        c_out.iter().any(|&x| x != 0.0),
+        "[diff:gpu_batched_experts_forward] C output is all zero"
+    );
+    assert!(
+        rs_out.iter().any(|&x| x != 0.0),
+        "[diff:gpu_batched_experts_forward] Rust output is all zero"
+    );
+
+    const COSINE_FLOOR: f32 = 0.9999;
+    const REL_DIFF_FLOOR: f32 = 1e-3;
+    assert!(
+        cos >= COSINE_FLOOR,
+        "[diff:gpu_batched_experts_forward] cosine {cos:.7} below {COSINE_FLOOR}"
+    );
+    assert!(
+        rel <= REL_DIFF_FLOOR,
+        "[diff:gpu_batched_experts_forward] relative max_abs_diff \
+         {rel:.3e} above {REL_DIFF_FLOOR:.3e}"
     );
 }
 

@@ -295,6 +295,52 @@ int mf_gpu_expert_forward(mf_ctx *ctx,
                            const float *h_post,
                            float *expert_out);
 
+// Batched K-expert FFN forward + GPU combine. Encodes K parallel
+// expert FFNs and then `moe_combine_residual` into a single command
+// buffer, runs it, and reads back the post-combine hidden state.
+//
+// The combine kernel computes:
+//
+//   hidden_out[i] = h_mid[i]
+//                 + Σ_{k<K} expert_weights[k] * expert_out_k[i]
+//                 + sigmoid(shared_gate_score) * shared_out[i]
+//
+// The caller stages all inputs:
+//
+//   actual_K:           1..16 (clamped at MAX_K=16 — values above are -1).
+//   expert_data:        actual_K * EXPERT_SIZE bytes, K expert blobs
+//                       laid out in slot order (slot 0 first, then 1, ...).
+//                       Layout per-blob is the standard 4-bit
+//                       `[gate | up | down]` from `model_variant.h`.
+//   expert_data_len:    must equal actual_K * EXPERT_SIZE.
+//   h_post:             [HIDDEN_DIM] post-attn-norm hidden state, the
+//                       shared input to every expert's gate / up matvec.
+//   h_mid:              [HIDDEN_DIM] residual added by the combine
+//                       (the pre-MoE hidden state in the production
+//                       decode path).
+//   shared_out:         [HIDDEN_DIM] the shared expert's output. Pass
+//                       zeros + a very negative `shared_gate_score` to
+//                       neutralize the shared expert if you only want
+//                       routed-experts behaviour.
+//   expert_weights:     [actual_K] routing weights (typically a
+//                       softmax-normalized top-K).
+//   shared_gate_score:  pre-sigmoid gate logit for the shared expert.
+//   hidden_out:         [HIDDEN_DIM] post-combine hidden state.
+//
+// Returns 0 on success; -1 on NULL args, wrong `expert_data_len`,
+// `actual_K` out of range, ctx initialized with `use_2bit != 0`, or
+// missing Metal pipelines.
+int mf_gpu_batched_experts_forward(mf_ctx *ctx,
+                                    int32_t actual_K,
+                                    const void *expert_data,
+                                    size_t expert_data_len,
+                                    const float *h_post,
+                                    const float *h_mid,
+                                    const float *shared_out,
+                                    const float *expert_weights,
+                                    float shared_gate_score,
+                                    float *hidden_out);
+
 // ============================================================================
 // State snapshot / restore (Option B in NOTES.md)
 // ============================================================================

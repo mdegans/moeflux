@@ -8030,6 +8030,98 @@ int mf_gpu_expert_forward(mf_ctx *ctx,
     return 0;
 }
 
+// Diff-oracle entry: batched K-expert FFN forward + GPU combine.
+// Stages caller-provided inputs into the file-scope `g_metal`'s
+// pre-allocated multi-expert buffers, encodes the same per-expert
+// pipeline `gpu_encode_experts_batched` uses in production, then
+// `moe_combine_residual`, commits, waits, and reads back. Mirrors
+// the production callsite at infer.m:5680..5710 minus the RMSNorm
+// fusion (slice 9e) and the deferred-state plumbing (slice 9d).
+int mf_gpu_batched_experts_forward(mf_ctx *ctx,
+                                    int32_t actual_K,
+                                    const void *expert_data,
+                                    size_t expert_data_len,
+                                    const float *h_post,
+                                    const float *h_mid,
+                                    const float *shared_out,
+                                    const float *expert_weights,
+                                    float shared_gate_score,
+                                    float *hidden_out)
+{
+    if (!ctx || !expert_data || !h_post || !h_mid || !shared_out
+        || !expert_weights || !hidden_out) return -1;
+    if (g_use_2bit) return -1;
+    if (actual_K < 1 || actual_K > MAX_K) return -1;
+    if (expert_data_len != (size_t)EXPERT_SIZE * (size_t)actual_K) return -1;
+    if (!g_metal || !g_metal->moe_combine_residual) return -1;
+
+    // Stage the K expert blobs into buf_multi_expert_data[0..K).
+    const uint8_t *src = (const uint8_t *)expert_data;
+    for (int k = 0; k < actual_K; k++) {
+        memcpy([g_metal->buf_multi_expert_data[k] contents],
+               src + (size_t)k * (size_t)EXPERT_SIZE,
+               (size_t)EXPERT_SIZE);
+    }
+    // Stage the shared input (h_post), residual (h_mid), shared expert
+    // output, and combine params.
+    memcpy([g_metal->buf_multi_expert_input contents], h_post,
+           (size_t)HIDDEN_DIM * sizeof(float));
+    memcpy([g_metal->buf_h_mid contents], h_mid,
+           (size_t)HIDDEN_DIM * sizeof(float));
+    memcpy([g_metal->buf_shared_out contents], shared_out,
+           (size_t)HIDDEN_DIM * sizeof(float));
+    {
+        float *params = (float *)[g_metal->buf_combine_params contents];
+        memset(params, 0, 18 * sizeof(float));
+        for (int k = 0; k < actual_K; k++) {
+            params[k] = expert_weights[k];
+        }
+        params[16] = shared_gate_score;
+    }
+    int valid[MAX_K];
+    for (int k = 0; k < MAX_K; k++) valid[k] = (k < actual_K) ? 1 : 0;
+
+    id<MTLCommandBuffer> cmdbuf = [g_metal->queue commandBuffer];
+
+    // Per-expert: 2 encoders (gate+up, then SwiGLU+down). Same path
+    // as production — `gpu_encode_experts_batched` reads the staged
+    // buf_multi_expert_data slot and writes to gate/up/act/out[k].
+    gpu_encode_experts_batched(g_metal, cmdbuf, actual_K, valid,
+                               g_metal->buf_multi_expert_data);
+
+    // moe_combine_residual: bind h_mid, shared_out, hidden_out (in
+    // buf_moe_hidden), all 16 expert output buffers, params, and the
+    // dim/K constants. Unused expert slots have weight=0 in params,
+    // so the kernel's per-slot branch keeps them out of the sum.
+    {
+        id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+        [enc setComputePipelineState:g_metal->moe_combine_residual];
+        [enc setBuffer:g_metal->buf_h_mid      offset:0 atIndex:0];
+        [enc setBuffer:g_metal->buf_shared_out offset:0 atIndex:1];
+        [enc setBuffer:g_metal->buf_moe_hidden offset:0 atIndex:2];
+        for (int k = 0; k < MAX_K; k++) {
+            [enc setBuffer:g_metal->buf_multi_expert_out[k]
+                    offset:0 atIndex:(3 + k)];
+        }
+        [enc setBuffer:g_metal->buf_combine_params offset:0 atIndex:19];
+        uint32_t dim = HIDDEN_DIM;
+        uint32_t k_val = (uint32_t)actual_K;
+        [enc setBytes:&dim   length:4 atIndex:20];
+        [enc setBytes:&k_val length:4 atIndex:21];
+        uint32_t tgs = (dim + 255) / 256;
+        [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+    }
+
+    [cmdbuf commit];
+    [cmdbuf waitUntilCompleted];
+
+    memcpy(hidden_out, [g_metal->buf_moe_hidden contents],
+           (size_t)HIDDEN_DIM * sizeof(float));
+    return 0;
+}
+
 // ============================================================================
 // State snapshot / restore (Option B)
 // ============================================================================
