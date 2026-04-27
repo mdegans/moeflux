@@ -479,6 +479,28 @@ impl Ctx {
         if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
     }
 
+    /// GPU RMSNorm with bf16 weights. Wraps `mf_gpu_rms_norm_fused`.
+    /// `x` and `out` are HIDDEN_DIM floats; `weight_bf16` is
+    /// `HIDDEN_DIM * 2` bytes of little-endian bf16. Diff-oracle dump
+    /// point for the GPU rms_norm_sum_sq + rms_norm_apply_bf16 chain.
+    pub fn gpu_rms_norm_fused(
+        &self,
+        x: &[f32],
+        weight_bf16: &[u8],
+        out: &mut [f32],
+    ) -> Result<(), Error> {
+        let rc = unsafe {
+            sys::mf_gpu_rms_norm_fused(
+                self.inner.as_ptr(),
+                x.as_ptr(),
+                weight_bf16.as_ptr().cast(),
+                weight_bf16.len(),
+                out.as_mut_ptr(),
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
+    }
+
     /// Read one expert's `EXPERT_SIZE`-byte 4-bit blob from the
     /// per-layer packed-expert file. Bypasses every cache. Wraps
     /// `mf_load_expert_bytes`; rejects 2-bit ctxs and any

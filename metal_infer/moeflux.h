@@ -361,6 +361,26 @@ int mf_load_expert_bytes(mf_ctx *ctx,
                           void *out,
                           size_t out_len);
 
+// GPU RMSNorm with bf16 weights — chains `rms_norm_sum_sq` (one
+// threadgroup, two-stage SIMD-then-shared reduction) followed by
+// `rms_norm_apply_bf16` (per-element). Mirrors the production CMD3
+// fast-path at `infer.m:5712..5744`. Uses the active variant's
+// `RMS_NORM_EPS`. Caller stages all bytes; weight is passed in
+// directly so the hook doesn't depend on tensor-name resolution.
+//
+//   x:               [HIDDEN_DIM] input vector (f32).
+//   weight_bf16:     `HIDDEN_DIM * 2` bytes, bf16 weights.
+//   weight_bf16_len: must equal `HIDDEN_DIM * 2`.
+//   out:             [HIDDEN_DIM] normed output (f32).
+//
+// Returns 0 on success; -1 on NULL args, wrong `weight_bf16_len`, or
+// missing GPU pipelines.
+int mf_gpu_rms_norm_fused(mf_ctx *ctx,
+                           const float *x,
+                           const void *weight_bf16,
+                           size_t weight_bf16_len,
+                           float *out);
+
 // ============================================================================
 // State snapshot / restore (Option B in NOTES.md)
 // ============================================================================

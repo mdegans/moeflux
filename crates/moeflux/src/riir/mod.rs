@@ -26,6 +26,7 @@ use std::path::Path;
 pub mod embedding;
 pub mod expert_forward;
 pub mod expert_io;
+pub mod gpu_norm;
 pub mod linear_attn;
 pub mod lm_head;
 pub mod metal;
@@ -41,6 +42,7 @@ pub use expert_forward::{
     MoeBuffers, MAX_K,
 };
 pub use expert_io::{ExpertFiles, ExpertIoError};
+pub use gpu_norm::{gpu_rms_norm_fused, GpuNormError};
 pub use linear_attn::{
     conv1d_step, gated_delta_recurrence, rms_norm_bare, rms_norm_gated,
     LinearAttnError,
@@ -374,6 +376,24 @@ impl RsCtx {
             out_values,
         )
         .map_err(|_| RsError::EvalFailed)
+    }
+
+    /// GPU RMSNorm with bf16 weights (slice 9e). Chains
+    /// `rms_norm_sum_sq` + `rms_norm_apply_bf16` into one cmdbuf.
+    /// `weight_bf16` is the raw little-endian bf16 byte sequence
+    /// (typically from `WeightFile::tensor_bytes(name)`).
+    /// First GPU kernel under diff with threadgroup-shared
+    /// reduction — empirical question whether this engages the
+    /// cosine/Jaccard floors.
+    pub fn gpu_rms_norm_fused(
+        &mut self,
+        x: &[f32],
+        weight_bf16: &[u8],
+        out: &mut [f32],
+    ) -> Result<(), RsError> {
+        let metal = self.metal_mut()?;
+        gpu_rms_norm_fused(metal, x, weight_bf16, out)
+            .map_err(|_| RsError::EvalFailed)
     }
 
     /// Read one expert's `EXPERT_SIZE`-byte 4-bit blob from disk

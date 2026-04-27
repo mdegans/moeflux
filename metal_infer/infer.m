@@ -8147,6 +8147,87 @@ int mf_load_expert_bytes(mf_ctx *ctx,
     return 0;
 }
 
+// Diff-oracle entry: GPU RMSNorm with bf16 weights — chains
+// `rms_norm_sum_sq` and `rms_norm_apply_bf16` against fresh
+// per-call scratch buffers. Mirrors the production CMD3 fast-path
+// at infer.m:5712..5744 minus the deferred plumbing — this hook is
+// synchronous (commit + wait) so the diff harness can read the
+// result back at a known boundary.
+int mf_gpu_rms_norm_fused(mf_ctx *ctx,
+                           const float *x,
+                           const void *weight_bf16,
+                           size_t weight_bf16_len,
+                           float *out)
+{
+    if (!ctx || !x || !weight_bf16 || !out) return -1;
+    if (weight_bf16_len != (size_t)HIDDEN_DIM * sizeof(uint16_t)) return -1;
+    if (!g_metal || !g_metal->rms_norm_sum || !g_metal->rms_norm_apply_bf16) {
+        return -1;
+    }
+
+    // Scratch buffers. Per-call alloc — same shape on both diff sides
+    // so the comparison is fair. Production reuses `buf_moe_hidden /
+    // buf_cmd3_sum_sq / buf_input` from the model context; fresh
+    // allocation costs ~µs and removes the "is the production layout
+    // alive" precondition from the test surface.
+    id<MTLBuffer> buf_x = [g_metal->device
+        newBufferWithBytes:x
+                    length:(size_t)HIDDEN_DIM * sizeof(float)
+                   options:MTLResourceStorageModeShared];
+    id<MTLBuffer> buf_w = [g_metal->device
+        newBufferWithBytes:weight_bf16
+                    length:weight_bf16_len
+                   options:MTLResourceStorageModeShared];
+    id<MTLBuffer> buf_sum_sq = [g_metal->device
+        newBufferWithLength:sizeof(float)
+                    options:MTLResourceStorageModeShared];
+    id<MTLBuffer> buf_out = [g_metal->device
+        newBufferWithLength:(size_t)HIDDEN_DIM * sizeof(float)
+                    options:MTLResourceStorageModeShared];
+
+    id<MTLCommandBuffer> cmdbuf = [g_metal->queue commandBuffer];
+
+    // Stage 1: rms_norm_sum_sq. Single threadgroup of 256 threads
+    // computes the scalar Σ x[i]² via simd_sum + threadgroup-shared
+    // second-stage reduction.
+    {
+        id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+        [enc setComputePipelineState:g_metal->rms_norm_sum];
+        [enc setBuffer:buf_x      offset:0 atIndex:0];
+        [enc setBuffer:buf_sum_sq offset:0 atIndex:1];
+        uint32_t dim = HIDDEN_DIM;
+        [enc setBytes:&dim length:4 atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+    }
+
+    // Stage 2: rms_norm_apply_bf16. Per-element; each thread reads
+    // sum_sq[0] and applies the rsqrt + bf16 weight.
+    {
+        id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+        [enc setComputePipelineState:g_metal->rms_norm_apply_bf16];
+        [enc setBuffer:buf_x      offset:0 atIndex:0];
+        [enc setBuffer:buf_w      offset:0 atIndex:1];
+        [enc setBuffer:buf_sum_sq offset:0 atIndex:2];
+        [enc setBuffer:buf_out    offset:0 atIndex:3];
+        uint32_t dim = HIDDEN_DIM;
+        float eps = RMS_NORM_EPS;
+        [enc setBytes:&dim length:4 atIndex:4];
+        [enc setBytes:&eps length:4 atIndex:5];
+        uint32_t tgs = (dim + 255) / 256;
+        [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+    }
+
+    [cmdbuf commit];
+    [cmdbuf waitUntilCompleted];
+
+    memcpy(out, [buf_out contents], (size_t)HIDDEN_DIM * sizeof(float));
+    return 0;
+}
+
 // ============================================================================
 // State snapshot / restore (Option B)
 // ============================================================================

@@ -181,6 +181,15 @@ pub trait DiffBackend {
     /// (slice 9c). Returns the raw on-disk bytes.
     fn load_expert_bytes(&self, layer_idx: i32, expert_idx: i32) -> Vec<u8>;
 
+    /// GPU RMSNorm with bf16 weights (slice 9e). `x` is HIDDEN_DIM
+    /// floats; `weight_bf16` is HIDDEN_DIM × 2 bytes (typically the
+    /// raw `model.norm.weight` mmap region). Returns HIDDEN_DIM floats.
+    fn gpu_rms_norm_fused(
+        &mut self,
+        x: &[f32],
+        weight_bf16: &[u8],
+    ) -> Vec<f32>;
+
     /// Single-expert GPU FFN forward (slice 9a). `expert_data` is one
     /// expert's `EXPERT_SIZE`-byte 4-bit blob; `h_post` is HIDDEN_DIM
     /// floats. Returns the HIDDEN_DIM-float expert output. Takes
@@ -421,6 +430,18 @@ impl DiffBackend for CBackend {
         self.0
             .load_expert_bytes(layer_idx, expert_idx, &mut out)
             .expect("CBackend load_expert_bytes");
+        out
+    }
+
+    fn gpu_rms_norm_fused(
+        &mut self,
+        x: &[f32],
+        weight_bf16: &[u8],
+    ) -> Vec<f32> {
+        let mut out = vec![0.0f32; moeflux::riir::VARIANT.hidden_dim];
+        self.0
+            .gpu_rms_norm_fused(x, weight_bf16, &mut out)
+            .expect("CBackend gpu_rms_norm_fused");
         out
     }
 
@@ -691,6 +712,18 @@ impl DiffBackend for RsBackend {
                 &mut out,
             )
             .expect("RsBackend load_expert_bytes");
+        out
+    }
+
+    fn gpu_rms_norm_fused(
+        &mut self,
+        x: &[f32],
+        weight_bf16: &[u8],
+    ) -> Vec<f32> {
+        let mut out = vec![0.0f32; moeflux::riir::VARIANT.hidden_dim];
+        self.0
+            .gpu_rms_norm_fused(x, weight_bf16, &mut out)
+            .expect("RsBackend gpu_rms_norm_fused");
         out
     }
 
@@ -2037,6 +2070,103 @@ fn gpu_expert_forward_close_c_vs_rust() {
     assert!(
         rel <= REL_DIFF_FLOOR,
         "[diff:gpu_expert_forward] relative max_abs_diff {rel:.3e} \
+         above {REL_DIFF_FLOOR:.3e}"
+    );
+}
+
+/// Phase 3 slice 9e — GPU RMSNorm fused chain.
+///
+/// `rms_norm_sum_sq` is the first kernel in the diff suite using
+/// **threadgroup-shared memory across SIMD groups** (256 threads
+/// reduce to 1 scalar via simd_sum + 32-element shared array +
+/// second-stage simd_sum). If Metal nondeterminism is going to
+/// engage, this is the most plausible spot in the slices ported so
+/// far.
+///
+/// Test pattern: load real `model.norm.weight` bytes via the C side's
+/// existing wrapper (the Rust port hasn't published the weight file
+/// over its public API surface; we read from the C-side ctx since
+/// both ctxs were opened over the same artifacts). Run the chain on
+/// the same x on both backends; compare.
+///
+/// Empirical floors: cosine ≥ 0.9999, rel ≤ 1e-3 (the GPU "atomic-op
+/// tolerance" envelope). If both kernels turn out to also be
+/// deterministic-per-PSO (likely — `simd_sum` is documented as such,
+/// the threadgroup-shared write/read is barrier-fenced), this lands
+/// bit-exact like 9a/9b.
+#[test]
+#[ignore = "long running; needs Metal device + moeflux artifacts"]
+fn gpu_rms_norm_fused_close_c_vs_rust() {
+    use moeflux::riir::VARIANT;
+
+    let mut c: CBackend = open_backend();
+    let mut rs: RsBackend = open_backend();
+
+    // Load `model.norm.weight` as raw bf16 bytes via the Rust
+    // weight-file wrapper (which both backends opened over the same
+    // artifacts). Only the bytes are needed; same on both sides.
+    let art = artifacts_dir();
+    let wf = moeflux::riir::WeightFile::open(
+        &art.join("model_weights.bin"),
+        &art.join("model_weights.json"),
+    )
+    .expect("WeightFile::open");
+    let weight = wf
+        .tensor_bytes("model.norm.weight")
+        .expect("model.norm.weight present in manifest");
+    assert_eq!(weight.len(), VARIANT.hidden_dim * 2);
+
+    // Synthetic x: not symmetric around zero so sum_sq is meaningful.
+    let x: Vec<f32> = (0..VARIANT.hidden_dim)
+        .map(|i| (i as f32 * 0.013).sin() * 0.5 + 0.1)
+        .collect();
+
+    let c_out = c.gpu_rms_norm_fused(&x, weight);
+    let rs_out = rs.gpu_rms_norm_fused(&x, weight);
+    assert_eq!(c_out.len(), VARIANT.hidden_dim);
+    assert_eq!(rs_out.len(), VARIANT.hidden_dim);
+
+    let cos = cosine_sim(&c_out, &rs_out);
+    let max_abs_out = c_out
+        .iter()
+        .chain(rs_out.iter())
+        .map(|x| x.abs())
+        .fold(0.0f32, f32::max);
+    let max_abs_diff = c_out
+        .iter()
+        .zip(rs_out.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let rel = if max_abs_out > 0.0 {
+        max_abs_diff / max_abs_out
+    } else {
+        0.0
+    };
+
+    eprintln!(
+        "[diff:gpu_rms_norm_fused] cosine={cos:.7} \
+         max_abs_diff={max_abs_diff:.3e} max_abs_out={max_abs_out:.3e} \
+         relative={rel:.3e}"
+    );
+
+    assert!(
+        c_out.iter().all(|x| x.is_finite()),
+        "[diff:gpu_rms_norm_fused] C output has NaN/Inf"
+    );
+    assert!(
+        rs_out.iter().all(|x| x.is_finite()),
+        "[diff:gpu_rms_norm_fused] Rust output has NaN/Inf"
+    );
+
+    const COSINE_FLOOR: f32 = 0.9999;
+    const REL_DIFF_FLOOR: f32 = 1e-3;
+    assert!(
+        cos >= COSINE_FLOOR,
+        "[diff:gpu_rms_norm_fused] cosine {cos:.7} below {COSINE_FLOOR}"
+    );
+    assert!(
+        rel <= REL_DIFF_FLOOR,
+        "[diff:gpu_rms_norm_fused] relative max_abs_diff {rel:.3e} \
          above {REL_DIFF_FLOOR:.3e}"
     );
 }
