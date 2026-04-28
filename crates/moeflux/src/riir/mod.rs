@@ -773,6 +773,8 @@ impl RsCtx {
                 prefetch,
                 kv_state,
                 gpu_combine,
+                /* prev_layer_chained = */ false,
+                /* chain_next_norm_off = */ None,
             )
             .map_err(|_| RsError::EvalFailed)?;
         } else {
@@ -797,6 +799,8 @@ impl RsCtx {
                 prefetch,
                 layer_state,
                 gpu_combine,
+                /* prev_layer_chained = */ false,
+                /* chain_next_norm_off = */ None,
             )
             .map_err(|_| RsError::EvalFailed)?;
         }
@@ -1049,28 +1053,38 @@ impl RsCtx {
         }
 
         // Per-layer loop. Each layer leaves a deferred K-expert
-        // dispatch active; the next iteration drains it into
-        // `linear_buffers.input` before running its own forward.
-        // gpu_combine = true everywhere preserves the slice 4f-3
-        // production behavior; slice 4f-perf will gate this on
-        // `should_gpu_combine`'s C-mirrored conditions.
+        // dispatch active; the next iteration drains it before running
+        // its own forward. gpu_combine = true everywhere preserves the
+        // slice 4f-3 production behavior.
+        //
+        // Slice 5d-8: when the previous layer chained, the K-expert
+        // cmdbuf already wrote the next layer's normed input into
+        // `linear_buffers.normed` and the unnormed combine output into
+        // `linear_buffers.input` — the drain becomes a bare wait, no
+        // readback. The chain is enabled for every non-last layer.
+        let mut prev_layer_chained = false;
         for layer_idx in 0..v.num_layers {
             if layer_idx > 0 {
-                // Drain previous layer's deferred dispatch into
-                // linear_buffers.input. SAFETY: shared-storage
-                // buffer; complete_* waits before reading.
-                let buf_input_slice = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        linear_buffers.input.contents() as *mut f32,
-                        v.hidden_dim,
+                if prev_layer_chained {
+                    deferred::complete_deferred_experts_chained(deferred)
+                        .map_err(|_| RsError::EvalFailed)?;
+                } else {
+                    // Drain previous layer's deferred dispatch into
+                    // linear_buffers.input. SAFETY: shared-storage
+                    // buffer; complete_* waits before reading.
+                    let buf_input_slice = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            linear_buffers.input.contents() as *mut f32,
+                            v.hidden_dim,
+                        )
+                    };
+                    deferred::complete_deferred_experts_into(
+                        deferred,
+                        moe_buffers,
+                        buf_input_slice,
                     )
-                };
-                deferred::complete_deferred_experts_into(
-                    deferred,
-                    moe_buffers,
-                    buf_input_slice,
-                )
-                .map_err(|_| RsError::EvalFailed)?;
+                    .map_err(|_| RsError::EvalFailed)?;
+                }
             }
 
             // Slice 5d-6b: kick off async prefetch for THIS layer
@@ -1097,6 +1111,15 @@ impl RsCtx {
                 );
             }
 
+            // Slice 5d-8: chain enabled for every non-last layer
+            // (gpu_combine is hardcoded true here). Last layer's
+            // combine still writes to bufs.moe_hidden so the post-loop
+            // final drain reads from it as before.
+            let chain_next = layer_idx + 1 < v.num_layers;
+            let chain_next_norm_off = chain_next.then(|| {
+                layer_caches[layer_idx + 1].input_layernorm_w
+            });
+
             let is_full = v.layer_kind(layer_idx)
                 == variants::LayerKind::FullAttn;
             if is_full {
@@ -1122,6 +1145,8 @@ impl RsCtx {
                     prefetch,
                     kv_state,
                     /* gpu_combine = */ true,
+                    prev_layer_chained,
+                    chain_next_norm_off,
                 )
                 .map_err(|_| RsError::EvalFailed)?;
             } else {
@@ -1146,9 +1171,12 @@ impl RsCtx {
                     prefetch,
                     layer_state,
                     /* gpu_combine = */ true,
+                    prev_layer_chained,
+                    chain_next_norm_off,
                 )
                 .map_err(|_| RsError::EvalFailed)?;
             }
+            prev_layer_chained = chain_next;
         }
 
         // Final layer left a deferred dispatch active. Drain (or

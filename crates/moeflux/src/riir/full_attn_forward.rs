@@ -93,6 +93,9 @@ pub fn full_attn_layer_forward(
     prefetch: &mut super::PrefetchState,
     kv_state: &mut KvCache,
     gpu_combine: bool,
+    // Slice 5d-8: see `linear_attn_layer_forward` for the contract.
+    prev_layer_chained: bool,
+    chain_next_norm_off: Option<u64>,
 ) -> Result<(), LayerForwardError> {
     let v = VARIANT;
 
@@ -168,17 +171,21 @@ pub fn full_attn_layer_forward(
     {
         let cmdbuf = metal.queue().new_command_buffer();
 
-        encode_rms_norm_bf16_into(
-            cmdbuf,
-            &rms_pipes,
-            &buffers.input,
-            wf_buf.buffer(),
-            layer_cache.input_layernorm_w,
-            &buffers.sum_sq,
-            &buffers.normed,
-            v.hidden_dim as u32,
-            super::variants::RMS_NORM_EPS,
-        );
+        // Slice 5d-8: skip the input-norm prelude when the previous
+        // layer chained — `buffers.normed` is already populated.
+        if !prev_layer_chained {
+            encode_rms_norm_bf16_into(
+                cmdbuf,
+                &rms_pipes,
+                &buffers.input,
+                wf_buf.buffer(),
+                layer_cache.input_layernorm_w,
+                &buffers.sum_sq,
+                &buffers.normed,
+                v.hidden_dim as u32,
+                super::variants::RMS_NORM_EPS,
+            );
+        }
 
         let specs = [
             MatvecSpec {
@@ -406,5 +413,6 @@ pub fn full_attn_layer_forward(
         },
         gpu_combine,
         gpu_attn_args,
+        chain_next_norm_off,
     )
 }

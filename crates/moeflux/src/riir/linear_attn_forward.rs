@@ -42,7 +42,7 @@ use super::deferred::{
     gpu_batched_experts_begin, gpu_batched_experts_begin_pre_staged,
     DeferredError, DeferredState,
 };
-use super::expert_forward::MoeBuffers;
+use super::expert_forward::{ChainToNormed, MoeBuffers};
 use super::expert_io::ExpertFiles;
 use super::gpu_attn::{
     encode_attn_scores_batched_into, encode_attn_softmax_batched_into,
@@ -424,6 +424,17 @@ pub fn linear_attn_layer_forward(
     prefetch: &mut super::PrefetchState,
     _layer_state: &mut LinearAttnState,
     gpu_combine: bool,
+    // Slice 5d-8: previous layer's K-expert dispatch chained the
+    // post-combine rms_norm into its cmdbuf, so `buffers.normed` is
+    // already populated when we land here. Skip CMD1's input-norm
+    // prelude in that case.
+    prev_layer_chained: bool,
+    // Slice 5d-8: when `Some`, this layer's K-expert cmdbuf appends
+    // rms_norm_sum_sq + rms_norm_apply_bf16 against the next layer's
+    // input_layernorm.weight at this offset (in `wf_buf`). Output lands
+    // in `buffers.normed`, ready for the next layer's CMD1. `None`
+    // disables the chain — used for the last layer and the dump hook.
+    chain_next_norm_off: Option<u64>,
 ) -> Result<(), LayerForwardError> {
     let v = VARIANT;
     let linear_layer_idx = linear_layer_idx_for(layer_idx).ok_or(
@@ -515,17 +526,23 @@ pub fn linear_attn_layer_forward(
     {
         let cmdbuf = metal.queue().new_command_buffer();
 
-        encode_rms_norm_bf16_into(
-            cmdbuf,
-            &rms_pipes,
-            &buffers.input,
-            wf_buf.buffer(),
-            layer_cache.input_layernorm_w,
-            &buffers.sum_sq,
-            &buffers.normed,
-            v.hidden_dim as u32,
-            RMS_NORM_EPS,
-        );
+        // Slice 5d-8: skip the input-norm prelude when the previous
+        // layer chained — `buffers.normed` is already populated by the
+        // appended rms_norm at the tail of the previous K-expert cmdbuf
+        // (drained at the top of `step_internal`'s layer iteration).
+        if !prev_layer_chained {
+            encode_rms_norm_bf16_into(
+                cmdbuf,
+                &rms_pipes,
+                &buffers.input,
+                wf_buf.buffer(),
+                layer_cache.input_layernorm_w,
+                &buffers.sum_sq,
+                &buffers.normed,
+                v.hidden_dim as u32,
+                RMS_NORM_EPS,
+            );
+        }
 
         // 4 batched projections from buffers.normed:
         let specs = [
@@ -665,6 +682,7 @@ pub fn linear_attn_layer_forward(
         },
         gpu_combine,
         /* gpu_attn_args = */ None,
+        chain_next_norm_off,
     )
 }
 
@@ -710,6 +728,12 @@ pub(super) fn post_attention_tail(
     o_proj: OProj,
     gpu_combine: bool,
     gpu_attn_args: Option<GpuAttnEncodeArgs>,
+    // Slice 5d-8: when `Some` AND `gpu_combine` is true, the K-expert
+    // cmdbuf appends rms_norm_sum_sq + rms_norm_apply_bf16 against the
+    // next layer's input_layernorm.weight at this offset (in `wf_buf`).
+    // Output lands in `buffers.normed`, ready for the next layer's
+    // CMD1. `None` (or CPU-combine) disables the chain.
+    chain_next_norm_off: Option<u64>,
 ) -> Result<(), LayerForwardError> {
     let v = VARIANT;
 
@@ -1092,6 +1116,30 @@ pub(super) fn post_attention_tail(
         // load-bearing: firing the prefetch here would race with
         // the in-flight GPU read of data_prefetch[slot] for the
         // current layer's hits.
+        //
+        // Slice 5d-8 chain: when `chain_next_norm_off` is `Some`, the
+        // K-expert cmdbuf rebinds combine output to `buffers.input` and
+        // appends rms_norm_sum_sq + rms_norm_apply_bf16, leaving the
+        // next layer's normed input in `buffers.normed`. Allocated only
+        // when the chain is active so the borrow doesn't outlive the
+        // call.
+        let chain_rms_pipes = chain_next_norm_off.map(|_| {
+            super::gpu_norm::RmsNormBf16Pipelines {
+                sum: sum_sq.clone(),
+                apply: apply.clone(),
+            }
+        });
+        let chain = chain_next_norm_off.and_then(|off| {
+            chain_rms_pipes.as_ref().map(|pipes| ChainToNormed {
+                pipes,
+                wf_buf: wf_buf.buffer(),
+                next_norm_off: off,
+                combine_out: &buffers.input,
+                chain_sum_sq: &buffers.sum_sq,
+                chain_normed: &buffers.normed,
+                eps: RMS_NORM_EPS,
+            })
+        });
         gpu_batched_experts_begin_pre_staged(
             metal,
             moe,
@@ -1104,6 +1152,7 @@ pub(super) fn post_attention_tail(
             shared_gate_score,
             layer_idx as i32,
             &data_set_per_slot,
+            chain,
         )?;
     } else {
         let expert_size = v.expert_size_4bit();

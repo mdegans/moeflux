@@ -46,11 +46,32 @@
 //! `use_2bit` so users can opt in.
 
 use metal::{
-    BufferRef, CommandBufferRef, ComputePipelineState, MTLSize, NSUInteger,
+    Buffer, BufferRef, CommandBufferRef, ComputePipelineState, MTLSize,
+    NSUInteger,
 };
 
+use super::gpu_norm::{encode_rms_norm_bf16_into, RmsNormBf16Pipelines};
 use super::metal::{MetalBackend, MetalError, MtlBuffer};
 use super::variants::{Variant, GROUP_SIZE, VARIANT};
+
+/// Chained-norm targets for slice 5d-8. When `Some`, the K-expert
+/// encoder rebinds `moe_combine_residual` to write into `combine_out`
+/// (instead of `bufs.moe_hidden`) and appends `rms_norm_sum_sq` +
+/// `rms_norm_apply_bf16` so the next layer's normed input is ready
+/// when this cmdbuf completes. Mirrors C's `gpu_combine` path
+/// (`infer.m:5677..5750`). `combine_out` doubles as combine output
+/// target and chain rms_norm input — in production this is
+/// `linear_buffers.input`, the same buffer that serves as the next
+/// layer's residual source for CMD2.
+pub(crate) struct ChainToNormed<'a> {
+    pub pipes: &'a RmsNormBf16Pipelines,
+    pub wf_buf: &'a Buffer,
+    pub next_norm_off: u64,
+    pub combine_out: &'a Buffer,
+    pub chain_sum_sq: &'a Buffer,
+    pub chain_normed: &'a Buffer,
+    pub eps: f32,
+}
 
 /// Architectural maximum top-K. Mirrors `MAX_K` in `infer.m` (16).
 /// Sets the slot count of [`MoeBuffers`] and the binding-table width
@@ -598,6 +619,7 @@ pub(crate) fn gpu_batched_experts_encode(
         k,
         v,
         &data_set_per_slot,
+        None,
     );
     Ok(cmdbuf.to_owned())
 }
@@ -625,6 +647,7 @@ pub(crate) fn gpu_batched_experts_encode_pre_staged(
     expert_weights: &[f32],
     shared_gate_score: f32,
     data_set_per_slot: &[super::SlotSource; MAX_K],
+    chain: Option<ChainToNormed<'_>>,
 ) -> Result<metal::CommandBuffer, ExpertForwardError> {
     let v = VARIANT;
     if actual_k < 1 || (actual_k as usize) > MAX_K {
@@ -670,6 +693,7 @@ pub(crate) fn gpu_batched_experts_encode_pre_staged(
         k,
         v,
         data_set_per_slot,
+        chain,
     );
     Ok(cmdbuf.to_owned())
 }
@@ -728,6 +752,7 @@ fn emit_batched_experts(
     k: usize,
     v: Variant,
     data_set_per_slot: &[super::SlotSource; MAX_K],
+    chain: Option<ChainToNormed<'_>>,
 ) {
     // Per-expert: Encoder A (gate+up — both read the shared `input`),
     // Encoder B (SwiGLU then down). Two encoders per expert exposes
@@ -805,12 +830,22 @@ fn emit_batched_experts(
     // MAX_K out buffers, weights via the params buffer. Skipped when
     // `gpu_combine == false` — caller will run the equivalent on the
     // CPU side after wait.
+    //
+    // Slice 5d-8: when `chain.is_some()`, the combine writes directly
+    // into the next layer's input buffer (`chain.combine_out`) instead
+    // of `bufs.moe_hidden`, and two more dispatches are appended to
+    // produce the next layer's normalized input (`chain.chain_normed`).
+    // Mirrors C's gpu_combine fast path (`infer.m:5677..5750`).
     if let Some(combine) = combine {
+        let combine_out: &BufferRef = match chain.as_ref() {
+            Some(c) => c.combine_out,
+            None => bufs.moe_hidden.raw(),
+        };
         let enc = cmdbuf.new_compute_command_encoder();
         enc.set_compute_pipeline_state(combine);
         enc.set_buffer(0, Some(h_mid), 0);
         enc.set_buffer(1, Some(shared_out), 0);
-        enc.set_buffer(2, Some(bufs.moe_hidden.raw()), 0);
+        enc.set_buffer(2, Some(combine_out), 0);
         for slot in 0..MAX_K {
             enc.set_buffer(
                 3 + slot as NSUInteger,
@@ -829,6 +864,27 @@ fn emit_batched_experts(
             MTLSize::new(256, 1, 1),
         );
         enc.end_encoding();
+
+        // Slice 5d-8 chain appendix: rms_norm_sum_sq +
+        // rms_norm_apply_bf16 reading combine_out, writing chain_normed
+        // via chain_sum_sq scratch. Bound to the next layer's
+        // input_layernorm.weight in wf_buf at chain.next_norm_off. Same
+        // kernel pair the CMD1 input-norm prelude uses (slice 9e
+        // bit-exact per-PSO); equivalent to chaining Enc C2/C3 onto
+        // the K-expert cmdbuf in C.
+        if let Some(c) = chain {
+            encode_rms_norm_bf16_into(
+                cmdbuf,
+                c.pipes,
+                c.combine_out,
+                c.wf_buf,
+                c.next_norm_off,
+                c.chain_sum_sq,
+                c.chain_normed,
+                v.hidden_dim as u32,
+                c.eps,
+            );
+        }
     }
 }
 

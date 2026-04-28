@@ -43,7 +43,7 @@
 
 use super::expert_forward::{
     gpu_batched_experts_encode, gpu_batched_experts_encode_pre_staged,
-    ExpertForwardError, MoeBuffers,
+    ChainToNormed, ExpertForwardError, MoeBuffers,
 };
 use super::metal::MetalBackend;
 use super::variants::VARIANT;
@@ -214,6 +214,7 @@ pub(crate) fn gpu_batched_experts_begin_pre_staged(
     shared_gate_score: f32,
     layer_idx: i32,
     data_set_per_slot: &[super::SlotSource; super::MAX_K],
+    chain: Option<ChainToNormed<'_>>,
 ) -> Result<(), DeferredError> {
     if slot.is_some() {
         return Err(DeferredError::AlreadyActive);
@@ -228,6 +229,7 @@ pub(crate) fn gpu_batched_experts_begin_pre_staged(
         expert_weights,
         shared_gate_score,
         data_set_per_slot,
+        chain,
     )?;
     cmd_buffer.commit();
     *slot = Some(DeferredState {
@@ -284,6 +286,21 @@ pub(crate) fn complete_deferred_experts_into(
             );
         }
     }
+    Ok(())
+}
+
+/// Drain a chained K-expert dispatch (slice 5d-8). The chain wrote
+/// the next layer's normalized input directly into
+/// `linear_buffers.normed`, so this just waits + clears `slot`. No
+/// readback. Used by the layer loop on iterations where the previous
+/// layer chained.
+pub(crate) fn complete_deferred_experts_chained(
+    slot: &mut Option<DeferredState>,
+) -> Result<(), DeferredError> {
+    let Some(state) = slot.take() else {
+        return Ok(());
+    };
+    state.cmd_buffer.wait_until_completed();
     Ok(())
 }
 
