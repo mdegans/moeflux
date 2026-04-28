@@ -298,6 +298,27 @@ impl MoeBuffers {
         let data = std::array::from_fn(|_| {
             MtlBuffer::<u8>::with_len(device, v.expert_size_4bit())
         });
+        // Slice 5d-6: probe 2 MB DMA alignment on the data slots.
+        // Apple's malloc-via-mmap path *often* lands large (>= 1 MB)
+        // shared-storage allocations on 2 MB boundaries; the C path
+        // claims a 3.6× DMA improvement over 16 KB alignment for the
+        // pread destination (`metal_infer/infer.m:1196`). We rely on
+        // that incidental behavior rather than a custom allocator;
+        // warn once if it ever fails so we can revisit (fallback
+        // would be `posix_memalign + new_buffer_with_bytes_no_copy`).
+        const TWO_MIB: usize = 2 * 1024 * 1024;
+        for (slot, buf) in data.iter().enumerate() {
+            let addr = buf.raw().contents() as usize;
+            if addr % TWO_MIB != 0 {
+                eprintln!(
+                    "[moe] WARNING: data slot {slot} not 2 MB aligned \
+                     (contents=0x{addr:x}, off=0x{off:x}); pread DMA \
+                     may use scatter-gather. See slice 5d-6 plan.",
+                    off = addr % TWO_MIB
+                );
+                break;
+            }
+        }
         let gate =
             std::array::from_fn(|_| MtlBuffer::<f32>::with_len(device, v.moe_intermediate));
         let up = std::array::from_fn(|_| {
@@ -338,18 +359,15 @@ impl MoeBuffers {
         &self.out[slot]
     }
 
-    /// Mutable byte view into the per-expert weight-blob slot. Slice
-    /// 5d-5 entry point: production callers `pread` directly into this
-    /// shared-storage buffer instead of staging through an
-    /// intermediate `Vec<u8>` and memcpying. Saves ~7 MB/layer of
-    /// memcpy on A3B (K=4 × ~1.77 MB).
+    /// All per-slot data buffers as disjoint `&mut [u8]` views,
+    /// suitable for parallel pread. Slice 5d-6a entry point: K
+    /// concurrent `read_expert` calls can each take one slot's
+    /// `&mut [u8]` from this array without aliasing the others.
     ///
-    /// SAFETY/CORRECTNESS: caller must ensure no GPU dispatch reading
-    /// from `bufs.data[slot]` is in flight. The deferred-state
-    /// `complete_*` / `discard_*` calls at the top of each layer's
-    /// forward establish this invariant.
-    pub(crate) fn data_slot_mut(&mut self, slot: usize) -> &mut [u8] {
-        self.data[slot].as_mut_slice()
+    /// SAFETY/CORRECTNESS: same invariant as [`Self::data_slot_mut`] —
+    /// no GPU dispatch reading from any slot may be in flight.
+    pub(crate) fn data_slots_mut_array(&mut self) -> [&mut [u8]; MAX_K] {
+        self.data.each_mut().map(|b| b.as_mut_slice())
     }
 }
 

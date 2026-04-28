@@ -29,6 +29,7 @@ riir-port = [
     "dep:serde",
     "dep:serde_json",
     "dep:metal",
+    "dep:rayon",
 ]
 
 [dependencies]
@@ -38,3 +39,4 @@ memmap2     = { workspace = true, optional = true }
 serde       = { workspace = true, optional = true }
 serde_json  = { workspace = true, optional = true }
 metal       = { workspace = true, optional = true }
+rayon       = { workspace = true, optional = true }

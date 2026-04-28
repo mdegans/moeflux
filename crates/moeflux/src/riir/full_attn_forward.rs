@@ -88,6 +88,7 @@ pub fn full_attn_layer_forward(
     pos: i32,
     k_active: usize,
     expert_files: &ExpertFiles,
+    pool: &rayon::ThreadPool,
     kv_state: &mut KvCache,
     gpu_combine: bool,
 ) -> Result<(), LayerForwardError> {
@@ -338,6 +339,7 @@ pub fn full_attn_layer_forward(
         layer_idx,
         k_active,
         expert_files,
+        pool,
         OProj {
             w_off: o_w,
             s_off: o_s,

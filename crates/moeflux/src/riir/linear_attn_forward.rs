@@ -329,6 +329,7 @@ pub fn linear_attn_layer_forward(
     layer_idx: usize,
     k_active: usize,
     expert_files: &ExpertFiles,
+    pool: &rayon::ThreadPool,
     _layer_state: &mut LinearAttnState,
     gpu_combine: bool,
 ) -> Result<(), LayerForwardError> {
@@ -559,6 +560,7 @@ pub fn linear_attn_layer_forward(
         layer_idx,
         k_active,
         expert_files,
+        pool,
         OProj {
             w_off: o_w,
             s_off: o_s,
@@ -607,6 +609,7 @@ pub(super) fn post_attention_tail(
     layer_idx: usize,
     k_active: usize,
     expert_files: &ExpertFiles,
+    pool: &rayon::ThreadPool,
     o_proj: OProj,
     gpu_combine: bool,
 ) -> Result<(), LayerForwardError> {
@@ -850,11 +853,23 @@ pub(super) fn post_attention_tail(
     // snapshots of `h_mid` / `shared_out` for the finalize pass.
     let k = k_active;
     if gpu_combine {
-        for slot in 0..k {
-            let expert_idx = indices[slot] as usize;
-            let dst = moe.data_slot_mut(slot);
-            expert_files.read_expert(layer_idx, expert_idx, dst)?;
-        }
+        // Slice 5d-6a: parallel K-expert pread via the io_pool.
+        // `read_expert(&self, ...)` is concurrent-safe (each call has
+        // its own dst slice; pread64 is thread-safe per POSIX). The
+        // disjoint `&mut [u8]` slot views from `data_slots_mut_array`
+        // satisfy rayon's borrow requirements.
+        use rayon::prelude::*;
+        let mut dsts = moe.data_slots_mut_array();
+        let active = &mut dsts[..k];
+        pool.install(|| -> Result<(), super::expert_io::ExpertIoError> {
+            active
+                .par_iter_mut()
+                .enumerate()
+                .try_for_each(|(slot, dst)| {
+                    let expert_idx = indices[slot] as usize;
+                    expert_files.read_expert(layer_idx, expert_idx, *dst)
+                })
+        })?;
         gpu_batched_experts_begin_pre_staged(
             metal,
             moe,

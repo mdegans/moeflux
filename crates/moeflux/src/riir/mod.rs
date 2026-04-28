@@ -143,6 +143,13 @@ pub struct RsCtx {
     /// resources. Replaces the per-token `lm_head_cpu` call (which
     /// dominated the 2026-04-27 perf profile at 59% of CPU time).
     lm_head_gpu: Option<GpuLmHead>,
+    /// Slice 5d-6 — work-stealing thread pool for parallel K-expert
+    /// pread (8 workers on M2 Max P-cores). Eagerly built at
+    /// [`Self::open`] so the per-token hot path can `pool.install` /
+    /// `pool.spawn` without paying init cost. C analogue is
+    /// `g_io_pool` (4 pthreads); we use 8 since M2 Max has 8 P-cores
+    /// and there's no contention with other moeflux work.
+    io_pool: rayon::ThreadPool,
     // Future phases populate: vocab.
 }
 
@@ -166,6 +173,11 @@ impl RsCtx {
             .map_err(|_| RsError::InitFailed)?;
         let layer_states = alloc_layer_states();
         let k_active = (experts_per_tok as usize).clamp(1, VARIANT.num_experts_per_tok);
+        let io_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(8)
+            .thread_name(|i| format!("moeflux-io-{}", i))
+            .build()
+            .map_err(|_| RsError::InitFailed)?;
         Ok(Self {
             wf,
             metal: None,
@@ -178,6 +190,7 @@ impl RsCtx {
             linear_buffers: None,
             deferred: None,
             lm_head_gpu: None,
+            io_pool,
         })
     }
 
@@ -615,6 +628,7 @@ impl RsCtx {
             layer_caches,
             linear_buffers,
             deferred,
+            io_pool,
             ..
         } = self;
 
@@ -626,6 +640,7 @@ impl RsCtx {
             linear_buffers.as_mut().expect("ensure_linear_resources");
         let moe_buffers =
             moe_buffers.as_mut().expect("ensure_linear_resources");
+        let io_pool: &rayon::ThreadPool = &*io_pool;
 
         // Defensive: drain any leaked deferred state from a prior
         // failed call so this entry point stays safe to call
@@ -664,6 +679,7 @@ impl RsCtx {
                 pos,
                 k_active,
                 experts,
+                io_pool,
                 kv_state,
                 gpu_combine,
             )
@@ -686,6 +702,7 @@ impl RsCtx {
                 layer_idx_us,
                 k_active,
                 experts,
+                io_pool,
                 layer_state,
                 gpu_combine,
             )
@@ -905,6 +922,7 @@ impl RsCtx {
             linear_buffers,
             deferred,
             lm_head_gpu,
+            io_pool,
             ..
         } = self;
         let metal = metal.as_mut().expect("ensure_linear_resources");
@@ -917,6 +935,7 @@ impl RsCtx {
             moe_buffers.as_mut().expect("ensure_linear_resources");
         let lm_head_gpu =
             lm_head_gpu.as_ref().expect("ensure_linear_resources");
+        let io_pool: &rayon::ThreadPool = &*io_pool;
 
         // Defensive bracket — drain stale state from a buggy prior
         // call so re-entrancy holds.
@@ -982,6 +1001,7 @@ impl RsCtx {
                     pos,
                     k_active,
                     experts,
+                    io_pool,
                     kv_state,
                     /* gpu_combine = */ true,
                 )
@@ -1004,6 +1024,7 @@ impl RsCtx {
                     layer_idx,
                     k_active,
                     experts,
+                    io_pool,
                     layer_state,
                     /* gpu_combine = */ true,
                 )
