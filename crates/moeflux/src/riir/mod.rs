@@ -29,6 +29,7 @@ pub mod embedding;
 pub mod expert_forward;
 pub mod expert_io;
 pub mod full_attn_forward;
+pub mod gpu_attn;
 pub mod gpu_linear_attn;
 pub mod gpu_lm_head;
 pub mod gpu_matvec;
@@ -55,6 +56,10 @@ pub use expert_forward::{
     MoeBuffers, MAX_K,
 };
 pub use expert_io::{ExpertFiles, ExpertIoError};
+pub use gpu_attn::{
+    gpu_attn_scores_batched, gpu_attn_softmax_batched,
+    gpu_attn_values_batched, gpu_sigmoid_gate, GpuAttnError,
+};
 pub use gpu_lm_head::{GpuLmHead, GpuLmHeadError};
 pub use gpu_norm::{gpu_rms_norm_fused, GpuNormError};
 pub use linear_attn::{
@@ -487,6 +492,73 @@ impl RsCtx {
     ) -> Result<(), RsError> {
         let metal = self.metal_mut()?;
         gpu_rms_norm_fused(metal, x, weight_bf16, out)
+            .map_err(|_| RsError::EvalFailed)
+    }
+
+    /// `attn_scores_batched` (slice 5d-7a). Per-head Q · K^T scaled.
+    /// Stride-tight oracle entry (`seq_stride = seq_len`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_scores_batched(
+        &mut self,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        seq_len: u32,
+        q: &[f32],
+        k_cache: &[f32],
+        scale: f32,
+        scores_out: &mut [f32],
+    ) -> Result<(), RsError> {
+        let metal = self.metal_mut()?;
+        gpu_attn_scores_batched(
+            metal, num_heads, num_kv_heads, head_dim, seq_len, q, k_cache,
+            scale, scores_out,
+        )
+        .map_err(|_| RsError::EvalFailed)
+    }
+
+    /// `attn_softmax_batched` (slice 5d-7a). Per-head softmax over
+    /// `[0, seq_len)`, in place.
+    pub fn attn_softmax_batched(
+        &mut self,
+        num_heads: u32,
+        seq_len: u32,
+        scores_inout: &mut [f32],
+    ) -> Result<(), RsError> {
+        let metal = self.metal_mut()?;
+        gpu_attn_softmax_batched(metal, num_heads, seq_len, scores_inout)
+            .map_err(|_| RsError::EvalFailed)
+    }
+
+    /// `attn_values_batched` (slice 5d-7a). Per-head scores · V.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_values_batched(
+        &mut self,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        seq_len: u32,
+        scores: &[f32],
+        v_cache: &[f32],
+        out: &mut [f32],
+    ) -> Result<(), RsError> {
+        let metal = self.metal_mut()?;
+        gpu_attn_values_batched(
+            metal, num_heads, num_kv_heads, head_dim, seq_len, scores,
+            v_cache, out,
+        )
+        .map_err(|_| RsError::EvalFailed)
+    }
+
+    /// `sigmoid_gate` (slice 5d-7a). `x_inout[i] *= sigmoid(gate[i])`.
+    pub fn sigmoid_gate(
+        &mut self,
+        dim: u32,
+        gate: &[f32],
+        x_inout: &mut [f32],
+    ) -> Result<(), RsError> {
+        let metal = self.metal_mut()?;
+        gpu_sigmoid_gate(metal, dim, gate, x_inout)
             .map_err(|_| RsError::EvalFailed)
     }
 

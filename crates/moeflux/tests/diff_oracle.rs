@@ -216,6 +216,54 @@ pub trait DiffBackend {
         shared_gate_score: f32,
     ) -> Vec<f32>;
 
+    /// `attn_scores_batched` (slice 5d-7a). Returns `[num_heads * seq_len]`
+    /// scaled per-head Q · K^T scores (stride-tight).
+    #[allow(clippy::too_many_arguments)]
+    fn attn_scores_batched(
+        &mut self,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        seq_len: u32,
+        q: &[f32],
+        k_cache: &[f32],
+        scale: f32,
+    ) -> Vec<f32>;
+
+    /// `attn_softmax_batched` (slice 5d-7a). Per-head softmax over
+    /// `[0, seq_len)`. Input is `[num_heads * seq_len]` raw scores;
+    /// output is the same shape, post-softmax.
+    fn attn_softmax_batched(
+        &mut self,
+        num_heads: u32,
+        seq_len: u32,
+        scores_in: &[f32],
+    ) -> Vec<f32>;
+
+    /// `attn_values_batched` (slice 5d-7a). Returns `[num_heads *
+    /// head_dim]` per-head value aggregation.
+    #[allow(clippy::too_many_arguments)]
+    fn attn_values_batched(
+        &mut self,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        seq_len: u32,
+        scores: &[f32],
+        v_cache: &[f32],
+    ) -> Vec<f32>;
+
+    /// `sigmoid_gate` (slice 5d-7a). Returns `[dim]` gated values
+    /// (`x_in[i] * sigmoid(gate[i])`). Caller passes the pre-gate
+    /// values in `x_in`; the trait surface clones to the in/out buffer
+    /// internally.
+    fn sigmoid_gate(
+        &mut self,
+        dim: u32,
+        gate: &[f32],
+        x_in: &[f32],
+    ) -> Vec<f32>;
+
     /// Slice 4e — begin a deferred K-expert dispatch (commits async,
     /// no readback). Pair with [`Self::complete_deferred_experts`] or
     /// [`Self::discard_deferred_experts`].
@@ -521,6 +569,82 @@ impl DiffBackend for CBackend {
                 &mut out,
             )
             .expect("CBackend gpu_batched_experts_forward");
+        out
+    }
+
+    fn attn_scores_batched(
+        &mut self,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        seq_len: u32,
+        q: &[f32],
+        k_cache: &[f32],
+        scale: f32,
+    ) -> Vec<f32> {
+        let mut out = vec![0.0f32; (num_heads * seq_len) as usize];
+        self.0
+            .attn_scores_batched(
+                num_heads as i32,
+                num_kv_heads as i32,
+                head_dim as i32,
+                seq_len as i32,
+                q,
+                k_cache,
+                scale,
+                &mut out,
+            )
+            .expect("CBackend attn_scores_batched");
+        out
+    }
+
+    fn attn_softmax_batched(
+        &mut self,
+        num_heads: u32,
+        seq_len: u32,
+        scores_in: &[f32],
+    ) -> Vec<f32> {
+        let mut out = scores_in.to_vec();
+        self.0
+            .attn_softmax_batched(num_heads as i32, seq_len as i32, &mut out)
+            .expect("CBackend attn_softmax_batched");
+        out
+    }
+
+    fn attn_values_batched(
+        &mut self,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        seq_len: u32,
+        scores: &[f32],
+        v_cache: &[f32],
+    ) -> Vec<f32> {
+        let mut out = vec![0.0f32; (num_heads * head_dim) as usize];
+        self.0
+            .attn_values_batched(
+                num_heads as i32,
+                num_kv_heads as i32,
+                head_dim as i32,
+                seq_len as i32,
+                scores,
+                v_cache,
+                &mut out,
+            )
+            .expect("CBackend attn_values_batched");
+        out
+    }
+
+    fn sigmoid_gate(
+        &mut self,
+        dim: u32,
+        gate: &[f32],
+        x_in: &[f32],
+    ) -> Vec<f32> {
+        let mut out = x_in.to_vec();
+        self.0
+            .sigmoid_gate(dim as i32, gate, &mut out)
+            .expect("CBackend sigmoid_gate");
         out
     }
 
@@ -853,6 +977,71 @@ impl DiffBackend for RsBackend {
                 &mut out,
             )
             .expect("RsBackend gpu_batched_experts_forward");
+        out
+    }
+
+    fn attn_scores_batched(
+        &mut self,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        seq_len: u32,
+        q: &[f32],
+        k_cache: &[f32],
+        scale: f32,
+    ) -> Vec<f32> {
+        let mut out = vec![0.0f32; (num_heads * seq_len) as usize];
+        self.0
+            .attn_scores_batched(
+                num_heads, num_kv_heads, head_dim, seq_len, q, k_cache,
+                scale, &mut out,
+            )
+            .expect("RsBackend attn_scores_batched");
+        out
+    }
+
+    fn attn_softmax_batched(
+        &mut self,
+        num_heads: u32,
+        seq_len: u32,
+        scores_in: &[f32],
+    ) -> Vec<f32> {
+        let mut out = scores_in.to_vec();
+        self.0
+            .attn_softmax_batched(num_heads, seq_len, &mut out)
+            .expect("RsBackend attn_softmax_batched");
+        out
+    }
+
+    fn attn_values_batched(
+        &mut self,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        seq_len: u32,
+        scores: &[f32],
+        v_cache: &[f32],
+    ) -> Vec<f32> {
+        let mut out = vec![0.0f32; (num_heads * head_dim) as usize];
+        self.0
+            .attn_values_batched(
+                num_heads, num_kv_heads, head_dim, seq_len, scores, v_cache,
+                &mut out,
+            )
+            .expect("RsBackend attn_values_batched");
+        out
+    }
+
+    fn sigmoid_gate(
+        &mut self,
+        dim: u32,
+        gate: &[f32],
+        x_in: &[f32],
+    ) -> Vec<f32> {
+        let mut out = x_in.to_vec();
+        self.0
+            .sigmoid_gate(dim, gate, &mut out)
+            .expect("RsBackend sigmoid_gate");
         out
     }
 
@@ -2478,6 +2667,342 @@ fn gpu_batched_experts_forward_close_c_vs_rust() {
         rel <= REL_DIFF_FLOOR,
         "[diff:gpu_batched_experts_forward] relative max_abs_diff \
          {rel:.3e} above {REL_DIFF_FLOOR:.3e}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Slice 5d-7a — per-kernel diff coverage for GPU full-attention
+// ---------------------------------------------------------------------------
+//
+// Synthetic deterministic inputs against the same per-kernel
+// tolerance regime as slices 9a / 9b / 9e (cosine ≥ 0.9999,
+// rel_max_abs_diff ≤ 1e-3). The four kernels have only SIMD or
+// threadgroup-shared reductions (no atomics), so empirical
+// expectation is bit-exact per-PSO; the floor is defensive.
+
+/// Generate `n` deterministic floats from a low-discrepancy sequence
+/// shifted by a per-test seed. Avoids per-test PRNG plumbing while
+/// keeping the inputs non-symmetric (so reductions are meaningful).
+fn synth_floats(seed: u32, n: usize, scale: f32) -> Vec<f32> {
+    (0..n)
+        .map(|i| {
+            let phase = (seed as f32 * 0.13) + (i as f32 * 0.017);
+            phase.sin() * scale + (phase * 1.7).cos() * (scale * 0.5)
+        })
+        .collect()
+}
+
+/// `attn_scores_batched` (slice 5d-7a). Synthetic Q + K, varying
+/// `seq_len`. Stride-tight output. Empirically bit-exact per-PSO; the
+/// cosine/rel floors are defensive.
+#[test]
+#[ignore = "long running; needs Metal device + moeflux artifacts"]
+fn attn_scores_close_c_vs_rust() {
+    use moeflux::riir::VARIANT;
+
+    let mut c: CBackend = open_backend();
+    let mut rs: RsBackend = open_backend();
+
+    let v = VARIANT;
+    let num_heads = v.num_attn_heads as u32;
+    let num_kv_heads = v.num_kv_heads as u32;
+    let head_dim = v.head_dim as u32;
+    let kv_dim = num_kv_heads * head_dim;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+
+    for &seq_len in &[32u32, 64, 128, 512] {
+        let q = synth_floats(seq_len, (num_heads * head_dim) as usize, 0.4);
+        let k_cache =
+            synth_floats(seq_len + 1, (seq_len * kv_dim) as usize, 0.3);
+
+        let c_out = c.attn_scores_batched(
+            num_heads, num_kv_heads, head_dim, seq_len, &q, &k_cache, scale,
+        );
+        let rs_out = rs.attn_scores_batched(
+            num_heads, num_kv_heads, head_dim, seq_len, &q, &k_cache, scale,
+        );
+        assert_eq!(c_out.len(), (num_heads * seq_len) as usize);
+        assert_eq!(rs_out.len(), c_out.len());
+
+        let cos = cosine_sim(&c_out, &rs_out);
+        let max_abs_out = c_out
+            .iter()
+            .chain(rs_out.iter())
+            .map(|x| x.abs())
+            .fold(0.0f32, f32::max);
+        let max_abs_diff = c_out
+            .iter()
+            .zip(rs_out.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let rel = if max_abs_out > 0.0 {
+            max_abs_diff / max_abs_out
+        } else {
+            0.0
+        };
+
+        eprintln!(
+            "[diff:attn_scores seq_len={seq_len}] cosine={cos:.7} \
+             max_abs_diff={max_abs_diff:.3e} \
+             max_abs_out={max_abs_out:.3e} relative={rel:.3e}"
+        );
+
+        assert!(
+            c_out.iter().all(|x| x.is_finite()),
+            "[diff:attn_scores seq_len={seq_len}] C output has NaN/Inf"
+        );
+        assert!(
+            rs_out.iter().all(|x| x.is_finite()),
+            "[diff:attn_scores seq_len={seq_len}] Rust output has NaN/Inf"
+        );
+
+        const COSINE_FLOOR: f32 = 0.9999;
+        const REL_DIFF_FLOOR: f32 = 1e-3;
+        assert!(
+            cos >= COSINE_FLOOR,
+            "[diff:attn_scores seq_len={seq_len}] cosine {cos:.7} \
+             below {COSINE_FLOOR}"
+        );
+        assert!(
+            rel <= REL_DIFF_FLOOR,
+            "[diff:attn_scores seq_len={seq_len}] relative max_abs_diff \
+             {rel:.3e} above {REL_DIFF_FLOOR:.3e}"
+        );
+    }
+}
+
+/// `attn_softmax_batched` (slice 5d-7a). Synthetic per-row logits,
+/// varying `seq_len`. Three-pass softmax with two SIMD reductions —
+/// empirically bit-exact per-PSO.
+#[test]
+#[ignore = "long running; needs Metal device + moeflux artifacts"]
+fn attn_softmax_close_c_vs_rust() {
+    use moeflux::riir::VARIANT;
+
+    let mut c: CBackend = open_backend();
+    let mut rs: RsBackend = open_backend();
+
+    let v = VARIANT;
+    let num_heads = v.num_attn_heads as u32;
+
+    for &seq_len in &[32u32, 64, 128, 512] {
+        let scores =
+            synth_floats(seq_len * 7, (num_heads * seq_len) as usize, 1.5);
+
+        let c_out = c.attn_softmax_batched(num_heads, seq_len, &scores);
+        let rs_out = rs.attn_softmax_batched(num_heads, seq_len, &scores);
+        assert_eq!(c_out.len(), (num_heads * seq_len) as usize);
+
+        // Per-row softmax sums should be ~1.
+        for h in 0..num_heads as usize {
+            let row = &c_out[h * seq_len as usize..(h + 1) * seq_len as usize];
+            let sum: f32 = row.iter().sum();
+            assert!(
+                (sum - 1.0).abs() < 1e-3,
+                "[diff:attn_softmax seq_len={seq_len}] row {h} sum {sum} \
+                 not ~1"
+            );
+        }
+
+        let cos = cosine_sim(&c_out, &rs_out);
+        let max_abs_out = c_out
+            .iter()
+            .chain(rs_out.iter())
+            .map(|x| x.abs())
+            .fold(0.0f32, f32::max);
+        let max_abs_diff = c_out
+            .iter()
+            .zip(rs_out.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let rel = if max_abs_out > 0.0 {
+            max_abs_diff / max_abs_out
+        } else {
+            0.0
+        };
+
+        eprintln!(
+            "[diff:attn_softmax seq_len={seq_len}] cosine={cos:.7} \
+             max_abs_diff={max_abs_diff:.3e} \
+             max_abs_out={max_abs_out:.3e} relative={rel:.3e}"
+        );
+
+        assert!(
+            c_out.iter().all(|x| x.is_finite()),
+            "[diff:attn_softmax seq_len={seq_len}] C output has NaN/Inf"
+        );
+        assert!(
+            rs_out.iter().all(|x| x.is_finite()),
+            "[diff:attn_softmax seq_len={seq_len}] Rust output has NaN/Inf"
+        );
+
+        const COSINE_FLOOR: f32 = 0.9999;
+        const REL_DIFF_FLOOR: f32 = 1e-3;
+        assert!(
+            cos >= COSINE_FLOOR,
+            "[diff:attn_softmax seq_len={seq_len}] cosine {cos:.7} \
+             below {COSINE_FLOOR}"
+        );
+        assert!(
+            rel <= REL_DIFF_FLOOR,
+            "[diff:attn_softmax seq_len={seq_len}] relative max_abs_diff \
+             {rel:.3e} above {REL_DIFF_FLOOR:.3e}"
+        );
+    }
+}
+
+/// `attn_values_batched` (slice 5d-7a). Synthetic post-softmax probs +
+/// V, varying `seq_len`. Per-thread inner loop over `seq_len` — no
+/// reductions; bit-exact per-PSO.
+#[test]
+#[ignore = "long running; needs Metal device + moeflux artifacts"]
+fn attn_values_close_c_vs_rust() {
+    use moeflux::riir::VARIANT;
+
+    let mut c: CBackend = open_backend();
+    let mut rs: RsBackend = open_backend();
+
+    let v = VARIANT;
+    let num_heads = v.num_attn_heads as u32;
+    let num_kv_heads = v.num_kv_heads as u32;
+    let head_dim = v.head_dim as u32;
+    let kv_dim = num_kv_heads * head_dim;
+
+    for &seq_len in &[32u32, 64, 128, 512] {
+        // Build a valid softmax by exp-then-normalize per row.
+        let raw = synth_floats(seq_len + 11, (num_heads * seq_len) as usize, 1.0);
+        let mut scores = vec![0.0f32; raw.len()];
+        for h in 0..num_heads as usize {
+            let row_start = h * seq_len as usize;
+            let row = &raw[row_start..row_start + seq_len as usize];
+            let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> =
+                row.iter().map(|&x| (x - max).exp()).collect();
+            let sum: f32 = exps.iter().sum();
+            for i in 0..seq_len as usize {
+                scores[row_start + i] = exps[i] / sum;
+            }
+        }
+        let v_cache =
+            synth_floats(seq_len + 13, (seq_len * kv_dim) as usize, 0.5);
+
+        let c_out = c.attn_values_batched(
+            num_heads, num_kv_heads, head_dim, seq_len, &scores, &v_cache,
+        );
+        let rs_out = rs.attn_values_batched(
+            num_heads, num_kv_heads, head_dim, seq_len, &scores, &v_cache,
+        );
+        assert_eq!(c_out.len(), (num_heads * head_dim) as usize);
+        assert_eq!(rs_out.len(), c_out.len());
+
+        let cos = cosine_sim(&c_out, &rs_out);
+        let max_abs_out = c_out
+            .iter()
+            .chain(rs_out.iter())
+            .map(|x| x.abs())
+            .fold(0.0f32, f32::max);
+        let max_abs_diff = c_out
+            .iter()
+            .zip(rs_out.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let rel = if max_abs_out > 0.0 {
+            max_abs_diff / max_abs_out
+        } else {
+            0.0
+        };
+
+        eprintln!(
+            "[diff:attn_values seq_len={seq_len}] cosine={cos:.7} \
+             max_abs_diff={max_abs_diff:.3e} \
+             max_abs_out={max_abs_out:.3e} relative={rel:.3e}"
+        );
+
+        assert!(
+            c_out.iter().all(|x| x.is_finite()),
+            "[diff:attn_values seq_len={seq_len}] C output has NaN/Inf"
+        );
+        assert!(
+            rs_out.iter().all(|x| x.is_finite()),
+            "[diff:attn_values seq_len={seq_len}] Rust output has NaN/Inf"
+        );
+
+        const COSINE_FLOOR: f32 = 0.9999;
+        const REL_DIFF_FLOOR: f32 = 1e-3;
+        assert!(
+            cos >= COSINE_FLOOR,
+            "[diff:attn_values seq_len={seq_len}] cosine {cos:.7} \
+             below {COSINE_FLOOR}"
+        );
+        assert!(
+            rel <= REL_DIFF_FLOOR,
+            "[diff:attn_values seq_len={seq_len}] relative max_abs_diff \
+             {rel:.3e} above {REL_DIFF_FLOOR:.3e}"
+        );
+    }
+}
+
+/// `sigmoid_gate` (slice 5d-7a). Per-thread elementwise — no
+/// reductions, no atomics. Expected bit-exact.
+#[test]
+#[ignore = "long running; needs Metal device + moeflux artifacts"]
+fn sigmoid_gate_close_c_vs_rust() {
+    use moeflux::riir::VARIANT;
+
+    let mut c: CBackend = open_backend();
+    let mut rs: RsBackend = open_backend();
+
+    let v = VARIANT;
+    let dim = (v.num_attn_heads * v.head_dim) as u32;
+    let x = synth_floats(101, dim as usize, 0.7);
+    let gate = synth_floats(202, dim as usize, 1.2);
+
+    let c_out = c.sigmoid_gate(dim, &gate, &x);
+    let rs_out = rs.sigmoid_gate(dim, &gate, &x);
+    assert_eq!(c_out.len(), dim as usize);
+    assert_eq!(rs_out.len(), dim as usize);
+
+    let max_abs_diff = c_out
+        .iter()
+        .zip(rs_out.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let cos = cosine_sim(&c_out, &rs_out);
+    let max_abs_out = c_out
+        .iter()
+        .chain(rs_out.iter())
+        .map(|x| x.abs())
+        .fold(0.0f32, f32::max);
+
+    eprintln!(
+        "[diff:sigmoid_gate] cosine={cos:.7} max_abs_diff={max_abs_diff:.3e} \
+         max_abs_out={max_abs_out:.3e}"
+    );
+
+    assert!(
+        c_out.iter().all(|x| x.is_finite()),
+        "[diff:sigmoid_gate] C output has NaN/Inf"
+    );
+    assert!(
+        rs_out.iter().all(|x| x.is_finite()),
+        "[diff:sigmoid_gate] Rust output has NaN/Inf"
+    );
+
+    // Bit-exact expected (no reductions, no atomics — `sigmoid_gate`
+    // is a pure per-thread elementwise op). Floors held loose to absorb
+    // any libm-vs-MSL exp/sigmoid drift we haven't characterized; if
+    // observed in practice we'll tighten.
+    let first_diff = c_out.iter().zip(rs_out.iter()).position(|(a, b)| a != b);
+    if let Some(i) = first_diff {
+        eprintln!(
+            "[diff:sigmoid_gate] first non-bit-exact at i={i}: \
+             c={} rs={}",
+            c_out[i], rs_out[i]
+        );
+    }
+    assert_eq!(
+        max_abs_diff, 0.0,
+        "[diff:sigmoid_gate] expected bit-exact, got max_abs_diff {max_abs_diff:.3e}"
     );
 }
 

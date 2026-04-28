@@ -8350,6 +8350,213 @@ int mf_gpu_rms_norm_fused(mf_ctx *ctx,
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// Slice 5d-7a — GPU full-attention kernels under per-kernel diff
+// ---------------------------------------------------------------------------
+//
+// Test-only oracle wrappers. Each allocates fresh shared-storage GPU
+// buffers, encodes ONE kernel, commits + waits, copies back. The
+// production `gpu_attn_fuse` (`infer.m:5051..5163`) is left untouched
+// — it encodes all 4 kernels into a single CMD2 cmdbuf alongside the
+// post-attention work; these oracle hooks duplicate the encoder logic
+// per-kernel for fine-grained diff coverage. Stride convention is
+// `seq_stride = seq_len` (tight); production uses `seq_stride =
+// GPU_KV_SEQ` for the persistent score buffer.
+
+int mf_attn_scores_batched(mf_ctx *ctx,
+                            int32_t num_heads,
+                            int32_t num_kv_heads,
+                            int32_t head_dim,
+                            int32_t seq_len,
+                            const float *q,
+                            const float *k_cache,
+                            float scale,
+                            float *scores_out)
+{
+    if (!ctx || !q || !k_cache || !scores_out) return -1;
+    if (num_heads <= 0 || num_kv_heads <= 0 || head_dim <= 0 || seq_len <= 0) return -1;
+    if (num_heads % num_kv_heads != 0) return -1;
+    if (!g_metal || !g_metal->attn_scores_pipe) return -1;
+
+    int32_t kv_dim = num_kv_heads * head_dim;
+    int32_t heads_per_kv = num_heads / num_kv_heads;
+
+    id<MTLBuffer> buf_q = [g_metal->device
+        newBufferWithBytes:q
+                    length:(size_t)num_heads * (size_t)head_dim * sizeof(float)
+                   options:MTLResourceStorageModeShared];
+    id<MTLBuffer> buf_k = [g_metal->device
+        newBufferWithBytes:k_cache
+                    length:(size_t)seq_len * (size_t)kv_dim * sizeof(float)
+                   options:MTLResourceStorageModeShared];
+    id<MTLBuffer> buf_scores = [g_metal->device
+        newBufferWithLength:(size_t)num_heads * (size_t)seq_len * sizeof(float)
+                    options:MTLResourceStorageModeShared];
+
+    id<MTLCommandBuffer> cmdbuf = [g_metal->queue commandBuffer];
+    {
+        id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+        [enc setComputePipelineState:g_metal->attn_scores_pipe];
+        [enc setBuffer:buf_q      offset:0 atIndex:0];
+        [enc setBuffer:buf_k      offset:0 atIndex:1];
+        [enc setBuffer:buf_scores offset:0 atIndex:2];
+        uint32_t hd = (uint32_t)head_dim;
+        uint32_t kvd = (uint32_t)kv_dim;
+        uint32_t sl = (uint32_t)seq_len;
+        uint32_t seq_stride = sl;       // tight packing for oracle
+        uint32_t hpkv = (uint32_t)heads_per_kv;
+        [enc setBytes:&hd         length:4 atIndex:3];
+        [enc setBytes:&kvd        length:4 atIndex:4];
+        [enc setBytes:&sl         length:4 atIndex:5];
+        [enc setBytes:&seq_stride length:4 atIndex:6];
+        [enc setBytes:&scale      length:4 atIndex:7];
+        [enc setBytes:&hpkv       length:4 atIndex:8];
+        [enc setBytes:&sl         length:4 atIndex:9];   // num_seq_tgs == seq_len
+        uint32_t total_tgs = sl * (uint32_t)num_heads;
+        [enc dispatchThreadgroups:MTLSizeMake(total_tgs, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+    }
+    [cmdbuf commit];
+    [cmdbuf waitUntilCompleted];
+
+    memcpy(scores_out, [buf_scores contents],
+           (size_t)num_heads * (size_t)seq_len * sizeof(float));
+    return 0;
+}
+
+int mf_attn_softmax_batched(mf_ctx *ctx,
+                             int32_t num_heads,
+                             int32_t seq_len,
+                             float *scores_inout)
+{
+    if (!ctx || !scores_inout) return -1;
+    if (num_heads <= 0 || seq_len <= 0) return -1;
+    if (!g_metal || !g_metal->attn_softmax_pipe) return -1;
+
+    size_t bytes = (size_t)num_heads * (size_t)seq_len * sizeof(float);
+    id<MTLBuffer> buf_scores = [g_metal->device
+        newBufferWithBytes:scores_inout
+                    length:bytes
+                   options:MTLResourceStorageModeShared];
+
+    id<MTLCommandBuffer> cmdbuf = [g_metal->queue commandBuffer];
+    {
+        id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+        [enc setComputePipelineState:g_metal->attn_softmax_pipe];
+        [enc setBuffer:buf_scores offset:0 atIndex:0];
+        uint32_t sl = (uint32_t)seq_len;
+        uint32_t seq_stride = sl;
+        [enc setBytes:&sl         length:4 atIndex:1];
+        [enc setBytes:&seq_stride length:4 atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake((uint32_t)num_heads, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+    }
+    [cmdbuf commit];
+    [cmdbuf waitUntilCompleted];
+
+    memcpy(scores_inout, [buf_scores contents], bytes);
+    return 0;
+}
+
+int mf_attn_values_batched(mf_ctx *ctx,
+                            int32_t num_heads,
+                            int32_t num_kv_heads,
+                            int32_t head_dim,
+                            int32_t seq_len,
+                            const float *scores,
+                            const float *v_cache,
+                            float *out)
+{
+    if (!ctx || !scores || !v_cache || !out) return -1;
+    if (num_heads <= 0 || num_kv_heads <= 0 || head_dim <= 0 || seq_len <= 0) return -1;
+    if (num_heads % num_kv_heads != 0) return -1;
+    if (!g_metal || !g_metal->attn_values_pipe) return -1;
+
+    int32_t kv_dim = num_kv_heads * head_dim;
+    int32_t heads_per_kv = num_heads / num_kv_heads;
+
+    id<MTLBuffer> buf_scores = [g_metal->device
+        newBufferWithBytes:scores
+                    length:(size_t)num_heads * (size_t)seq_len * sizeof(float)
+                   options:MTLResourceStorageModeShared];
+    id<MTLBuffer> buf_v = [g_metal->device
+        newBufferWithBytes:v_cache
+                    length:(size_t)seq_len * (size_t)kv_dim * sizeof(float)
+                   options:MTLResourceStorageModeShared];
+    id<MTLBuffer> buf_out = [g_metal->device
+        newBufferWithLength:(size_t)num_heads * (size_t)head_dim * sizeof(float)
+                    options:MTLResourceStorageModeShared];
+
+    id<MTLCommandBuffer> cmdbuf = [g_metal->queue commandBuffer];
+    {
+        id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+        [enc setComputePipelineState:g_metal->attn_values_pipe];
+        [enc setBuffer:buf_scores offset:0 atIndex:0];
+        [enc setBuffer:buf_v      offset:0 atIndex:1];
+        [enc setBuffer:buf_out    offset:0 atIndex:2];
+        uint32_t hd = (uint32_t)head_dim;
+        uint32_t kvd = (uint32_t)kv_dim;
+        uint32_t sl = (uint32_t)seq_len;
+        uint32_t seq_stride = sl;
+        uint32_t hpkv = (uint32_t)heads_per_kv;
+        [enc setBytes:&hd         length:4 atIndex:3];
+        [enc setBytes:&kvd        length:4 atIndex:4];
+        [enc setBytes:&sl         length:4 atIndex:5];
+        [enc setBytes:&seq_stride length:4 atIndex:6];
+        [enc setBytes:&hpkv       length:4 atIndex:7];
+        uint32_t total_threads = (uint32_t)head_dim * (uint32_t)num_heads;
+        uint32_t tgs = (total_threads + 255) / 256;
+        [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+    }
+    [cmdbuf commit];
+    [cmdbuf waitUntilCompleted];
+
+    memcpy(out, [buf_out contents],
+           (size_t)num_heads * (size_t)head_dim * sizeof(float));
+    return 0;
+}
+
+int mf_sigmoid_gate(mf_ctx *ctx,
+                     int32_t dim,
+                     const float *gate,
+                     float *x_inout)
+{
+    if (!ctx || !gate || !x_inout) return -1;
+    if (dim <= 0) return -1;
+    if (!g_metal || !g_metal->sigmoid_gate_pipe) return -1;
+
+    size_t bytes = (size_t)dim * sizeof(float);
+    id<MTLBuffer> buf_x = [g_metal->device
+        newBufferWithBytes:x_inout length:bytes
+                   options:MTLResourceStorageModeShared];
+    id<MTLBuffer> buf_g = [g_metal->device
+        newBufferWithBytes:gate    length:bytes
+                   options:MTLResourceStorageModeShared];
+
+    id<MTLCommandBuffer> cmdbuf = [g_metal->queue commandBuffer];
+    {
+        id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+        [enc setComputePipelineState:g_metal->sigmoid_gate_pipe];
+        [enc setBuffer:buf_x offset:0 atIndex:0];
+        [enc setBuffer:buf_g offset:0 atIndex:1];
+        uint32_t d = (uint32_t)dim;
+        [enc setBytes:&d length:4 atIndex:2];
+        uint32_t tgs = (d + 255) / 256;
+        [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+    }
+    [cmdbuf commit];
+    [cmdbuf waitUntilCompleted];
+
+    memcpy(x_inout, [buf_x contents], bytes);
+    return 0;
+}
+
 // Phase 4 layer-boundary checkpoint hook. Loads `hidden_in` into the
 // ctx's hidden buffer, runs `fused_layer_forward` for one layer using
 // the ctx's existing per-layer state arrays, flushes the deferred-

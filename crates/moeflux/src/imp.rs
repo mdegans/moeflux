@@ -501,6 +501,99 @@ impl Ctx {
         if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
     }
 
+    /// `attn_scores_batched` (slice 5d-7a). Stride-tight; output is
+    /// `[num_heads * seq_len]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_scores_batched(
+        &self,
+        num_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        seq_len: i32,
+        q: &[f32],
+        k_cache: &[f32],
+        scale: f32,
+        scores_out: &mut [f32],
+    ) -> Result<(), Error> {
+        let rc = unsafe {
+            sys::mf_attn_scores_batched(
+                self.inner.as_ptr(),
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                seq_len,
+                q.as_ptr(),
+                k_cache.as_ptr(),
+                scale,
+                scores_out.as_mut_ptr(),
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
+    }
+
+    /// `attn_softmax_batched` (slice 5d-7a). In-place per-head softmax.
+    pub fn attn_softmax_batched(
+        &self,
+        num_heads: i32,
+        seq_len: i32,
+        scores_inout: &mut [f32],
+    ) -> Result<(), Error> {
+        let rc = unsafe {
+            sys::mf_attn_softmax_batched(
+                self.inner.as_ptr(),
+                num_heads,
+                seq_len,
+                scores_inout.as_mut_ptr(),
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
+    }
+
+    /// `attn_values_batched` (slice 5d-7a). Per-head scores · V.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_values_batched(
+        &self,
+        num_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        seq_len: i32,
+        scores: &[f32],
+        v_cache: &[f32],
+        out: &mut [f32],
+    ) -> Result<(), Error> {
+        let rc = unsafe {
+            sys::mf_attn_values_batched(
+                self.inner.as_ptr(),
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                seq_len,
+                scores.as_ptr(),
+                v_cache.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
+    }
+
+    /// `sigmoid_gate` (slice 5d-7a). In-place `x *= sigmoid(gate)`.
+    pub fn sigmoid_gate(
+        &self,
+        dim: i32,
+        gate: &[f32],
+        x_inout: &mut [f32],
+    ) -> Result<(), Error> {
+        let rc = unsafe {
+            sys::mf_sigmoid_gate(
+                self.inner.as_ptr(),
+                dim,
+                gate.as_ptr(),
+                x_inout.as_mut_ptr(),
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
+    }
+
     /// Read one expert's `EXPERT_SIZE`-byte 4-bit blob from the
     /// per-layer packed-expert file. Bypasses every cache. Wraps
     /// `mf_load_expert_bytes`; rejects 2-bit ctxs and any

@@ -432,6 +432,100 @@ int mf_gpu_rms_norm_fused(mf_ctx *ctx,
                            size_t weight_bf16_len,
                            float *out);
 
+// ---------------------------------------------------------------------------
+// Slice 5d-7a — GPU full-attention kernels under per-kernel diff
+// ---------------------------------------------------------------------------
+//
+// Test-only oracle wrappers around the four kernels that make up
+// `gpu_attn_fuse` (`infer.m:5051..5163`):
+//
+//   mf_attn_scores_batched   — Q · K^T per head, scaled
+//   mf_attn_softmax_batched  — per-head softmax over [0, seq_len)
+//   mf_attn_values_batched   — scores · V per head
+//   mf_sigmoid_gate          — out[i] *= sigmoid(gate[i])
+//
+// Each hook allocates its own scratch GPU buffers, encodes ONE kernel
+// into a fresh cmdbuf, commits + waits, and reads back. Same shape as
+// `mf_gpu_rms_norm_fused`. The C production path's monolithic
+// `gpu_attn_fuse` is left untouched; these oracle wrappers duplicate
+// encoder logic with fresh buffers so the pre-existing tests against
+// `gpu_attn_fuse`'s runtime behavior continue to compare bit-exact.
+//
+// Stride convention: oracle output uses `seq_stride = seq_len` (tight
+// packing). Production callers use `seq_stride = GPU_KV_SEQ` for the
+// persistent score buffer; the kernels write the same per-row values
+// regardless of stride choice, so test vs. production agree per-element
+// after slicing the strided rows.
+//
+// `kv_dim = num_kv_heads * head_dim`; `heads_per_kv = num_heads /
+// num_kv_heads` (GQA). `num_heads` must be a multiple of `num_kv_heads`.
+
+// Compute `scores[h, p] = (Q[h] · K_cache[p, kv_h]) * scale` for all
+// h in [0, num_heads) and p in [0, seq_len). GQA: each query head h
+// maps to kv_head `h / heads_per_kv`.
+//
+//   q:           [num_heads * head_dim] post-RoPE query.
+//   k_cache:     [seq_len * kv_dim] post-RoPE K rows, packed prefix.
+//   scale:       1/sqrt(head_dim) (passed explicitly).
+//   scores_out:  [num_heads * seq_len] — per-head, per-position scores.
+//                Output stride is `seq_len` (no padding).
+//
+// Returns 0 on success; -1 on NULL args / non-positive shape /
+// `num_heads % num_kv_heads != 0` / missing pipeline.
+int mf_attn_scores_batched(mf_ctx *ctx,
+                            int32_t num_heads,
+                            int32_t num_kv_heads,
+                            int32_t head_dim,
+                            int32_t seq_len,
+                            const float *q,
+                            const float *k_cache,
+                            float scale,
+                            float *scores_out);
+
+// Per-head softmax over `[0, seq_len)`. Numerically stable (max-shift
+// before exp). Mutates `scores_inout` in place.
+//
+//   scores_inout: [num_heads * seq_len] — per-head, per-position
+//                 logits in, softmax probs out.
+//
+// Returns 0 on success; -1 on NULL args / non-positive shape /
+// missing pipeline.
+int mf_attn_softmax_batched(mf_ctx *ctx,
+                             int32_t num_heads,
+                             int32_t seq_len,
+                             float *scores_inout);
+
+// Aggregate values: `out[h * head_dim + d] = Σ_p scores[h, p] *
+// V_cache[p, kv_h, d]`.
+//
+//   scores:  [num_heads * seq_len] post-softmax probs.
+//   v_cache: [seq_len * kv_dim] V rows, packed prefix.
+//   out:     [num_heads * head_dim] aggregated output.
+//
+// Returns 0 on success; -1 on NULL args / non-positive shape /
+// `num_heads % num_kv_heads != 0` / missing pipeline.
+int mf_attn_values_batched(mf_ctx *ctx,
+                            int32_t num_heads,
+                            int32_t num_kv_heads,
+                            int32_t head_dim,
+                            int32_t seq_len,
+                            const float *scores,
+                            const float *v_cache,
+                            float *out);
+
+// Element-wise sigmoid gate: `x_inout[i] *= sigmoid(gate[i])`. Per-
+// thread, no reductions — bit-exact per-PSO.
+//
+//   gate:      [dim] pre-sigmoid gate logits.
+//   x_inout:   [dim] in: pre-gated; out: gated values.
+//
+// Returns 0 on success; -1 on NULL args / non-positive `dim` /
+// missing pipeline.
+int mf_sigmoid_gate(mf_ctx *ctx,
+                     int32_t dim,
+                     const float *gate,
+                     float *x_inout);
+
 // Run a single layer's forward pass starting from the supplied hidden
 // state and return the post-layer hidden state. Phase 4 diff-oracle
 // dump point — the layer-boundary checkpoint shape that lets the
