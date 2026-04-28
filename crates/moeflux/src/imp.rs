@@ -211,6 +211,602 @@ impl Ctx {
         if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
     }
 
+    /// Embed a single token via the C path's `embed_lookup`. Writes
+    /// `HIDDEN_DIM` floats into `out`. Used by the RIIR diff oracle as
+    /// the per-layer dump point for the embedding kernel; not part of
+    /// production decode.
+    pub fn embed(&self, token_id: i32, out: &mut [f32]) -> Result<(), Error> {
+        let rc = unsafe {
+            sys::mf_embed_lookup(self.inner.as_ptr(), token_id, out.as_mut_ptr())
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
+    }
+
+    /// CPU RMSNorm against the weight tensor named `weight_name`
+    /// (typically `model.norm.weight` or one of the per-layer
+    /// `*.input_layernorm.weight` / `*.post_attention_layernorm.weight`
+    /// tensors). Diff-oracle dump point for the RMSNorm kernel.
+    pub fn rms_norm_cpu(
+        &self,
+        weight_name: &str,
+        x: &[f32],
+        out: &mut [f32],
+    ) -> Result<(), Error> {
+        let cname =
+            std::ffi::CString::new(weight_name).map_err(|_| Error::PathHasNul)?;
+        let rc = unsafe {
+            sys::mf_rms_norm_cpu(
+                self.inner.as_ptr(),
+                cname.as_ptr(),
+                x.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
+    }
+
+    /// Apply rotary position embedding to Q and K at `pos`. Both
+    /// buffers are mutated in place. Diff-oracle dump point for the
+    /// RoPE kernel.
+    pub fn apply_rotary_emb(
+        &self,
+        pos: i32,
+        q: &mut [f32],
+        k: &mut [f32],
+    ) -> Result<(), Error> {
+        let rc = unsafe {
+            sys::mf_apply_rotary_emb(
+                self.inner.as_ptr(),
+                pos,
+                q.as_mut_ptr(),
+                k.as_mut_ptr(),
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
+    }
+
+    /// Per-head CPU RMSNorm, mutating `x_inout` in place. Layout is
+    /// `num_heads` contiguous head slices of `head_dim` floats each;
+    /// the same `head_dim`-long bf16 weight (from `weight_name`) is
+    /// applied to every head. Diff-oracle dump point for the per-head
+    /// Q/K norm used inside attention layers.
+    pub fn rms_norm_per_head_cpu(
+        &self,
+        weight_name: &str,
+        num_heads: usize,
+        head_dim: usize,
+        x_inout: &mut [f32],
+    ) -> Result<(), Error> {
+        let cname =
+            std::ffi::CString::new(weight_name).map_err(|_| Error::PathHasNul)?;
+        let rc = unsafe {
+            sys::mf_rms_norm_per_head_cpu(
+                self.inner.as_ptr(),
+                cname.as_ptr(),
+                num_heads as i32,
+                head_dim as i32,
+                x_inout.as_mut_ptr(),
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
+    }
+
+    /// CPU scaled dot-product attention with sigmoid-gated output,
+    /// single query position against `kv_len` cached positions. Uses
+    /// the active variant's NUM_ATTN_HEADS / NUM_KV_HEADS / HEAD_DIM
+    /// (GQA: `num_attn_heads / num_kv_heads` query heads share one
+    /// kv head). `out` is overwritten. Diff-oracle dump point for
+    /// the SDPA core of full-attention layers.
+    pub fn sdpa_cpu(
+        &self,
+        kv_len: i32,
+        q: &[f32],
+        q_gate: &[f32],
+        k_cache: &[f32],
+        v_cache: &[f32],
+        out: &mut [f32],
+    ) -> Result<(), Error> {
+        let rc = unsafe {
+            sys::mf_sdpa_cpu(
+                self.inner.as_ptr(),
+                kv_len,
+                q.as_ptr(),
+                q_gate.as_ptr(),
+                k_cache.as_ptr(),
+                v_cache.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
+    }
+
+    /// CPU LM head matvec. `x` is `HIDDEN_DIM` floats, `out` is
+    /// `VOCAB_SIZE` floats. Diff-oracle dump point for the final
+    /// logits projection; routes through `cpu_dequant_matvec`
+    /// regardless of Metal availability so the diff harness compares
+    /// CPU outputs head-on.
+    pub fn lm_head_cpu(&self, x: &[f32], out: &mut [f32]) -> Result<(), Error> {
+        let rc = unsafe {
+            sys::mf_lm_head_cpu(
+                self.inner.as_ptr(),
+                x.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
+    }
+
+    /// CPU MoE router: softmax → top-K → normalize. `scores` is the
+    /// raw gate logit vector (mutated in place — afterwards holds
+    /// softmax probabilities). `indices` and `weights` are output
+    /// parallel arrays both of length `k`; the slot order matches the
+    /// C selection-sort and is not sorted by score. Diff-oracle dump
+    /// point for the per-layer expert-routing decision.
+    pub fn moe_router_cpu(
+        &self,
+        scores: &mut [f32],
+        k: usize,
+        indices: &mut [i32],
+        weights: &mut [f32],
+    ) -> Result<(), Error> {
+        let rc = unsafe {
+            sys::mf_moe_router_cpu(
+                self.inner.as_ptr(),
+                scores.as_mut_ptr(),
+                scores.len() as i32,
+                k as i32,
+                indices.as_mut_ptr(),
+                weights.as_mut_ptr(),
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
+    }
+
+    /// Depthwise 1D conv step + SiLU. `weight_name` is a bf16 tensor of
+    /// length `channels * kernel_size`. Diff-oracle dump point for the
+    /// linear-attention conv1d primitive.
+    pub fn conv1d_step_cpu(
+        &self,
+        weight_name: &str,
+        channels: usize,
+        kernel_size: usize,
+        conv_state: &[f32],
+        new_input: &[f32],
+        out: &mut [f32],
+    ) -> Result<(), Error> {
+        let cname =
+            std::ffi::CString::new(weight_name).map_err(|_| Error::PathHasNul)?;
+        let rc = unsafe {
+            sys::mf_conv1d_step_cpu(
+                self.inner.as_ptr(),
+                cname.as_ptr(),
+                channels as i32,
+                kernel_size as i32,
+                conv_state.as_ptr(),
+                new_input.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
+    }
+
+    /// CPU bare RMSNorm (no weight). Diff-oracle dump point for the
+    /// per-head Q/K bare-norm inside linear-attention layers.
+    pub fn rms_norm_bare_cpu(
+        &self,
+        eps: f32,
+        x: &[f32],
+        out: &mut [f32],
+    ) -> Result<(), Error> {
+        let rc = unsafe {
+            sys::mf_rms_norm_bare_cpu(
+                self.inner.as_ptr(),
+                x.len() as i32,
+                eps,
+                x.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
+    }
+
+    /// CPU RMSNormGated: rms_norm(x) × weight × silu(z). Diff-oracle
+    /// dump point for the gated-norm tail of the linear-attention
+    /// recurrence output.
+    pub fn rms_norm_gated_cpu(
+        &self,
+        weight_name: &str,
+        eps: f32,
+        x: &[f32],
+        z: &[f32],
+        out: &mut [f32],
+    ) -> Result<(), Error> {
+        let cname =
+            std::ffi::CString::new(weight_name).map_err(|_| Error::PathHasNul)?;
+        let rc = unsafe {
+            sys::mf_rms_norm_gated_cpu(
+                self.inner.as_ptr(),
+                cname.as_ptr(),
+                x.len() as i32,
+                eps,
+                x.as_ptr(),
+                z.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
+    }
+
+    /// CPU gated-delta-net recurrence step. Loads `A_log` and
+    /// `dt_bias` from the manifest for `layer_idx`. Diff-oracle dump
+    /// point for the heart of GatedDeltaNet — the production decode
+    /// path uses the GPU `gated_delta_net_step` shader; the diff
+    /// oracle exercises the parallel CPU helper that mirrors the same
+    /// arithmetic.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gated_delta_recurrence_cpu(
+        &self,
+        layer_idx: usize,
+        alpha: &[f32],
+        beta: &[f32],
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        v_heads: usize,
+        k_heads: usize,
+        key_dim: usize,
+        value_dim: usize,
+        ssm_state: &mut [f32],
+        out_values: &mut [f32],
+    ) -> Result<(), Error> {
+        let rc = unsafe {
+            sys::mf_gated_delta_recurrence_cpu(
+                self.inner.as_ptr(),
+                layer_idx as i32,
+                alpha.as_ptr(),
+                beta.as_ptr(),
+                q.as_ptr(),
+                k.as_ptr(),
+                v.as_ptr(),
+                v_heads as i32,
+                k_heads as i32,
+                key_dim as i32,
+                value_dim as i32,
+                ssm_state.as_mut_ptr(),
+                out_values.as_mut_ptr(),
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
+    }
+
+    /// GPU RMSNorm with bf16 weights. Wraps `mf_gpu_rms_norm_fused`.
+    /// `x` and `out` are HIDDEN_DIM floats; `weight_bf16` is
+    /// `HIDDEN_DIM * 2` bytes of little-endian bf16. Diff-oracle dump
+    /// point for the GPU rms_norm_sum_sq + rms_norm_apply_bf16 chain.
+    pub fn gpu_rms_norm_fused(
+        &self,
+        x: &[f32],
+        weight_bf16: &[u8],
+        out: &mut [f32],
+    ) -> Result<(), Error> {
+        let rc = unsafe {
+            sys::mf_gpu_rms_norm_fused(
+                self.inner.as_ptr(),
+                x.as_ptr(),
+                weight_bf16.as_ptr().cast(),
+                weight_bf16.len(),
+                out.as_mut_ptr(),
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
+    }
+
+    /// `attn_scores_batched` (slice 5d-7a). Stride-tight; output is
+    /// `[num_heads * seq_len]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_scores_batched(
+        &self,
+        num_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        seq_len: i32,
+        q: &[f32],
+        k_cache: &[f32],
+        scale: f32,
+        scores_out: &mut [f32],
+    ) -> Result<(), Error> {
+        let rc = unsafe {
+            sys::mf_attn_scores_batched(
+                self.inner.as_ptr(),
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                seq_len,
+                q.as_ptr(),
+                k_cache.as_ptr(),
+                scale,
+                scores_out.as_mut_ptr(),
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
+    }
+
+    /// `attn_softmax_batched` (slice 5d-7a). In-place per-head softmax.
+    pub fn attn_softmax_batched(
+        &self,
+        num_heads: i32,
+        seq_len: i32,
+        scores_inout: &mut [f32],
+    ) -> Result<(), Error> {
+        let rc = unsafe {
+            sys::mf_attn_softmax_batched(
+                self.inner.as_ptr(),
+                num_heads,
+                seq_len,
+                scores_inout.as_mut_ptr(),
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
+    }
+
+    /// `attn_values_batched` (slice 5d-7a). Per-head scores · V.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_values_batched(
+        &self,
+        num_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        seq_len: i32,
+        scores: &[f32],
+        v_cache: &[f32],
+        out: &mut [f32],
+    ) -> Result<(), Error> {
+        let rc = unsafe {
+            sys::mf_attn_values_batched(
+                self.inner.as_ptr(),
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                seq_len,
+                scores.as_ptr(),
+                v_cache.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
+    }
+
+    /// `sigmoid_gate` (slice 5d-7a). In-place `x *= sigmoid(gate)`.
+    pub fn sigmoid_gate(
+        &self,
+        dim: i32,
+        gate: &[f32],
+        x_inout: &mut [f32],
+    ) -> Result<(), Error> {
+        let rc = unsafe {
+            sys::mf_sigmoid_gate(
+                self.inner.as_ptr(),
+                dim,
+                gate.as_ptr(),
+                x_inout.as_mut_ptr(),
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
+    }
+
+    /// Read one expert's `EXPERT_SIZE`-byte 4-bit blob from the
+    /// per-layer packed-expert file. Bypasses every cache. Wraps
+    /// `mf_load_expert_bytes`; rejects 2-bit ctxs and any
+    /// out-of-range layer/expert index. `out` must be exactly
+    /// `EXPERT_SIZE` bytes.
+    pub fn load_expert_bytes(
+        &self,
+        layer_idx: i32,
+        expert_idx: i32,
+        out: &mut [u8],
+    ) -> Result<(), Error> {
+        let rc = unsafe {
+            sys::mf_load_expert_bytes(
+                self.inner.as_ptr(),
+                layer_idx,
+                expert_idx,
+                out.as_mut_ptr().cast(),
+                out.len(),
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
+    }
+
+    /// Single-expert GPU FFN forward. Wraps the C-side
+    /// `mf_gpu_expert_forward` hook. `expert_data` must be exactly
+    /// `EXPERT_SIZE` bytes for the active 4-bit variant — the C path
+    /// rejects 2-bit ctxs (those use a different pipeline + layout).
+    /// `h_post` is HIDDEN_DIM floats; `expert_out` receives HIDDEN_DIM
+    /// floats. Diff-oracle dump point for the GPU expert FFN.
+    pub fn gpu_expert_forward(
+        &self,
+        expert_data: &[u8],
+        h_post: &[f32],
+        expert_out: &mut [f32],
+    ) -> Result<(), Error> {
+        let rc = unsafe {
+            sys::mf_gpu_expert_forward(
+                self.inner.as_ptr(),
+                expert_data.as_ptr().cast(),
+                expert_data.len(),
+                h_post.as_ptr(),
+                expert_out.as_mut_ptr(),
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
+    }
+
+    /// Batched K-expert FFN forward + GPU combine. Wraps
+    /// `mf_gpu_batched_experts_forward`. `expert_data` is K expert
+    /// blobs concatenated in slot order (K × `EXPERT_SIZE` bytes).
+    /// `h_post`, `h_mid`, `shared_out`, `hidden_out` are HIDDEN_DIM
+    /// floats; `expert_weights` is K floats. `actual_k` must satisfy
+    /// `1 ≤ actual_k ≤ MAX_K=16`. Diff-oracle dump point for the
+    /// production MoE expert + combine path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gpu_batched_experts_forward(
+        &self,
+        actual_k: i32,
+        expert_data: &[u8],
+        h_post: &[f32],
+        h_mid: &[f32],
+        shared_out: &[f32],
+        expert_weights: &[f32],
+        shared_gate_score: f32,
+        hidden_out: &mut [f32],
+    ) -> Result<(), Error> {
+        let rc = unsafe {
+            sys::mf_gpu_batched_experts_forward(
+                self.inner.as_ptr(),
+                actual_k,
+                expert_data.as_ptr().cast(),
+                expert_data.len(),
+                h_post.as_ptr(),
+                h_mid.as_ptr(),
+                shared_out.as_ptr(),
+                expert_weights.as_ptr(),
+                shared_gate_score,
+                hidden_out.as_mut_ptr(),
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
+    }
+
+    /// Slice 4e — begin a deferred K-expert dispatch. Encodes the same
+    /// pipeline as [`Self::gpu_batched_experts_forward`] but commits
+    /// async (without `waitUntilCompleted`) and stashes the cmdbuf in
+    /// `g_deferred`. Pair with [`Self::complete_deferred_experts`] (to
+    /// wait + read back) or [`Self::discard_deferred_experts`] (to wait
+    /// + clear without readback). Mirrors `mf_begin_deferred_experts`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_deferred_experts(
+        &mut self,
+        actual_k: i32,
+        expert_data: &[u8],
+        h_post: &[f32],
+        h_mid: &[f32],
+        shared_out: &[f32],
+        expert_weights: &[f32],
+        shared_gate_score: f32,
+    ) -> Result<(), Error> {
+        let rc = unsafe {
+            sys::mf_begin_deferred_experts(
+                self.inner.as_ptr(),
+                actual_k,
+                expert_data.as_ptr().cast(),
+                expert_data.len(),
+                h_post.as_ptr(),
+                h_mid.as_ptr(),
+                shared_out.as_ptr(),
+                expert_weights.as_ptr(),
+                shared_gate_score,
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
+    }
+
+    /// Slice 4e — wait for the deferred GPU dispatch, read back the
+    /// post-combine hidden state into `hidden_out`, clear `g_deferred`.
+    /// No-op if no deferred dispatch is active. `hidden_out` is
+    /// `HIDDEN_DIM` floats.
+    pub fn complete_deferred_experts(
+        &mut self,
+        hidden_out: &mut [f32],
+    ) -> Result<(), Error> {
+        let rc = unsafe {
+            sys::mf_complete_deferred_experts(
+                self.inner.as_ptr(),
+                hidden_out.as_mut_ptr(),
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
+    }
+
+    /// Slice 4e — wait for the deferred GPU dispatch (so the persistent
+    /// MoE buffers are no longer in use) and clear `g_deferred` without
+    /// reading back. No-op if no deferred dispatch is active.
+    pub fn discard_deferred_experts(&mut self) -> Result<(), Error> {
+        let rc =
+            unsafe { sys::mf_discard_deferred_experts(self.inner.as_ptr()) };
+        if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
+    }
+
+    /// Run a single layer's forward pass starting from `hidden_in`,
+    /// returning the post-layer hidden state in `hidden_out`. Phase 4
+    /// layer-boundary checkpoint hook — the diff-oracle dump point for
+    /// `fused_layer_forward`. Drives the targeted layer's per-layer
+    /// state in place; the deferred-expert pipeline is flushed before
+    /// return so `g_deferred.active` is 0 on both entry and exit.
+    ///
+    /// `hidden_in` and `hidden_out` are both `HIDDEN_DIM` floats.
+    pub fn layer_forward_dump(
+        &mut self,
+        layer_idx: i32,
+        pos: i32,
+        hidden_in: &[f32],
+        hidden_out: &mut [f32],
+    ) -> Result<(), Error> {
+        let rc = unsafe {
+            sys::mf_layer_forward_dump(
+                self.inner.as_ptr(),
+                layer_idx,
+                pos,
+                hidden_in.as_ptr(),
+                hidden_out.as_mut_ptr(),
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
+    }
+
+    /// 4c diagnostic — same as [`Self::layer_forward_dump`] but also
+    /// copies out the layer's intermediate buffers so the test
+    /// harness can pinpoint where the C-vs-Rust divergence appears.
+    /// Pass `None` to skip a particular intermediate.
+    #[allow(clippy::too_many_arguments)]
+    pub fn layer_forward_dump_intermediates(
+        &mut self,
+        layer_idx: i32,
+        pos: i32,
+        hidden_in: &[f32],
+        hidden_out: &mut [f32],
+        h_post_out: Option<&mut [f32]>,
+        h_mid_out: Option<&mut [f32]>,
+        shared_out_out: Option<&mut [f32]>,
+        gate_score_out: Option<&mut f32>,
+    ) -> Result<(), Error> {
+        let h_post_ptr = h_post_out
+            .map(|b| b.as_mut_ptr())
+            .unwrap_or(std::ptr::null_mut());
+        let h_mid_ptr = h_mid_out
+            .map(|b| b.as_mut_ptr())
+            .unwrap_or(std::ptr::null_mut());
+        let shared_ptr = shared_out_out
+            .map(|b| b.as_mut_ptr())
+            .unwrap_or(std::ptr::null_mut());
+        let gate_ptr = gate_score_out
+            .map(|f| f as *mut f32)
+            .unwrap_or(std::ptr::null_mut());
+        let rc = unsafe {
+            sys::mf_layer_forward_dump_intermediates(
+                self.inner.as_ptr(),
+                layer_idx,
+                pos,
+                hidden_in.as_ptr(),
+                hidden_out.as_mut_ptr(),
+                h_post_ptr,
+                h_mid_ptr,
+                shared_ptr,
+                gate_ptr,
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::EvalFailed) }
+    }
+
     /// Reset the sequence to empty.
     pub fn memory_clear(&mut self) {
         unsafe { sys::mf_memory_clear(self.inner.as_ptr()) }

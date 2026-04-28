@@ -17,9 +17,10 @@ include       = [
     "wrapper.h",
     "README.md",
     "LICENSE",
-    # The C/Metal sources are one level up; we copy them via build.rs
-    # at publish time. For local path-dep consumers (drama_llama),
-    # build.rs reads them directly from ../../metal_infer.
+    # The C sources are one level up at metal_infer/; the Metal
+    # shaders moved to ../moeflux/shaders/ in Phase 6 (source of
+    # truth lives with the Rust port now). build.rs reads both
+    # directly from those locations for local path-dep consumers.
 ]
 
 [features]

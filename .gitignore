@@ -1,3 +1,6 @@
+# IDE
+.vscode/
+
 # Build artifacts
 metal_infer/infer
 metal_infer/metal_infer

@@ -1,20 +1,23 @@
 # moeflux
 
-Streaming-experts Mixture-of-Experts decode kernels for Apple
-Silicon, packaged as a library with a stable C API so it can slot
-into [`drama_llama`](https://github.com/mdegans/drama_llama) (and,
-through it, into [Agora](https://subliminal.technology/agora)).
+Pure-Rust streaming-experts Mixture-of-Experts decode for Apple
+Silicon. Slots into [`drama_llama`](https://github.com/mdegans/drama_llama)
+(and through it into [Agora](https://subliminal.technology/agora)).
 
 Derived from
 [danveloper/flash-moe](https://github.com/danveloper/flash-moe).
 The core Metal streaming-experts kernels were authored by **Claude
 Opus 4.6** (Anthropic) during a 24-hour session with @danveloper —
 see upstream's `CLAUDE.md` for the full story. moeflux is a
-Rust-downstream reshape of that work: the kernels and Metal
-pipeline carry over; the surrounding scaffolding (chat client,
-hand-rolled tokenizer, interactive REPL) does not. Upstream is
-actively maintained and will continue its own direction; we are
-not competing with it.
+Rust-downstream reshape of that work: the kernels carry over
+verbatim; the host-side dispatch was rewritten in Rust on
+`metal-rs` (RIIR Phases 0–6, 2026-04-25..28) to lifetime-bind the
+process-globals upstream's C path used and to deliver typed errors
+instead of silent state mutation. The original C/Objective-C
+implementation is preserved behind the `diff-oracle` cargo feature
+as a regression net for future ports (DeepSeek-V3, Cogito-V2 671B).
+Upstream is actively maintained and will continue its own direction;
+we are not competing with it.
 
 ## Why this fork exists
 
@@ -29,17 +32,26 @@ Max; our 96GB target box should do comparably on Cogito 600B.
 
 ## What's here
 
-- `metal_infer/` — inference kernels (Metal + C + Accelerate BLAS).
-  Inherited from upstream; being reshaped around a stable `mf_*`
-  C API in Phase 3 of the drama_llama v0.8.0 work.
+- `crates/moeflux/` — the Rust port. `RsCtx::open` opens a model;
+  `eval_prompt` / `eval_token` / `state_save` / `state_load` are
+  the public surface. Kernels at `crates/moeflux/shaders/shaders.metal`
+  are embedded into the binary via `include_str!` and compiled at
+  runtime via `MTLDevice newLibraryWithSource:`.
+- `crates/moeflux-sys/` — raw FFI bindings to the upstream C path.
+  `dev-dependency`-only; gated behind moeflux's `diff-oracle` feature.
+  Production builds skip it entirely.
+- `metal_infer/` — the upstream C + Objective-C reference
+  implementation. Test-only; built by `moeflux-sys/build.rs` when
+  `diff-oracle` is enabled. Provides per-kernel C-side hooks the
+  diff oracle uses to bit-exact-validate every Rust kernel.
 - `repack_experts.py`, `extract_weights.py` — model-prep pipeline.
   One-time-per-target-model; not runtime.
 
 ## Status
 
-**Pre-alpha**, pre-`0.1`. API is unstable and will break until
-the drama_llama side of integration lands and we have the Cogito
-probe running. Not yet published to crates.io.
+**Pre-alpha**, pre-`0.1`. RIIR Phases 0–6 landed; perf parity with
+the C path achieved (A3B 94%, A17B +22%) on M2 Max. API will
+stabilize once a runtime variant dispatch lands (Phase 7).
 
 ## License
 

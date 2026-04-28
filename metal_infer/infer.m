@@ -721,6 +721,88 @@ static void cpu_rms_norm(const float *x, const uint16_t *w_bf16, float *out, int
     }
 }
 
+// Per-head RMS norm. `x_inout` holds `num_heads * head_dim` floats laid
+// out contiguously per head; each head's `head_dim`-long slice is
+// independently RMS-normalized and scaled by the same `head_dim`-long
+// bf16 weight tensor. Mutates `x_inout` in place. Used for the per-head
+// Q/K norm in attention layers.
+static void cpu_rms_norm_per_head(float *x_inout, const uint16_t *w_bf16,
+                                   int num_heads, int head_dim, float eps) {
+    for (int h = 0; h < num_heads; h++) {
+        float *xh = x_inout + h * head_dim;
+        float sum_sq = 0.0f;
+        for (int i = 0; i < head_dim; i++) sum_sq += xh[i] * xh[i];
+        float inv_rms = 1.0f / sqrtf(sum_sq / (float)head_dim + eps);
+        for (int i = 0; i < head_dim; i++) {
+            xh[i] = xh[i] * inv_rms * bf16_to_f32(w_bf16[i]);
+        }
+    }
+}
+
+// Forward decls for helpers defined later in this file.
+static void cpu_softmax(float *x, int dim);
+
+// Scaled dot-product attention with sigmoid-gated output, single query
+// position, multi-position KV cache. GQA via `num_attn_heads /
+// num_kv_heads`. K/V cache layout per position: `[num_kv_heads,
+// head_dim]` contiguous; cache stride between positions is
+// `num_kv_heads * head_dim`.
+//
+//   scores[p] = dot(Q[h], K[p, kv_h]) / sqrt(head_dim)
+//   weights   = softmax(scores)
+//   out[h]    = sum_p weights[p] * V[p, kv_h]
+//   out      *= sigmoid(q_gate)
+//
+// Buffers (all f32):
+//   q:       [num_attn_heads * head_dim]   query for this position
+//   q_gate:  [num_attn_heads * head_dim]   pre-sigmoid gate logits
+//   k_cache: [kv_len * num_kv_heads * head_dim]
+//   v_cache: [kv_len * num_kv_heads * head_dim]
+//   out:     [num_attn_heads * head_dim]   gated attention output
+static void cpu_sdpa(int kv_len,
+                     const float *q, const float *q_gate,
+                     const float *k_cache, const float *v_cache,
+                     int num_attn_heads, int num_kv_heads, int head_dim,
+                     float *out) {
+    int q_dim = num_attn_heads * head_dim;
+    int kv_dim = num_kv_heads * head_dim;
+    int heads_per_kv = num_attn_heads / num_kv_heads;
+    float scale = 1.0f / sqrtf((float)head_dim);
+
+    memset(out, 0, q_dim * sizeof(float));
+
+    for (int h = 0; h < num_attn_heads; h++) {
+        int kv_h = h / heads_per_kv;
+        const float *qh = q + h * head_dim;
+
+        float *scores = malloc(kv_len * sizeof(float));
+        for (int p = 0; p < kv_len; p++) {
+            const float *kp = k_cache + p * kv_dim + kv_h * head_dim;
+            float dot = 0.0f;
+            for (int d = 0; d < head_dim; d++) {
+                dot += qh[d] * kp[d];
+            }
+            scores[p] = dot * scale;
+        }
+
+        cpu_softmax(scores, kv_len);
+
+        float *oh = out + h * head_dim;
+        for (int p = 0; p < kv_len; p++) {
+            const float *vp = v_cache + p * kv_dim + kv_h * head_dim;
+            for (int d = 0; d < head_dim; d++) {
+                oh[d] += scores[p] * vp[d];
+            }
+        }
+        free(scores);
+    }
+
+    for (int i = 0; i < q_dim; i++) {
+        float g = 1.0f / (1.0f + expf(-q_gate[i]));
+        out[i] *= g;
+    }
+}
+
 // SwiGLU: out = silu(gate) * up
 static void cpu_swiglu(const float *gate, const float *up, float *out, int dim) {
     for (int i = 0; i < dim; i++) {
@@ -2370,27 +2452,11 @@ static void full_attention_forward(
 
     // Apply per-head Q norm
     if (qnorm_w) {
-        for (int h = 0; h < NUM_ATTN_HEADS; h++) {
-            float *qh = q + h * HEAD_DIM;
-            float sum_sq = 0.0f;
-            for (int i = 0; i < HEAD_DIM; i++) sum_sq += qh[i] * qh[i];
-            float inv_rms = 1.0f / sqrtf(sum_sq / HEAD_DIM + RMS_NORM_EPS);
-            for (int i = 0; i < HEAD_DIM; i++) {
-                qh[i] = qh[i] * inv_rms * bf16_to_f32(qnorm_w[i]);
-            }
-        }
+        cpu_rms_norm_per_head(q, qnorm_w, NUM_ATTN_HEADS, HEAD_DIM, RMS_NORM_EPS);
     }
     // Apply per-head K norm
     if (knorm_w) {
-        for (int h = 0; h < NUM_KV_HEADS; h++) {
-            float *kh = k + h * HEAD_DIM;
-            float sum_sq = 0.0f;
-            for (int i = 0; i < HEAD_DIM; i++) sum_sq += kh[i] * kh[i];
-            float inv_rms = 1.0f / sqrtf(sum_sq / HEAD_DIM + RMS_NORM_EPS);
-            for (int i = 0; i < HEAD_DIM; i++) {
-                kh[i] = kh[i] * inv_rms * bf16_to_f32(knorm_w[i]);
-            }
-        }
+        cpu_rms_norm_per_head(k, knorm_w, NUM_KV_HEADS, HEAD_DIM, RMS_NORM_EPS);
     }
 
 
@@ -2403,51 +2469,12 @@ static void full_attention_forward(
     memcpy(kv->v_cache + cache_pos * kv_dim, v, kv_dim * sizeof(float));
     kv->len++;
 
-    // ---- Scaled dot-product attention ----
-    // GQA: NUM_ATTN_HEADS=32 heads, NUM_KV_HEADS=2 kv heads
-    // Each group of 16 query heads shares 1 kv head
-    int heads_per_kv = NUM_ATTN_HEADS / NUM_KV_HEADS;
-    float scale = 1.0f / sqrtf((float)HEAD_DIM);
-
+    // ---- Scaled dot-product attention + sigmoid gate ----
+    // GQA: each group of (NUM_ATTN_HEADS / NUM_KV_HEADS) query heads
+    // shares one kv head. Output is gated by sigmoid(q_gate).
     float *attn_out = calloc(q_dim, sizeof(float));
-
-    for (int h = 0; h < NUM_ATTN_HEADS; h++) {
-        int kv_h = h / heads_per_kv;
-        float *qh = q + h * HEAD_DIM;
-
-        // Compute attention scores for all cached positions
-        float *scores = malloc(kv->len * sizeof(float));
-        for (int p = 0; p < kv->len; p++) {
-            float *kp = kv->k_cache + p * kv_dim + kv_h * HEAD_DIM;
-            float dot = 0.0f;
-            for (int d = 0; d < HEAD_DIM; d++) {
-                dot += qh[d] * kp[d];
-            }
-            scores[p] = dot * scale;
-        }
-
-        // Softmax
-        cpu_softmax(scores, kv->len);
-
-        // Weighted sum of values
-        float *oh = attn_out + h * HEAD_DIM;
-        for (int p = 0; p < kv->len; p++) {
-            float *vp = kv->v_cache + p * kv_dim + kv_h * HEAD_DIM;
-            for (int d = 0; d < HEAD_DIM; d++) {
-                oh[d] += scores[p] * vp[d];
-            }
-        }
-        free(scores);
-    }
-
-
-    // ---- Apply sigmoid gate to attention output ----
-    // MLX: return self.o_proj(output * mx.sigmoid(gate))
-    // gate is reshaped to [B, L, num_heads*head_dim] = flat [q_dim]
-    for (int i = 0; i < q_dim; i++) {
-        float g = 1.0f / (1.0f + expf(-q_gate[i]));
-        attn_out[i] *= g;
-    }
+    cpu_sdpa(kv->len, q, q_gate, kv->k_cache, kv->v_cache,
+             NUM_ATTN_HEADS, NUM_KV_HEADS, HEAD_DIM, attn_out);
 
     // ---- Output projection ----
     float *attn_projected = calloc(HIDDEN_DIM, sizeof(float));
@@ -7636,6 +7663,18 @@ void mf_free_model(mf_ctx *ctx) {
     if (ctx->logits) free(ctx->logits);
     // wf->data is mmap'd; upstream main() leaks it on exit. We match
     // that rather than inventing a free path. vocab similarly.
+    //
+    // Defensive: invalidate the file-scope `layer_cache` since its
+    // weight pointers were resolved against THIS ctx's `wf`. If a
+    // subsequent ctx is opened in the same process, the cache must be
+    // rebuilt against the new weight file. Without this, the second
+    // ctx's `fused_layer_forward` reads through freed pointers, an
+    // effective no-op when the OS has zeroed those pages. Bug class
+    // is the same as the documented `g_deferred` cross-Ctx issue;
+    // Phase 7 of the RIIR moves both onto Ctx in the Rust port and
+    // makes the C-side `static` not bug-prone. Until then this minimal
+    // reset keeps the cross-Ctx diff oracle honest.
+    layer_cache_built = 0;
     free(ctx);
 }
 
@@ -7756,6 +7795,873 @@ const char *mf_model_name(const mf_ctx *ctx) {
     // parameterization lands (Phase 5 for Cogito 600B) this will
     // read from the loaded manifest instead.
     return MOEFLUX_MODEL_NAME;
+}
+
+// ============================================================================
+// Diff-oracle hooks (RIIR Phase 3 — per-layer dump points)
+// ============================================================================
+//
+// Thin accessors that expose the existing static forward-pass primitives
+// at the FFI boundary so the differential test harness can compare
+// per-layer outputs against the pure-Rust port (`riir::*`). No new
+// computation; each function delegates to the original `static`
+// implementation.
+
+int mf_embed_lookup(mf_ctx *ctx, int32_t token_id, float *out) {
+    if (!ctx || !out) return -1;
+    if (token_id < 0 || (size_t)token_id >= VOCAB_SIZE) return -1;
+    embed_lookup(ctx->wf, token_id, out);
+    return 0;
+}
+
+int mf_rms_norm_cpu(mf_ctx *ctx, const char *weight_name,
+                    const float *x, float *out)
+{
+    if (!ctx || !weight_name || !x || !out) return -1;
+    uint16_t *w_bf16 = (uint16_t *)get_tensor_ptr(ctx->wf, weight_name);
+    if (!w_bf16) return -1;
+    cpu_rms_norm(x, w_bf16, out, HIDDEN_DIM, RMS_NORM_EPS);
+    return 0;
+}
+
+int mf_apply_rotary_emb(mf_ctx *ctx, int32_t pos, float *q, float *k) {
+    if (!ctx || !q || !k || pos < 0) return -1;
+    apply_rotary_emb(q, k, pos, NUM_ATTN_HEADS, NUM_KV_HEADS,
+                     HEAD_DIM, ROTARY_DIM);
+    return 0;
+}
+
+int mf_rms_norm_per_head_cpu(mf_ctx *ctx, const char *weight_name,
+                              int32_t num_heads, int32_t head_dim,
+                              float *x_inout)
+{
+    if (!ctx || !weight_name || !x_inout) return -1;
+    if (num_heads <= 0 || head_dim <= 0) return -1;
+    uint16_t *w_bf16 = (uint16_t *)get_tensor_ptr(ctx->wf, weight_name);
+    if (!w_bf16) return -1;
+    cpu_rms_norm_per_head(x_inout, w_bf16, num_heads, head_dim, RMS_NORM_EPS);
+    return 0;
+}
+
+int mf_sdpa_cpu(mf_ctx *ctx, int32_t kv_len,
+                const float *q, const float *q_gate,
+                const float *k_cache, const float *v_cache,
+                float *out)
+{
+    if (!ctx || !q || !q_gate || !k_cache || !v_cache || !out) return -1;
+    if (kv_len <= 0) return -1;
+    cpu_sdpa((int)kv_len, q, q_gate, k_cache, v_cache,
+             NUM_ATTN_HEADS, NUM_KV_HEADS, HEAD_DIM, out);
+    return 0;
+}
+
+int mf_lm_head_cpu(mf_ctx *ctx, const float *x, float *out) {
+    if (!ctx || !x || !out) return -1;
+    TensorInfo *w_info = get_tensor_info(ctx->wf, "lm_head.weight");
+    TensorInfo *s_info = get_tensor_info(ctx->wf, "lm_head.scales");
+    TensorInfo *b_info = get_tensor_info(ctx->wf, "lm_head.biases");
+    if (!w_info || !s_info || !b_info) return -1;
+    uint32_t *W = (uint32_t *)((char *)ctx->wf->data + w_info->offset);
+    uint16_t *S = (uint16_t *)((char *)ctx->wf->data + s_info->offset);
+    uint16_t *B = (uint16_t *)((char *)ctx->wf->data + b_info->offset);
+    cpu_dequant_matvec(W, S, B, x, out, VOCAB_SIZE, HIDDEN_DIM, GROUP_SIZE, 4);
+    return 0;
+}
+
+int mf_moe_router_cpu(mf_ctx *ctx,
+                      float *scores, int32_t n_scores,
+                      int32_t k,
+                      int32_t *indices_out,
+                      float *weights_out)
+{
+    if (!ctx || !scores || !indices_out || !weights_out) return -1;
+    if (n_scores <= 0 || k <= 0 || k > n_scores) return -1;
+    cpu_softmax(scores, (int)n_scores);
+    cpu_topk(scores, (int)n_scores, (int)k, indices_out, weights_out);
+    cpu_normalize_weights(weights_out, (int)k);
+    return 0;
+}
+
+int mf_conv1d_step_cpu(mf_ctx *ctx, const char *weight_name,
+                        int32_t channels, int32_t kernel_size,
+                        const float *conv_state,
+                        const float *new_input,
+                        float *out)
+{
+    if (!ctx || !weight_name || !conv_state || !new_input || !out) return -1;
+    if (channels <= 0 || kernel_size <= 0) return -1;
+    uint16_t *w_bf16 = (uint16_t *)get_tensor_ptr(ctx->wf, weight_name);
+    if (!w_bf16) return -1;
+    cpu_conv1d_step(conv_state, new_input, w_bf16, out,
+                    (int)channels, (int)kernel_size);
+    return 0;
+}
+
+int mf_rms_norm_bare_cpu(mf_ctx *ctx, int32_t dim, float eps,
+                          const float *x, float *out)
+{
+    if (!ctx || !x || !out) return -1;
+    if (dim <= 0) return -1;
+    cpu_rms_norm_bare(x, out, (int)dim, eps);
+    return 0;
+}
+
+int mf_rms_norm_gated_cpu(mf_ctx *ctx, const char *weight_name,
+                           int32_t dim, float eps,
+                           const float *x, const float *z,
+                           float *out)
+{
+    if (!ctx || !weight_name || !x || !z || !out) return -1;
+    if (dim <= 0) return -1;
+    uint16_t *w_bf16 = (uint16_t *)get_tensor_ptr(ctx->wf, weight_name);
+    if (!w_bf16) return -1;
+    cpu_rms_norm_gated(x, z, w_bf16, out, (int)dim, eps);
+    return 0;
+}
+
+// CPU-only gated-delta-net recurrence helper. Mirrors the per-v-head
+// loop in `linear_attention_forward` (the GPU path skips this entirely
+// in production). Runs the same arithmetic shape so the diff oracle
+// can compare CPU outputs head-on against the Rust port.
+//
+// Standalone (not called by `linear_attention_forward`) so a refactor
+// during the port doesn't risk shifting the production code's
+// floating-point semantics; the diff harness asserts both compute the
+// same bytes.
+static void cpu_gated_delta_recurrence(
+    const float *A_log, const uint16_t *dt_bias_bf16,
+    const float *alpha, const float *beta,
+    const float *q, const float *k, const float *v,
+    int v_heads, int k_heads, int key_dim, int value_dim,
+    float *ssm_state, float *out_values)
+{
+    int k_heads_per_v = v_heads / k_heads;
+    int head_state_stride = value_dim * key_dim;
+
+    float *g_decay = (float *)malloc((size_t)v_heads * sizeof(float));
+    float *beta_gate = (float *)malloc((size_t)v_heads * sizeof(float));
+    for (int vh = 0; vh < v_heads; vh++) {
+        float a_val = alpha[vh];
+        float dt_b = bf16_to_f32(dt_bias_bf16[vh]);
+        float A_val = expf(A_log[vh]);
+        float softplus_val = logf(1.0f + expf(a_val + dt_b));
+        g_decay[vh] = expf(-A_val * softplus_val);
+        beta_gate[vh] = cpu_sigmoid(beta[vh]);
+    }
+
+    for (int vh = 0; vh < v_heads; vh++) {
+        int kh = vh / k_heads_per_v;
+        float g = g_decay[vh];
+        float b_gate = beta_gate[vh];
+        float *S = ssm_state + (size_t)vh * head_state_stride;
+        const float *v_h = v + (size_t)vh * value_dim;
+        const float *k_h = k + (size_t)kh * key_dim;
+        const float *q_h = q + (size_t)kh * key_dim;
+        float *o_h = out_values + (size_t)vh * value_dim;
+
+        for (int vi = 0; vi < value_dim; vi++) {
+            for (int ki = 0; ki < key_dim; ki++) {
+                S[vi * key_dim + ki] *= g;
+            }
+        }
+        for (int vi = 0; vi < value_dim; vi++) {
+            float kv_mem = 0.0f;
+            for (int ki = 0; ki < key_dim; ki++) {
+                kv_mem += S[vi * key_dim + ki] * k_h[ki];
+            }
+            float delta = (v_h[vi] - kv_mem) * b_gate;
+            for (int ki = 0; ki < key_dim; ki++) {
+                S[vi * key_dim + ki] += k_h[ki] * delta;
+            }
+        }
+        for (int vi = 0; vi < value_dim; vi++) {
+            float sum = 0.0f;
+            for (int ki = 0; ki < key_dim; ki++) {
+                sum += S[vi * key_dim + ki] * q_h[ki];
+            }
+            o_h[vi] = sum;
+        }
+    }
+
+    free(g_decay);
+    free(beta_gate);
+}
+
+int mf_gated_delta_recurrence_cpu(mf_ctx *ctx, int32_t layer_idx,
+                                   const float *alpha, const float *beta,
+                                   const float *q, const float *k,
+                                   const float *v,
+                                   int32_t v_heads, int32_t k_heads,
+                                   int32_t key_dim, int32_t value_dim,
+                                   float *ssm_state, float *out_values)
+{
+    if (!ctx || !alpha || !beta || !q || !k || !v || !ssm_state || !out_values)
+        return -1;
+    if (v_heads <= 0 || k_heads <= 0 || key_dim <= 0 || value_dim <= 0)
+        return -1;
+    if (v_heads % k_heads != 0) return -1;
+
+    char name[256];
+    snprintf(name, sizeof(name), "model.layers.%d.linear_attn.A_log", layer_idx);
+    float *A_log = get_tensor_ptr(ctx->wf, name);
+    snprintf(name, sizeof(name), "model.layers.%d.linear_attn.dt_bias", layer_idx);
+    uint16_t *dt_bias = get_tensor_ptr(ctx->wf, name);
+    if (!A_log || !dt_bias) return -1;
+
+    cpu_gated_delta_recurrence(A_log, dt_bias, alpha, beta, q, k, v,
+                                (int)v_heads, (int)k_heads,
+                                (int)key_dim, (int)value_dim,
+                                ssm_state, out_values);
+    return 0;
+}
+
+// Diff-oracle entry: single-expert GPU FFN forward. Wraps the internal
+// `gpu_expert_forward` so the Rust port can compare its
+// `riir::gpu_expert_forward` against the same Metal pipelines
+// (matvec_v3 / swiglu_fused) the production path uses.
+//
+// The active 4-bit layout is required: `g_use_2bit` must be zero. The
+// 2-bit path uses different pipeline state and a different expert
+// block layout; surfacing it through the diff oracle is a separate
+// slice. Returns -1 if the ctx was opened with `use_2bit != 0`.
+int mf_gpu_expert_forward(mf_ctx *ctx,
+                           const void *expert_data, size_t expert_data_len,
+                           const float *h_post,
+                           float *expert_out)
+{
+    if (!ctx || !expert_data || !h_post || !expert_out) return -1;
+    if (g_use_2bit) return -1;
+    if (expert_data_len != (size_t)EXPERT_SIZE) return -1;
+    if (!g_metal) return -1;
+
+    // gpu_expert_forward operates on the file-scope MetalCtx (which
+    // owns the buffers + pipelines), not on mf_ctx. Match the existing
+    // production callsite at infer.m:2922.
+    gpu_expert_forward(g_metal, expert_data, h_post, expert_out,
+                       /*expert_data_already_in_buffer=*/0);
+    return 0;
+}
+
+// Stage caller inputs into the file-scope `g_metal` multi-expert
+// buffers and encode K-expert FFN + `moe_combine_residual` into the
+// supplied cmdbuf. Caller owns the cmdbuf and decides commit/wait
+// policy: the synchronous diff hook commits + waits + reads back, the
+// deferred hook commits async and stashes for later wait. Mirrors the
+// production callsite at infer.m:5628..5710 minus the RMSNorm fusion
+// (slice 9e) and the shared-expert SwiGLU+down (caller pre-computes
+// `shared_out`).
+//
+// Returns 0 on success; -1 on bad args, 2-bit ctx, or missing
+// pipelines. Does NOT commit `cmdbuf`.
+static int oracle_batched_experts_encode(
+    id<MTLCommandBuffer> cmdbuf,
+    int32_t actual_K,
+    const void *expert_data,
+    size_t expert_data_len,
+    const float *h_post,
+    const float *h_mid,
+    const float *shared_out,
+    const float *expert_weights,
+    float shared_gate_score)
+{
+    if (!cmdbuf || !expert_data || !h_post || !h_mid || !shared_out
+        || !expert_weights) return -1;
+    if (g_use_2bit) return -1;
+    if (actual_K < 1 || actual_K > MAX_K) return -1;
+    if (expert_data_len != (size_t)EXPERT_SIZE * (size_t)actual_K) return -1;
+    if (!g_metal || !g_metal->moe_combine_residual) return -1;
+
+    // Stage the K expert blobs into buf_multi_expert_data[0..K).
+    const uint8_t *src = (const uint8_t *)expert_data;
+    for (int k = 0; k < actual_K; k++) {
+        memcpy([g_metal->buf_multi_expert_data[k] contents],
+               src + (size_t)k * (size_t)EXPERT_SIZE,
+               (size_t)EXPERT_SIZE);
+    }
+    // Stage the shared input (h_post), residual (h_mid), shared expert
+    // output, and combine params.
+    memcpy([g_metal->buf_multi_expert_input contents], h_post,
+           (size_t)HIDDEN_DIM * sizeof(float));
+    memcpy([g_metal->buf_h_mid contents], h_mid,
+           (size_t)HIDDEN_DIM * sizeof(float));
+    memcpy([g_metal->buf_shared_out contents], shared_out,
+           (size_t)HIDDEN_DIM * sizeof(float));
+    {
+        float *params = (float *)[g_metal->buf_combine_params contents];
+        memset(params, 0, 18 * sizeof(float));
+        for (int k = 0; k < actual_K; k++) {
+            params[k] = expert_weights[k];
+        }
+        params[16] = shared_gate_score;
+    }
+    int valid[MAX_K];
+    for (int k = 0; k < MAX_K; k++) valid[k] = (k < actual_K) ? 1 : 0;
+
+    // Per-expert: 2 encoders (gate+up, then SwiGLU+down). Same path
+    // as production — `gpu_encode_experts_batched` reads the staged
+    // buf_multi_expert_data slot and writes to gate/up/act/out[k].
+    gpu_encode_experts_batched(g_metal, cmdbuf, actual_K, valid,
+                               g_metal->buf_multi_expert_data);
+
+    // moe_combine_residual: bind h_mid, shared_out, hidden_out (in
+    // buf_moe_hidden), all 16 expert output buffers, params, and the
+    // dim/K constants. Unused expert slots have weight=0 in params,
+    // so the kernel's per-slot branch keeps them out of the sum.
+    {
+        id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+        [enc setComputePipelineState:g_metal->moe_combine_residual];
+        [enc setBuffer:g_metal->buf_h_mid      offset:0 atIndex:0];
+        [enc setBuffer:g_metal->buf_shared_out offset:0 atIndex:1];
+        [enc setBuffer:g_metal->buf_moe_hidden offset:0 atIndex:2];
+        for (int k = 0; k < MAX_K; k++) {
+            [enc setBuffer:g_metal->buf_multi_expert_out[k]
+                    offset:0 atIndex:(3 + k)];
+        }
+        [enc setBuffer:g_metal->buf_combine_params offset:0 atIndex:19];
+        uint32_t dim = HIDDEN_DIM;
+        uint32_t k_val = (uint32_t)actual_K;
+        [enc setBytes:&dim   length:4 atIndex:20];
+        [enc setBytes:&k_val length:4 atIndex:21];
+        uint32_t tgs = (dim + 255) / 256;
+        [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+    }
+
+    return 0;
+}
+
+// Diff-oracle entry: batched K-expert FFN forward + GPU combine.
+// Synchronous wrapper around `oracle_batched_experts_encode`: encodes,
+// commits, waits, reads back. Mirrors the production callsite at
+// infer.m:5680..5710 minus the RMSNorm fusion (slice 9e) and the
+// deferred-state plumbing (slice 4e — see `mf_begin_deferred_experts`
+// for the async variant).
+int mf_gpu_batched_experts_forward(mf_ctx *ctx,
+                                    int32_t actual_K,
+                                    const void *expert_data,
+                                    size_t expert_data_len,
+                                    const float *h_post,
+                                    const float *h_mid,
+                                    const float *shared_out,
+                                    const float *expert_weights,
+                                    float shared_gate_score,
+                                    float *hidden_out)
+{
+    if (!ctx || !hidden_out) return -1;
+    if (!g_metal) return -1;
+
+    id<MTLCommandBuffer> cmdbuf = [g_metal->queue commandBuffer];
+    int rc = oracle_batched_experts_encode(
+        cmdbuf, actual_K, expert_data, expert_data_len,
+        h_post, h_mid, shared_out, expert_weights, shared_gate_score);
+    if (rc != 0) return rc;
+
+    [cmdbuf commit];
+    [cmdbuf waitUntilCompleted];
+
+    memcpy(hidden_out, [g_metal->buf_moe_hidden contents],
+           (size_t)HIDDEN_DIM * sizeof(float));
+    return 0;
+}
+
+// Slice 4e — deferred-experts state machine, three-call API.
+//
+// `mf_begin_deferred_experts` encodes the same K-expert + combine
+// pipeline as the synchronous hook, commits async, and stashes
+// cmdbuf + metadata in `g_deferred` matching the production async
+// path at infer.m:5747..5776. `mf_complete_deferred_experts` waits +
+// reads back via the existing static `complete_deferred_experts`
+// (which routes through `finalize_deferred_experts`'s
+// `gpu_combined=1` branch — that branch reads from `buf_moe_hidden`
+// into `g_deferred.hidden`, late-bound here to caller's
+// `hidden_out`). `mf_discard_deferred_experts` waits + clears
+// without readback.
+//
+// The hook always operates in `gpu_combined=1` mode: the encode
+// helper appends `moe_combine_residual` so the GPU produces the
+// final hidden in `buf_moe_hidden`. The `gpu_combined=0` (CPU
+// readback + per-expert madd + sigmoid gate + final combine) path
+// is exercised in production by `fused_layer_forward` when the next
+// layer's input-norm weight isn't cacheable; FIXME(riir): port that
+// mode when slice 4f integrates the production fast/slow split.
+int mf_begin_deferred_experts(mf_ctx *ctx,
+                               int32_t actual_K,
+                               const void *expert_data,
+                               size_t expert_data_len,
+                               const float *h_post,
+                               const float *h_mid,
+                               const float *shared_out,
+                               const float *expert_weights,
+                               float shared_gate_score)
+{
+    if (!ctx) return -1;
+    if (!g_metal) return -1;
+    if (g_deferred.active) return -1; // single-active-buffer invariant
+
+    // Bracket the entry like `mf_layer_forward_dump` (infer.m:8262):
+    // a no-op when nothing's pending, but defends against a previous
+    // test having returned without explicit `_complete` / `_discard`.
+    discard_deferred_experts();
+
+    id<MTLCommandBuffer> cmd = [g_metal->queue commandBuffer];
+    int rc = oracle_batched_experts_encode(
+        cmd, actual_K, expert_data, expert_data_len,
+        h_post, h_mid, shared_out, expert_weights, shared_gate_score);
+    if (rc != 0) return rc;
+
+    [cmd commit];
+
+    g_deferred.active = 1;
+    g_deferred.gpu_combined = 1;
+    g_deferred.cmd_experts = cmd;
+    g_deferred.actual_K = actual_K;
+    g_deferred.shared_gate_score = shared_gate_score;
+    g_deferred.hidden = NULL; // late-bound by `mf_complete_deferred_experts`
+    g_deferred.layer_idx = -1; // synthetic — no real layer
+    for (int k = 0; k < actual_K; k++) {
+        g_deferred.expert_weights[k] = expert_weights[k];
+        g_deferred.valid[k] = 1;
+    }
+    // h_mid is unused under gpu_combined=1 (finalize reads from
+    // buf_moe_hidden, not g_deferred.h_mid).
+    return 0;
+}
+
+int mf_complete_deferred_experts(mf_ctx *ctx, float *hidden_out)
+{
+    if (!ctx || !hidden_out) return -1;
+    if (!g_deferred.active) return 0; // mirrors C internal no-op
+    g_deferred.hidden = hidden_out;   // late-bind destination
+    complete_deferred_experts();      // wait + finalize (memcpy from buf_moe_hidden)
+    return 0;
+}
+
+int mf_discard_deferred_experts(mf_ctx *ctx)
+{
+    if (!ctx) return -1;
+    discard_deferred_experts(); // wait + clear without readback
+    return 0;
+}
+
+// Diff-oracle entry: read one expert's bytes straight from disk via
+// the per-layer fd opened in `mf_init_model`. Bypasses every cache
+// layer (`g_expert_cache`, `g_malloc_cache`, the LRU layers) so the
+// Rust port's expert-loader can be diffed against raw on-disk bytes.
+int mf_load_expert_bytes(mf_ctx *ctx,
+                          int32_t layer_idx,
+                          int32_t expert_idx,
+                          void *out,
+                          size_t out_len)
+{
+    if (!ctx || !out) return -1;
+    if (g_use_2bit) return -1;
+    if (out_len != (size_t)EXPERT_SIZE) return -1;
+    if (layer_idx < 0 || layer_idx >= NUM_LAYERS) return -1;
+    if (expert_idx < 0 || expert_idx >= NUM_EXPERTS) return -1;
+    if (!ctx->layer_fds) return -1;
+    int fd = ctx->layer_fds[layer_idx];
+    if (fd < 0) return -1;
+
+    off_t off = (off_t)expert_idx * (off_t)EXPERT_SIZE;
+    ssize_t n = pread(fd, out, (size_t)EXPERT_SIZE, off);
+    if (n != (ssize_t)EXPERT_SIZE) return -1;
+    return 0;
+}
+
+// Diff-oracle entry: GPU RMSNorm with bf16 weights — chains
+// `rms_norm_sum_sq` and `rms_norm_apply_bf16` against fresh
+// per-call scratch buffers. Mirrors the production CMD3 fast-path
+// at infer.m:5712..5744 minus the deferred plumbing — this hook is
+// synchronous (commit + wait) so the diff harness can read the
+// result back at a known boundary.
+int mf_gpu_rms_norm_fused(mf_ctx *ctx,
+                           const float *x,
+                           const void *weight_bf16,
+                           size_t weight_bf16_len,
+                           float *out)
+{
+    if (!ctx || !x || !weight_bf16 || !out) return -1;
+    if (weight_bf16_len != (size_t)HIDDEN_DIM * sizeof(uint16_t)) return -1;
+    if (!g_metal || !g_metal->rms_norm_sum || !g_metal->rms_norm_apply_bf16) {
+        return -1;
+    }
+
+    // Scratch buffers. Per-call alloc — same shape on both diff sides
+    // so the comparison is fair. Production reuses `buf_moe_hidden /
+    // buf_cmd3_sum_sq / buf_input` from the model context; fresh
+    // allocation costs ~µs and removes the "is the production layout
+    // alive" precondition from the test surface.
+    id<MTLBuffer> buf_x = [g_metal->device
+        newBufferWithBytes:x
+                    length:(size_t)HIDDEN_DIM * sizeof(float)
+                   options:MTLResourceStorageModeShared];
+    id<MTLBuffer> buf_w = [g_metal->device
+        newBufferWithBytes:weight_bf16
+                    length:weight_bf16_len
+                   options:MTLResourceStorageModeShared];
+    id<MTLBuffer> buf_sum_sq = [g_metal->device
+        newBufferWithLength:sizeof(float)
+                    options:MTLResourceStorageModeShared];
+    id<MTLBuffer> buf_out = [g_metal->device
+        newBufferWithLength:(size_t)HIDDEN_DIM * sizeof(float)
+                    options:MTLResourceStorageModeShared];
+
+    id<MTLCommandBuffer> cmdbuf = [g_metal->queue commandBuffer];
+
+    // Stage 1: rms_norm_sum_sq. Single threadgroup of 256 threads
+    // computes the scalar Σ x[i]² via simd_sum + threadgroup-shared
+    // second-stage reduction.
+    {
+        id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+        [enc setComputePipelineState:g_metal->rms_norm_sum];
+        [enc setBuffer:buf_x      offset:0 atIndex:0];
+        [enc setBuffer:buf_sum_sq offset:0 atIndex:1];
+        uint32_t dim = HIDDEN_DIM;
+        [enc setBytes:&dim length:4 atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+    }
+
+    // Stage 2: rms_norm_apply_bf16. Per-element; each thread reads
+    // sum_sq[0] and applies the rsqrt + bf16 weight.
+    {
+        id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+        [enc setComputePipelineState:g_metal->rms_norm_apply_bf16];
+        [enc setBuffer:buf_x      offset:0 atIndex:0];
+        [enc setBuffer:buf_w      offset:0 atIndex:1];
+        [enc setBuffer:buf_sum_sq offset:0 atIndex:2];
+        [enc setBuffer:buf_out    offset:0 atIndex:3];
+        uint32_t dim = HIDDEN_DIM;
+        float eps = RMS_NORM_EPS;
+        [enc setBytes:&dim length:4 atIndex:4];
+        [enc setBytes:&eps length:4 atIndex:5];
+        uint32_t tgs = (dim + 255) / 256;
+        [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+    }
+
+    [cmdbuf commit];
+    [cmdbuf waitUntilCompleted];
+
+    memcpy(out, [buf_out contents], (size_t)HIDDEN_DIM * sizeof(float));
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Slice 5d-7a — GPU full-attention kernels under per-kernel diff
+// ---------------------------------------------------------------------------
+//
+// Test-only oracle wrappers. Each allocates fresh shared-storage GPU
+// buffers, encodes ONE kernel, commits + waits, copies back. The
+// production `gpu_attn_fuse` (`infer.m:5051..5163`) is left untouched
+// — it encodes all 4 kernels into a single CMD2 cmdbuf alongside the
+// post-attention work; these oracle hooks duplicate the encoder logic
+// per-kernel for fine-grained diff coverage. Stride convention is
+// `seq_stride = seq_len` (tight); production uses `seq_stride =
+// GPU_KV_SEQ` for the persistent score buffer.
+
+int mf_attn_scores_batched(mf_ctx *ctx,
+                            int32_t num_heads,
+                            int32_t num_kv_heads,
+                            int32_t head_dim,
+                            int32_t seq_len,
+                            const float *q,
+                            const float *k_cache,
+                            float scale,
+                            float *scores_out)
+{
+    if (!ctx || !q || !k_cache || !scores_out) return -1;
+    if (num_heads <= 0 || num_kv_heads <= 0 || head_dim <= 0 || seq_len <= 0) return -1;
+    if (num_heads % num_kv_heads != 0) return -1;
+    if (!g_metal || !g_metal->attn_scores_pipe) return -1;
+
+    int32_t kv_dim = num_kv_heads * head_dim;
+    int32_t heads_per_kv = num_heads / num_kv_heads;
+
+    id<MTLBuffer> buf_q = [g_metal->device
+        newBufferWithBytes:q
+                    length:(size_t)num_heads * (size_t)head_dim * sizeof(float)
+                   options:MTLResourceStorageModeShared];
+    id<MTLBuffer> buf_k = [g_metal->device
+        newBufferWithBytes:k_cache
+                    length:(size_t)seq_len * (size_t)kv_dim * sizeof(float)
+                   options:MTLResourceStorageModeShared];
+    id<MTLBuffer> buf_scores = [g_metal->device
+        newBufferWithLength:(size_t)num_heads * (size_t)seq_len * sizeof(float)
+                    options:MTLResourceStorageModeShared];
+
+    id<MTLCommandBuffer> cmdbuf = [g_metal->queue commandBuffer];
+    {
+        id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+        [enc setComputePipelineState:g_metal->attn_scores_pipe];
+        [enc setBuffer:buf_q      offset:0 atIndex:0];
+        [enc setBuffer:buf_k      offset:0 atIndex:1];
+        [enc setBuffer:buf_scores offset:0 atIndex:2];
+        uint32_t hd = (uint32_t)head_dim;
+        uint32_t kvd = (uint32_t)kv_dim;
+        uint32_t sl = (uint32_t)seq_len;
+        uint32_t seq_stride = sl;       // tight packing for oracle
+        uint32_t hpkv = (uint32_t)heads_per_kv;
+        [enc setBytes:&hd         length:4 atIndex:3];
+        [enc setBytes:&kvd        length:4 atIndex:4];
+        [enc setBytes:&sl         length:4 atIndex:5];
+        [enc setBytes:&seq_stride length:4 atIndex:6];
+        [enc setBytes:&scale      length:4 atIndex:7];
+        [enc setBytes:&hpkv       length:4 atIndex:8];
+        [enc setBytes:&sl         length:4 atIndex:9];   // num_seq_tgs == seq_len
+        uint32_t total_tgs = sl * (uint32_t)num_heads;
+        [enc dispatchThreadgroups:MTLSizeMake(total_tgs, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+    }
+    [cmdbuf commit];
+    [cmdbuf waitUntilCompleted];
+
+    memcpy(scores_out, [buf_scores contents],
+           (size_t)num_heads * (size_t)seq_len * sizeof(float));
+    return 0;
+}
+
+int mf_attn_softmax_batched(mf_ctx *ctx,
+                             int32_t num_heads,
+                             int32_t seq_len,
+                             float *scores_inout)
+{
+    if (!ctx || !scores_inout) return -1;
+    if (num_heads <= 0 || seq_len <= 0) return -1;
+    if (!g_metal || !g_metal->attn_softmax_pipe) return -1;
+
+    size_t bytes = (size_t)num_heads * (size_t)seq_len * sizeof(float);
+    id<MTLBuffer> buf_scores = [g_metal->device
+        newBufferWithBytes:scores_inout
+                    length:bytes
+                   options:MTLResourceStorageModeShared];
+
+    id<MTLCommandBuffer> cmdbuf = [g_metal->queue commandBuffer];
+    {
+        id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+        [enc setComputePipelineState:g_metal->attn_softmax_pipe];
+        [enc setBuffer:buf_scores offset:0 atIndex:0];
+        uint32_t sl = (uint32_t)seq_len;
+        uint32_t seq_stride = sl;
+        [enc setBytes:&sl         length:4 atIndex:1];
+        [enc setBytes:&seq_stride length:4 atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake((uint32_t)num_heads, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+    }
+    [cmdbuf commit];
+    [cmdbuf waitUntilCompleted];
+
+    memcpy(scores_inout, [buf_scores contents], bytes);
+    return 0;
+}
+
+int mf_attn_values_batched(mf_ctx *ctx,
+                            int32_t num_heads,
+                            int32_t num_kv_heads,
+                            int32_t head_dim,
+                            int32_t seq_len,
+                            const float *scores,
+                            const float *v_cache,
+                            float *out)
+{
+    if (!ctx || !scores || !v_cache || !out) return -1;
+    if (num_heads <= 0 || num_kv_heads <= 0 || head_dim <= 0 || seq_len <= 0) return -1;
+    if (num_heads % num_kv_heads != 0) return -1;
+    if (!g_metal || !g_metal->attn_values_pipe) return -1;
+
+    int32_t kv_dim = num_kv_heads * head_dim;
+    int32_t heads_per_kv = num_heads / num_kv_heads;
+
+    id<MTLBuffer> buf_scores = [g_metal->device
+        newBufferWithBytes:scores
+                    length:(size_t)num_heads * (size_t)seq_len * sizeof(float)
+                   options:MTLResourceStorageModeShared];
+    id<MTLBuffer> buf_v = [g_metal->device
+        newBufferWithBytes:v_cache
+                    length:(size_t)seq_len * (size_t)kv_dim * sizeof(float)
+                   options:MTLResourceStorageModeShared];
+    id<MTLBuffer> buf_out = [g_metal->device
+        newBufferWithLength:(size_t)num_heads * (size_t)head_dim * sizeof(float)
+                    options:MTLResourceStorageModeShared];
+
+    id<MTLCommandBuffer> cmdbuf = [g_metal->queue commandBuffer];
+    {
+        id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+        [enc setComputePipelineState:g_metal->attn_values_pipe];
+        [enc setBuffer:buf_scores offset:0 atIndex:0];
+        [enc setBuffer:buf_v      offset:0 atIndex:1];
+        [enc setBuffer:buf_out    offset:0 atIndex:2];
+        uint32_t hd = (uint32_t)head_dim;
+        uint32_t kvd = (uint32_t)kv_dim;
+        uint32_t sl = (uint32_t)seq_len;
+        uint32_t seq_stride = sl;
+        uint32_t hpkv = (uint32_t)heads_per_kv;
+        [enc setBytes:&hd         length:4 atIndex:3];
+        [enc setBytes:&kvd        length:4 atIndex:4];
+        [enc setBytes:&sl         length:4 atIndex:5];
+        [enc setBytes:&seq_stride length:4 atIndex:6];
+        [enc setBytes:&hpkv       length:4 atIndex:7];
+        uint32_t total_threads = (uint32_t)head_dim * (uint32_t)num_heads;
+        uint32_t tgs = (total_threads + 255) / 256;
+        [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+    }
+    [cmdbuf commit];
+    [cmdbuf waitUntilCompleted];
+
+    memcpy(out, [buf_out contents],
+           (size_t)num_heads * (size_t)head_dim * sizeof(float));
+    return 0;
+}
+
+int mf_sigmoid_gate(mf_ctx *ctx,
+                     int32_t dim,
+                     const float *gate,
+                     float *x_inout)
+{
+    if (!ctx || !gate || !x_inout) return -1;
+    if (dim <= 0) return -1;
+    if (!g_metal || !g_metal->sigmoid_gate_pipe) return -1;
+
+    size_t bytes = (size_t)dim * sizeof(float);
+    id<MTLBuffer> buf_x = [g_metal->device
+        newBufferWithBytes:x_inout length:bytes
+                   options:MTLResourceStorageModeShared];
+    id<MTLBuffer> buf_g = [g_metal->device
+        newBufferWithBytes:gate    length:bytes
+                   options:MTLResourceStorageModeShared];
+
+    id<MTLCommandBuffer> cmdbuf = [g_metal->queue commandBuffer];
+    {
+        id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+        [enc setComputePipelineState:g_metal->sigmoid_gate_pipe];
+        [enc setBuffer:buf_x offset:0 atIndex:0];
+        [enc setBuffer:buf_g offset:0 atIndex:1];
+        uint32_t d = (uint32_t)dim;
+        [enc setBytes:&d length:4 atIndex:2];
+        uint32_t tgs = (d + 255) / 256;
+        [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+    }
+    [cmdbuf commit];
+    [cmdbuf waitUntilCompleted];
+
+    memcpy(x_inout, [buf_x contents], bytes);
+    return 0;
+}
+
+// Phase 4 layer-boundary checkpoint hook. Loads `hidden_in` into the
+// ctx's hidden buffer, runs `fused_layer_forward` for one layer using
+// the ctx's existing per-layer state arrays, flushes the deferred-
+// expert pipeline, then copies the resulting hidden state to
+// `hidden_out`. Brackets the call with `discard_deferred_experts` /
+// `complete_deferred_experts` so `g_deferred.active` is 0 on both
+// entry and exit — repeated hook calls don't bleed deferred state
+// between layers (or between Ctx instances; that bug class is the
+// Phase 7 cross-Ctx NaN that 4e captures structurally).
+int mf_layer_forward_dump(mf_ctx *ctx,
+                          int32_t layer_idx,
+                          int32_t pos,
+                          const float *hidden_in,
+                          float *hidden_out)
+{
+    if (!ctx || !hidden_in || !hidden_out) return -1;
+    if (layer_idx < 0 || layer_idx >= NUM_LAYERS) return -1;
+    if (pos < 0) return -1;
+
+    discard_deferred_experts();
+
+    memcpy(ctx->hidden, hidden_in, HIDDEN_DIM * sizeof(float));
+
+    int is_full = ((layer_idx + 1) % FULL_ATTN_INTERVAL == 0);
+    void *mmap_base =
+        (ctx->layer_mmaps[layer_idx] != MAP_FAILED)
+            ? ctx->layer_mmaps[layer_idx]
+            : NULL;
+    fused_layer_forward(
+        ctx->wf, layer_idx, ctx->hidden,
+        is_full ? ctx->kv_caches[layer_idx] : NULL,
+        is_full ? NULL : (LinearAttnState *)ctx->layer_states[layer_idx],
+        pos, mmap_base, ctx->K, ctx->layer_fds[layer_idx]);
+
+    complete_deferred_experts();
+
+    memcpy(hidden_out, ctx->hidden, HIDDEN_DIM * sizeof(float));
+    return 0;
+}
+
+// 4c diagnostic — same as mf_layer_forward_dump but also returns the
+// post-attn-norm hidden, the post-residual h_mid, the pre-sigmoid-gate
+// shared expert output, and the shared gate score. Any `*_out` may be
+// NULL. NB: g_deferred is cleared by `complete_deferred_experts`, so
+// `shared_gate_score` is captured into a local before that call.
+int mf_layer_forward_dump_intermediates(mf_ctx *ctx,
+                                        int32_t layer_idx,
+                                        int32_t pos,
+                                        const float *hidden_in,
+                                        float *hidden_out,
+                                        float *h_post_out,
+                                        float *h_mid_out,
+                                        float *shared_out_out,
+                                        float *gate_score_out)
+{
+    if (!ctx || !hidden_in || !hidden_out) return -1;
+    if (layer_idx < 0 || layer_idx >= NUM_LAYERS) return -1;
+    if (pos < 0) return -1;
+
+    discard_deferred_experts();
+
+    memcpy(ctx->hidden, hidden_in, HIDDEN_DIM * sizeof(float));
+
+    int is_full = ((layer_idx + 1) % FULL_ATTN_INTERVAL == 0);
+    void *mmap_base =
+        (ctx->layer_mmaps[layer_idx] != MAP_FAILED)
+            ? ctx->layer_mmaps[layer_idx]
+            : NULL;
+    fused_layer_forward(
+        ctx->wf, layer_idx, ctx->hidden,
+        is_full ? ctx->kv_caches[layer_idx] : NULL,
+        is_full ? NULL : (LinearAttnState *)ctx->layer_states[layer_idx],
+        pos, mmap_base, ctx->K, ctx->layer_fds[layer_idx]);
+
+    // Capture deferred fields before complete_deferred_experts wipes
+    // them.
+    float captured_gate_score = g_deferred.shared_gate_score;
+
+    // h_post / h_mid are written synchronously by CMD2 (which has
+    // committed and waited by the time fused_layer_forward returns
+    // for the slow path); their buffers are valid right now.
+    if (h_post_out && g_metal && g_metal->buf_input) {
+        memcpy(h_post_out, [g_metal->buf_input contents],
+               HIDDEN_DIM * sizeof(float));
+    }
+    if (h_mid_out && g_metal && g_metal->buf_h_mid) {
+        memcpy(h_mid_out, [g_metal->buf_h_mid contents],
+               HIDDEN_DIM * sizeof(float));
+    }
+
+    // shared_out is written by CMD3's cmd_experts buffer, which is
+    // committed *async* and not yet waited. Read it AFTER
+    // complete_deferred_experts so we see the final shared FFN
+    // output.
+    complete_deferred_experts();
+
+    if (shared_out_out && g_metal && g_metal->buf_shared_out) {
+        memcpy(shared_out_out, [g_metal->buf_shared_out contents],
+               HIDDEN_DIM * sizeof(float));
+    }
+
+    if (gate_score_out) *gate_score_out = captured_gate_score;
+
+    memcpy(hidden_out, ctx->hidden, HIDDEN_DIM * sizeof(float));
+    return 0;
 }
 
 // ============================================================================
