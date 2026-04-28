@@ -330,6 +330,7 @@ pub fn linear_attn_layer_forward(
     k_active: usize,
     expert_files: &ExpertFiles,
     pool: &rayon::ThreadPool,
+    prefetch: &mut super::PrefetchState,
     _layer_state: &mut LinearAttnState,
     gpu_combine: bool,
 ) -> Result<(), LayerForwardError> {
@@ -561,6 +562,7 @@ pub fn linear_attn_layer_forward(
         k_active,
         expert_files,
         pool,
+        prefetch,
         OProj {
             w_off: o_w,
             s_off: o_s,
@@ -610,6 +612,7 @@ pub(super) fn post_attention_tail(
     k_active: usize,
     expert_files: &ExpertFiles,
     pool: &rayon::ThreadPool,
+    prefetch: &mut super::PrefetchState,
     o_proj: OProj,
     gpu_combine: bool,
 ) -> Result<(), LayerForwardError> {
@@ -853,23 +856,69 @@ pub(super) fn post_attention_tail(
     // snapshots of `h_mid` / `shared_out` for the finalize pass.
     let k = k_active;
     if gpu_combine {
-        // Slice 5d-6a: parallel K-expert pread via the io_pool.
-        // `read_expert(&self, ...)` is concurrent-safe (each call has
-        // its own dst slice; pread64 is thread-safe per POSIX). The
-        // disjoint `&mut [u8]` slot views from `data_slots_mut_array`
-        // satisfy rayon's borrow requirements.
+        // Slice 5d-6b: speculative-prefetch state machine.
+        //
+        // 1. Wait for any in-flight prefetch targeting THIS layer.
+        // 2. For each slot, decide if the prefetch hit (read from
+        //    `data_prefetch[slot]`) or missed (need a sync pread
+        //    into `data_synced[slot]`).
+        // 3. Parallel sync-pread the missed slots via the io_pool.
+        // 4. Encode K-expert dispatch with per-slot SlotSource.
+        // 5. Record this layer's actual indices as the prediction
+        //    for the next token's same layer.
+        // 6. If not the last layer, fire async prefetch for layer
+        //    N+1 using the prediction we have for it.
         use rayon::prelude::*;
-        let mut dsts = moe.data_slots_mut_array();
+        use super::prefetch::SlotSource;
+        const MAX_K: usize = super::expert_forward::MAX_K;
+
+        // Step 1: drain any in-flight prefetch and check whether it
+        // was for this layer.
+        let prefetch_status = prefetch.wait_for(layer_idx);
+
+        // Step 2: per-slot hit/miss decision.
+        let mut data_set_per_slot: [SlotSource; MAX_K] =
+            [SlotSource::Synced; MAX_K];
+        if let Some(status) = prefetch_status {
+            for slot in 0..k.min(status.k) {
+                if status.loaded_indices[slot] == indices[slot] {
+                    data_set_per_slot[slot] = SlotSource::Prefetched;
+                }
+            }
+        }
+
+        // Step 3: parallel sync-pread the misses into data_synced.
+        let mut dsts = moe.data_synced_slots_mut_array();
         let active = &mut dsts[..k];
         pool.install(|| -> Result<(), super::expert_io::ExpertIoError> {
             active
                 .par_iter_mut()
                 .enumerate()
                 .try_for_each(|(slot, dst)| {
-                    let expert_idx = indices[slot] as usize;
-                    expert_files.read_expert(layer_idx, expert_idx, *dst)
+                    if data_set_per_slot[slot] == SlotSource::Synced {
+                        let expert_idx = indices[slot] as usize;
+                        expert_files
+                            .read_expert(layer_idx, expert_idx, *dst)
+                    } else {
+                        Ok(())
+                    }
                 })
         })?;
+
+        // Step 5: record actuals (the prediction for the next
+        // token's same layer). Done before dispatch so it doesn't
+        // depend on the dispatch's success/failure path.
+        let mut actuals: [i32; MAX_K] = [0; MAX_K];
+        actuals[..k].copy_from_slice(&indices[..k]);
+        prefetch.record_actual(layer_idx, actuals);
+
+        // Step 4: encode K-expert dispatch with the per-slot mix.
+        // The prefetch for the *next* layer is NOT fired here — it
+        // lives in the per-layer loop in `step_internal`, after the
+        // drain of THIS layer's deferred dispatch. That ordering is
+        // load-bearing: firing the prefetch here would race with
+        // the in-flight GPU read of data_prefetch[slot] for the
+        // current layer's hits.
         gpu_batched_experts_begin_pre_staged(
             metal,
             moe,
@@ -881,6 +930,7 @@ pub(super) fn post_attention_tail(
             &weights,
             shared_gate_score,
             layer_idx as i32,
+            &data_set_per_slot,
         )?;
     } else {
         let expert_size = v.expert_size_4bit();

@@ -3448,3 +3448,162 @@ fn eval_prompt_matches_c_multi_token() {
         &rs_logits,
     );
 }
+
+// ---------------------------------------------------------------------------
+// Phase 5d-6b — speculative-prefetch correctness
+// ---------------------------------------------------------------------------
+
+/// The prefetch hit path (normal flow) and the all-miss path
+/// (predictions cleared between every token) must produce
+/// **bit-identical** logits. Per-PSO Metal kernels are deterministic
+/// (slice 9 finding); the only difference between the two paths is
+/// which buffer (`data_prefetch[slot]` vs `data_synced[slot]`) the
+/// expert weights came from. Both buffers should hold identical
+/// bytes for the same expert.
+///
+/// Catches: any bug where `data_prefetch[slot]` ends up loaded with
+/// the wrong expert, or where the encoder binds the wrong buffer
+/// for a given `SlotSource`.
+#[test]
+#[ignore = "long running; needs moeflux artifacts"]
+fn prefetch_hit_miss_equivalence_rust() {
+    let prompt: [i32; 4] = [1, 200, 600, 1100];
+    let next_token = 7i32;
+    let next_pos = prompt.len();
+
+    // Reference: normal eval with prefetch hits where they apply.
+    let mut rs_normal: RsBackend = open_backend();
+    let _ = rs_normal.eval_prompt(&prompt, 0);
+    let normal_logits = rs_normal.eval_token(next_token, next_pos);
+
+    // Test: same prompt+token, but clear prefetch predictions just
+    // before the token-decode. With no predictions, every layer
+    // takes the all-miss (sync-pread into data_synced) path.
+    let mut rs_miss: RsBackend = open_backend();
+    let _ = rs_miss.eval_prompt(&prompt, 0);
+    rs_miss.0.clear_prefetch_predictions();
+    let miss_logits = rs_miss.eval_token(next_token, next_pos);
+
+    assert_eq!(normal_logits.len(), miss_logits.len());
+    let drift_max = normal_logits
+        .iter()
+        .zip(miss_logits.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let cos = cosine_sim(&normal_logits, &miss_logits);
+    eprintln!(
+        "[diff:prefetch_hit_miss_equivalence] \
+         max_abs_diff={drift_max:.3e} cosine={cos:.7} \
+         argmax(normal)={a} argmax(miss)={b}",
+        a = argmax(&normal_logits),
+        b = argmax(&miss_logits),
+    );
+    assert_eq!(
+        argmax(&normal_logits),
+        argmax(&miss_logits),
+        "prefetch hit and all-miss paths produced different argmax"
+    );
+    assert_eq!(
+        drift_max, 0.0,
+        "prefetch hit and all-miss paths should be bit-identical, \
+         got drift {drift_max:.3e}"
+    );
+}
+
+/// `step → memory_clear → step` must produce the same logits as a
+/// fresh-Ctx `step → step`. Catches: prefetch state leaking across
+/// `memory_clear` (stale predictions, in-flight prefetch not
+/// drained, last_token_indices not cleared).
+#[test]
+#[ignore = "long running; needs moeflux artifacts"]
+fn memory_clear_cancels_prefetch_no_leak() {
+    let prompt_a: [i32; 4] = [1, 200, 600, 1100];
+    let prompt_b: [i32; 4] = [2, 300, 700, 1200];
+    let next_token = 7i32;
+    let next_pos = prompt_b.len();
+
+    // Reference: fresh ctx, eval prompt_b only, get next-token logits.
+    let mut rs_ref: RsBackend = open_backend();
+    let _ = rs_ref.eval_prompt(&prompt_b, 0);
+    let ref_logits = rs_ref.eval_token(next_token, next_pos);
+
+    // Test: same ctx, eval prompt_a, memory_clear, eval prompt_b,
+    // get next-token logits. Should match ref_logits.
+    let mut rs: RsBackend = open_backend();
+    let _ = rs.eval_prompt(&prompt_a, 0);
+    rs.memory_clear();
+    let _ = rs.eval_prompt(&prompt_b, 0);
+    let test_logits = rs.eval_token(next_token, next_pos);
+
+    assert_eq!(test_logits.len(), ref_logits.len());
+    let drift_max = ref_logits
+        .iter()
+        .zip(test_logits.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let cos = cosine_sim(&ref_logits, &test_logits);
+    eprintln!(
+        "[diff:memory_clear_cancels_prefetch] \
+         max_abs_diff={drift_max:.3e} cosine={cos:.7}"
+    );
+    assert_eq!(
+        argmax(&ref_logits),
+        argmax(&test_logits),
+        "memory_clear leaked prefetch state across reset"
+    );
+    assert!(
+        cos >= 0.9999,
+        "memory_clear leak: cosine {cos:.7} below 0.9999"
+    );
+}
+
+/// Two consecutive `eval_token` calls with `clear_prefetch_predictions`
+/// between them must produce the same logits as a fresh ctx running
+/// the same sequence with no prefetch state at all. Catches: stale
+/// `data_synced[slot]` bytes from token N polluting token N+1's
+/// dispatch (would only happen if the parallel pread or the slot-
+/// reuse contract were broken).
+#[test]
+#[ignore = "long running; needs moeflux artifacts"]
+fn slot_reuse_race_regression_rust() {
+    let prompt: [i32; 4] = [1, 200, 600, 1100];
+    let token_t1 = 7i32;
+    let token_t2 = 42i32;
+    let pos_t1 = prompt.len();
+    let pos_t2 = pos_t1 + 1;
+
+    // Reference: fresh ctx per token, no prefetch state ever exists.
+    let mut rs_ref1: RsBackend = open_backend();
+    let _ = rs_ref1.eval_prompt(&prompt, 0);
+    let _ = rs_ref1.eval_token(token_t1, pos_t1);
+    let ref_t2 = rs_ref1.eval_token(token_t2, pos_t2);
+
+    // Test: same ctx through both tokens, but clear predictions
+    // before each call. Should match ref_t2.
+    let mut rs: RsBackend = open_backend();
+    let _ = rs.eval_prompt(&prompt, 0);
+    rs.0.clear_prefetch_predictions();
+    let _ = rs.eval_token(token_t1, pos_t1);
+    rs.0.clear_prefetch_predictions();
+    let test_t2 = rs.eval_token(token_t2, pos_t2);
+
+    let drift_max = ref_t2
+        .iter()
+        .zip(test_t2.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let cos = cosine_sim(&ref_t2, &test_t2);
+    eprintln!(
+        "[diff:slot_reuse_race_regression] \
+         max_abs_diff={drift_max:.3e} cosine={cos:.7}"
+    );
+    assert_eq!(
+        argmax(&ref_t2),
+        argmax(&test_t2),
+        "slot-reuse race: argmax changed across consecutive evals"
+    );
+    assert!(
+        cos >= 0.9999,
+        "slot-reuse race regression: cosine {cos:.7} below 0.9999"
+    );
+}

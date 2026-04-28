@@ -40,6 +40,7 @@ pub mod lm_head;
 pub mod metal;
 pub mod moe_router;
 pub mod mtl_weight_buf;
+pub mod prefetch;
 pub mod rms_norm;
 pub mod rope;
 pub mod sdpa;
@@ -75,6 +76,7 @@ pub use linear_attn_forward::{
 #[allow(deprecated)]
 pub use linear_attn_forward::{LinearAttnBuffers, LinearAttnForwardError};
 pub use mtl_weight_buf::{MtlWeightBuf, MtlWeightBufError};
+pub use prefetch::{PrefetchState, PrefetchStatus, SlotSource};
 pub use sdpa::{sdpa_cpu, SdpaError};
 pub use state::{
     alloc_layer_states, clear_all, pos_max, truncate, KvCache, LayerState,
@@ -150,6 +152,13 @@ pub struct RsCtx {
     /// `g_io_pool` (4 pthreads); we use 8 since M2 Max has 8 P-cores
     /// and there's no contention with other moeflux work.
     io_pool: rayon::ThreadPool,
+    /// Slice 5d-6b — speculative-prefetch state machine. One entry
+    /// per layer of last-token K indices (used as next-token same-
+    /// layer prediction) plus an in-flight async pread handle.
+    /// Drained at `memory_clear`, `state_save`, `state_load`, and
+    /// `Drop`. See [`prefetch`] module docs for the soundness
+    /// argument.
+    prefetch: PrefetchState,
     // Future phases populate: vocab.
 }
 
@@ -178,6 +187,7 @@ impl RsCtx {
             .thread_name(|i| format!("moeflux-io-{}", i))
             .build()
             .map_err(|_| RsError::InitFailed)?;
+        let prefetch = PrefetchState::new(VARIANT.num_layers);
         Ok(Self {
             wf,
             metal: None,
@@ -191,6 +201,7 @@ impl RsCtx {
             deferred: None,
             lm_head_gpu: None,
             io_pool,
+            prefetch,
         })
     }
 
@@ -629,6 +640,7 @@ impl RsCtx {
             linear_buffers,
             deferred,
             io_pool,
+            prefetch,
             ..
         } = self;
 
@@ -649,7 +661,13 @@ impl RsCtx {
         // return, and a buggy caller might forget to drain — this
         // bracketing guarantees the dump-hook contract (single
         // synchronous layer step) holds regardless.
+        //
+        // Slice 5d-6b: also drain any in-flight prefetch + clear
+        // last-token predictions. The dump hook tests one layer at
+        // a time; predictions from a previous test would either be
+        // stale or wouldn't match this test's routing anyway.
         deferred::discard_deferred_experts_in(deferred);
+        prefetch.invalidate_all();
 
         // Stage hidden_in into the persistent input buffer.
         unsafe {
@@ -680,6 +698,7 @@ impl RsCtx {
                 k_active,
                 experts,
                 io_pool,
+                prefetch,
                 kv_state,
                 gpu_combine,
             )
@@ -703,6 +722,7 @@ impl RsCtx {
                 k_active,
                 experts,
                 io_pool,
+                prefetch,
                 layer_state,
                 gpu_combine,
             )
@@ -923,6 +943,7 @@ impl RsCtx {
             deferred,
             lm_head_gpu,
             io_pool,
+            prefetch,
             ..
         } = self;
         let metal = metal.as_mut().expect("ensure_linear_resources");
@@ -980,6 +1001,30 @@ impl RsCtx {
                 .map_err(|_| RsError::EvalFailed)?;
             }
 
+            // Slice 5d-6b: kick off async prefetch for THIS layer
+            // using its prediction (= last token's same-layer
+            // indices). Runs concurrently with this layer's
+            // CMD1+CMD2 GPU compute and finishes before the K-expert
+            // dispatch (which `wait_for`s inside post_attention_tail).
+            //
+            // Ordering is load-bearing — the prefetch must run AFTER
+            // layer N-1's deferred drain (above) so the previous
+            // layer's GPU read of data_prefetch[slot] is complete
+            // before we overwrite it. First token has no predictions,
+            // skip the fire (predict_for returns None).
+            if let Some(predicted) = prefetch.predict_for(layer_idx) {
+                let data_prefetch =
+                    moe_buffers.data_prefetch_slots_mut_array();
+                prefetch.dispatch(
+                    layer_idx,
+                    predicted,
+                    k_active,
+                    data_prefetch,
+                    io_pool,
+                    experts,
+                );
+            }
+
             let is_full = v.layer_kind(layer_idx)
                 == variants::LayerKind::FullAttn;
             if is_full {
@@ -1002,6 +1047,7 @@ impl RsCtx {
                     k_active,
                     experts,
                     io_pool,
+                    prefetch,
                     kv_state,
                     /* gpu_combine = */ true,
                 )
@@ -1025,6 +1071,7 @@ impl RsCtx {
                     k_active,
                     experts,
                     io_pool,
+                    prefetch,
                     layer_state,
                     /* gpu_combine = */ true,
                 )
@@ -1093,6 +1140,23 @@ impl RsCtx {
         if let Some(bufs) = self.linear_buffers.as_mut() {
             bufs.reset_recurrence();
         }
+        // Slice 5d-6b: drain any in-flight prefetch and clear all
+        // last-token predictions. After memory_clear the next token
+        // starts from cold-prediction state (no stale predictions
+        // from a different prefix).
+        self.prefetch.invalidate_all();
+    }
+
+    /// Drain any in-flight prefetch and clear all per-layer
+    /// last-token predictions. After this call the next forward
+    /// starts from cold-prediction state — every K-expert slot in
+    /// every layer takes the all-miss (sync-pread) path.
+    ///
+    /// Slice 5d-6b. Exposed mainly for diff tests that need to force
+    /// the all-miss path; production callers shouldn't need this
+    /// (prefetch is a perf hint, not a correctness toggle).
+    pub fn clear_prefetch_predictions(&mut self) {
+        self.prefetch.invalidate_all();
     }
 
     /// Truncate every layer's state to positions `[0, p0)`. Linear-attn
@@ -1136,6 +1200,11 @@ impl RsCtx {
         // Drain deferred state so the snapshot reflects post-token
         // state, not mid-flight.
         state_snapshot::drain_deferred(&mut self.deferred);
+        // Slice 5d-6b: drain any in-flight prefetch (no contribution
+        // to the snapshot — predictions are per-token, not part of
+        // the wire format — but we need to quiesce the worker pool
+        // before any subsequent ctx mutation).
+        self.prefetch.drain();
         let linear_buffers = self
             .linear_buffers
             .as_ref()
@@ -1158,6 +1227,11 @@ impl RsCtx {
         // Drain any pending dispatch — load overwrites the state the
         // dispatch was producing for.
         state_snapshot::drain_deferred(&mut self.deferred);
+        // Slice 5d-6b: drain any in-flight prefetch + clear
+        // last-token predictions. After load, the prefix is whatever
+        // the loaded snapshot represents — predictions from the
+        // pre-load state would be stale.
+        self.prefetch.invalidate_all();
         // Ensure linear_buffers exist so we have somewhere to push
         // the linear-attn recurrence into. Fresh-Ctx state_load
         // before any eval would otherwise hit BuffersNotReady; load

@@ -272,9 +272,22 @@ fn encode_swiglu(
 ///   layout `[weights[0..16], shared_gate_score, padding]`.
 ///
 /// Allocated once and reused across every batched call. Total ~28 MB
-/// for A3B (dominated by `MAX_K × EXPERT_SIZE` ≈ 27 MB).
+/// for A3B (dominated by `MAX_K × EXPERT_SIZE` ≈ 27 MB) for slice
+/// 5d-6a; ~56 MB for slice 5d-6b after `data_prefetch` is added.
+///
+/// The two K-element data sets have **fixed roles**, not a ping-pong:
+/// - [`Self::data_synced`] is the on-demand sync-pread target. The
+///   GPU dispatch reads from this set for slots whose actual expert
+///   index missed the prefetch prediction.
+/// - [`Self::data_prefetch`] is the speculative prefetch target. The
+///   GPU dispatch reads from this set for slots that hit the
+///   prediction. Filled async by the prefetch thread pool ahead of
+///   the layer that consumes it.
 pub struct MoeBuffers {
-    data: [MtlBuffer<u8>; MAX_K],
+    /// Sync-pread (miss) target. See type-level docs.
+    data_synced: [MtlBuffer<u8>; MAX_K],
+    /// Async-prefetch (hit) target. See type-level docs.
+    data_prefetch: [MtlBuffer<u8>; MAX_K],
     gate: [MtlBuffer<f32>; MAX_K],
     up: [MtlBuffer<f32>; MAX_K],
     act: [MtlBuffer<f32>; MAX_K],
@@ -295,7 +308,10 @@ impl MoeBuffers {
     pub fn new(device: &metal::Device) -> Self {
         let v: Variant = VARIANT;
         // Build arrays without requiring Default on MtlBuffer.
-        let data = std::array::from_fn(|_| {
+        let data_synced = std::array::from_fn(|_| {
+            MtlBuffer::<u8>::with_len(device, v.expert_size_4bit())
+        });
+        let data_prefetch = std::array::from_fn(|_| {
             MtlBuffer::<u8>::with_len(device, v.expert_size_4bit())
         });
         // Slice 5d-6: probe 2 MB DMA alignment on the data slots.
@@ -307,16 +323,21 @@ impl MoeBuffers {
         // warn once if it ever fails so we can revisit (fallback
         // would be `posix_memalign + new_buffer_with_bytes_no_copy`).
         const TWO_MIB: usize = 2 * 1024 * 1024;
-        for (slot, buf) in data.iter().enumerate() {
-            let addr = buf.raw().contents() as usize;
-            if addr % TWO_MIB != 0 {
-                eprintln!(
-                    "[moe] WARNING: data slot {slot} not 2 MB aligned \
-                     (contents=0x{addr:x}, off=0x{off:x}); pread DMA \
-                     may use scatter-gather. See slice 5d-6 plan.",
-                    off = addr % TWO_MIB
-                );
-                break;
+        for (label, set) in
+            [("synced", &data_synced[..]), ("prefetch", &data_prefetch[..])]
+        {
+            for (slot, buf) in set.iter().enumerate() {
+                let addr = buf.raw().contents() as usize;
+                if addr % TWO_MIB != 0 {
+                    eprintln!(
+                        "[moe] WARNING: data_{label} slot {slot} not 2 MB \
+                         aligned (contents=0x{addr:x}, off=0x{off:x}); \
+                         pread DMA may use scatter-gather. See slice 5d-6 \
+                         plan.",
+                        off = addr % TWO_MIB
+                    );
+                    break;
+                }
             }
         }
         let gate =
@@ -330,7 +351,8 @@ impl MoeBuffers {
         let out =
             std::array::from_fn(|_| MtlBuffer::<f32>::with_len(device, v.hidden_dim));
         Self {
-            data,
+            data_synced,
+            data_prefetch,
             gate,
             up,
             act,
@@ -359,15 +381,37 @@ impl MoeBuffers {
         &self.out[slot]
     }
 
-    /// All per-slot data buffers as disjoint `&mut [u8]` views,
-    /// suitable for parallel pread. Slice 5d-6a entry point: K
-    /// concurrent `read_expert` calls can each take one slot's
-    /// `&mut [u8]` from this array without aliasing the others.
+    /// All per-slot data_synced (sync-pread / miss target) buffers as
+    /// disjoint `&mut [u8]` views, suitable for parallel pread. Slice
+    /// 5d-6a entry point: K concurrent `read_expert` calls can each
+    /// take one slot's `&mut [u8]` from this array without aliasing
+    /// the others.
     ///
-    /// SAFETY/CORRECTNESS: same invariant as [`Self::data_slot_mut`] —
-    /// no GPU dispatch reading from any slot may be in flight.
-    pub(crate) fn data_slots_mut_array(&mut self) -> [&mut [u8]; MAX_K] {
-        self.data.each_mut().map(|b| b.as_mut_slice())
+    /// SAFETY/CORRECTNESS: caller ensures no GPU dispatch reading
+    /// from any slot is in flight. The deferred-state `complete_*` /
+    /// `discard_*` calls at the top of each layer's forward establish
+    /// this invariant.
+    pub(crate) fn data_synced_slots_mut_array(
+        &mut self,
+    ) -> [&mut [u8]; MAX_K] {
+        self.data_synced.each_mut().map(|b| b.as_mut_slice())
+    }
+
+    /// All per-slot data_prefetch (async-prefetch / hit target)
+    /// buffers as disjoint `&mut [u8]` views, suitable for parallel
+    /// async pread by the prefetch state machine. Slice 5d-6b entry
+    /// point.
+    ///
+    /// SAFETY/CORRECTNESS: caller ensures no GPU dispatch reading
+    /// from any prefetch slot is in flight, AND that the previous
+    /// async prefetch into these buffers has been drained.
+    /// [`super::prefetch::PrefetchState::wait_for`] /
+    /// [`super::prefetch::PrefetchState::drain`] are the established
+    /// synchronization points.
+    pub(crate) fn data_prefetch_slots_mut_array(
+        &mut self,
+    ) -> [&mut [u8]; MAX_K] {
+        self.data_prefetch.each_mut().map(|b| b.as_mut_slice())
     }
 }
 
@@ -520,7 +564,7 @@ pub(crate) fn gpu_batched_experts_encode(
     let expert_size = v.expert_size_4bit();
     for slot in 0..k {
         let src = &expert_data[slot * expert_size..(slot + 1) * expert_size];
-        bufs.data[slot].as_mut_slice().copy_from_slice(src);
+        bufs.data_synced[slot].as_mut_slice().copy_from_slice(src);
     }
     bufs.input.as_mut_slice().copy_from_slice(h_post);
     bufs.h_mid.as_mut_slice().copy_from_slice(h_mid);
@@ -537,6 +581,11 @@ pub(crate) fn gpu_batched_experts_encode(
     // just staged. Field-disjoint borrows: bufs is borrowed shared via
     // the bufs.input.raw() etc. derivations; emit_batched_experts only
     // reads bufs (also shared). All consistent.
+    //
+    // Host-slice variant always stages into `data_synced`; emit reads
+    // accordingly.
+    let data_set_per_slot: [super::SlotSource; MAX_K] =
+        [super::SlotSource::Synced; MAX_K];
     emit_batched_experts(
         cmdbuf,
         &matvec,
@@ -548,6 +597,7 @@ pub(crate) fn gpu_batched_experts_encode(
         bufs.shared_out.raw(),
         k,
         v,
+        &data_set_per_slot,
     );
     Ok(cmdbuf.to_owned())
 }
@@ -574,6 +624,7 @@ pub(crate) fn gpu_batched_experts_encode_pre_staged(
     shared_out: &BufferRef,
     expert_weights: &[f32],
     shared_gate_score: f32,
+    data_set_per_slot: &[super::SlotSource; MAX_K],
 ) -> Result<metal::CommandBuffer, ExpertForwardError> {
     let v = VARIANT;
     if actual_k < 1 || (actual_k as usize) > MAX_K {
@@ -596,8 +647,9 @@ pub(crate) fn gpu_batched_experts_encode_pre_staged(
     let swiglu = metal.pipeline("swiglu_fused")?.clone();
     let combine = metal.pipeline("moe_combine_residual")?.clone();
 
-    // Only stage the 18-float combine params — bufs.data is the
-    // caller's responsibility.
+    // Only stage the 18-float combine params — bufs' data buffers are
+    // the caller's responsibility (data_synced via 5d-6a's parallel
+    // pread, data_prefetch via 5d-6b's async prefetch).
     {
         let params = bufs.combine_params.as_mut_slice();
         params.fill(0.0);
@@ -617,6 +669,7 @@ pub(crate) fn gpu_batched_experts_encode_pre_staged(
         shared_out,
         k,
         v,
+        data_set_per_slot,
     );
     Ok(cmdbuf.to_owned())
 }
@@ -655,6 +708,13 @@ fn validate_inputs(
 /// (optionally) `moe_combine_residual` into `cmdbuf`. Takes the input
 /// buffers as explicit refs so the host-slice and buf-ref entry points
 /// can share this body.
+///
+/// `data_set_per_slot[slot]` selects whether to bind
+/// `bufs.data_synced[slot]` ([`super::SlotSource::Synced`]) or
+/// `bufs.data_prefetch[slot]` ([`super::SlotSource::Prefetched`]) as
+/// the expert-weights source. Synchronous callers pass
+/// `[SlotSource::Synced; MAX_K]`; the 5d-6b prefetch hot path passes
+/// a per-slot mix.
 #[allow(clippy::too_many_arguments)]
 fn emit_batched_experts(
     cmdbuf: &CommandBufferRef,
@@ -667,12 +727,20 @@ fn emit_batched_experts(
     shared_out: &BufferRef,
     k: usize,
     v: Variant,
+    data_set_per_slot: &[super::SlotSource; MAX_K],
 ) {
     // Per-expert: Encoder A (gate+up — both read the shared `input`),
     // Encoder B (SwiGLU then down). Two encoders per expert exposes
     // GPU parallelism across slots; within an encoder the dispatches
     // serialize by Metal's encoder-internal ordering.
+    let pick = |slot: usize| -> &MtlBuffer<u8> {
+        match data_set_per_slot[slot] {
+            super::SlotSource::Synced => &bufs.data_synced[slot],
+            super::SlotSource::Prefetched => &bufs.data_prefetch[slot],
+        }
+    };
     for slot in 0..k {
+        let weights_buf = pick(slot);
         // Encoder A — gate + up
         {
             let enc = cmdbuf.new_compute_command_encoder();
@@ -680,7 +748,7 @@ fn emit_batched_experts(
             encode_matvec_into(
                 enc,
                 matvec,
-                &bufs.data[slot],
+                weights_buf,
                 v.gate_w_off_4bit(),
                 v.gate_s_off_4bit(),
                 v.gate_b_off_4bit(),
@@ -693,7 +761,7 @@ fn emit_batched_experts(
             encode_matvec_into(
                 enc,
                 matvec,
-                &bufs.data[slot],
+                weights_buf,
                 v.up_w_off_4bit(),
                 v.up_s_off_4bit(),
                 v.up_b_off_4bit(),
@@ -719,7 +787,7 @@ fn emit_batched_experts(
             encode_matvec_into(
                 enc,
                 matvec,
-                &bufs.data[slot],
+                weights_buf,
                 v.down_w_off_4bit(),
                 v.down_s_off_4bit(),
                 v.down_b_off_4bit(),

@@ -213,6 +213,7 @@ pub(crate) fn gpu_batched_experts_begin_pre_staged(
     expert_weights: &[f32],
     shared_gate_score: f32,
     layer_idx: i32,
+    data_set_per_slot: &[super::SlotSource; super::MAX_K],
 ) -> Result<(), DeferredError> {
     if slot.is_some() {
         return Err(DeferredError::AlreadyActive);
@@ -226,6 +227,7 @@ pub(crate) fn gpu_batched_experts_begin_pre_staged(
         shared_out,
         expert_weights,
         shared_gate_score,
+        data_set_per_slot,
     )?;
     cmd_buffer.commit();
     *slot = Some(DeferredState {
