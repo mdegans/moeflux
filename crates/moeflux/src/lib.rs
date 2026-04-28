@@ -43,4 +43,6 @@ pub mod riir;
 
 /// Default backend re-export. The Rust port is the only path.
 #[cfg(target_os = "macos")]
-pub use riir::{RsCtx as Ctx, RsError as Error};
+pub use riir::{
+    CheckpointError, RsCtx as Ctx, RsError as Error, DEFAULT_MAX_CHECKPOINTS,
+};

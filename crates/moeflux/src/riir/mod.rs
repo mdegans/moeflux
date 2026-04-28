@@ -21,6 +21,7 @@
 
 #![allow(missing_docs)] // Phase 3 — types fill in incrementally.
 
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 
 pub mod cpu_ops;
@@ -89,6 +90,27 @@ pub use state::{
 };
 pub use variants::{Variant, VARIANT};
 pub use weight_file::{TensorInfo, WeightFile, WeightFileError};
+
+/// Default cap on stored snapshot checkpoints per [`RsCtx`]. Matches
+/// Anthropic's API limit on `cache_control` breakpoints per prompt
+/// (4) — the cap aligns with the upstream contract by construction,
+/// not coincidence.
+pub const DEFAULT_MAX_CHECKPOINTS: usize = 4;
+
+/// Errors from [`RsCtx::restore_to`].
+#[derive(Debug, thiserror::Error)]
+pub enum CheckpointError {
+    /// No snapshot exists at the requested position. Caller should
+    /// fall back to a full clear + reprefill.
+    #[error("no checkpoint stored at position {pos}")]
+    NoCheckpoint { pos: i32 },
+    /// State-snapshot deserialization failed. By construction this
+    /// shouldn't fire (we only restore from buffers we wrote with
+    /// `state_save` ourselves) — surface it rather than panic so
+    /// callers can log and recover.
+    #[error("snapshot reload failed: {0}")]
+    Snapshot(#[source] state_snapshot::StateSnapshotError),
+}
 
 /// Pure-Rust analogue of [`crate::imp::Ctx`]. API surface mirrors the
 /// C wrapper 1:1 during the port — the diff harness compares behavior
@@ -167,6 +189,25 @@ pub struct RsCtx {
     /// `Drop`. See [`prefetch`] module docs for the soundness
     /// argument.
     prefetch: PrefetchState,
+    /// Phase 7 — checkpoint snapshots keyed by sequence position.
+    /// Populated by [`Self::checkpoint_pos`] (typically called by
+    /// drama_llama's `Session` after prefilling each cache-breakpoint
+    /// chunk), consumed by [`Self::restore_to`] on partial-hit cache
+    /// reuse. Each value is the byte buffer produced by
+    /// [`Self::state_save`] at that position. Drained on
+    /// [`Self::memory_clear`] and on every `restore_to(pos)` for keys
+    /// `> pos` (their futures are invalidated).
+    checkpoints: HashMap<i32, Vec<u8>>,
+    /// LRU order for `checkpoints`. Front = oldest, back = newest.
+    /// When `checkpoints.len() > max_checkpoints`, evict from the
+    /// front while skipping pos-0 (kept for repeat full-prefill
+    /// reuse) and the most recently inserted position.
+    checkpoint_order: VecDeque<i32>,
+    /// Cap on stored snapshots. Defaults to 4 — matches Anthropic's
+    /// API limit on `cache_control` breakpoints per prompt, so the
+    /// cap aligns with the upstream contract by construction.
+    /// Adjustable via [`Self::set_max_checkpoints`].
+    max_checkpoints: usize,
     // Future phases populate: vocab.
 }
 
@@ -210,6 +251,9 @@ impl RsCtx {
             lm_head_gpu: None,
             io_pool,
             prefetch,
+            checkpoints: HashMap::new(),
+            checkpoint_order: VecDeque::new(),
+            max_checkpoints: DEFAULT_MAX_CHECKPOINTS,
         })
     }
 
@@ -1280,6 +1324,10 @@ impl RsCtx {
         // starts from cold-prediction state (no stale predictions
         // from a different prefix).
         self.prefetch.invalidate_all();
+        // Phase 7: snapshot store is keyed by sequence position; a
+        // full clear invalidates every key.
+        self.checkpoints.clear();
+        self.checkpoint_order.clear();
     }
 
     /// Drain any in-flight prefetch and clear all per-layer
@@ -1303,6 +1351,114 @@ impl RsCtx {
     pub fn memory_seq_rm(&mut self, _seq_id: i32, p0: i32, p1: i32) -> bool {
         truncate(&mut self.layer_states, p0, p1);
         true
+    }
+
+    /// Snapshot the current ctx state at sequence position `pos`.
+    /// Subsequent [`Self::restore_to`] calls with the same `pos` will
+    /// reload exactly this state.
+    ///
+    /// Internally allocates a buffer of [`Self::state_size`] bytes and
+    /// calls [`Self::state_save`] into it — drains pending GPU work
+    /// and serializes the full ctx (linear-attn recurrence + full-attn
+    /// KV) into the wire format. Bytes-per-snapshot grow with KV
+    /// length at `pos`.
+    ///
+    /// Eviction: if storing this snapshot pushes the count past
+    /// `max_checkpoints`, evict from the LRU front while skipping
+    /// `pos == 0` and the position just inserted. If a snapshot
+    /// already exists at `pos`, it is overwritten (and the LRU is
+    /// updated).
+    ///
+    /// Errors only on [`StateSnapshotError`] from `state_save` —
+    /// effectively, `BuffersNotReady` if called before the first
+    /// eval/`memory_clear`. Callers (drama_llama `Session`) check
+    /// after the first prefill on a sequence so this should not fire
+    /// in normal use.
+    pub fn checkpoint_pos(
+        &mut self,
+        pos: i32,
+    ) -> Result<(), state_snapshot::StateSnapshotError> {
+        let mut buf = vec![0u8; self.state_size()];
+        self.state_save(&mut buf)?;
+
+        match self.checkpoints.insert(pos, buf) {
+            Some(_) => {
+                // Overwrite: refresh LRU position.
+                if let Some(idx) =
+                    self.checkpoint_order.iter().position(|&p| p == pos)
+                {
+                    self.checkpoint_order.remove(idx);
+                }
+            }
+            None => {}
+        }
+        self.checkpoint_order.push_back(pos);
+
+        // Evict oldest until under cap, skipping pos=0 and the just-
+        // inserted position. `pos=0` is kept because it's the natural
+        // resume point for a fresh full-prefix reuse; the just-
+        // inserted position is the freshest data we have.
+        while self.checkpoints.len() > self.max_checkpoints {
+            let mut evicted = false;
+            for i in 0..self.checkpoint_order.len() {
+                let candidate = self.checkpoint_order[i];
+                if candidate == 0 || candidate == pos {
+                    continue;
+                }
+                self.checkpoint_order.remove(i);
+                self.checkpoints.remove(&candidate);
+                evicted = true;
+                break;
+            }
+            if !evicted {
+                // Only pos=0 and `pos` remain (or pathological config
+                // with max_checkpoints < 2). Stop — refusing to evict
+                // protected entries beats silently corrupting
+                // future-fast-resume.
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Restore ctx state to a previously-snapshotted position. After
+    /// success, KV state matches what was current immediately after
+    /// the [`Self::checkpoint_pos`] call at `pos`, and any snapshots
+    /// stored at positions `> pos` are dropped (their futures are now
+    /// invalid — the sequence is being rewritten from `pos` forward).
+    ///
+    /// Returns [`CheckpointError::NoCheckpoint`] if no snapshot exists
+    /// at exactly `pos`. drama_llama's `Session` interprets this as a
+    /// signal to fall back to full-clear + full reprefill.
+    pub fn restore_to(&mut self, pos: i32) -> Result<(), CheckpointError> {
+        let buf = self
+            .checkpoints
+            .get(&pos)
+            .ok_or(CheckpointError::NoCheckpoint { pos })?
+            .clone();
+        self.state_load(&buf).map_err(CheckpointError::Snapshot)?;
+
+        // Drop snapshots whose key > pos: the resuming prefill will
+        // write fresh content at those positions. Keep `pos` itself
+        // (we may restore here again) and any earlier snapshots.
+        self.checkpoints.retain(|&k, _| k <= pos);
+        self.checkpoint_order.retain(|&k| k <= pos);
+
+        Ok(())
+    }
+
+    /// Set the snapshot count cap. Default is
+    /// [`DEFAULT_MAX_CHECKPOINTS`] = 4. Lowering past the current
+    /// `checkpoints.len()` triggers eviction at the next
+    /// `checkpoint_pos`; this method does not retroactively evict.
+    pub fn set_max_checkpoints(&mut self, n: usize) {
+        self.max_checkpoints = n;
+    }
+
+    /// Current snapshot count. Useful for tests.
+    pub fn checkpoint_count(&self) -> usize {
+        self.checkpoints.len()
     }
 
     /// Largest occupied position across full-attn layers, or `-1` if
