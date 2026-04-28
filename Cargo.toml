@@ -11,7 +11,10 @@ edition       = "2024"
 rust-version  = "1.89"
 license       = "MIT"
 repository    = "https://github.com/mdegans/moeflux"
-authors       = ["Michael de Gans <michael.john.degans@gmail.com>"]
+authors       = [
+    "Michael de Gans <michael.john.degans@gmail.com>",
+    "Claude Opus 4.7 (Anthropic) <noreply@anthropic.com>",
+]
 
 [workspace.dependencies]
 moeflux-sys = { path = "crates/moeflux-sys", version = "=0.1.0-pre.2" }
