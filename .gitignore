@@ -1,21 +1,21 @@
 # IDE
 .vscode/
 
-# Build artifacts
-metal_infer/infer
-metal_infer/metal_infer
-metal_infer/bench_pread
-metal_infer/libmoeflux.a
-metal_infer/smoke
+# Build artifacts (Phase 6 relocated metal_infer/ into moeflux-sys)
+crates/moeflux-sys/metal_infer/infer
+crates/moeflux-sys/metal_infer/metal_infer
+crates/moeflux-sys/metal_infer/bench_pread
+crates/moeflux-sys/metal_infer/libmoeflux.a
+crates/moeflux-sys/metal_infer/smoke
 *.o
 *.air
 *.metallib
 
 # Generated model files (recreate with scripts — see CLAUDE.md Quick Start)
-metal_infer/model_weights.bin
-metal_infer/model_weights.json
-metal_infer/vocab.bin
-metal_infer/tokenizer.bin
+crates/moeflux-sys/metal_infer/model_weights.bin
+crates/moeflux-sys/metal_infer/model_weights.json
+crates/moeflux-sys/metal_infer/vocab.bin
+crates/moeflux-sys/metal_infer/tokenizer.bin
 
 # Python
 __pycache__/
@@ -36,7 +36,7 @@ logs/
 *.log
 
 # Experiment data
-metal_infer/routing_data.bin
+crates/moeflux-sys/metal_infer/routing_data.bin
 
 # Rust
 target/

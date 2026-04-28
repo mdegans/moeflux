@@ -48,16 +48,18 @@
 //!
 //! ```bash
 //! cargo test -p moeflux \
-//!     --features "model-qwen3-6-35b-a3b,diff-oracle" \
+//!     --features "model-qwen3-6-35b-a3b" \
 //!     --test diff_oracle --release \
 //!     -- --ignored --nocapture --test-threads=1
 //! ```
 
-#![cfg(all(target_os = "macos", feature = "diff-oracle"))]
+#![cfg(target_os = "macos")]
 
 use std::path::{Path, PathBuf};
 
-use moeflux::{imp::Ctx, riir::RsCtx};
+mod common;
+use common::c_backend::Ctx;
+use moeflux::riir::RsCtx;
 
 // ---------------------------------------------------------------------------
 // Trait + impls
@@ -1314,7 +1316,7 @@ fn weight_file_loads_a3b() {
 #[ignore = "long running; needs moeflux artifacts"]
 fn variants_match_c() {
     let c: CBackend = open_backend();
-    moeflux::riir::variants::assert_matches_c(&c.0);
+    common::c_backend::assert_matches_c(&c.0);
     eprintln!(
         "[diff:variants] {} n_vocab={} n_ctx={} eos={}",
         c.model_name(),

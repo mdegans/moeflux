@@ -10,17 +10,19 @@ authors       = { workspace = true }
 links         = "moeflux"
 readme        = "README.md"
 # Don't publish the 69GB of model weights + Metal shaders by accident.
-# Only the sources + header + build.rs get packaged.
+# Only the C/Objective-C sources + header + build.rs get packaged.
+# Phase 6 relocated metal_infer/ inside this crate so `cargo publish`
+# can verify a self-contained build. The shader source-of-truth lives
+# with the moeflux crate (`crates/moeflux/shaders/`) and is read by
+# moeflux::imp at runtime; moeflux-sys doesn't ship the shader.
 include       = [
     "src/**",
+    "metal_infer/*.m",
+    "metal_infer/*.h",
     "build.rs",
     "wrapper.h",
     "README.md",
     "LICENSE",
-    # The C sources are one level up at metal_infer/; the Metal
-    # shaders moved to ../moeflux/shaders/ in Phase 6 (source of
-    # truth lives with the Rust port now). build.rs reads both
-    # directly from those locations for local path-dep consumers.
 ]
 
 [features]

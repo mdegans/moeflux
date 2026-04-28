@@ -11,17 +11,19 @@
 //! 1. Add the matching Cargo feature to `crates/moeflux/Cargo.toml`
 //!    (and in `moeflux-sys/Cargo.toml`).
 //! 2. Add a new `#[cfg(feature = "…")]` `VARIANT` block below.
-//! 3. Confirm with the runtime [`assert_matches_c`] sanity check —
-//!    boots a C ctx and asserts every public field matches.
+//! 3. Confirm via the integration-test helper `assert_matches_c`
+//!    in `tests/common/c_backend.rs` — boots a C ctx and asserts
+//!    every public field matches.
 //!
 //! ## Sync invariant
 //!
 //! The Rust constants here MUST agree with the C-side `model_variant.h`
 //! values for the same Cargo feature. The compile-time variant
 //! selection in C and the `cfg(feature = …)` selection here are kept
-//! in lockstep manually. Any drift is caught at runtime by
-//! [`assert_matches_c`] (uses `mf_n_vocab` / `mf_n_ctx` / `mf_eos`
-//! / `mf_model_name`) and at test time by the diff oracle.
+//! in lockstep manually. Any drift is caught at runtime by the
+//! integration-test `assert_matches_c` (uses `mf_n_vocab` /
+//! `mf_n_ctx` / `mf_eos` / `mf_model_name`) and at test time by the
+//! diff oracle.
 
 /// Kind of a single transformer layer. The qwen3_5_moe family
 /// alternates linear-attention layers with periodic full-attention
@@ -296,41 +298,11 @@ const _: () = {
 };
 
 // --- Runtime cross-check against the C path ----------------------
-
-/// Open a C `Ctx` and assert every shape constant exposed by `mf_*`
-/// matches the Rust constant. Used by integration tests; the input
-/// `ctx` is borrowed read-only.
-///
-/// Catches drift if `model_variant.h` is updated but [`VARIANT`]
-/// here isn't (or vice versa). Currently the C side only exposes
-/// `n_vocab`, `n_ctx`, `eos`, and `model_name` via `mf_*` getters —
-/// the rest of the shape parameters aren't reachable through the
-/// public C API. Those rely on [`assert_static_invariants`]'s
-/// compile-time checks plus the diff oracle's end-to-end behavioral
-/// agreement.
-#[cfg(feature = "diff-oracle")]
-pub fn assert_matches_c(ctx: &crate::imp::Ctx) {
-    assert_eq!(
-        ctx.n_vocab(),
-        VARIANT.vocab_size,
-        "C n_vocab disagrees with VARIANT.vocab_size",
-    );
-    assert_eq!(
-        ctx.n_ctx(),
-        MAX_SEQ_LEN,
-        "C n_ctx disagrees with MAX_SEQ_LEN",
-    );
-    assert_eq!(
-        ctx.eos(),
-        VARIANT.eos_token_1,
-        "C eos disagrees with VARIANT.eos_token_1",
-    );
-    assert_eq!(
-        ctx.model_name(),
-        VARIANT.name,
-        "C model_name disagrees with VARIANT.name",
-    );
-}
+//
+// `assert_matches_c` lives in the integration-test layer at
+// `tests/common/c_backend.rs` since Phase 6 — it's the only consumer
+// of the C-API safe wrapper, and that wrapper is no longer part of
+// moeflux's lib surface.
 
 /// Compile-time invariants this module relies on. No-op at runtime;
 /// presence forces the static asserts above to be evaluated when

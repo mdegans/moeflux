@@ -1,9 +1,9 @@
 //! Build script for moeflux-sys.
 //!
-//! Compiles the C/Objective-C sources from `../../metal_infer`, generates
-//! Rust bindings against `moeflux.h`, and links the macOS frameworks the
-//! Metal pipeline needs. macOS-only; on other platforms build.rs is a
-//! no-op so `cargo check` at least succeeds in CI.
+//! Compiles the C/Objective-C sources from `metal_infer/`, generates
+//! Rust bindings against `moeflux.h`, and links the macOS frameworks
+//! the Metal pipeline needs. macOS-only; on other platforms build.rs
+//! is a no-op so `cargo check` at least succeeds in CI.
 
 use std::env;
 use std::path::PathBuf;
@@ -41,22 +41,15 @@ fn main() {
     };
 
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let metal_infer = manifest.join("../../metal_infer");
+    let metal_infer = manifest.join("metal_infer");
     let infer_m = metal_infer.join("infer.m");
     let moeflux_h = metal_infer.join("moeflux.h");
 
-    // Bake the shader-source absolute path into the crate so consumers
-    // don't have to manage cwd. metal_setup() picks this up via the
-    // MOEFLUX_SHADERS_PATH env var at runtime; the safe wrapper sets
-    // that env var from this const on Ctx::open. Phase 6 moved the
-    // source-of-truth shader into the safe-wrapper crate; the C-side
-    // oracle now reads from there.
-    let shaders_src = manifest.join("../moeflux/shaders/shaders.metal");
-    let shaders_abs = shaders_src.canonicalize()
-        .unwrap_or_else(|_| shaders_src.clone());
-    println!("cargo:rustc-env=MOEFLUX_COMPILED_SHADERS_PATH={}",
-             shaders_abs.display());
-    println!("cargo:rerun-if-changed={}", shaders_src.display());
+    // Shader source-of-truth lives in the moeflux crate (Phase 6).
+    // moeflux-sys does NOT bake a shader path — consumers of this
+    // crate (the diff oracle suite via the moeflux crate's `imp`
+    // module) own shader-path discovery. This keeps moeflux-sys
+    // self-contained for `cargo publish`.
 
     for p in [&infer_m, &moeflux_h] {
         println!("cargo:rerun-if-changed={}", p.display());

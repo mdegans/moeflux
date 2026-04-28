@@ -1,4 +1,14 @@
-//! macOS implementation.
+//! C-backend wrapper used by the differential oracle.
+//!
+//! This is a safe Rust wrapper around the upstream C/Objective-C
+//! `mf_*` API exposed by `moeflux-sys`. It used to live in `src/`
+//! (and was a public surface of the moeflux crate) but Phase 6
+//! relocated it into the test layer: production moeflux ships only
+//! the Rust port, and this wrapper exists solely to give the diff
+//! oracle a stable C reference to validate the Rust port against.
+//!
+//! Integration tests pick this up via `mod common; use
+//! common::c_backend::Ctx;`.
 
 use std::ffi::{CStr, CString};
 use std::fmt;
@@ -85,20 +95,26 @@ impl Ctx {
         use_2bit: bool,
     ) -> Result<Self, Error> {
         // Point the Metal backend at shaders.metal via env var unless
-        // the caller has already set it. The compile-time default
-        // path comes from moeflux-sys's build.rs, so this works from
-        // any cwd / downstream crate without extra configuration.
+        // the caller has already set it. The shader lives with the
+        // moeflux crate (`shaders/shaders.metal`) and is found via
+        // CARGO_MANIFEST_DIR at compile time — this Just Works from
+        // any cwd or downstream crate without extra configuration.
+        //
         // SAFETY: set_var is safe in the single-threaded init path
         // before any Ctx is created; if a user later spawns threads
         // and races open, they should set MOEFLUX_SHADERS_PATH
         // themselves before launching.
+        const DEFAULT_SHADERS_PATH: &str = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/shaders/shaders.metal",
+        );
         if std::env::var_os("MOEFLUX_SHADERS_PATH").is_none() {
             // set_var became unsafe in edition 2024; the guard above
             // documents our invariant.
             unsafe {
                 std::env::set_var(
                     "MOEFLUX_SHADERS_PATH",
-                    sys::DEFAULT_SHADERS_PATH,
+                    DEFAULT_SHADERS_PATH,
                 );
             }
         }
@@ -886,4 +902,37 @@ fn path_to_c(p: &Path) -> Result<CString, Error> {
     // requiring UTF-8. CString::new fails only on interior NULs.
     use std::os::unix::ffi::OsStrExt;
     CString::new(p.as_os_str().as_bytes()).map_err(|_| Error::PathHasNul)
+}
+
+/// Open a C [`Ctx`] and assert every shape constant exposed by
+/// `mf_*` matches the Rust [`moeflux::riir::variants::VARIANT`]
+/// constant. Catches drift if `model_variant.h` is updated but the
+/// Rust side isn't (or vice versa). Currently the C side only
+/// exposes `n_vocab`, `n_ctx`, `eos`, and `model_name` via `mf_*`
+/// getters — the rest of the shape parameters aren't reachable
+/// through the public C API. Those rely on `variants::assert_static_invariants`
+/// compile-time checks plus the diff oracle's end-to-end behavioral
+/// agreement.
+pub fn assert_matches_c(ctx: &Ctx) {
+    use moeflux::riir::variants::{MAX_SEQ_LEN, VARIANT};
+    assert_eq!(
+        ctx.n_vocab(),
+        VARIANT.vocab_size,
+        "C n_vocab disagrees with VARIANT.vocab_size",
+    );
+    assert_eq!(
+        ctx.n_ctx(),
+        MAX_SEQ_LEN,
+        "C n_ctx disagrees with MAX_SEQ_LEN",
+    );
+    assert_eq!(
+        ctx.eos(),
+        VARIANT.eos_token_1,
+        "C eos disagrees with VARIANT.eos_token_1",
+    );
+    assert_eq!(
+        ctx.model_name(),
+        VARIANT.name,
+        "C model_name disagrees with VARIANT.name",
+    );
 }

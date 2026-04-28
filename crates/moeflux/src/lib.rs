@@ -28,9 +28,10 @@
 //!
 //! ## Differential oracle
 //!
-//! The original C-via-Objective-C implementation is preserved behind
-//! the `diff-oracle` cargo feature for regression testing. Production
-//! consumers don't enable it; moeflux's `tests/diff_oracle.rs` does.
+//! The original C-via-Objective-C implementation is wrapped as a
+//! test-only helper at `tests/common/c_backend.rs`. moeflux's lib
+//! ships only the Rust port; the C oracle exists solely to validate
+//! the port via `tests/diff_oracle.rs`.
 
 #![cfg_attr(not(target_os = "macos"), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -40,14 +41,6 @@
 #[cfg(target_os = "macos")]
 pub mod riir;
 
-/// C-via-`moeflux-sys` implementation. Available behind the
-/// `diff-oracle` cargo feature for differential regression testing.
-/// Production consumers should ignore this module.
-#[cfg(all(target_os = "macos", feature = "diff-oracle"))]
-pub mod imp;
-
-/// Default backend re-export. The Rust port is the only path; the
-/// `diff-oracle` feature exposes the C path under [`mod@imp`] but
-/// does not change the [`Ctx`] / [`Error`] aliases.
+/// Default backend re-export. The Rust port is the only path.
 #[cfg(target_os = "macos")]
 pub use riir::{RsCtx as Ctx, RsError as Error};

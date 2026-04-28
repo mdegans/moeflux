@@ -12,25 +12,22 @@ readme        = "../../README.md"
 [features]
 default = []
 
-# Model variant features. Select exactly one. Forwards to moeflux-sys
-# (when `diff-oracle` is also enabled) so the C-side oracle gets the
-# matching `MOEFLUX_MODEL_*` define for differential testing.
-model-qwen3-5-a17b      = ["moeflux-sys?/model-qwen3-5-a17b"]
-model-qwen3-6-35b-a3b   = ["moeflux-sys?/model-qwen3-6-35b-a3b"]
-
-# Differential-oracle backend. Compiles the C-via-`moeflux-sys` path
-# alongside the Rust port for the integration test suite. Test-only
-# in practice — production drama_llama doesn't need it. Phase 6 gated
-# the C path here rather than deleting it; the diff oracle stays as
-# a regression net for DeepSeek-V3 / Cogito-V2 671B / runtime-variant
-# work.
-diff-oracle = ["dep:moeflux-sys"]
+# Model variant features. Select exactly one. The same name on
+# moeflux-sys (a dev-dep) is forwarded so the C-side oracle gets
+# the matching `MOEFLUX_MODEL_*` define when integration tests run.
+model-qwen3-5-a17b      = ["moeflux-sys/model-qwen3-5-a17b"]
+model-qwen3-6-35b-a3b   = ["moeflux-sys/model-qwen3-6-35b-a3b"]
 
 [dependencies]
-moeflux-sys = { workspace = true, optional = true }
 thiserror   = { workspace = true }
 memmap2     = { workspace = true }
 serde       = { workspace = true }
 serde_json  = { workspace = true }
 metal       = { workspace = true }
 rayon       = { workspace = true }
+
+[dev-dependencies]
+# Test-only access to the upstream C/Objective-C reference
+# implementation. Used by `tests/diff_oracle.rs` to validate the
+# Rust port; not part of the public API or production builds.
+moeflux-sys = { workspace = true }

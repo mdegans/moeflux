@@ -4,7 +4,8 @@
 //! Consumers should prefer the safe wrapper in the `moeflux` crate.
 //! This crate exists separately so that downstream code that needs
 //! raw `unsafe extern "C"` access can drop down without reinventing
-//! the build rules.
+//! the build rules — and so the diff oracle suite has a stable C
+//! reference to validate the Rust port against.
 //!
 //! Platform: macOS only. On non-macOS targets the build script is
 //! a no-op and this crate exposes no symbols.
@@ -15,10 +16,3 @@
 
 #[cfg(target_os = "macos")]
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
-
-/// Absolute path to `shaders.metal` as seen at build time. The safe
-/// wrapper sets this as `MOEFLUX_SHADERS_PATH` on first `Ctx::open`
-/// so the Metal backend can locate shaders regardless of cwd. Set
-/// `MOEFLUX_SHADERS_PATH` in the environment to override.
-#[cfg(target_os = "macos")]
-pub const DEFAULT_SHADERS_PATH: &str = env!("MOEFLUX_COMPILED_SHADERS_PATH");

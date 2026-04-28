@@ -40,10 +40,11 @@ Max; our 96GB target box should do comparably on Cogito 600B.
 - `crates/moeflux-sys/` — raw FFI bindings to the upstream C path.
   `dev-dependency`-only; gated behind moeflux's `diff-oracle` feature.
   Production builds skip it entirely.
-- `metal_infer/` — the upstream C + Objective-C reference
-  implementation. Test-only; built by `moeflux-sys/build.rs` when
-  `diff-oracle` is enabled. Provides per-kernel C-side hooks the
-  diff oracle uses to bit-exact-validate every Rust kernel.
+- `crates/moeflux-sys/metal_infer/` — the upstream C + Objective-C
+  reference implementation. Test-only; built by
+  `moeflux-sys/build.rs` when `diff-oracle` is enabled. Provides
+  per-kernel C-side hooks the diff oracle uses to bit-exact-validate
+  every Rust kernel.
 - `repack_experts.py`, `extract_weights.py` — model-prep pipeline.
   One-time-per-target-model; not runtime.
 
