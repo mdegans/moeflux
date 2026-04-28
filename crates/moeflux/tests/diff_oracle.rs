@@ -3553,6 +3553,94 @@ fn layer_forward_dump_close_c_vs_rust_full_attn() {
     );
 }
 
+/// Slice 5d-7b: full-attention layer forward at `kv_len ≥ 32` —
+/// exercises the GPU SDPA fast path on both backends. The
+/// `layer_forward_dump_close_c_vs_rust_full_attn` sibling above runs
+/// at `pos = 0` (kv_len = 1 after append), which is below the gate
+/// (`kv_len >= 32`); this test prefills the KV cache so the test
+/// call lands on the gate predicate and the 4 GPU attn kernels run
+/// inside CMD2.
+///
+/// Both backends share the same gate predicate (`kv_len >= 32 && <
+/// GPU_KV_SEQ`); both will run GPU SDPA on the test call, so the
+/// comparison stays at the same tolerance regime as the existing
+/// full-attn dump test.
+#[test]
+#[ignore = "long running; needs moeflux artifacts"]
+fn layer_forward_dump_close_c_vs_rust_full_attn_gpu_path() {
+    let mut c: CBackend = open_backend();
+    let mut rs: RsBackend = open_backend();
+    let hidden_dim = moeflux::riir::VARIANT.hidden_dim;
+
+    c.memory_clear();
+    rs.memory_clear();
+
+    let layer_idx = 3i32; // first full-attn layer (full_attn_interval = 4)
+
+    // Prefill: call layer_forward_dump at pos=0..31 to fill layer 3's
+    // KV cache to length 32 on both backends. Distinct token per
+    // position so each entry is non-trivial.
+    for pos in 0i32..32 {
+        let hidden_in = c.embed(1 + pos);
+        let _c_drain = c.layer_forward_dump(layer_idx, pos, &hidden_in);
+        let _rs_drain = rs.layer_forward_dump(layer_idx, pos, &hidden_in);
+    }
+
+    // Test call: pos=32 → kv_len becomes 33 after append, satisfying
+    // the GPU-path gate (`kv_len >= 32`). The 4 attn kernels fire on
+    // both backends.
+    let pos = 32i32;
+    let hidden_in = c.embed(1 + pos);
+    let c_out = c.layer_forward_dump(layer_idx, pos, &hidden_in);
+    let rs_out = rs.layer_forward_dump(layer_idx, pos, &hidden_in);
+    assert_eq!(c_out.len(), hidden_dim);
+    assert_eq!(rs_out.len(), hidden_dim);
+
+    assert!(
+        c_out.iter().all(|x| x.is_finite()),
+        "[diff:layer_forward_dump_full_gpu] C output has NaN/Inf"
+    );
+    assert!(
+        rs_out.iter().all(|x| x.is_finite()),
+        "[diff:layer_forward_dump_full_gpu] Rust output has NaN/Inf"
+    );
+
+    let max_abs_out =
+        c_out.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+    assert!(
+        max_abs_out > 1e-6,
+        "[diff:layer_forward_dump_full_gpu] C output magnitude \
+         {max_abs_out:.3e} too small — GPU path likely no-op'd"
+    );
+
+    let cos = cosine_sim(&c_out, &rs_out);
+    let max_abs_diff = c_out
+        .iter()
+        .zip(rs_out.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let rel = max_abs_diff / max_abs_out.max(f32::EPSILON);
+
+    eprintln!(
+        "[diff:layer_forward_dump layer=3 (full-attn, GPU SDPA at kv_len=33)] \
+         cosine={cos:.7} max_abs_diff={max_abs_diff:.3e} \
+         max_abs_out={max_abs_out:.3e} rel={rel:.3e}"
+    );
+
+    const COSINE_FLOOR: f32 = 0.9999;
+    const REL_DIFF_FLOOR: f32 = 1e-3;
+    assert!(
+        cos >= COSINE_FLOOR,
+        "[diff:layer_forward_dump_full_gpu] cosine {cos:.7} below \
+         {COSINE_FLOOR}"
+    );
+    assert!(
+        rel <= REL_DIFF_FLOOR,
+        "[diff:layer_forward_dump_full_gpu] relative max_abs_diff \
+         {rel:.3e} above {REL_DIFF_FLOOR:.3e}"
+    );
+}
+
 /// Phase 4b sanity: the C-side `mf_layer_forward_dump` hook is
 /// callable and returns finite output. The numerical-correctness
 /// signal lands in 4c when `RsCtx::layer_forward_dump` exists and

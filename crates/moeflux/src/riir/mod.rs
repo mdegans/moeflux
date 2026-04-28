@@ -1211,6 +1211,11 @@ impl RsCtx {
         clear_all(&mut self.layer_states);
         if let Some(bufs) = self.linear_buffers.as_mut() {
             bufs.reset_recurrence();
+            // Slice 5d-7b — zero the GPU full-attn KV mirrors
+            // alongside the host-side clear. Without this, the GPU
+            // SDPA fast path would read stale k/v from the previous
+            // sequence at positions [0, prev_len).
+            bufs.reset_gpu_attn_kv_mirrors();
         }
         // Slice 5d-6b: drain any in-flight prefetch and clear all
         // last-token predictions. After memory_clear the next token

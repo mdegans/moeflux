@@ -44,6 +44,11 @@ use super::deferred::{
 };
 use super::expert_forward::MoeBuffers;
 use super::expert_io::ExpertFiles;
+use super::gpu_attn::{
+    encode_attn_scores_batched_into, encode_attn_softmax_batched_into,
+    encode_attn_values_batched_into, encode_sigmoid_gate_into,
+    GpuAttnPipelines,
+};
 use super::gpu_linear_attn::{
     encode_compute_decay_beta, encode_conv1d_step, encode_delta_net_step,
     encode_gated_rms_norm, encode_rms_norm_qk, LinearAttnPipelines,
@@ -146,6 +151,26 @@ pub struct LayerForwardBuffers {
     pub q_proj_out: Buffer,
     pub k_out: Buffer,
     pub v_out: Buffer,
+
+    /// Slice 5d-7b — GPU full-attention buffers.
+    ///
+    /// Per-full-attn-layer KV mirrors (host KV stays canonical for
+    /// `state_save`; these get one-way-synced on append + state_load):
+    /// `gpu_kv_k[fa_idx]` / `gpu_kv_v[fa_idx]` are `GPU_KV_SEQ * kv_dim`
+    /// floats each. `fa_idx` = `full_attn_layer_idx_for(layer_idx)`.
+    /// Mirrors C `g_metal->buf_kv_k[NUM_FULL_ATTN_LAYERS]` allocation
+    /// at `infer.m:1255..1260`.
+    pub gpu_kv_k: Vec<Buffer>,
+    pub gpu_kv_v: Vec<Buffer>,
+    /// Shared scratch for the GPU SDPA fast path. Reused across layers
+    /// because SDPA is layer-sequential per token (matches C). Sizes:
+    /// - `gpu_attn_q` / `gpu_attn_out` / `gpu_attn_gate`:
+    ///   `num_attn_heads * head_dim` floats each
+    /// - `gpu_attn_scores`: `num_attn_heads * GPU_KV_SEQ` floats
+    pub gpu_attn_q: Buffer,
+    pub gpu_attn_scores: Buffer,
+    pub gpu_attn_out: Buffer,
+    pub gpu_attn_gate: Buffer,
 }
 
 /// Backwards-compat alias for the original 4c name.
@@ -210,6 +235,14 @@ impl LayerForwardBuffers {
             })
             .collect();
 
+        let num_full_attn = num_full_attn_layers(&v);
+        let gpu_kv_floats =
+            super::variants::GPU_KV_SEQ * kv_dim_full;
+        let gpu_kv_k =
+            (0..num_full_attn).map(|_| f32_buf(gpu_kv_floats)).collect();
+        let gpu_kv_v =
+            (0..num_full_attn).map(|_| f32_buf(gpu_kv_floats)).collect();
+
         Self {
             input: f32_buf(v.hidden_dim),
             normed: f32_buf(v.hidden_dim),
@@ -231,6 +264,14 @@ impl LayerForwardBuffers {
             q_proj_out: f32_buf(q_proj_dim_full),
             k_out: f32_buf(kv_dim_full),
             v_out: f32_buf(kv_dim_full),
+            gpu_kv_k,
+            gpu_kv_v,
+            gpu_attn_q: f32_buf(q_dim_full),
+            gpu_attn_scores: f32_buf(
+                v.num_attn_heads * super::variants::GPU_KV_SEQ,
+            ),
+            gpu_attn_out: f32_buf(q_dim_full),
+            gpu_attn_gate: f32_buf(q_dim_full),
         }
     }
 
@@ -243,6 +284,20 @@ impl LayerForwardBuffers {
             zero_f32_buffer(b);
         }
         for b in &self.delta_state {
+            zero_f32_buffer(b);
+        }
+    }
+
+    /// Slice 5d-7b — zero the GPU full-attn KV mirrors. Called from
+    /// `RsCtx::memory_clear` alongside `reset_recurrence`. The host
+    /// KV cache is cleared via `clear_all(layer_states)`; this is the
+    /// matching reset on the GPU side. Mirrors the C path's reset of
+    /// `buf_kv_k` / `buf_kv_v` at `mf_memory_clear`.
+    pub fn reset_gpu_attn_kv_mirrors(&mut self) {
+        for b in &self.gpu_kv_k {
+            zero_f32_buffer(b);
+        }
+        for b in &self.gpu_kv_v {
             zero_f32_buffer(b);
         }
     }
@@ -273,7 +328,19 @@ pub fn linear_layer_idx_for(layer_idx: usize) -> Option<usize> {
     }
 }
 
-fn num_full_attn_layers(v: &Variant) -> usize {
+/// `fa_idx = (layer_idx + 1) / FULL_ATTN_INTERVAL - 1`. Returns
+/// `None` if `layer_idx` is a linear-attn layer. Mirrors C
+/// `(layer_idx + 1) / FULL_ATTN_INTERVAL - 1` at `infer.m:5092`.
+pub fn full_attn_layer_idx_for(layer_idx: usize) -> Option<usize> {
+    use super::variants::LayerKind;
+    if VARIANT.layer_kind(layer_idx) == LayerKind::FullAttn {
+        Some((layer_idx + 1) / VARIANT.full_attn_interval - 1)
+    } else {
+        None
+    }
+}
+
+pub(super) fn num_full_attn_layers(v: &Variant) -> usize {
     v.num_layers / v.full_attn_interval
 }
 
@@ -296,9 +363,33 @@ pub(super) struct OProj {
     pub b_off: u64,
     pub bits: u32,
     /// Number of input floats the matvec reads from
-    /// `buffers.batch_out[6]`. Linear: `linear_total_value`. Full:
-    /// `num_attn_heads * head_dim`. Equal on qwen3_5_moe variants.
+    /// `buffers.batch_out[6]` (CPU SDPA path) or
+    /// `buffers.gpu_attn_out` (GPU SDPA path). Linear:
+    /// `linear_total_value`. Full: `num_attn_heads * head_dim`.
     pub in_dim: u32,
+}
+
+/// Slice 5d-7b — args for the GPU SDPA fast path encoded at the top
+/// of CMD2 inside [`post_attention_tail`]. Carries the per-call
+/// inputs not derivable from `VARIANT`: which full-attn KV mirror
+/// slot to use, and the current KV length. When `Some`, the tail
+/// encodes the 4 attn kernels (`attn_scores_batched` →
+/// `attn_softmax_batched` → `attn_values_batched` → `sigmoid_gate`)
+/// into the same cmdbuf as `o_proj`, residual_add, and post-attn
+/// rms_norm — no extra commit-wait. Q + q_gate are pre-staged into
+/// `buffers.gpu_attn_q` / `buffers.gpu_attn_gate` by the caller; K/V
+/// mirrors are pre-populated by the per-token KV-append memcpy.
+///
+/// When `None`, the tail follows the existing CPU-attn path: o_proj
+/// reads from `buffers.batch_out[6]` (caller-staged via
+/// `sdpa_cpu` + memcpy).
+pub(super) struct GpuAttnEncodeArgs {
+    /// Index into `LayerForwardBuffers::gpu_kv_k` / `gpu_kv_v`. From
+    /// [`full_attn_layer_idx_for`].
+    pub fa_idx: usize,
+    /// `kv_state.len` after this token's KV append — the number of
+    /// positions the kernels read from the mirror.
+    pub kv_len: u32,
 }
 
 /// Run one linear-attention layer's forward pass on the GPU.
@@ -549,7 +640,9 @@ pub fn linear_attn_layer_forward(
     // ── Hand off to the shared post-attention tail ───────────────
     // `batch_out[6]` already holds the `gated_rms_norm` output —
     // exactly the o_proj input the tail consumes. The tail leaves an
-    // in-flight K-expert dispatch in `*deferred`.
+    // in-flight K-expert dispatch in `*deferred`. Linear-attn never
+    // takes the GPU SDPA fast path (it has no attention-kernel
+    // pipeline), so `gpu_attn_args = None`.
     post_attention_tail(
         metal,
         wf,
@@ -571,6 +664,7 @@ pub fn linear_attn_layer_forward(
             in_dim: v.linear_total_value() as u32,
         },
         gpu_combine,
+        /* gpu_attn_args = */ None,
     )
 }
 
@@ -615,6 +709,7 @@ pub(super) fn post_attention_tail(
     prefetch: &mut super::PrefetchState,
     o_proj: OProj,
     gpu_combine: bool,
+    gpu_attn_args: Option<GpuAttnEncodeArgs>,
 ) -> Result<(), LayerForwardError> {
     let v = VARIANT;
 
@@ -668,6 +763,14 @@ pub(super) fn post_attention_tail(
     let apply = metal.pipeline("rms_norm_apply_bf16")?.clone();
     let resid_add = metal.pipeline("residual_add")?.clone();
     let swiglu = metal.pipeline("swiglu_fused")?.clone();
+    // Slice 5d-7b: pre-fetch attn pipelines only when the GPU SDPA
+    // fast path is active. Keeps the CPU-SDPA / linear-attn paths
+    // free of unrelated pipeline lookups.
+    let attn_pipes = if gpu_attn_args.is_some() {
+        Some(GpuAttnPipelines::fetch(metal)?)
+    } else {
+        None
+    };
 
     // ── CMD2+3: post-attn + shared FFN + gate logits, single cmdbuf ─
     //
@@ -693,7 +796,77 @@ pub(super) fn post_attention_tail(
     {
         let cmdbuf = metal.queue().new_command_buffer();
 
+        // ── Slice 5d-7b: GPU full-attn fast path (Enc A1..A4) ──────
+        //
+        // When active, encode the 4 attn kernels at the head of CMD2
+        // so SDPA + sigmoid gate piggyback on the same commit-wait as
+        // o_proj + residual + post-attn rms_norm. Mirrors the C path's
+        // `gpu_attn_fuse` block at `infer.m:5091..5163`. Q + q_gate
+        // are pre-staged into `buffers.gpu_attn_q` / `gpu_attn_gate` by
+        // the caller; K/V mirrors are pre-populated by the per-token
+        // KV-append memcpy.
+        if let (Some(args), Some(attn_pipes)) =
+            (gpu_attn_args.as_ref(), attn_pipes.as_ref())
+        {
+            let head_dim = v.head_dim as u32;
+            let kv_dim = (v.num_kv_heads * v.head_dim) as u32;
+            let num_heads = v.num_attn_heads as u32;
+            let heads_per_kv = (v.num_attn_heads / v.num_kv_heads) as u32;
+            let scale = 1.0f32 / (head_dim as f32).sqrt();
+            let seq_stride = super::variants::GPU_KV_SEQ as u32;
+
+            encode_attn_scores_batched_into(
+                cmdbuf,
+                &attn_pipes.scores,
+                &buffers.gpu_attn_q,
+                &buffers.gpu_kv_k[args.fa_idx],
+                &buffers.gpu_attn_scores,
+                num_heads,
+                head_dim,
+                kv_dim,
+                args.kv_len,
+                seq_stride,
+                heads_per_kv,
+                scale,
+            );
+            encode_attn_softmax_batched_into(
+                cmdbuf,
+                &attn_pipes.softmax,
+                &buffers.gpu_attn_scores,
+                num_heads,
+                args.kv_len,
+                seq_stride,
+            );
+            encode_attn_values_batched_into(
+                cmdbuf,
+                &attn_pipes.values,
+                &buffers.gpu_attn_scores,
+                &buffers.gpu_kv_v[args.fa_idx],
+                &buffers.gpu_attn_out,
+                num_heads,
+                head_dim,
+                kv_dim,
+                args.kv_len,
+                seq_stride,
+                heads_per_kv,
+            );
+            encode_sigmoid_gate_into(
+                cmdbuf,
+                &attn_pipes.gate,
+                &buffers.gpu_attn_out,
+                &buffers.gpu_attn_gate,
+                num_heads * head_dim,
+            );
+        }
+
         // o_proj + residual_add + post-attn rms_norm (was CMD2).
+        // GPU SDPA path: read from `gpu_attn_out` (zero-host-stage).
+        // CPU SDPA / linear-attn paths: read from `batch_out[6]`.
+        let oproj_input = if gpu_attn_args.is_some() {
+            &buffers.gpu_attn_out
+        } else {
+            &buffers.batch_out[6]
+        };
         encode_matvec(
             cmdbuf,
             &mv,
@@ -702,7 +875,7 @@ pub(super) fn post_attention_tail(
                 w_off: o_proj.w_off,
                 s_off: o_proj.s_off,
                 b_off: o_proj.b_off,
-                input: &buffers.batch_out[6],
+                input: oproj_input,
                 output: &buffers.output,
                 out_dim: v.hidden_dim as u32,
                 in_dim: o_proj.in_dim,

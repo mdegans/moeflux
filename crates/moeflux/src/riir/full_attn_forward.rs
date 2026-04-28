@@ -50,8 +50,9 @@ use super::gpu_matvec::{encode_matvec, MatvecPipelines, MatvecSpec};
 use super::gpu_norm::{encode_rms_norm_bf16_into, RmsNormBf16Pipelines};
 use super::layer_weight_cache::LayerWeightCache;
 use super::linear_attn_forward::{
-    bits_of, post_attention_tail, read_buffer_to_vec,
-    LayerForwardBuffers, LayerForwardError, OProj,
+    bits_of, full_attn_layer_idx_for, post_attention_tail,
+    read_buffer_to_vec, GpuAttnEncodeArgs, LayerForwardBuffers,
+    LayerForwardError, OProj,
 };
 use super::metal::MetalBackend;
 use super::mtl_weight_buf::MtlWeightBuf;
@@ -267,13 +268,7 @@ pub fn full_attn_layer_forward(
     // ── RoPE on q + k ────────────────────────────────────────────
     apply_rotary_emb(pos, &mut q_host, &mut k_host)?;
 
-    // ── KV append into host-side cache ───────────────────────────
-    // FIXME(riir): the C path also mirrors k/v into the GPU-resident
-    // KV buffers (`buf_kv_k[fa_idx]`, `buf_kv_v[fa_idx]` at
-    // infer.m:4796–4802). Those feed the GPU-attention fast path that
-    // engages once `kv_len >= 32`. Skipped here because the dump-hook
-    // diff runs at `pos=0` (kv_len=1 after this append) and never
-    // exercises the GPU path. Wire when 4e/4f integration lands.
+    // ── KV append: host-canonical + GPU mirror (slice 5d-7b) ─────
     let cache_pos = kv_state.len as usize;
     if cache_pos + 1 > super::variants::MAX_SEQ_LEN {
         return Err(LayerForwardError::MissingTensor {
@@ -287,26 +282,85 @@ pub fn full_attn_layer_forward(
     kv_state.v_cache[row_start..row_end].copy_from_slice(&v_host);
     kv_state.len += 1;
 
-    // ── CPU SDPA ─────────────────────────────────────────────────
-    // Slice the caches to the occupied prefix; sdpa_cpu validates
-    // length against `kv_len * num_kv_heads * head_dim`.
-    let kv_len = kv_state.len;
-    let kv_total = (kv_len as usize) * kv_dim;
-    let mut attn_out = vec![0.0f32; q_dim];
-    sdpa_cpu(
-        kv_len,
-        &q_host,
-        &q_gate_host,
-        &kv_state.k_cache[..kv_total],
-        &kv_state.v_cache[..kv_total],
-        &mut attn_out,
-    )?;
+    // GPU mirror of host KV — feeds the GPU SDPA fast path when the
+    // gate predicate fires below. Mirrors C `infer.m:4796..4802`. Only
+    // populated for full-attn layers; bounded by `GPU_KV_SEQ` to avoid
+    // overrunning the persistent buffer (above that, the C path also
+    // falls back to CPU SDPA).
+    let fa_idx = full_attn_layer_idx_for(layer_idx);
+    if let Some(fa_idx) = fa_idx {
+        if cache_pos < super::variants::GPU_KV_SEQ {
+            // SAFETY: shared-storage buffer; no GPU work in flight on
+            // gpu_kv_k/v at this point (no encode has been dispatched
+            // yet this layer; previous dispatch's CMD2 commit-wait
+            // happened in last layer's `complete_deferred_experts_into`
+            // drain at the top of this layer's eval call).
+            unsafe {
+                let k_dst = buffers.gpu_kv_k[fa_idx].contents() as *mut f32;
+                let v_dst = buffers.gpu_kv_v[fa_idx].contents() as *mut f32;
+                std::ptr::copy_nonoverlapping(
+                    k_host.as_ptr(),
+                    k_dst.add(row_start),
+                    kv_dim,
+                );
+                std::ptr::copy_nonoverlapping(
+                    v_host.as_ptr(),
+                    v_dst.add(row_start),
+                    kv_dim,
+                );
+            }
+        }
+    }
 
-    // ── Stage attn_out into batch_out[6] for o_proj input ────────
-    {
+    // ── Decide between GPU SDPA fast path and CPU SDPA ──────────
+    //
+    // Match C `infer.m:5054` exactly: gate fires when the layer is
+    // full-attn, KV mirror fits in the persistent buffer, and we're
+    // past the GPU dispatch break-even point (kv_len < 32 keeps
+    // command-encoder overhead from dominating).
+    let kv_len = kv_state.len;
+    let gpu_attn_ready = fa_idx.is_some()
+        && kv_len >= 32
+        && (kv_len as usize) < super::variants::GPU_KV_SEQ;
+
+    let gpu_attn_args = if gpu_attn_ready {
+        let fa_idx = fa_idx.expect("gpu_attn_ready ⇒ Some(fa_idx)");
+        // Stage Q + q_gate (both post-norm + RoPE for q) into the
+        // shared GPU scratch buffers. Read by Enc A1 (scores) and
+        // Enc A4 (sigmoid gate). SAFETY: shared-storage; no GPU work
+        // in flight on these buffers (CMD1 above committed and waited;
+        // CMD2 hasn't been built yet).
+        unsafe {
+            let q_dst = buffers.gpu_attn_q.contents() as *mut f32;
+            let g_dst = buffers.gpu_attn_gate.contents() as *mut f32;
+            std::ptr::copy_nonoverlapping(q_host.as_ptr(), q_dst, q_dim);
+            std::ptr::copy_nonoverlapping(
+                q_gate_host.as_ptr(),
+                g_dst,
+                q_dim,
+            );
+        }
+        Some(GpuAttnEncodeArgs {
+            fa_idx,
+            kv_len: kv_len as u32,
+        })
+    } else {
+        // CPU SDPA fallback. Slice the caches to the occupied prefix
+        // and stage the result into batch_out[6] for o_proj.
+        let kv_total = (kv_len as usize) * kv_dim;
+        let mut attn_out = vec![0.0f32; q_dim];
+        sdpa_cpu(
+            kv_len,
+            &q_host,
+            &q_gate_host,
+            &kv_state.k_cache[..kv_total],
+            &kv_state.v_cache[..kv_total],
+            &mut attn_out,
+        )?;
+
         let dst = buffers.batch_out[6].contents() as *mut f32;
-        // SAFETY: shared storage; no GPU work in flight (CMD1 above
-        // committed and waited).
+        // SAFETY: shared-storage; no GPU work in flight (CMD1
+        // committed and waited above).
         unsafe {
             std::ptr::copy_nonoverlapping(
                 attn_out.as_ptr(),
@@ -314,9 +368,6 @@ pub fn full_attn_layer_forward(
                 q_dim,
             );
         }
-        // batch_out[6] was sized to `max(linear_total_value, q_dim)`
-        // floats at allocation; assert the expected slot is large
-        // enough so a future Variant change can't silently overflow.
         debug_assert!(
             buffers.batch_out[6].length() as usize
                 >= q_dim * std::mem::size_of::<f32>(),
@@ -324,11 +375,15 @@ pub fn full_attn_layer_forward(
             buffers.batch_out[6].length() as NSUInteger,
             q_dim * std::mem::size_of::<f32>(),
         );
-    }
+        None
+    };
 
     // ── Hand off to the shared post-attention tail ───────────────
-    // The tail leaves an in-flight K-expert dispatch in `*deferred`;
-    // caller drains.
+    // When `gpu_attn_args` is `Some`, the tail encodes the 4 attn
+    // kernels at the head of CMD2 and reads o_proj from
+    // `gpu_attn_out`. Otherwise it reads from `batch_out[6]` (the
+    // CPU-SDPA staging slot above). The tail leaves an in-flight
+    // K-expert dispatch in `*deferred`; caller drains.
     post_attention_tail(
         metal,
         wf,
@@ -350,5 +405,6 @@ pub fn full_attn_layer_forward(
             in_dim: q_dim as u32,
         },
         gpu_combine,
+        gpu_attn_args,
     )
 }

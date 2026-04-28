@@ -42,9 +42,11 @@
 use metal::Buffer;
 
 use super::deferred;
-use super::linear_attn_forward::{linear_layer_idx_for, LayerForwardBuffers};
+use super::linear_attn_forward::{
+    full_attn_layer_idx_for, linear_layer_idx_for, LayerForwardBuffers,
+};
 use super::state::LayerState;
-use super::variants::{LayerKind, Variant, VARIANT};
+use super::variants::{LayerKind, Variant, GPU_KV_SEQ, VARIANT};
 
 /// `'MFLX'` little-endian. Wire-compatible with the C side's
 /// `MF_SNAPSHOT_MAGIC` (infer.m:8487).
@@ -404,6 +406,42 @@ pub fn state_load(
                 kv.k_cache[from..].fill(0.0);
                 kv.v_cache[from..].fill(0.0);
                 kv.len = len;
+
+                // Slice 5d-7b — mirror restored host KV into the GPU
+                // KV mirrors so the GPU SDPA fast path sees the same
+                // prefix. Mirrors C `infer.m:6570..6577`. Capped at
+                // `GPU_KV_SEQ` (the persistent buffer's slot count);
+                // restored sequences past that fall back to CPU SDPA
+                // exactly as the C side does.
+                if let Some(fa_idx) = full_attn_layer_idx_for(i) {
+                    let mirror_len = (len as usize).min(GPU_KV_SEQ);
+                    if mirror_len > 0 {
+                        let n = mirror_len * stride;
+                        // SAFETY: shared-storage GPU buffer; called at a
+                        // token boundary (per moeflux.h:481 contract +
+                        // the `discard_deferred_experts` guard at the
+                        // top of state_load callers), so no GPU work is
+                        // in flight on the mirror.
+                        unsafe {
+                            let k_dst = linear_buffers.gpu_kv_k[fa_idx]
+                                .contents()
+                                as *mut f32;
+                            let v_dst = linear_buffers.gpu_kv_v[fa_idx]
+                                .contents()
+                                as *mut f32;
+                            std::ptr::copy_nonoverlapping(
+                                kv.k_cache.as_ptr(),
+                                k_dst,
+                                n,
+                            );
+                            std::ptr::copy_nonoverlapping(
+                                kv.v_cache.as_ptr(),
+                                v_dst,
+                                n,
+                            );
+                        }
+                    }
+                }
             }
             LayerKind::LinearAttn => {
                 let linear_idx = linear_layer_idx_for(i)
