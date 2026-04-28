@@ -1,6 +1,6 @@
 [package]
 name          = "moeflux"
-description   = "Safe Rust bindings to the moeflux streaming-experts MoE Metal backend."
+description   = "Pure-Rust streaming-experts MoE inference on Metal. Forked from flash-moe; only the Metal kernels remain from upstream."
 version       = { workspace = true }
 edition       = { workspace = true }
 rust-version  = { workspace = true }
@@ -12,31 +12,25 @@ readme        = "README.md"
 [features]
 default = []
 
-# Re-exported variant features — consumers select the model here and
-# the -sys crate gets the matching C define via build.rs.
-model-qwen3-5-a17b      = ["moeflux-sys/model-qwen3-5-a17b"]
-model-qwen3-6-35b-a3b   = ["moeflux-sys/model-qwen3-6-35b-a3b"]
+# Model variant features. Select exactly one. Forwards to moeflux-sys
+# (when `diff-oracle` is also enabled) so the C-side oracle gets the
+# matching `MOEFLUX_MODEL_*` define for differential testing.
+model-qwen3-5-a17b      = ["moeflux-sys?/model-qwen3-5-a17b"]
+model-qwen3-6-35b-a3b   = ["moeflux-sys?/model-qwen3-6-35b-a3b"]
 
-# RIIR port toggle. When on, exposes `moeflux::riir` containing the
-# pure-Rust implementation (under construction). When off (default),
-# only the C-via-`moeflux-sys` path is available. Both can be on
-# simultaneously, which is the configuration the differential test
-# harness uses. Removed at the Phase 6 cutover, when the Rust path
-# becomes the only path.
-riir-port = [
-    "dep:thiserror",
-    "dep:memmap2",
-    "dep:serde",
-    "dep:serde_json",
-    "dep:metal",
-    "dep:rayon",
-]
+# Differential-oracle backend. Compiles the C-via-`moeflux-sys` path
+# alongside the Rust port for the integration test suite. Test-only
+# in practice — production drama_llama doesn't need it. Phase 6 gated
+# the C path here rather than deleting it; the diff oracle stays as
+# a regression net for DeepSeek-V3 / Cogito-V2 671B / runtime-variant
+# work.
+diff-oracle = ["dep:moeflux-sys"]
 
 [dependencies]
-moeflux-sys = { workspace = true }
-thiserror   = { workspace = true, optional = true }
-memmap2     = { workspace = true, optional = true }
-serde       = { workspace = true, optional = true }
-serde_json  = { workspace = true, optional = true }
-metal       = { workspace = true, optional = true }
-rayon       = { workspace = true, optional = true }
+moeflux-sys = { workspace = true, optional = true }
+thiserror   = { workspace = true }
+memmap2     = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+metal       = { workspace = true }
+rayon       = { workspace = true }

@@ -303,10 +303,19 @@ impl LayerForwardBuffers {
     }
 }
 
+/// Zero every byte of a shared-storage Metal buffer. Used by
+/// `memory_clear` to reset GPU-resident state (linear-attn
+/// recurrence, full-attn KV mirrors).
+///
+/// # Safety
+///
+/// `memory_clear` is the only caller and must run after all
+/// in-flight dispatches have completed. The deferred-ring drain at
+/// the top of `memory_clear` enforces this; no other path reaches
+/// this function.
 fn zero_f32_buffer(b: &Buffer) {
     let bytes = b.length() as usize;
-    // SAFETY: Shared-storage buffer; no GPU work is in flight when
-    // memory_clear is called (caller invariant).
+    // SAFETY: see fn docs.
     unsafe {
         std::ptr::write_bytes(b.contents() as *mut u8, 0, bytes);
     }
@@ -1201,9 +1210,22 @@ pub(super) fn post_attention_tail(
 }
 
 
+/// Copy `len` f32s from a shared-storage Metal buffer into a fresh
+/// `Vec`. Used by the layer-forward dump path and full-attn host
+/// staging where the persistent buffers are bare `metal::Buffer`s
+/// (not [`MtlBuffer<f32>`](super::metal::MtlBuffer)). Direct
+/// counterpart to [`MtlBuffer::to_vec`](super::metal::MtlBuffer::to_vec)
+/// for the unwrapped-buffer case.
+///
+/// # Safety
+///
+/// Caller must ensure no GPU command buffer writing to `b` is in
+/// flight. Typical discipline: a `wait_until_completed` on the most
+/// recent dispatch, or a `complete_deferred_experts_into` drain
+/// before the read.
 pub(super) fn read_buffer_to_vec(b: &Buffer, len: usize) -> Vec<f32> {
     let ptr = b.contents() as *const f32;
-    // SAFETY: caller ensures no GPU work in flight on `b`.
+    // SAFETY: see fn docs.
     unsafe { std::slice::from_raw_parts(ptr, len).to_vec() }
 }
 

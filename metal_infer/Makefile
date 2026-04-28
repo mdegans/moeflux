@@ -1,21 +1,15 @@
-# Makefile for moeflux/metal_infer — streaming-experts MoE inference
+# Makefile for moeflux/metal_infer — preserved for the differential
+# regression oracle (`crates/moeflux` `diff-oracle` feature).
 #
 # Targets:
-#   make          — build metal_infer + infer binaries
-#   make run      — single expert forward pass
-#   make verify   — verify Metal vs CPU reference
-#   make bench    — benchmark single expert (10 iterations)
-#   make moe      — full MoE forward pass (K experts, single layer)
-#   make moebench — benchmark MoE (10 iterations)
-#   make full     — full 60-layer MoE forward pass (K=4)
-#   make fullbench — benchmark full 60-layer forward (3 iterations)
+#   make infer    — build the standalone C/Objective-C inference engine
+#   make lib      — build libmoeflux.a (linked by moeflux-sys's build.rs)
 #   make clean    — remove build artifacts
 #
-# Upstream had a `chat` HTTP/SSE client target — stripped in the
-# moeflux fork since drama_llama drives generation. See NOTES.md.
-#
-# A `libmoeflux.a` static-library target will be added in Phase 3b.4
-# once the mf_* C API surface is in place.
+# Phase 6 cutover (2026-04-28) moved the source-of-truth Metal kernels
+# to `../crates/moeflux/shaders/shaders.metal`. The standalone targets
+# below read shaders at runtime via MTLDevice newLibraryWithSource:;
+# point MOEFLUX_SHADERS_PATH at the new shader location before running.
 #
 # Note: Metal shaders are compiled from source at runtime via
 # MTLDevice newLibraryWithSource:, so no offline metal compiler needed.
@@ -39,16 +33,6 @@ $(error Unknown MODEL=$(MODEL). Supported: qwen3-5-a17b, qwen3-6-35b-a3b)
 endif
 CFLAGS += $(MODEL_DEFINE)
 
-TARGET = metal_infer
-MAIN_SRC = main.m
-
-# Optional: offline shader compilation (faster startup, but not required)
-METALC = xcrun -sdk macosx metal
-METALLIB_TOOL = xcrun -sdk macosx metallib
-SHADER_SRC = shaders.metal
-SHADER_AIR = shaders.air
-SHADER_LIB = shaders.metallib
-
 # Inference engine (complete forward pass)
 INFER_TARGET = infer
 INFER_SRC = infer.m
@@ -58,22 +42,9 @@ INFER_SRC = infer.m
 LIB_TARGET = libmoeflux.a
 LIB_OBJ = infer_lib.o
 
-.PHONY: all clean run verify bench moe moebench full fullbench fast metallib infer infer-run lib
+.PHONY: all clean infer infer-run lib
 
-all: $(TARGET) $(INFER_TARGET)
-
-# Build the binary (shaders compiled at runtime from source)
-$(TARGET): $(MAIN_SRC) $(SHADER_SRC)
-	$(CC) $(CFLAGS) $(FRAMEWORKS) $(LDFLAGS) $(MAIN_SRC) -o $(TARGET)
-
-# Optional: pre-compile shaders (not required — runtime compilation is the default)
-metallib: $(SHADER_LIB)
-
-$(SHADER_AIR): $(SHADER_SRC)
-	$(METALC) -c $(SHADER_SRC) -o $(SHADER_AIR)
-
-$(SHADER_LIB): $(SHADER_AIR)
-	$(METALLIB_TOOL) $(SHADER_AIR) -o $(SHADER_LIB)
+all: $(INFER_TARGET) $(LIB_TARGET)
 
 # Build the inference engine
 $(INFER_TARGET): $(INFER_SRC)
@@ -100,32 +71,7 @@ $(SMOKE_TARGET): $(SMOKE_SRC) $(LIB_TARGET) moeflux.h
 	$(CC) -O2 -Wall -I. $(SMOKE_SRC) $(LIB_TARGET) $(FRAMEWORKS) $(LDFLAGS) -o $(SMOKE_TARGET)
 
 clean:
-	rm -f $(TARGET) $(INFER_TARGET) $(LIB_TARGET) $(LIB_OBJ) $(SMOKE_TARGET) $(SHADER_AIR) $(SHADER_LIB)
-
-# Run targets
-run: $(TARGET)
-	./$(TARGET) --layer 0 --expert 0
-
-verify: $(TARGET)
-	./$(TARGET) --layer 0 --expert 0 --verify
-
-fast: $(TARGET)
-	./$(TARGET) --layer 0 --expert 0 --fast --verify
-
-bench: $(TARGET)
-	./$(TARGET) --layer 0 --expert 0 --fast --benchmark
-
-moe: $(TARGET)
-	./$(TARGET) --layer 0 --fast --moe
-
-moebench: $(TARGET)
-	./$(TARGET) --layer 0 --fast --moe --benchmark
-
-full: $(TARGET)
-	./$(TARGET) --fast --full --k 4
-
-fullbench: $(TARGET)
-	./$(TARGET) --fast --full --k 4 --benchmark
+	rm -f $(INFER_TARGET) $(LIB_TARGET) $(LIB_OBJ) $(SMOKE_TARGET)
 
 # Inference engine targets
 build-infer: $(INFER_TARGET)

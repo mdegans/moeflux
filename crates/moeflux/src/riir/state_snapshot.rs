@@ -472,21 +472,32 @@ pub(super) fn drain_deferred(deferred: &mut deferred::DeferredRing) {
     deferred::discard_deferred_experts_in(deferred);
 }
 
+/// Copy `dst.len()` bytes from a shared-storage Metal buffer to host.
+///
+/// # Safety
+///
+/// Caller (always `state_save`) drains pending deferred dispatch
+/// before reading. No other path reaches this function.
 fn read_buffer_bytes(buf: &Buffer, dst: &mut [u8]) {
     let n = dst.len();
     debug_assert!(buf.length() as usize >= n);
-    // SAFETY: shared-storage Metal buffer; caller ensures no GPU
-    // work is in flight (state_save's contract).
+    // SAFETY: see fn docs.
     unsafe {
         std::ptr::copy_nonoverlapping(buf.contents() as *const u8, dst.as_mut_ptr(), n);
     }
 }
 
+/// Copy `src.len()` bytes from host into a shared-storage Metal
+/// buffer.
+///
+/// # Safety
+///
+/// Caller (always `state_load`) drains pending deferred dispatch
+/// before writing. No other path reaches this function.
 fn write_buffer_bytes(buf: &Buffer, src: &[u8]) {
     let n = src.len();
     debug_assert!(buf.length() as usize >= n);
-    // SAFETY: shared-storage Metal buffer; caller ensures no GPU
-    // work is in flight (state_load's contract).
+    // SAFETY: see fn docs.
     unsafe {
         std::ptr::copy_nonoverlapping(src.as_ptr(), buf.contents() as *mut u8, n);
     }

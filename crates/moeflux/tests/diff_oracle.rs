@@ -48,12 +48,12 @@
 //!
 //! ```bash
 //! cargo test -p moeflux \
-//!     --features "model-qwen3-6-35b-a3b,riir-port" \
+//!     --features "model-qwen3-6-35b-a3b,diff-oracle" \
 //!     --test diff_oracle --release \
 //!     -- --ignored --nocapture --test-threads=1
 //! ```
 
-#![cfg(all(target_os = "macos", feature = "riir-port"))]
+#![cfg(all(target_os = "macos", feature = "diff-oracle"))]
 
 use std::path::{Path, PathBuf};
 

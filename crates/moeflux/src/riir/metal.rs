@@ -6,12 +6,12 @@
 //!
 //! ## Shader source location
 //!
-//! During the port (Phases 2–6) we read the same `shaders.metal`
-//! that the C path uses, located via [`moeflux_sys::DEFAULT_SHADERS_PATH`].
-//! That constant is baked in by `moeflux-sys`'s `build.rs` at
-//! workspace-build time. The Phase 6 cutover replaces this with
-//! `include_str!` against a copy under `crates/moeflux/shaders/`,
-//! so the Rust crate stops depending on `moeflux-sys` for anything.
+//! `shaders.metal` lives at `crates/moeflux/shaders/shaders.metal`
+//! and is embedded into the binary at compile time via
+//! [`include_str!`]. No env vars, no path discovery, no runtime IO
+//! to find the source. The C-side oracle (`mod imp`, gated behind
+//! the `diff-oracle` feature) reads from the same file via the path
+//! `moeflux-sys`'s `build.rs` bakes in.
 //!
 //! ## What's cached, what isn't
 //!
@@ -42,12 +42,6 @@ use metal::{
 pub enum MetalError {
     #[error("no Metal device available (system has no GPU?)")]
     NoDevice,
-    #[error("reading shader source from {path}: {source}")]
-    ShaderIo {
-        path: String,
-        #[source]
-        source: std::io::Error,
-    },
     #[error("compiling shaders.metal: {0}")]
     LibraryCompile(String),
     #[error("kernel '{name}' not found in compiled library")]
@@ -55,6 +49,11 @@ pub enum MetalError {
     #[error("pipeline-state creation failed for '{name}': {err}")]
     PipelineCreate { name: String, err: String },
 }
+
+/// Embedded `shaders.metal` source — compiled into the binary so
+/// runtime has no path-discovery requirement. See module doc.
+const SHADER_SOURCE: &str =
+    include_str!("../../shaders/shaders.metal");
 
 /// All kernels in `shaders.metal`. The smoke test compiles every
 /// one of these at startup; if any fails, the shader source is
@@ -118,17 +117,9 @@ impl MetalBackend {
         let device = Device::system_default().ok_or(MetalError::NoDevice)?;
         let queue = device.new_command_queue();
 
-        let shaders_path = moeflux_sys::DEFAULT_SHADERS_PATH;
-        let source =
-            std::fs::read_to_string(shaders_path).map_err(|source| {
-                MetalError::ShaderIo {
-                    path: shaders_path.to_string(),
-                    source,
-                }
-            })?;
         let options = CompileOptions::new();
         let library = device
-            .new_library_with_source(&source, &options)
+            .new_library_with_source(SHADER_SOURCE, &options)
             .map_err(MetalError::LibraryCompile)?;
 
         Ok(Self {

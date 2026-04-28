@@ -48,11 +48,15 @@ fn main() {
     // Bake the shader-source absolute path into the crate so consumers
     // don't have to manage cwd. metal_setup() picks this up via the
     // MOEFLUX_SHADERS_PATH env var at runtime; the safe wrapper sets
-    // that env var from this const on Ctx::open.
-    let shaders_abs = metal_infer.join("shaders.metal").canonicalize()
-        .unwrap_or_else(|_| metal_infer.join("shaders.metal"));
+    // that env var from this const on Ctx::open. Phase 6 moved the
+    // source-of-truth shader into the safe-wrapper crate; the C-side
+    // oracle now reads from there.
+    let shaders_src = manifest.join("../moeflux/shaders/shaders.metal");
+    let shaders_abs = shaders_src.canonicalize()
+        .unwrap_or_else(|_| shaders_src.clone());
     println!("cargo:rustc-env=MOEFLUX_COMPILED_SHADERS_PATH={}",
              shaders_abs.display());
+    println!("cargo:rerun-if-changed={}", shaders_src.display());
 
     for p in [&infer_m, &moeflux_h] {
         println!("cargo:rerun-if-changed={}", p.display());
