@@ -463,13 +463,13 @@ pub fn state_load(
 }
 
 /// Public-facing convenience for `RsCtx`-aware callers that don't
-/// have direct access to the `linear_buffers` field. Drains any
-/// pending deferred dispatch first (the moeflux.h:481 contract) so
-/// the snapshot reflects post-token state, not mid-flight state.
-pub(super) fn drain_deferred(
-    deferred_slot: &mut Option<deferred::DeferredState>,
-) {
-    deferred::discard_deferred_experts_in(deferred_slot);
+/// have direct access to the `linear_buffers` field. Drains EVERY
+/// in-flight deferred dispatch (the moeflux.h:481 contract) so the
+/// snapshot reflects post-token state, not mid-flight state. Slice
+/// 5d-9 widened the deferred slot to a depth-2 ring; this drains
+/// the whole ring.
+pub(super) fn drain_deferred(deferred: &mut deferred::DeferredRing) {
+    deferred::discard_deferred_experts_in(deferred);
 }
 
 fn read_buffer_bytes(buf: &Buffer, dst: &mut [u8]) {

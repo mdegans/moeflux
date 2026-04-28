@@ -84,13 +84,16 @@ pub fn full_attn_layer_forward(
     layer_cache: &LayerWeightCache,
     buffers: &mut LayerForwardBuffers,
     moe: &mut MoeBuffers,
-    deferred: &mut Option<super::deferred::DeferredState>,
+    deferred: &mut super::deferred::DeferredRing,
     layer_idx: usize,
     pos: i32,
     k_active: usize,
     expert_files: &ExpertFiles,
     pool: &rayon::ThreadPool,
     prefetch: &mut super::PrefetchState,
+    // Slice 5d-9: which `data_prefetch` set this layer reads from
+    // (parity ping-pong: `layer_idx % 2`).
+    prefetch_set: usize,
     kv_state: &mut KvCache,
     gpu_combine: bool,
     // Slice 5d-8: see `linear_attn_layer_forward` for the contract.
@@ -404,6 +407,7 @@ pub fn full_attn_layer_forward(
         expert_files,
         pool,
         prefetch,
+        prefetch_set,
         OProj {
             w_off: o_w,
             s_off: o_s,

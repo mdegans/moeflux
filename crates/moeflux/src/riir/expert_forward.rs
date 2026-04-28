@@ -294,21 +294,29 @@ fn encode_swiglu(
 ///
 /// Allocated once and reused across every batched call. Total ~28 MB
 /// for A3B (dominated by `MAX_K × EXPERT_SIZE` ≈ 27 MB) for slice
-/// 5d-6a; ~56 MB for slice 5d-6b after `data_prefetch` is added.
+/// 5d-6a; ~56 MB for slice 5d-6b after `data_prefetch` is added; ~63 MB
+/// for slice 5d-9 after the prefetch set ping-pongs.
 ///
-/// The two K-element data sets have **fixed roles**, not a ping-pong:
+/// The data sets have **fixed roles**:
 /// - [`Self::data_synced`] is the on-demand sync-pread target. The
 ///   GPU dispatch reads from this set for slots whose actual expert
 ///   index missed the prefetch prediction.
-/// - [`Self::data_prefetch`] is the speculative prefetch target. The
-///   GPU dispatch reads from this set for slots that hit the
-///   prediction. Filled async by the prefetch thread pool ahead of
-///   the layer that consumes it.
+/// - [`Self::data_prefetch`] is the speculative prefetch target —
+///   slice 5d-9 widened it to TWO physical sets indexed by `set: 0|1`.
+///   Layer N's prefetch writes set `N % 2`; layer N+1's writes the
+///   OTHER set. With the depth-2 deferred ring, layer N+1's prefetch
+///   can fire while layer N's K-expert is still reading set `N % 2`
+///   from the GPU, because the two layers reference different
+///   physical buffers — no race. By the time layer N+2's prefetch
+///   writes set `N % 2` again, the depth-2 ring has drained layer
+///   N's deferred so set `N % 2` is safe to overwrite.
 pub struct MoeBuffers {
     /// Sync-pread (miss) target. See type-level docs.
     data_synced: [MtlBuffer<u8>; MAX_K],
-    /// Async-prefetch (hit) target. See type-level docs.
-    data_prefetch: [MtlBuffer<u8>; MAX_K],
+    /// Async-prefetch (hit) target — two parity-keyed sets. Layer N's
+    /// prefetch writes set `N % 2`; the encoder for layer N reads from
+    /// the same set. See type-level docs for the soundness argument.
+    data_prefetch: [[MtlBuffer<u8>; MAX_K]; 2],
     gate: [MtlBuffer<f32>; MAX_K],
     up: [MtlBuffer<f32>; MAX_K],
     act: [MtlBuffer<f32>; MAX_K],
@@ -332,9 +340,12 @@ impl MoeBuffers {
         let data_synced = std::array::from_fn(|_| {
             MtlBuffer::<u8>::with_len(device, v.expert_size_4bit())
         });
-        let data_prefetch = std::array::from_fn(|_| {
-            MtlBuffer::<u8>::with_len(device, v.expert_size_4bit())
-        });
+        let data_prefetch: [[MtlBuffer<u8>; MAX_K]; 2] =
+            std::array::from_fn(|_| {
+                std::array::from_fn(|_| {
+                    MtlBuffer::<u8>::with_len(device, v.expert_size_4bit())
+                })
+            });
         // Slice 5d-6: probe 2 MB DMA alignment on the data slots.
         // Apple's malloc-via-mmap path *often* lands large (>= 1 MB)
         // shared-storage allocations on 2 MB boundaries; the C path
@@ -344,9 +355,7 @@ impl MoeBuffers {
         // warn once if it ever fails so we can revisit (fallback
         // would be `posix_memalign + new_buffer_with_bytes_no_copy`).
         const TWO_MIB: usize = 2 * 1024 * 1024;
-        for (label, set) in
-            [("synced", &data_synced[..]), ("prefetch", &data_prefetch[..])]
-        {
+        let probe = |label: &str, set: &[MtlBuffer<u8>]| {
             for (slot, buf) in set.iter().enumerate() {
                 let addr = buf.raw().contents() as usize;
                 if addr % TWO_MIB != 0 {
@@ -357,10 +366,13 @@ impl MoeBuffers {
                          plan.",
                         off = addr % TWO_MIB
                     );
-                    break;
+                    return;
                 }
             }
-        }
+        };
+        probe("synced", &data_synced[..]);
+        probe("prefetch[0]", &data_prefetch[0][..]);
+        probe("prefetch[1]", &data_prefetch[1][..]);
         let gate =
             std::array::from_fn(|_| MtlBuffer::<f32>::with_len(device, v.moe_intermediate));
         let up = std::array::from_fn(|_| {
@@ -419,20 +431,26 @@ impl MoeBuffers {
     }
 
     /// All per-slot data_prefetch (async-prefetch / hit target)
-    /// buffers as disjoint `&mut [u8]` views, suitable for parallel
-    /// async pread by the prefetch state machine. Slice 5d-6b entry
-    /// point.
+    /// buffers in `set` as disjoint `&mut [u8]` views, suitable for
+    /// parallel async pread by the prefetch state machine. Slice 5d-6b
+    /// entry point; slice 5d-9 added the `set: usize` index for the
+    /// parity ping-pong.
+    ///
+    /// `set` must be `0` or `1`. The convention is layer N writes set
+    /// `N % 2`; the encoder for layer N reads from the same set.
     ///
     /// SAFETY/CORRECTNESS: caller ensures no GPU dispatch reading
-    /// from any prefetch slot is in flight, AND that the previous
-    /// async prefetch into these buffers has been drained.
+    /// from this set's slots is in flight, AND that the previous
+    /// async prefetch into THIS set has been drained.
     /// [`super::prefetch::PrefetchState::wait_for`] /
     /// [`super::prefetch::PrefetchState::drain`] are the established
     /// synchronization points.
     pub(crate) fn data_prefetch_slots_mut_array(
         &mut self,
+        set: usize,
     ) -> [&mut [u8]; MAX_K] {
-        self.data_prefetch.each_mut().map(|b| b.as_mut_slice())
+        debug_assert!(set < 2, "prefetch set index must be 0 or 1");
+        self.data_prefetch[set].each_mut().map(|b| b.as_mut_slice())
     }
 }
 
@@ -604,7 +622,8 @@ pub(crate) fn gpu_batched_experts_encode(
     // reads bufs (also shared). All consistent.
     //
     // Host-slice variant always stages into `data_synced`; emit reads
-    // accordingly.
+    // accordingly. `prefetch_set` is unused (no Prefetched slots) — pass
+    // 0 as a placeholder.
     let data_set_per_slot: [super::SlotSource; MAX_K] =
         [super::SlotSource::Synced; MAX_K];
     emit_batched_experts(
@@ -619,6 +638,7 @@ pub(crate) fn gpu_batched_experts_encode(
         k,
         v,
         &data_set_per_slot,
+        /* prefetch_set = */ 0,
         None,
     );
     Ok(cmdbuf.to_owned())
@@ -647,6 +667,7 @@ pub(crate) fn gpu_batched_experts_encode_pre_staged(
     expert_weights: &[f32],
     shared_gate_score: f32,
     data_set_per_slot: &[super::SlotSource; MAX_K],
+    prefetch_set: usize,
     chain: Option<ChainToNormed<'_>>,
 ) -> Result<metal::CommandBuffer, ExpertForwardError> {
     let v = VARIANT;
@@ -693,6 +714,7 @@ pub(crate) fn gpu_batched_experts_encode_pre_staged(
         k,
         v,
         data_set_per_slot,
+        prefetch_set,
         chain,
     );
     Ok(cmdbuf.to_owned())
@@ -735,10 +757,16 @@ fn validate_inputs(
 ///
 /// `data_set_per_slot[slot]` selects whether to bind
 /// `bufs.data_synced[slot]` ([`super::SlotSource::Synced`]) or
-/// `bufs.data_prefetch[slot]` ([`super::SlotSource::Prefetched`]) as
-/// the expert-weights source. Synchronous callers pass
-/// `[SlotSource::Synced; MAX_K]`; the 5d-6b prefetch hot path passes
-/// a per-slot mix.
+/// `bufs.data_prefetch[prefetch_set][slot]`
+/// ([`super::SlotSource::Prefetched`]) as the expert-weights source.
+/// Synchronous callers pass `[SlotSource::Synced; MAX_K]`; the prefetch
+/// hot path passes a per-slot mix.
+///
+/// `prefetch_set` (slice 5d-9) selects which of the two parity-keyed
+/// `data_prefetch` sets to read for `Prefetched` slots. Layer N
+/// reads from set `N % 2`; the prefetch state machine wrote set
+/// `N % 2` at the top of layer N's iteration. Ignored when no slot
+/// is `Prefetched`.
 #[allow(clippy::too_many_arguments)]
 fn emit_batched_experts(
     cmdbuf: &CommandBufferRef,
@@ -752,8 +780,10 @@ fn emit_batched_experts(
     k: usize,
     v: Variant,
     data_set_per_slot: &[super::SlotSource; MAX_K],
+    prefetch_set: usize,
     chain: Option<ChainToNormed<'_>>,
 ) {
+    debug_assert!(prefetch_set < 2, "prefetch set index must be 0 or 1");
     // Per-expert: Encoder A (gate+up — both read the shared `input`),
     // Encoder B (SwiGLU then down). Two encoders per expert exposes
     // GPU parallelism across slots; within an encoder the dispatches
@@ -761,7 +791,9 @@ fn emit_batched_experts(
     let pick = |slot: usize| -> &MtlBuffer<u8> {
         match data_set_per_slot[slot] {
             super::SlotSource::Synced => &bufs.data_synced[slot],
-            super::SlotSource::Prefetched => &bufs.data_prefetch[slot],
+            super::SlotSource::Prefetched => {
+                &bufs.data_prefetch[prefetch_set][slot]
+            }
         }
     };
     for slot in 0..k {

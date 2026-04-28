@@ -41,6 +41,8 @@
 //! state because there is no shared state to inherit. The cross-Ctx
 //! bug class is structurally absent in this port.
 
+use std::collections::VecDeque;
+
 use super::expert_forward::{
     gpu_batched_experts_encode, gpu_batched_experts_encode_pre_staged,
     ChainToNormed, ExpertForwardError, MoeBuffers,
@@ -48,6 +50,80 @@ use super::expert_forward::{
 use super::metal::MetalBackend;
 use super::variants::VARIANT;
 use super::{RsCtx, RsError};
+
+/// Slice 5d-9 — bounded ring of in-flight deferred K-expert dispatches.
+///
+/// Replaces the single `Option<DeferredState>` slot. With the prefetch
+/// buffer ping-ponged into two parity-keyed sets (see
+/// [`MoeBuffers::data_prefetch`]), layer N+1's prefetch can fire
+/// without racing layer N's GPU read of set `N % 2` — so the CPU no
+/// longer needs to wait at the layer boundary. Instead, the wait
+/// collapses into ring-cleanup: drain the oldest entry only when the
+/// ring is at capacity.
+///
+/// Depth = 2: at any time, layer N-1's K-expert and layer N's K-expert
+/// can both be in flight. Entering layer N+1, we drain layer N-1
+/// (oldest). By that point N-1 has had ~2 layer-times of GPU runtime
+/// so the wait is short or zero. Metal queue serialization on a single
+/// command queue (`metal::MetalBackend::queue`) handles the inter-
+/// cmdbuf data dependencies (`linear_buffers.{normed, input, sum_sq}`
+/// written by N's chain, read by N+1's CMD1) without explicit CPU
+/// synchronization.
+///
+/// Going deeper would need a third prefetch set + another layer of
+/// pipeline for diminishing returns.
+pub struct DeferredRing {
+    states: VecDeque<DeferredState>,
+}
+
+impl DeferredRing {
+    /// Maximum number of concurrently in-flight deferred dispatches.
+    pub(crate) const DEPTH: usize = 2;
+
+    pub fn new() -> Self {
+        Self {
+            states: VecDeque::with_capacity(Self::DEPTH),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.states.is_empty()
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.states.len() >= Self::DEPTH
+    }
+
+    pub fn len(&self) -> usize {
+        self.states.len()
+    }
+
+    /// Push a fresh dispatch onto the ring. Errors with [`DeferredError::RingFull`]
+    /// if the ring is already at [`Self::DEPTH`] — callers in
+    /// `step_internal` must drain before pushing past capacity.
+    pub(crate) fn push(
+        &mut self,
+        state: DeferredState,
+    ) -> Result<(), DeferredError> {
+        if self.is_full() {
+            return Err(DeferredError::RingFull);
+        }
+        self.states.push_back(state);
+        Ok(())
+    }
+
+    /// Remove and return the oldest in-flight dispatch (FIFO). Caller
+    /// is responsible for `wait_until_completed` + readback as needed.
+    pub(crate) fn pop_oldest(&mut self) -> Option<DeferredState> {
+        self.states.pop_front()
+    }
+}
+
+impl Default for DeferredRing {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Finalize-policy for a deferred K-expert dispatch. Slice 4f-3
 /// shipped only [`Self::Gpu`] (CMD3 includes
@@ -99,12 +175,17 @@ pub struct DeferredState {
 /// Errors from the deferred-experts state machine.
 #[derive(Debug, thiserror::Error)]
 pub enum DeferredError {
+    /// Slice 5d-9: ring at capacity. Drain the oldest dispatch
+    /// (`complete_deferred_experts_*` or `discard_deferred_experts_*`)
+    /// before pushing a new one. With the depth-2 ring, this fires
+    /// only if a caller forgot to drain after `DeferredRing::DEPTH`
+    /// pushes — production `step_internal` drains when full so this
+    /// is unreachable on the hot path.
     #[error(
-        "a deferred-experts dispatch is already active; call \
-         complete_deferred_experts or discard_deferred_experts before \
-         begin_deferred_experts"
+        "deferred-experts ring is at capacity; drain the oldest dispatch \
+         before pushing a new one"
     )]
-    AlreadyActive,
+    RingFull,
     #[error(
         "hidden_out must be HIDDEN_DIM={expected} floats, got {actual}"
     )]
@@ -136,7 +217,7 @@ impl From<RsError> for DeferredError {
 pub(crate) fn gpu_batched_experts_begin(
     metal: &mut MetalBackend,
     bufs: &mut MoeBuffers,
-    slot: &mut Option<DeferredState>,
+    ring: &mut DeferredRing,
     actual_k: i32,
     expert_data: &[u8],
     h_post: &[f32],
@@ -147,8 +228,8 @@ pub(crate) fn gpu_batched_experts_begin(
     layer_idx: i32,
     gpu_combine: bool,
 ) -> Result<(), DeferredError> {
-    if slot.is_some() {
-        return Err(DeferredError::AlreadyActive);
+    if ring.is_full() {
+        return Err(DeferredError::RingFull);
     }
     let cmd_buffer = gpu_batched_experts_encode(
         metal,
@@ -180,12 +261,12 @@ pub(crate) fn gpu_batched_experts_begin(
             shared_gate_score,
         }
     };
-    *slot = Some(DeferredState {
+    ring.push(DeferredState {
         cmd_buffer,
         mode,
         layer_idx,
         actual_k: actual_k as usize,
-    });
+    })?;
     Ok(())
 }
 
@@ -205,7 +286,7 @@ pub(crate) fn gpu_batched_experts_begin(
 pub(crate) fn gpu_batched_experts_begin_pre_staged(
     metal: &mut MetalBackend,
     bufs: &mut MoeBuffers,
-    slot: &mut Option<DeferredState>,
+    ring: &mut DeferredRing,
     actual_k: i32,
     input: &metal::BufferRef,
     h_mid: &metal::BufferRef,
@@ -214,10 +295,11 @@ pub(crate) fn gpu_batched_experts_begin_pre_staged(
     shared_gate_score: f32,
     layer_idx: i32,
     data_set_per_slot: &[super::SlotSource; super::MAX_K],
+    prefetch_set: usize,
     chain: Option<ChainToNormed<'_>>,
 ) -> Result<(), DeferredError> {
-    if slot.is_some() {
-        return Err(DeferredError::AlreadyActive);
+    if ring.is_full() {
+        return Err(DeferredError::RingFull);
     }
     let cmd_buffer = gpu_batched_experts_encode_pre_staged(
         metal,
@@ -229,21 +311,22 @@ pub(crate) fn gpu_batched_experts_begin_pre_staged(
         expert_weights,
         shared_gate_score,
         data_set_per_slot,
+        prefetch_set,
         chain,
     )?;
     cmd_buffer.commit();
-    *slot = Some(DeferredState {
+    ring.push(DeferredState {
         cmd_buffer,
         mode: DeferredMode::Gpu,
         layer_idx,
         actual_k: actual_k as usize,
-    });
+    })?;
     Ok(())
 }
 
 /// Free-function variant of [`RsCtx::complete_deferred_experts`].
-/// Drains the in-flight dispatch into `hidden_out` and clears
-/// `slot`. No-op if `slot` is `None`.
+/// Pops the OLDEST dispatch from the ring, waits for it, and drains
+/// it into `hidden_out`. No-op if the ring is empty.
 ///
 /// In [`DeferredMode::Gpu`] mode, the readback target is
 /// `bufs.moe_hidden`. In [`DeferredMode::Cpu`] mode, the K per-
@@ -251,7 +334,7 @@ pub(crate) fn gpu_batched_experts_begin_pre_staged(
 /// CPU-side per `infer.m:4106..4129`:
 /// `hidden = h_mid + Σ_k weights[k] × out[k] + sigmoid(gate) × shared_out`.
 pub(crate) fn complete_deferred_experts_into(
-    slot: &mut Option<DeferredState>,
+    ring: &mut DeferredRing,
     bufs: &MoeBuffers,
     hidden_out: &mut [f32],
 ) -> Result<(), DeferredError> {
@@ -261,7 +344,7 @@ pub(crate) fn complete_deferred_experts_into(
             actual: hidden_out.len(),
         });
     }
-    let Some(state) = slot.take() else {
+    let Some(state) = ring.pop_oldest() else {
         return Ok(());
     };
     state.cmd_buffer.wait_until_completed();
@@ -291,13 +374,13 @@ pub(crate) fn complete_deferred_experts_into(
 
 /// Drain a chained K-expert dispatch (slice 5d-8). The chain wrote
 /// the next layer's normalized input directly into
-/// `linear_buffers.normed`, so this just waits + clears `slot`. No
-/// readback. Used by the layer loop on iterations where the previous
-/// layer chained.
+/// `linear_buffers.normed`, so this just waits + pops the ring's
+/// oldest entry. No readback. Used by the layer loop on iterations
+/// where the previous layer chained.
 pub(crate) fn complete_deferred_experts_chained(
-    slot: &mut Option<DeferredState>,
+    ring: &mut DeferredRing,
 ) -> Result<(), DeferredError> {
-    let Some(state) = slot.take() else {
+    let Some(state) = ring.pop_oldest() else {
         return Ok(());
     };
     state.cmd_buffer.wait_until_completed();
@@ -355,13 +438,16 @@ fn cpu_combine(
     }
 }
 
-/// Free-function variant of [`RsCtx::discard_deferred_experts`]. Used
-/// to defensively drain `slot` without reading back — both for
-/// prefill tokens whose hidden state will be overwritten by the next
-/// embedding and as a bracketing guard in `RsCtx::layer_forward_dump`
-/// against stale state from a buggy caller.
-pub(crate) fn discard_deferred_experts_in(slot: &mut Option<DeferredState>) {
-    if let Some(state) = slot.take() {
+/// Free-function variant of [`RsCtx::discard_deferred_experts`]. Drains
+/// EVERY in-flight dispatch in the ring without reading back — used
+/// for prefill tokens whose hidden state will be overwritten by the
+/// next embedding, as a bracketing guard in `RsCtx::layer_forward_dump`
+/// against stale state from a buggy caller, and inside
+/// `RsCtx::memory_clear` / `state_save` / `state_load` to ensure no
+/// GPU work is in flight against shared buffers when the caller
+/// mutates host-side state.
+pub(crate) fn discard_deferred_experts_in(ring: &mut DeferredRing) {
+    while let Some(state) = ring.pop_oldest() {
         state.cmd_buffer.wait_until_completed();
     }
 }
@@ -376,9 +462,9 @@ impl RsCtx {
     /// non-layer dispatches.
     ///
     /// Errors:
-    /// - [`DeferredError::AlreadyActive`] if a previous deferred
-    ///   dispatch is still pending. Mirrors the C path's
-    ///   single-active-buffer invariant.
+    /// - [`DeferredError::RingFull`] if the depth-2 ring is at
+    ///   capacity. The diff-oracle entry path always drains between
+    ///   calls so this is unreachable in practice.
     /// - [`DeferredError::Encode`] for any input-validation failure
     ///   from [`gpu_batched_experts_encode`].
     /// - [`DeferredError::Init`] if Metal / MoE buffers fail to

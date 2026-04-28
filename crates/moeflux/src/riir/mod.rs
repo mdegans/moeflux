@@ -49,7 +49,7 @@ pub mod state;
 pub mod state_snapshot;
 pub mod variants;
 pub mod weight_file;
-pub use deferred::{DeferredError, DeferredState};
+pub use deferred::{DeferredError, DeferredRing, DeferredState};
 pub use embedding::{bf16_to_f32, embed_lookup, EmbeddingError};
 pub use expert_forward::{
     gpu_batched_experts_forward, gpu_expert_forward, ExpertForwardError,
@@ -137,14 +137,17 @@ pub struct RsCtx {
     layer_caches: Option<Vec<LayerWeightCache>>,
     /// Lazily-built persistent buffer set for the linear-attn forward.
     linear_buffers: Option<LinearAttnBuffers>,
-    /// Slice 4e — pending deferred-experts state. `Some` ↔ a
-    /// `begin_deferred_experts` call has committed a cmdbuf without
-    /// waiting; the matching `complete_deferred_experts` /
-    /// `discard_deferred_experts` consumes it. C-side analogue is
+    /// Slice 4e — pending deferred-experts state. Originally a
+    /// single `Option<DeferredState>` (one in-flight K-expert dispatch
+    /// at a time); slice 5d-9 widened it to a depth-2
+    /// [`DeferredRing`] so layer N+1's CMD1 can be submitted while
+    /// layer N's K-expert is still running on the GPU. Drains by
+    /// `complete_deferred_experts_*` (pop oldest) or
+    /// `discard_deferred_experts_*` (drain all). C-side analogue is
     /// the file-scope `g_deferred` global; lifetime-binding to
     /// `RsCtx` here is what eliminates the cross-Ctx NaN bug class
     /// (see [`deferred`] module docs).
-    deferred: Option<DeferredState>,
+    deferred: DeferredRing,
     /// Persistent GPU LM head dispatcher. Lazily built by
     /// [`Self::ensure_linear_resources`] alongside the other GPU
     /// resources. Replaces the per-token `lm_head_cpu` call (which
@@ -203,7 +206,7 @@ impl RsCtx {
             wf_buf: None,
             layer_caches: None,
             linear_buffers: None,
-            deferred: None,
+            deferred: DeferredRing::new(),
             lm_head_gpu: None,
             io_pool,
             prefetch,
@@ -750,6 +753,13 @@ impl RsCtx {
             );
         }
 
+        // Slice 5d-9: dump hook tests one layer at a time. Match the
+        // production parity convention so the dispatched layer reads
+        // from the same set its prefetch (if any) wrote to. The
+        // `invalidate_all` above means no prefetch is in flight, but
+        // production-path data_set_per_slot stays consistent.
+        let prefetch_set = layer_idx_us % 2;
+
         if is_full {
             let kv_state = match &mut layer_states[layer_idx_us] {
                 LayerState::FullAttn(kv) => kv,
@@ -771,6 +781,7 @@ impl RsCtx {
                 experts,
                 io_pool,
                 prefetch,
+                prefetch_set,
                 kv_state,
                 gpu_combine,
                 /* prev_layer_chained = */ false,
@@ -797,6 +808,7 @@ impl RsCtx {
                 experts,
                 io_pool,
                 prefetch,
+                prefetch_set,
                 layer_state,
                 gpu_combine,
                 /* prev_layer_chained = */ false,
@@ -1052,39 +1064,34 @@ impl RsCtx {
                 .map_err(|_| RsError::EvalFailed)?;
         }
 
-        // Per-layer loop. Each layer leaves a deferred K-expert
-        // dispatch active; the next iteration drains it before running
-        // its own forward. gpu_combine = true everywhere preserves the
-        // slice 4f-3 production behavior.
+        // Per-layer loop. Slice 5d-9 widened the deferred slot to a
+        // depth-2 ring and dropped the explicit per-layer wait — the
+        // CPU now submits layer N+1's CMD1+CMD2+chain without waiting
+        // for layer N's K-expert. Metal queue serialization on a
+        // single command queue ensures N+1's CMD1 reads
+        // `linear_buffers.normed` only after N's chain wrote it.
         //
-        // Slice 5d-8: when the previous layer chained, the K-expert
-        // cmdbuf already wrote the next layer's normed input into
-        // `linear_buffers.normed` and the unnormed combine output into
-        // `linear_buffers.input` — the drain becomes a bare wait, no
-        // readback. The chain is enabled for every non-last layer.
+        // The wait collapses into ring-cleanup: drain the oldest
+        // dispatch only when the ring is at capacity. With depth 2,
+        // entering layer N drains layer N-2's dispatch — by then it's
+        // had ~2 layer-times of GPU runtime so the wait is short or
+        // zero.
+        //
+        // Soundness for prefetch: layer N's prefetch wrote set
+        // `N % 2`; layer N+1 writes the OTHER set (no race with N's
+        // GPU read). Layer N+2's prefetch writes set `N % 2` again,
+        // but by then layer N has been drained — set `N % 2` is
+        // free. See `MoeBuffers::data_prefetch` docs.
+        //
+        // gpu_combine = true everywhere preserves the slice 4f-3
+        // production behavior. Every non-last layer chains (slice
+        // 5d-8) so the drained N-2 dispatch is always chained — no
+        // host readback needed during the loop.
         let mut prev_layer_chained = false;
         for layer_idx in 0..v.num_layers {
-            if layer_idx > 0 {
-                if prev_layer_chained {
-                    deferred::complete_deferred_experts_chained(deferred)
-                        .map_err(|_| RsError::EvalFailed)?;
-                } else {
-                    // Drain previous layer's deferred dispatch into
-                    // linear_buffers.input. SAFETY: shared-storage
-                    // buffer; complete_* waits before reading.
-                    let buf_input_slice = unsafe {
-                        std::slice::from_raw_parts_mut(
-                            linear_buffers.input.contents() as *mut f32,
-                            v.hidden_dim,
-                        )
-                    };
-                    deferred::complete_deferred_experts_into(
-                        deferred,
-                        moe_buffers,
-                        buf_input_slice,
-                    )
+            if deferred.is_full() {
+                deferred::complete_deferred_experts_chained(deferred)
                     .map_err(|_| RsError::EvalFailed)?;
-                }
             }
 
             // Slice 5d-6b: kick off async prefetch for THIS layer
@@ -1098,9 +1105,14 @@ impl RsCtx {
             // layer's GPU read of data_prefetch[slot] is complete
             // before we overwrite it. First token has no predictions,
             // skip the fire (predict_for returns None).
+            // Slice 5d-9: layer N writes set `N % 2` so layer N+1's
+            // prefetch (which writes the OTHER set) doesn't race layer
+            // N's GPU read of set `N % 2`. The encoder for layer N
+            // reads from the same set this prefetch wrote to.
+            let prefetch_set = layer_idx % 2;
             if let Some(predicted) = prefetch.predict_for(layer_idx) {
                 let data_prefetch =
-                    moe_buffers.data_prefetch_slots_mut_array();
+                    moe_buffers.data_prefetch_slots_mut_array(prefetch_set);
                 prefetch.dispatch(
                     layer_idx,
                     predicted,
@@ -1143,6 +1155,7 @@ impl RsCtx {
                     experts,
                     io_pool,
                     prefetch,
+                    prefetch_set,
                     kv_state,
                     /* gpu_combine = */ true,
                     prev_layer_chained,
@@ -1169,6 +1182,7 @@ impl RsCtx {
                     experts,
                     io_pool,
                     prefetch,
+                    prefetch_set,
                     layer_state,
                     /* gpu_combine = */ true,
                     prev_layer_chained,
@@ -1179,8 +1193,24 @@ impl RsCtx {
             prev_layer_chained = chain_next;
         }
 
-        // Final layer left a deferred dispatch active. Drain (or
-        // discard) based on emit policy.
+        // Slice 5d-9 post-loop drain. With the depth-2 ring, the
+        // tail of the loop typically leaves [layer N-1, layer N]
+        // in flight, where N = num_layers - 1 is the unchained last
+        // layer and N-1 is chained (chain wrote `linear_buffers.normed`
+        // for what would be layer N+1 — but there is no layer N+1, so
+        // the chained-write is harmless and we just drain it without
+        // readback). Layer N's combine wrote into `bufs.moe_hidden`
+        // (chain disabled at last layer), so its drain readback is
+        // canonical for the LM head.
+        //
+        // For 1-layer models the ring has only [layer 0] and the
+        // while-loop is a no-op; for 2-layer models the ring has
+        // [layer 0 chained, layer 1 unchained] and the while-loop
+        // drains layer 0 once. Generalizes to N layers.
+        while deferred.len() > 1 {
+            deferred::complete_deferred_experts_chained(deferred)
+                .map_err(|_| RsError::EvalFailed)?;
+        }
         match logits_out {
             None => {
                 deferred::discard_deferred_experts_in(deferred);

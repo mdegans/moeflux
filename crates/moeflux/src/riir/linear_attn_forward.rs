@@ -40,7 +40,7 @@ use metal::{
 
 use super::deferred::{
     gpu_batched_experts_begin, gpu_batched_experts_begin_pre_staged,
-    DeferredError, DeferredState,
+    DeferredError,
 };
 use super::expert_forward::{ChainToNormed, MoeBuffers};
 use super::expert_io::ExpertFiles;
@@ -416,12 +416,16 @@ pub fn linear_attn_layer_forward(
     layer_cache: &LayerWeightCache,
     buffers: &mut LayerForwardBuffers,
     moe: &mut MoeBuffers,
-    deferred: &mut Option<DeferredState>,
+    deferred: &mut super::DeferredRing,
     layer_idx: usize,
     k_active: usize,
     expert_files: &ExpertFiles,
     pool: &rayon::ThreadPool,
     prefetch: &mut super::PrefetchState,
+    // Slice 5d-9: which `data_prefetch` set this layer reads from
+    // (parity ping-pong: `layer_idx % 2`). Plumbed through to
+    // `post_attention_tail`'s K-expert dispatch.
+    prefetch_set: usize,
     _layer_state: &mut LinearAttnState,
     gpu_combine: bool,
     // Slice 5d-8: previous layer's K-expert dispatch chained the
@@ -673,6 +677,7 @@ pub fn linear_attn_layer_forward(
         expert_files,
         pool,
         prefetch,
+        prefetch_set,
         OProj {
             w_off: o_w,
             s_off: o_s,
@@ -719,12 +724,16 @@ pub(super) fn post_attention_tail(
     layer_cache: &LayerWeightCache,
     buffers: &mut LayerForwardBuffers,
     moe: &mut MoeBuffers,
-    deferred: &mut Option<DeferredState>,
+    deferred: &mut super::DeferredRing,
     layer_idx: usize,
     k_active: usize,
     expert_files: &ExpertFiles,
     pool: &rayon::ThreadPool,
     prefetch: &mut super::PrefetchState,
+    // Slice 5d-9: which `data_prefetch` set this layer reads from. The
+    // caller assigns set `layer_idx % 2`; the prefetch state machine
+    // wrote that same set at the top of this layer's iteration.
+    prefetch_set: usize,
     o_proj: OProj,
     gpu_combine: bool,
     gpu_attn_args: Option<GpuAttnEncodeArgs>,
@@ -1152,6 +1161,7 @@ pub(super) fn post_attention_tail(
             shared_gate_score,
             layer_idx as i32,
             &data_set_per_slot,
+            prefetch_set,
             chain,
         )?;
     } else {
