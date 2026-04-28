@@ -6,7 +6,7 @@ members = [
 ]
 
 [workspace.package]
-version       = "0.1.0-pre.1"
+version       = "0.1.0-pre.2"
 edition       = "2024"
 rust-version  = "1.89"
 license       = "MIT"
@@ -14,7 +14,7 @@ repository    = "https://github.com/mdegans/moeflux"
 authors       = ["Michael de Gans <michael.john.degans@gmail.com>"]
 
 [workspace.dependencies]
-moeflux-sys = { path = "crates/moeflux-sys", version = "=0.1.0-pre.1" }
+moeflux-sys = { path = "crates/moeflux-sys", version = "=0.1.0-pre.2" }
 thiserror   = "1.0"
 memmap2     = "0.9"
 serde       = { version = "1", features = ["derive"] }
