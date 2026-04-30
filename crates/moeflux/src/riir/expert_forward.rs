@@ -50,9 +50,21 @@ use metal::{
     NSUInteger,
 };
 
+use super::gpu_matvec::MatvecPipelines;
 use super::gpu_norm::{encode_rms_norm_bf16_into, RmsNormBf16Pipelines};
 use super::metal::{MetalBackend, MetalError, MtlBuffer};
-use super::variants::{Variant, GROUP_SIZE, VARIANT};
+use super::variants::{SharedExpertGate, Variant, GROUP_SIZE, VARIANT};
+
+/// Pipeline name for the MoE combine kernel — varies by variant.
+/// Cogito-V2 / DeepSeek-V3 use the unscaled raw-add path; Qwen3 MoE
+/// keeps the sigmoid-gated path. Mirrors `deepseek_moe_cpu`'s
+/// unconditional `out[i] += shared[i]` (moe_cpu.rs:168-173).
+fn combine_kernel_name() -> &'static str {
+    match VARIANT.shared_expert_gate {
+        SharedExpertGate::SigmoidGate => "moe_combine_residual",
+        SharedExpertGate::Unscaled => "moe_combine_residual_unscaled",
+    }
+}
 
 /// Chained-norm targets for slice 5d-8. When `Some`, the K-expert
 /// encoder rebinds `moe_combine_residual` to write into `combine_out`
@@ -588,11 +600,14 @@ pub(crate) fn gpu_batched_experts_encode(
     }
 
     // Compile/fetch pipelines first so no `&mut metal` borrow holds across
-    // encoder construction.
-    let matvec = metal.pipeline("dequant_matvec_4bit_v3")?.clone();
+    // encoder construction. Both 4-bit matvec PSOs are fetched so the
+    // emit helper can pick v3 (in_dim ≤ 4096) vs fast (> 4096) per
+    // dispatch — Cogito-V2's hidden_dim=7168 needs `_fast` for the
+    // gate/up matvecs while down (in_dim=2048) stays on v3.
+    let matvec = MatvecPipelines::fetch(metal)?;
     let swiglu = metal.pipeline("swiglu_fused")?.clone();
     let combine = if gpu_combine {
-        Some(metal.pipeline("moe_combine_residual")?.clone())
+        Some(metal.pipeline(combine_kernel_name())?.clone())
     } else {
         None
     };
@@ -686,10 +701,11 @@ pub(crate) fn gpu_batched_experts_encode_pre_staged(
     }
 
     // Pipelines first; no `&mut metal` borrow held across encoder
-    // construction.
-    let matvec = metal.pipeline("dequant_matvec_4bit_v3")?.clone();
+    // construction. See sibling `gpu_batched_experts_encode` for why
+    // both matvec PSOs are fetched (Cogito-V2 hidden_dim>4096 split).
+    let matvec = MatvecPipelines::fetch(metal)?;
     let swiglu = metal.pipeline("swiglu_fused")?.clone();
-    let combine = metal.pipeline("moe_combine_residual")?.clone();
+    let combine = metal.pipeline(combine_kernel_name())?.clone();
 
     // Only stage the 18-float combine params — bufs' data buffers are
     // the caller's responsibility (data_synced via 5d-6a's parallel
@@ -770,7 +786,7 @@ fn validate_inputs(
 #[allow(clippy::too_many_arguments)]
 fn emit_batched_experts(
     cmdbuf: &CommandBufferRef,
-    matvec: &ComputePipelineState,
+    matvec: &MatvecPipelines,
     swiglu: &ComputePipelineState,
     combine: Option<&ComputePipelineState>,
     bufs: &MoeBuffers,
@@ -924,9 +940,17 @@ fn emit_batched_experts(
 /// takes a pre-existing encoder so the caller can fold multiple
 /// dispatches into one encoder (matches the C path's
 /// `gpu_encode_experts_batched` 2-encoder-per-expert layout).
+///
+/// Picks `dequant_matvec_4bit_v3` (cached input in 4096-float
+/// threadgroup memory; bounded by Apple's 32 KB tg limit) when
+/// `in_dim ≤ 4096`, else `dequant_matvec_4bit_fast` (no input cache).
+/// Mirrors [`encode_matvec`]'s pipeline-selection so the experts path
+/// works for variants whose `hidden_dim` exceeds 4096 (Cogito-V2 is
+/// 7168 — `dequant_matvec_4bit_v3` would silently truncate the input
+/// to 4096 and produce ~3% drift on the gate/up matvecs).
 fn encode_matvec_into(
     enc: &metal::ComputeCommandEncoderRef,
-    pipeline: &metal::ComputePipelineState,
+    pipes: &MatvecPipelines,
     data: &MtlBuffer<u8>,
     w_off: usize,
     s_off: usize,
@@ -937,6 +961,12 @@ fn encode_matvec_into(
     in_dim: u32,
 ) {
     let group_size = GROUP_SIZE as u32;
+    let use_v3 = in_dim <= 4096;
+    let pipeline = if use_v3 {
+        &pipes.v3_4bit
+    } else {
+        &pipes.fast_4bit
+    };
     enc.set_compute_pipeline_state(pipeline);
     enc.set_buffer(0, Some(data.raw()), w_off as NSUInteger);
     enc.set_buffer(1, Some(data.raw()), s_off as NSUInteger);
@@ -946,11 +976,18 @@ fn encode_matvec_into(
     enc.set_bytes(5, 4, (&out_dim as *const u32).cast());
     enc.set_bytes(6, 4, (&in_dim as *const u32).cast());
     enc.set_bytes(7, 4, (&group_size as *const u32).cast());
-    let num_tgs = (out_dim + 7) / 8;
-    enc.dispatch_thread_groups(
-        MTLSize::new(num_tgs as NSUInteger, 1, 1),
-        MTLSize::new(256, 1, 1),
-    );
+    if use_v3 {
+        let num_tgs = (out_dim + 7) / 8;
+        enc.dispatch_thread_groups(
+            MTLSize::new(num_tgs as NSUInteger, 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
+    } else {
+        enc.dispatch_thread_groups(
+            MTLSize::new(out_dim as NSUInteger, 1, 1),
+            MTLSize::new(64, 1, 1),
+        );
+    }
 }
 
 fn encode_swiglu_into_buf(

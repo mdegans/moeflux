@@ -1385,6 +1385,71 @@ kernel void moe_combine_residual(
 }
 
 // ============================================================================
+// Kernel 12b: MoE combine + residual (UNSCALED shared-expert variant)
+// ============================================================================
+// Sibling of `moe_combine_residual` for DeepSeek-V3 / Cogito-V2: the
+// shared-expert output is added unconditionally, no sigmoid, no gate
+// scalar. Mirrors `deepseek_moe_cpu` (moe_cpu.rs:168-173): raw
+// `out[i] += shared[i]`. Variant-flagged by `VARIANT.shared_expert_gate
+// == Unscaled` (variants.rs:115). Same buffer layout as the parent
+// kernel so the dispatcher just swaps PSOs.
+//
+// Dispatch:
+//   threadgroups = (ceil(dim/256), 1, 1)
+//   threads      = (256, 1, 1)
+//
+// Note: `params[16]` (shared_gate_score) is bound to keep the params
+// layout identical, but the kernel does not read it.
+
+kernel void moe_combine_residual_unscaled(
+    device const float* h_mid       [[buffer(0)]],   // [dim]
+    device const float* shared_out  [[buffer(1)]],   // [dim]
+    device float*       hidden_out  [[buffer(2)]],   // [dim] output
+    device const float* expert_out0 [[buffer(3)]],
+    device const float* expert_out1 [[buffer(4)]],
+    device const float* expert_out2 [[buffer(5)]],
+    device const float* expert_out3 [[buffer(6)]],
+    device const float* expert_out4 [[buffer(7)]],
+    device const float* expert_out5 [[buffer(8)]],
+    device const float* expert_out6 [[buffer(9)]],
+    device const float* expert_out7  [[buffer(10)]],
+    device const float* expert_out8  [[buffer(11)]],
+    device const float* expert_out9  [[buffer(12)]],
+    device const float* expert_out10 [[buffer(13)]],
+    device const float* expert_out11 [[buffer(14)]],
+    device const float* expert_out12 [[buffer(15)]],
+    device const float* expert_out13 [[buffer(16)]],
+    device const float* expert_out14 [[buffer(17)]],
+    device const float* expert_out15 [[buffer(18)]],
+    device const float* params       [[buffer(19)]], // [18]: weights[0..15], (16/17 unused here)
+    constant uint&      dim          [[buffer(20)]],
+    constant uint&      K            [[buffer(21)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= dim) return;
+
+    float moe = 0.0f;
+    if (K >  0) moe += params[ 0] * expert_out0[tid];
+    if (K >  1) moe += params[ 1] * expert_out1[tid];
+    if (K >  2) moe += params[ 2] * expert_out2[tid];
+    if (K >  3) moe += params[ 3] * expert_out3[tid];
+    if (K >  4) moe += params[ 4] * expert_out4[tid];
+    if (K >  5) moe += params[ 5] * expert_out5[tid];
+    if (K >  6) moe += params[ 6] * expert_out6[tid];
+    if (K >  7) moe += params[ 7] * expert_out7[tid];
+    if (K >  8) moe += params[ 8] * expert_out8[tid];
+    if (K >  9) moe += params[ 9] * expert_out9[tid];
+    if (K > 10) moe += params[10] * expert_out10[tid];
+    if (K > 11) moe += params[11] * expert_out11[tid];
+    if (K > 12) moe += params[12] * expert_out12[tid];
+    if (K > 13) moe += params[13] * expert_out13[tid];
+    if (K > 14) moe += params[14] * expert_out14[tid];
+    if (K > 15) moe += params[15] * expert_out15[tid];
+
+    hidden_out[tid] = h_mid[tid] + moe + shared_out[tid];
+}
+
+// ============================================================================
 // Kernel 13: YaRN RoPE (DeepSeek-V3 / Cogito-V2 MLA)
 // ============================================================================
 // In-place rotation of a `[num_heads, rotary_dim]` buffer using a
@@ -1697,5 +1762,105 @@ kernel void mla_sdpa_folded(
             acc = fma(scores[t], latent_cache[t * kv_lora_rank + c], acc);
         }
         vc_h[c] = acc;
+    }
+}
+
+// ============================================================================
+// Kernel 17: MLA fan-out split (Phase 4a — kill MLA sync points)
+// ============================================================================
+// One dispatch fans `q_full` (post `q_b_proj`) and `kv_pre` (post
+// `kv_a_proj_with_mqa`) out into the four downstream MLA buffers
+// (`q_nope`, `q_pe`, `kv_lat`, `k_pe`). Replaces the host-side scatter
+// at `mla_attn_forward.rs:380-407` so the whole MLA forward can stay
+// in one Metal command buffer (Plan-of-record's Phase 4a refactor).
+//
+// Layout per head in `q_full`: `[q_nope_part | q_pe_part]` of widths
+// `qk_nope_head_dim` and `qk_rope_head_dim`. Layout in `kv_pre`:
+// `[kv_lat (kv_lora_rank) | k_pe (qk_rope_head_dim)]`.
+//
+// Dispatch:
+//   threadgroups = ceil(max_out / 256)  where max_out = max(num_heads*qk_nope,
+//                                                            num_heads*qk_rope,
+//                                                            kv_lora_rank,
+//                                                            qk_rope_head_dim)
+//   threads      = (256, 1, 1)
+//
+// Each thread checks each output's bound and writes if in range —
+// pure scatter, no math. Cogito-V2 max_out = 128 * 128 = 16 384.
+
+kernel void mla_split_q_kv(
+    device const float* q_full          [[buffer(0)]],
+    device const float* kv_pre          [[buffer(1)]],
+    device float*       q_nope          [[buffer(2)]],
+    device float*       q_pe            [[buffer(3)]],
+    device float*       kv_lat          [[buffer(4)]],
+    device float*       k_pe            [[buffer(5)]],
+    constant uint&      num_heads       [[buffer(6)]],
+    constant uint&      qk_nope         [[buffer(7)]],
+    constant uint&      qk_rope         [[buffer(8)]],
+    constant uint&      kv_lora_rank    [[buffer(9)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    uint qk_head_dim = qk_nope + qk_rope;
+
+    // q_nope[h, i] = q_full[h, i]
+    uint q_nope_total = num_heads * qk_nope;
+    if (tid < q_nope_total) {
+        uint h = tid / qk_nope;
+        uint i = tid - h * qk_nope;
+        q_nope[h * qk_nope + i] = q_full[h * qk_head_dim + i];
+    }
+
+    // q_pe[h, i] = q_full[h, qk_nope + i]
+    uint q_pe_total = num_heads * qk_rope;
+    if (tid < q_pe_total) {
+        uint h = tid / qk_rope;
+        uint i = tid - h * qk_rope;
+        q_pe[h * qk_rope + i] = q_full[h * qk_head_dim + qk_nope + i];
+    }
+
+    // kv_lat[c] = kv_pre[c]
+    if (tid < kv_lora_rank) {
+        kv_lat[tid] = kv_pre[tid];
+    }
+
+    // k_pe[r] = kv_pre[kv_lora_rank + r]
+    if (tid < qk_rope) {
+        k_pe[tid] = kv_pre[kv_lora_rank + tid];
+    }
+}
+
+// ============================================================================
+// Kernel 18: MLA cache append (Phase 4a)
+// ============================================================================
+// Append `(kv_lat, k_pe)` into the per-layer MLA KV cache rows at
+// position `pos`. Mirrors the host-side memcpy at
+// `mla_attn_forward.rs:467-481`; runs as a Metal kernel so the whole
+// forward stays in one cmdbuf.
+//
+// Caller is responsible for incrementing `kv_cache.len = pos + 1`
+// after the cmdbuf commits — only the GPU-visible cache row update
+// happens here; the Rust-side `len` field is invisible to the kernel.
+//
+// Dispatch:
+//   threadgroups = ceil(max(kv_lora_rank, qk_rope_head_dim) / 256)
+//   threads      = (256, 1, 1)
+
+kernel void mla_kv_cache_append(
+    device const float* kv_lat        [[buffer(0)]],
+    device const float* k_pe          [[buffer(1)]],
+    device float*       latent_cache  [[buffer(2)]],
+    device float*       rope_k_cache  [[buffer(3)]],
+    constant uint&      kv_lora_rank  [[buffer(4)]],
+    constant uint&      qk_rope       [[buffer(5)]],
+    constant int&       pos           [[buffer(6)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    uint p = uint(pos);
+    if (tid < kv_lora_rank) {
+        latent_cache[p * kv_lora_rank + tid] = kv_lat[tid];
+    }
+    if (tid < qk_rope) {
+        rope_k_cache[p * qk_rope + tid] = k_pe[tid];
     }
 }
