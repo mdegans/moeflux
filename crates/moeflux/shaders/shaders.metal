@@ -1383,3 +1383,53 @@ kernel void moe_combine_residual(
 
     hidden_out[tid] = h_mid[tid] + moe + shared_gate * shared_out[tid];
 }
+
+// ============================================================================
+// Kernel 13: YaRN RoPE (DeepSeek-V3 / Cogito-V2 MLA)
+// ============================================================================
+// In-place rotation of a `[num_heads, rotary_dim]` buffer using a
+// pre-computed inv_freq table and a position scalar with mscale baked
+// into both cos and sin terms. Mirrors `apply_rotary_emb_yarn`
+// (rope.rs:306) bit-for-bit modulo libm-vs-Metal-fast-math drift.
+//
+// Pairing convention: x[h, i] paired with x[h, i + half] (MLX style),
+// where half = rotary_dim / 2.
+//
+// Dispatch:
+//   threadgroups = (num_heads, half, 1)
+//   threads      = (1, 1, 1)              (one rotation per thread)
+//
+// One thread handles one (head, i) pair; no inter-thread coordination
+// needed. The trivial threadgroup geometry is fine because num_heads ×
+// half ≈ 128 * 32 = 4096 threads for Cogito-V2 — plenty of work for
+// the GPU without any reduction.
+
+kernel void yarn_rope_apply(
+    device   float*       x          [[buffer(0)]],   // [num_heads, rotary_dim]
+    constant float*       inv_freq   [[buffer(1)]],   // [half]
+    constant uint&        num_heads  [[buffer(2)]],
+    constant uint&        rotary_dim [[buffer(3)]],
+    constant float&       pos_f      [[buffer(4)]],
+    constant float&       mscale     [[buffer(5)]],
+    uint2 tg_pos [[threadgroup_position_in_grid]]
+) {
+    uint h        = tg_pos.x;
+    uint i        = tg_pos.y;
+    uint half_dim = rotary_dim / 2;
+    if (h >= num_heads || i >= half_dim) return;
+
+    // `precise::cos` / `precise::sin` keep accuracy at large angles
+    // (RoPE positions can drive `pos * inv_freq[i]` into the
+    // thousands). Default Metal `cos`/`sin` are fast-math and lose
+    // accuracy badly past a few rotations — measured ~3e-4 absolute
+    // drift vs libm `cosf` at pos=4096 in the CPU diff oracle.
+    float angle = pos_f * inv_freq[i];
+    float cos_a = metal::precise::cos(angle) * mscale;
+    float sin_a = metal::precise::sin(angle) * mscale;
+
+    uint  base = h * rotary_dim;
+    float x0   = x[base + i];
+    float x1   = x[base + i + half_dim];
+    x[base + i]            = x0 * cos_a - x1 * sin_a;
+    x[base + i + half_dim] = x0 * sin_a + x1 * cos_a;
+}
