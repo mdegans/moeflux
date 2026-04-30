@@ -73,7 +73,7 @@ use super::cpu_matvec::{project_4bit_cpu, CpuMatvecError};
 use super::moe_router::softmax;
 use super::rms_norm::{rms_norm_per_head_cpu, RmsNormError};
 use super::rope::{apply_rotary_emb_yarn, YarnError};
-use super::state::MlaKvCache;
+use super::state::MlaKvCacheGpu;
 use super::variants::{MAX_SEQ_LEN, VARIANT};
 use super::weight_file::WeightFile;
 
@@ -131,7 +131,7 @@ pub fn mla_attn_layer_forward_cpu(
     layer_idx: usize,
     pos: i32,
     hidden: &[f32],
-    kv_cache: &mut MlaKvCache,
+    kv_cache: &mut MlaKvCacheGpu,
     yarn_inv_freq: &[f32],
     yarn_mscale: f32,
     out: &mut [f32],
@@ -249,17 +249,31 @@ pub fn mla_attn_layer_forward_cpu(
     }
 
     // ---- Append to MLA cache ----
+    //
+    // The cache lives in shared-storage Metal buffers; the CPU path
+    // grabs unsafe host slices over the appropriate row windows.
+    // No GPU work is in flight on this path (`step_internal_mla_cpu`
+    // is fully host-side except for the final lm_head dispatch),
+    // so the slices are safe to mutate.
     let new_idx = pos as usize;
-    {
-        let l_dst = &mut kv_cache.latent_cache
-            [new_idx * kv_lora_rank..(new_idx + 1) * kv_lora_rank];
+    // SAFETY: shared-storage buffer; CPU MLA path holds the no-GPU-
+    // work invariant. ensure_mla_resources was called before entry.
+    unsafe {
+        let l_dst = kv_cache.latent_slice_mut(new_idx, new_idx + 1);
         l_dst.copy_from_slice(&kv_pre[..kv_lora_rank]);
-        let r_dst = &mut kv_cache.rope_k_cache
-            [new_idx * rope..(new_idx + 1) * rope];
+        let r_dst = kv_cache.rope_k_slice_mut(new_idx, new_idx + 1);
         r_dst.copy_from_slice(&kv_pre[kv_lora_rank..]);
     }
     kv_cache.len = pos + 1;
     let cache_len = kv_cache.len as usize;
+    // Snapshot read-only views over the populated prefix once. The
+    // SDPA loop below borrows `latent_cache_view` / `rope_k_cache_view`
+    // instead of re-deriving slices through the accessor each step.
+    // SAFETY: see the mutable accessor above.
+    let latent_cache_view: &[f32] =
+        unsafe { kv_cache.latent_slice(cache_len) };
+    let rope_k_cache_view: &[f32] =
+        unsafe { kv_cache.rope_k_slice(cache_len) };
 
     // ---- Decompress kv_b_proj @ latent[j] for every cached j ----
     // decoded_all layout: [cache_len, num_heads, kv_b_per_head] flat.
@@ -268,7 +282,7 @@ pub fn mla_attn_layer_forward_cpu(
     let kv_b_name = format!("model.layers.{layer_idx}.self_attn.kv_b_proj");
     let mut decoded_all = vec![0.0f32; cache_len * num_heads * kv_b_per_head];
     for j in 0..cache_len {
-        let latent_j = &kv_cache.latent_cache
+        let latent_j = &latent_cache_view
             [j * kv_lora_rank..(j + 1) * kv_lora_rank];
         let dec_j = &mut decoded_all
             [j * num_heads * kv_b_per_head..(j + 1) * num_heads * kv_b_per_head];
@@ -299,8 +313,8 @@ pub fn mla_attn_layer_forward_cpu(
             let dec_jh = &decoded_all[(j * num_heads + h) * kv_b_per_head
                 ..(j * num_heads + h + 1) * kv_b_per_head];
             let k_nope_jh = &dec_jh[..nope];
-            let rope_k_j = &kv_cache.rope_k_cache
-                [j * rope..(j + 1) * rope];
+            let rope_k_j =
+                &rope_k_cache_view[j * rope..(j + 1) * rope];
             let mut s = 0.0f32;
             for c in 0..nope {
                 s = q_nope_h[c].mul_add(k_nope_jh[c], s);
@@ -396,7 +410,10 @@ mod tests {
         // non-zero, non-uniform input the kernel can transform).
         let mut hidden = vec![0.0f32; v.hidden_dim];
         hidden[7] = 1.0;
-        let mut cache = MlaKvCache::new();
+        let device = metal::Device::system_default()
+            .expect("Metal device for MLA KV cache buffers");
+        let mut cache = MlaKvCacheGpu::new();
+        cache.ensure_buffers(&device);
         let mut out = vec![0.0f32; v.hidden_dim];
 
         mla_attn_layer_forward_cpu(

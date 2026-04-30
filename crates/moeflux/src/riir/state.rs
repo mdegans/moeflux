@@ -23,6 +23,8 @@
 //! `infer.m:2291 mf_state_truncate`. Phase 7 introduces the typed
 //! error; in the meantime the call still resets to empty.
 
+use metal::{Buffer, Device, MTLResourceOptions, NSUInteger};
+
 use crate::riir::variants::{Variant, MAX_SEQ_LEN, VARIANT};
 
 /// Full-attention key/value cache for one layer. Allocated to
@@ -84,67 +86,236 @@ impl KvCache {
 /// `kv_b_proj` per cached position; only the rope-K is stored
 /// directly.
 ///
-/// Allocated to [`MAX_SEQ_LEN`] capacity. Pages are lazy-committed
-/// via `alloc_zeroed`, so the initial reservation is virtual-only on
-/// macOS.
+/// Storage is GPU-resident: `MTLResourceStorageModeShared` Metal
+/// buffers, sized to `MAX_SEQ_LEN` rows. Shared storage means the
+/// CPU MLA path can read/write the same bytes via `contents()`
+/// without a host-side mirror. macOS lazy-commits the virtual
+/// reservation, so non-touched rows don't consume physical RAM.
 ///
-/// Phase C scaffold: type defined; allocation and dispatch into
-/// [`LayerState`] land alongside the MLA forward kernel in
-/// [`super::mla_attn_cpu`].
+/// Buffers are `Option`-wrapped for lazy allocation: `LayerState`s
+/// are constructed at `Ctx::open` before the Metal device exists;
+/// `ensure_mla_gpu_resources` populates the buffers on first use.
+/// Tests that don't init Metal can still construct/mutate `len`
+/// without hitting the buffers (`truncate` is a no-op on `None`).
 #[derive(Debug)]
-pub struct MlaKvCache {
+pub struct MlaKvCacheGpu {
     /// `kv_a_layernorm`-output cache: post-down-projection,
-    /// post-norm latent. Shape `[max_seq, kv_lora_rank]` row-major.
-    pub latent_cache: Box<[f32]>,
+    /// post-norm latent. Shape `[MAX_SEQ_LEN, kv_lora_rank]`
+    /// row-major. `None` until populated by
+    /// `ensure_mla_gpu_resources` on first eval.
+    pub latent_cache: Option<Buffer>,
     /// Pre-RoPE'd rope-K cache (already RoPE-applied at the position
     /// it was stored at — broadcast across all heads at use time).
-    /// Shape `[max_seq, qk_rope_head_dim]`.
-    pub rope_k_cache: Box<[f32]>,
+    /// Shape `[MAX_SEQ_LEN, qk_rope_head_dim]`.
+    pub rope_k_cache: Option<Buffer>,
     /// Number of populated positions.
     pub len: i32,
 }
 
-impl MlaKvCache {
-    /// Allocate a zeroed MLA KV cache sized for the active variant.
-    /// Reads `kv_lora_rank` and `qk_rope_head_dim` from `VARIANT`.
-    /// On non-MLA variants these are 0 and the resulting cache is
-    /// empty — guarded against accidentally calling this at
-    /// allocation dispatch in [`alloc_layer_states`].
+impl MlaKvCacheGpu {
+    /// Construct an empty cache without any GPU buffers. Buffers are
+    /// allocated lazily by [`Self::ensure_buffers`] once a Metal
+    /// device is available.
     pub fn new() -> Self {
-        let latent_entries = MAX_SEQ_LEN * VARIANT.kv_lora_rank;
-        let rope_k_entries = MAX_SEQ_LEN * VARIANT.qk_rope_head_dim;
         Self {
-            latent_cache: vec![0.0f32; latent_entries].into_boxed_slice(),
-            rope_k_cache: vec![0.0f32; rope_k_entries].into_boxed_slice(),
+            latent_cache: None,
+            rope_k_cache: None,
             len: 0,
         }
     }
 
+    /// Allocate the underlying shared-storage Metal buffers if not
+    /// already present. Idempotent.
+    ///
+    /// Sizes are read from `VARIANT.kv_lora_rank` and
+    /// `VARIANT.qk_rope_head_dim`; for Cogito-V2 that's
+    /// `128k * 512 * 4 = 256 MB` for the latent cache and
+    /// `128k * 64 * 4 = 32 MB` for the rope-K cache, per layer.
+    /// Both are virtual reservations until pages are touched.
+    pub fn ensure_buffers(&mut self, device: &Device) {
+        if self.latent_cache.is_none() {
+            let bytes = (MAX_SEQ_LEN * VARIANT.kv_lora_rank
+                * std::mem::size_of::<f32>())
+                as NSUInteger;
+            let buf = device.new_buffer(
+                bytes,
+                MTLResourceOptions::StorageModeShared,
+            );
+            zero_shared_buffer(&buf);
+            self.latent_cache = Some(buf);
+        }
+        if self.rope_k_cache.is_none() {
+            let bytes = (MAX_SEQ_LEN * VARIANT.qk_rope_head_dim
+                * std::mem::size_of::<f32>())
+                as NSUInteger;
+            let buf = device.new_buffer(
+                bytes,
+                MTLResourceOptions::StorageModeShared,
+            );
+            zero_shared_buffer(&buf);
+            self.rope_k_cache = Some(buf);
+        }
+    }
+
     /// Reset to positions `[0, new_len)`. No-op if already shorter or
-    /// `new_len` is invalid.
+    /// `new_len` is invalid. When the underlying buffers exist, zeros
+    /// the `[new_len, old_len)` window so stale rows can't bleed into
+    /// later decodes.
     pub fn truncate(&mut self, new_len: i32) {
         if new_len < 0 || new_len > self.len {
             return;
         }
         let old_len = self.len;
         if new_len < old_len {
-            let l_start =
-                (new_len as usize) * VARIANT.kv_lora_rank;
-            let l_end = (old_len as usize) * VARIANT.kv_lora_rank;
-            self.latent_cache[l_start..l_end].fill(0.0);
-            let r_start =
-                (new_len as usize) * VARIANT.qk_rope_head_dim;
-            let r_end =
-                (old_len as usize) * VARIANT.qk_rope_head_dim;
-            self.rope_k_cache[r_start..r_end].fill(0.0);
+            if let Some(buf) = &self.latent_cache {
+                let stride_bytes =
+                    VARIANT.kv_lora_rank * std::mem::size_of::<f32>();
+                let start = (new_len as usize) * stride_bytes;
+                let end = (old_len as usize) * stride_bytes;
+                // SAFETY: shared-storage buffer; truncate is called
+                // outside per-token forward (memory_clear /
+                // checkpoint restore), with no GPU work in flight.
+                unsafe {
+                    let p = buf.contents() as *mut u8;
+                    std::ptr::write_bytes(
+                        p.add(start),
+                        0,
+                        end - start,
+                    );
+                }
+            }
+            if let Some(buf) = &self.rope_k_cache {
+                let stride_bytes = VARIANT.qk_rope_head_dim
+                    * std::mem::size_of::<f32>();
+                let start = (new_len as usize) * stride_bytes;
+                let end = (old_len as usize) * stride_bytes;
+                // SAFETY: see above.
+                unsafe {
+                    let p = buf.contents() as *mut u8;
+                    std::ptr::write_bytes(
+                        p.add(start),
+                        0,
+                        end - start,
+                    );
+                }
+            }
         }
         self.len = new_len;
     }
+
+    /// Host-readable slice over the populated prefix of the latent
+    /// cache (`[0, len) × kv_lora_rank` floats).
+    ///
+    /// # Safety
+    ///
+    /// Caller must guarantee no GPU work is reading or writing the
+    /// underlying buffer concurrently. The CPU MLA path holds this
+    /// invariant by construction (no GPU dispatch is in flight when
+    /// the CPU pipeline runs); the GPU path uses the buffer directly
+    /// via Metal kernels.
+    pub unsafe fn latent_slice(&self, len: usize) -> &[f32] {
+        let buf = self
+            .latent_cache
+            .as_ref()
+            .expect("latent_slice called before ensure_buffers");
+        let n = len * VARIANT.kv_lora_rank;
+        // SAFETY: caller upholds the no-concurrent-GPU-work invariant
+        // documented on this fn.
+        unsafe {
+            std::slice::from_raw_parts(buf.contents() as *const f32, n)
+        }
+    }
+
+    /// Mutable counterpart to [`Self::latent_slice`] over the row
+    /// window `[start_row, end_row) × kv_lora_rank`.
+    ///
+    /// # Safety
+    ///
+    /// See [`Self::latent_slice`].
+    pub unsafe fn latent_slice_mut(
+        &mut self,
+        start_row: usize,
+        end_row: usize,
+    ) -> &mut [f32] {
+        let buf = self
+            .latent_cache
+            .as_ref()
+            .expect("latent_slice_mut called before ensure_buffers");
+        let stride = VARIANT.kv_lora_rank;
+        // SAFETY: caller upholds the no-concurrent-GPU-work invariant
+        // documented on this fn.
+        unsafe {
+            let p =
+                (buf.contents() as *mut f32).add(start_row * stride);
+            std::slice::from_raw_parts_mut(
+                p,
+                (end_row - start_row) * stride,
+            )
+        }
+    }
+
+    /// Host-readable slice over the populated prefix of the rope-K
+    /// cache (`[0, len) × qk_rope_head_dim` floats).
+    ///
+    /// # Safety
+    ///
+    /// See [`Self::latent_slice`].
+    pub unsafe fn rope_k_slice(&self, len: usize) -> &[f32] {
+        let buf = self
+            .rope_k_cache
+            .as_ref()
+            .expect("rope_k_slice called before ensure_buffers");
+        let n = len * VARIANT.qk_rope_head_dim;
+        // SAFETY: caller upholds the no-concurrent-GPU-work invariant
+        // documented on this fn.
+        unsafe {
+            std::slice::from_raw_parts(buf.contents() as *const f32, n)
+        }
+    }
+
+    /// Mutable counterpart to [`Self::rope_k_slice`] over the row
+    /// window `[start_row, end_row) × qk_rope_head_dim`.
+    ///
+    /// # Safety
+    ///
+    /// See [`Self::latent_slice`].
+    pub unsafe fn rope_k_slice_mut(
+        &mut self,
+        start_row: usize,
+        end_row: usize,
+    ) -> &mut [f32] {
+        let buf = self
+            .rope_k_cache
+            .as_ref()
+            .expect("rope_k_slice_mut called before ensure_buffers");
+        let stride = VARIANT.qk_rope_head_dim;
+        // SAFETY: caller upholds the no-concurrent-GPU-work invariant
+        // documented on this fn.
+        unsafe {
+            let p =
+                (buf.contents() as *mut f32).add(start_row * stride);
+            std::slice::from_raw_parts_mut(
+                p,
+                (end_row - start_row) * stride,
+            )
+        }
+    }
 }
 
-impl Default for MlaKvCache {
+impl Default for MlaKvCacheGpu {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Zero every byte of a shared-storage Metal buffer. Used at buffer
+/// allocation and on `truncate` window-clears. Caller guarantees no
+/// in-flight GPU work on the buffer.
+fn zero_shared_buffer(b: &Buffer) {
+    let bytes = b.length() as usize;
+    // SAFETY: see fn docs.
+    unsafe {
+        std::ptr::write_bytes(b.contents() as *mut u8, 0, bytes);
     }
 }
 
@@ -193,7 +364,7 @@ impl LinearAttnState {
 #[derive(Debug)]
 pub enum LayerState {
     FullAttn(KvCache),
-    Mla(MlaKvCache),
+    Mla(MlaKvCacheGpu),
     LinearAttn(LinearAttnState),
 }
 
@@ -223,7 +394,7 @@ pub fn alloc_layer_states() -> Vec<LayerState> {
         .map(|i| match VARIANT.layer_kind(i) {
             LayerKind::FullAttn => match VARIANT.attn_kind {
                 AttnKind::Gqa => LayerState::FullAttn(KvCache::new()),
-                AttnKind::Mla => LayerState::Mla(MlaKvCache::new()),
+                AttnKind::Mla => LayerState::Mla(MlaKvCacheGpu::new()),
             },
             LayerKind::LinearAttn => {
                 LayerState::LinearAttn(LinearAttnState::new())

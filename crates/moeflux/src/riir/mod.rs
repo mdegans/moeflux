@@ -978,6 +978,17 @@ impl RsCtx {
                     .map_err(|_| RsError::InitFailed)?,
             );
         }
+        // Lazy-allocate per-layer MLA KV caches in shared-storage Metal
+        // buffers. Idempotent — `ensure_buffers` no-ops on already-
+        // populated layers, so re-entering after `memory_clear` (which
+        // truncates `len` to 0 but keeps the buffers) is cheap.
+        let device =
+            self.metal.as_ref().expect("just-set").device().to_owned();
+        for state in self.layer_states.iter_mut() {
+            if let LayerState::Mla(mla) = state {
+                mla.ensure_buffers(&device);
+            }
+        }
         Ok(())
     }
 
