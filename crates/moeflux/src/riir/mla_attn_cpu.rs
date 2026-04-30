@@ -69,8 +69,12 @@
 //! naive form for clarity; the folded form is a follow-up
 //! optimization once the model is producing tokens.
 
+use super::cpu_matvec::{project_4bit_cpu, CpuMatvecError};
+use super::moe_router::softmax;
+use super::rms_norm::{rms_norm_per_head_cpu, RmsNormError};
+use super::rope::{apply_rotary_emb_yarn, YarnError};
 use super::state::MlaKvCache;
-use super::variants::VARIANT;
+use super::variants::{MAX_SEQ_LEN, VARIANT};
 use super::weight_file::WeightFile;
 
 /// Errors specific to the MLA CPU forward.
@@ -84,8 +88,18 @@ pub enum MlaForwardError {
     HiddenLen { got: usize, expected: usize },
     #[error("output buffer length {got} != hidden_dim ({expected})")]
     OutLen { got: usize, expected: usize },
-    #[error("MLA forward not yet implemented (Phase C scaffold; next session)")]
-    NotImplemented,
+    #[error("position {pos} != kv_cache.len {cache_len} (single-step decode)")]
+    PosMismatch { pos: i32, cache_len: i32 },
+    #[error("kv_cache.len {len} would exceed MAX_SEQ_LEN={max} after append")]
+    CacheFull { len: i32, max: usize },
+    #[error("matvec error in MLA: {0}")]
+    Matvec(#[from] CpuMatvecError),
+    #[error("rms-norm error in MLA: {0}")]
+    Norm(#[from] RmsNormError),
+    #[error("YaRN RoPE error in MLA: {0}")]
+    Rope(#[from] YarnError),
+    #[error("softmax error in MLA: {0}")]
+    Softmax(#[from] super::moe_router::MoeRouterError),
 }
 
 /// Per-token MLA forward pass. Reads layer weights from `wf` by
@@ -105,9 +119,13 @@ pub enum MlaForwardError {
 ///   adds to the input hidden state per the standard transformer
 ///   block; same contract as the GQA forward).
 ///
-/// Phase C scaffold returns [`MlaForwardError::NotImplemented`].
-/// The kernel implementation arrives in the next session.
-#[allow(unused_variables, clippy::too_many_arguments)]
+/// Naive form: for each cached position j, run `kv_b_proj @ latent[j]`
+/// to materialize per-head `(k_nope, v)`. Cost is O(len * 16M ops) per
+/// token; tractable for first-run validation. The folded form (precompute
+/// `q_nope @ kv_b_proj_K` and `kv_b_proj_V @ scored_combine`) cuts this
+/// to O(16M + len * 130K) and is a follow-up once the model produces
+/// coherent text.
+#[allow(clippy::too_many_arguments)]
 pub fn mla_attn_layer_forward_cpu(
     wf: &WeightFile,
     layer_idx: usize,
@@ -124,24 +142,200 @@ pub fn mla_attn_layer_forward_cpu(
             kind: VARIANT.attn_kind,
         });
     }
-    if hidden.len() != VARIANT.hidden_dim {
+    let v = VARIANT;
+    if hidden.len() != v.hidden_dim {
         return Err(MlaForwardError::HiddenLen {
             got: hidden.len(),
-            expected: VARIANT.hidden_dim,
+            expected: v.hidden_dim,
         });
     }
-    if out.len() != VARIANT.hidden_dim {
+    if out.len() != v.hidden_dim {
         return Err(MlaForwardError::OutLen {
             got: out.len(),
-            expected: VARIANT.hidden_dim,
+            expected: v.hidden_dim,
+        });
+    }
+    if pos != kv_cache.len {
+        return Err(MlaForwardError::PosMismatch {
+            pos,
+            cache_len: kv_cache.len,
+        });
+    }
+    if (kv_cache.len as usize) >= MAX_SEQ_LEN {
+        return Err(MlaForwardError::CacheFull {
+            len: kv_cache.len,
+            max: MAX_SEQ_LEN,
         });
     }
 
-    // Phase C scaffold — kernel implementation in the next session.
-    // The cargo of work for that session lives in the next-session
-    // continuation memo at
-    // `~/Projects/drama_llama/.claude/memory/cogito_v2_landing_state.md`.
-    Err(MlaForwardError::NotImplemented)
+    let hidden_dim = v.hidden_dim;
+    let num_heads = v.num_attn_heads;
+    let q_lora_rank = v.q_lora_rank;
+    let kv_lora_rank = v.kv_lora_rank;
+    let nope = v.qk_nope_head_dim;
+    let rope = v.qk_rope_head_dim;
+    let v_head_dim = v.v_head_dim;
+    let qk_head_dim = nope + rope;
+    // 256 = nope (128) + v_head_dim (128) for Cogito-V2.
+    let kv_b_per_head = nope + v_head_dim;
+
+    // ---- Q chain ----
+    let q_a_name = format!("model.layers.{layer_idx}.self_attn.q_a_proj");
+    let q_a_norm =
+        format!("model.layers.{layer_idx}.self_attn.q_a_layernorm.weight");
+    let q_b_name = format!("model.layers.{layer_idx}.self_attn.q_b_proj");
+
+    let mut q_lat = vec![0.0f32; q_lora_rank];
+    project_4bit_cpu(wf, &q_a_name, hidden_dim, q_lora_rank, hidden, &mut q_lat)?;
+    rms_norm_per_head_cpu(wf, &q_a_norm, 1, q_lora_rank, &mut q_lat)?;
+
+    let mut q_full = vec![0.0f32; num_heads * qk_head_dim];
+    project_4bit_cpu(
+        wf,
+        &q_b_name,
+        q_lora_rank,
+        num_heads * qk_head_dim,
+        &q_lat,
+        &mut q_full,
+    )?;
+
+    // q_full is laid out per head as [nope | pe]. Extract pe halves
+    // contiguously for RoPE; copy back after.
+    let mut q_pe = vec![0.0f32; num_heads * rope];
+    for h in 0..num_heads {
+        let q_h = &q_full[h * qk_head_dim..(h + 1) * qk_head_dim];
+        let dst = &mut q_pe[h * rope..(h + 1) * rope];
+        dst.copy_from_slice(&q_h[nope..nope + rope]);
+    }
+
+    // ---- KV chain ----
+    let kv_a_name =
+        format!("model.layers.{layer_idx}.self_attn.kv_a_proj_with_mqa");
+    let kv_a_norm =
+        format!("model.layers.{layer_idx}.self_attn.kv_a_layernorm.weight");
+
+    let mut kv_pre = vec![0.0f32; kv_lora_rank + rope];
+    project_4bit_cpu(
+        wf,
+        &kv_a_name,
+        hidden_dim,
+        kv_lora_rank + rope,
+        hidden,
+        &mut kv_pre,
+    )?;
+    rms_norm_per_head_cpu(
+        wf,
+        &kv_a_norm,
+        1,
+        kv_lora_rank,
+        &mut kv_pre[..kv_lora_rank],
+    )?;
+
+    // ---- YaRN RoPE on the rope halves ----
+    apply_rotary_emb_yarn(pos, &mut q_pe, rope, yarn_inv_freq, yarn_mscale)?;
+    apply_rotary_emb_yarn(
+        pos,
+        &mut kv_pre[kv_lora_rank..],
+        rope,
+        yarn_inv_freq,
+        yarn_mscale,
+    )?;
+
+    // Write rotated q_pe back into q_full's per-head pe slots.
+    for h in 0..num_heads {
+        let dst = &mut q_full[h * qk_head_dim + nope..(h + 1) * qk_head_dim];
+        let src = &q_pe[h * rope..(h + 1) * rope];
+        dst.copy_from_slice(src);
+    }
+
+    // ---- Append to MLA cache ----
+    let new_idx = pos as usize;
+    {
+        let l_dst = &mut kv_cache.latent_cache
+            [new_idx * kv_lora_rank..(new_idx + 1) * kv_lora_rank];
+        l_dst.copy_from_slice(&kv_pre[..kv_lora_rank]);
+        let r_dst = &mut kv_cache.rope_k_cache
+            [new_idx * rope..(new_idx + 1) * rope];
+        r_dst.copy_from_slice(&kv_pre[kv_lora_rank..]);
+    }
+    kv_cache.len = pos + 1;
+    let cache_len = kv_cache.len as usize;
+
+    // ---- Decompress kv_b_proj @ latent[j] for every cached j ----
+    // decoded_all layout: [cache_len, num_heads, kv_b_per_head] flat.
+    // Per cached j, per head h: dec[j, h, ..nope] = k_nope, dec[j, h,
+    // nope..] = v.
+    let kv_b_name = format!("model.layers.{layer_idx}.self_attn.kv_b_proj");
+    let mut decoded_all = vec![0.0f32; cache_len * num_heads * kv_b_per_head];
+    for j in 0..cache_len {
+        let latent_j = &kv_cache.latent_cache
+            [j * kv_lora_rank..(j + 1) * kv_lora_rank];
+        let dec_j = &mut decoded_all
+            [j * num_heads * kv_b_per_head..(j + 1) * num_heads * kv_b_per_head];
+        project_4bit_cpu(
+            wf,
+            &kv_b_name,
+            kv_lora_rank,
+            num_heads * kv_b_per_head,
+            latent_j,
+            dec_j,
+        )?;
+    }
+
+    // ---- SDPA per head ----
+    // softmax_scale = (1/sqrt(qk_head_dim)) * mscale². For Cogito-V2's
+    // mscale=1.0/mscale_all_dim=1.0 this collapses to 1/sqrt(192).
+    let softmax_scale =
+        (1.0 / (qk_head_dim as f32).sqrt()) * yarn_mscale * yarn_mscale;
+
+    let mut head_out = vec![0.0f32; num_heads * v_head_dim];
+    let mut scores = vec![0.0f32; cache_len];
+
+    for h in 0..num_heads {
+        let q_h = &q_full[h * qk_head_dim..(h + 1) * qk_head_dim];
+        let q_nope_h = &q_h[..nope];
+        let q_pe_h = &q_h[nope..nope + rope];
+        for j in 0..cache_len {
+            let dec_jh = &decoded_all[(j * num_heads + h) * kv_b_per_head
+                ..(j * num_heads + h + 1) * kv_b_per_head];
+            let k_nope_jh = &dec_jh[..nope];
+            let rope_k_j = &kv_cache.rope_k_cache
+                [j * rope..(j + 1) * rope];
+            let mut s = 0.0f32;
+            for c in 0..nope {
+                s = q_nope_h[c].mul_add(k_nope_jh[c], s);
+            }
+            for c in 0..rope {
+                s = q_pe_h[c].mul_add(rope_k_j[c], s);
+            }
+            scores[j] = s * softmax_scale;
+        }
+        softmax(&mut scores)?;
+        let head_out_h = &mut head_out[h * v_head_dim..(h + 1) * v_head_dim];
+        head_out_h.fill(0.0);
+        for j in 0..cache_len {
+            let dec_jh = &decoded_all[(j * num_heads + h) * kv_b_per_head
+                ..(j * num_heads + h + 1) * kv_b_per_head];
+            let v_jh = &dec_jh[nope..nope + v_head_dim];
+            let w = scores[j];
+            for c in 0..v_head_dim {
+                head_out_h[c] = w.mul_add(v_jh[c], head_out_h[c]);
+            }
+        }
+    }
+
+    // ---- o_proj ----
+    let o_name = format!("model.layers.{layer_idx}.self_attn.o_proj");
+    project_4bit_cpu(
+        wf,
+        &o_name,
+        num_heads * v_head_dim,
+        hidden_dim,
+        &head_out,
+        out,
+    )?;
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -163,11 +357,67 @@ mod tests {
         // assertion for now.
     }
 
-    /// Stub returns NotImplemented for MLA variants — placeholder
-    /// until the kernel lands. Skipped because we can't construct a
-    /// WeightFile here; lives as documentation of intent.
+    /// Smoke test: run one MLA forward step on layer 0 with a
+    /// pulse-input hidden state, pos=0. Verifies the kernel finishes
+    /// without panic and produces finite output. Doesn't check
+    /// numerical correctness — that's the Phase G end-to-end bisect.
     #[cfg(feature = "model-cogito-v2-671b")]
     #[test]
-    #[ignore = "Phase C scaffold; kernel implementation pending"]
-    fn cogito_returns_not_implemented_until_kernel_lands() {}
+    #[ignore = "needs Cogito-V2 weights mmap'd from /Volumes/Temp Backup"]
+    fn mla_layer0_pos0_smoke() {
+        use super::super::rope::{compute_yarn_inv_freq, yarn_get_mscale_full};
+        use super::super::variants::ROPE_THETA;
+        use std::path::Path;
+
+        let bin = Path::new(
+            "/Volumes/Temp Backup/models/blallama/cogito-v2-671b/artifacts/model_weights.bin",
+        );
+        let manifest = Path::new(
+            "/Volumes/Temp Backup/models/blallama/cogito-v2-671b/artifacts/model_weights.json",
+        );
+        let wf = WeightFile::open(bin, manifest).expect("open weights");
+
+        let v = VARIANT;
+        let inv_freq = compute_yarn_inv_freq(
+            v.qk_rope_head_dim,
+            ROPE_THETA,
+            v.yarn_factor,
+            v.yarn_original_max_pos as f32,
+            v.yarn_beta_fast,
+            v.yarn_beta_slow,
+        );
+        let mscale = yarn_get_mscale_full(
+            v.yarn_factor,
+            v.yarn_mscale,
+            v.yarn_mscale_all_dim,
+        );
+
+        // Hidden = pulse at index 7 (no particular meaning; just a
+        // non-zero, non-uniform input the kernel can transform).
+        let mut hidden = vec![0.0f32; v.hidden_dim];
+        hidden[7] = 1.0;
+        let mut cache = MlaKvCache::new();
+        let mut out = vec![0.0f32; v.hidden_dim];
+
+        mla_attn_layer_forward_cpu(
+            &wf, 0, 0, &hidden, &mut cache, &inv_freq, mscale, &mut out,
+        )
+        .expect("MLA forward should succeed");
+
+        assert_eq!(cache.len, 1, "cache should advance to 1");
+        assert!(
+            out.iter().all(|v| v.is_finite()),
+            "out[i] non-finite at first index = {:?}",
+            out.iter().position(|v| !v.is_finite()),
+        );
+        let max_abs = out.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        assert!(
+            max_abs > 0.0,
+            "output is all zeros — likely a wiring bug"
+        );
+        assert!(
+            max_abs < 1e6,
+            "output magnitude {max_abs} suspiciously large"
+        );
+    }
 }

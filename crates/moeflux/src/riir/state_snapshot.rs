@@ -96,6 +96,12 @@ pub enum StateSnapshotError {
     /// `RsCtx::ensure_linear_resources` on first eval.
     #[error("linear_buffers not initialized — call eval_prompt or memory_clear first")]
     BuffersNotReady,
+    /// Snapshot wire format v1 doesn't encode MLA's compressed
+    /// latent + rope-K caches. A v2 format that supports MLA layers
+    /// is post-cutover work; until then save/load on Cogito-V2 /
+    /// DeepSeek-V3 builds returns this error.
+    #[error("snapshot v{SNAPSHOT_VERSION} doesn't support MLA layers (layer {layer})")]
+    MlaUnsupported { layer: usize },
 }
 
 #[inline]
@@ -121,6 +127,11 @@ fn linear_ssm_bytes(v: &Variant) -> usize {
 /// Bytes the caller must allocate to hold the current snapshot.
 /// Mirrors C `mf_state_size` (infer.m:8505..8523). Re-query after
 /// every evaluation: the value grows with KV length.
+///
+/// Returns 0 (a non-meaningful sentinel) if any layer is MLA — the
+/// v1 wire format can't encode the compressed cache. The actual
+/// rejection lives in `state_save` / `state_load` where it surfaces
+/// as a typed `MlaUnsupported` error.
 pub fn state_size(layer_states: &[LayerState]) -> usize {
     let v = VARIANT;
     let mut n = SNAPSHOT_HEADER_U32 * std::mem::size_of::<u32>();
@@ -133,6 +144,7 @@ pub fn state_size(layer_states: &[LayerState]) -> usize {
                 n += std::mem::size_of::<i32>();
                 let len = match layer {
                     LayerState::FullAttn(kv) => kv.len.max(0) as usize,
+                    LayerState::Mla(_) => return 0,
                     LayerState::LinearAttn(_) => 0,
                 };
                 n += 2 * len * fa_stride;
@@ -195,6 +207,11 @@ pub fn state_save(
             LayerKind::FullAttn => {
                 let kv = match layer {
                     LayerState::FullAttn(kv) => kv,
+                    LayerState::Mla(_) => {
+                        return Err(StateSnapshotError::MlaUnsupported {
+                            layer: i,
+                        });
+                    }
                     LayerState::LinearAttn(_) => {
                         return Err(StateSnapshotError::ShapeMismatch {
                             field: "layer_state_kind",
@@ -371,6 +388,11 @@ pub fn state_load(
                 off += 4;
                 let kv = match &mut layer_states[i] {
                     LayerState::FullAttn(kv) => kv,
+                    LayerState::Mla(_) => {
+                        return Err(StateSnapshotError::MlaUnsupported {
+                            layer: i,
+                        });
+                    }
                     LayerState::LinearAttn(_) => {
                         return Err(StateSnapshotError::ShapeMismatch {
                             field: "layer_state_kind",

@@ -185,27 +185,46 @@ impl LinearAttnState {
 /// `(layer + 1) % FULL_ATTN_INTERVAL == 0` test: every Nth layer is a
 /// full-attention layer with a KV cache, the rest are linear-attention
 /// layers with a GatedDeltaNet recurrence.
+///
+/// The full-attention slot has two flavors selected by
+/// [`Variant::attn_kind`]: GQA (`FullAttn`) caches per-head K and V
+/// directly; MLA (`Mla`) caches a compressed latent + a shared rope-K
+/// per token and reconstructs K/V at use time.
 #[derive(Debug)]
 pub enum LayerState {
     FullAttn(KvCache),
+    Mla(MlaKvCache),
     LinearAttn(LinearAttnState),
 }
 
 impl LayerState {
+    /// True for any flavor that grows a sequence-length-shaped cache
+    /// (GQA `FullAttn` or `Mla`). Used by callers that distinguish
+    /// "real" KV layers from the constant-state linear-attn layers.
     pub fn is_full(&self) -> bool {
-        matches!(self, Self::FullAttn(_))
+        matches!(self, Self::FullAttn(_) | Self::Mla(_))
     }
 }
 
 /// Allocate the per-layer state vector for the active variant.
-/// Dispatched via [`Variant::layer_kind`] — for qwen3_5_moe today
-/// that's the `(i + 1) % full_attn_interval == 0` predicate. Mirrors
-/// the C-side allocation in `mf_init_model` (infer.m:7511+).
+/// Dispatched via [`Variant::layer_kind`] — for qwen3_5_moe that's
+/// `(i + 1) % full_attn_interval == 0`; for DeepSeek-V3 / Cogito-V2
+/// every layer is full-attn (`full_attn_interval = 1`). The flavor
+/// of full-attn (GQA vs MLA) is selected by [`Variant::attn_kind`]:
+/// GQA gets a [`KvCache`], MLA gets a compressed [`MlaKvCache`].
+/// This matters at allocation because [`KvCache::new`] would reserve
+/// `num_kv_heads * head_dim * MAX_SEQ_LEN * 2 * 4` bytes — for
+/// Cogito-V2 that's a ~196 GB virtual reservation per layer, all of
+/// it lazy-committed but still wasted address space we never touch.
+/// Mirrors the C-side allocation in `mf_init_model` (infer.m:7511+).
 pub fn alloc_layer_states() -> Vec<LayerState> {
-    use super::variants::LayerKind;
+    use super::variants::{AttnKind, LayerKind};
     (0..VARIANT.num_layers)
         .map(|i| match VARIANT.layer_kind(i) {
-            LayerKind::FullAttn => LayerState::FullAttn(KvCache::new()),
+            LayerKind::FullAttn => match VARIANT.attn_kind {
+                AttnKind::Gqa => LayerState::FullAttn(KvCache::new()),
+                AttnKind::Mla => LayerState::Mla(MlaKvCache::new()),
+            },
             LayerKind::LinearAttn => {
                 LayerState::LinearAttn(LinearAttnState::new())
             }
@@ -219,6 +238,7 @@ pub fn clear_all(layers: &mut [LayerState]) {
     for layer in layers {
         match layer {
             LayerState::FullAttn(kv) => kv.truncate(0),
+            LayerState::Mla(mla) => mla.truncate(0),
             LayerState::LinearAttn(la) => la.reset(),
         }
     }
@@ -238,6 +258,12 @@ pub fn truncate(layers: &mut [LayerState], p0: i32, p1: i32) {
                 let truncate_to = new_len.min(effective_end);
                 kv.truncate(truncate_to);
             }
+            LayerState::Mla(mla) => {
+                let effective_end =
+                    if p1 < 0 || p1 > mla.len { mla.len } else { p1 };
+                let truncate_to = new_len.min(effective_end);
+                mla.truncate(truncate_to);
+            }
             // FIXME(riir): faithful port of the lossy semantic. A
             // partial truncation of a linear-attn span resets the
             // recurrence to empty. Phase 7 introduces a typed
@@ -248,15 +274,19 @@ pub fn truncate(layers: &mut [LayerState], p0: i32, p1: i32) {
     }
 }
 
-/// Largest occupied position across full-attn layers, or `-1` if
-/// none has any entries. Mirrors `mf_state_pos_max` (infer.m:2320).
+/// Largest occupied position across full-attn layers (GQA `FullAttn`
+/// or `Mla`), or `-1` if no full-attn layer exists at all. Mirrors
+/// `mf_state_pos_max` (infer.m:2320).
 pub fn pos_max(layers: &[LayerState]) -> i32 {
     let mut max_len = -1;
     for layer in layers {
-        if let LayerState::FullAttn(kv) = layer {
-            if kv.len > max_len {
-                max_len = kv.len;
-            }
+        let len = match layer {
+            LayerState::FullAttn(kv) => kv.len,
+            LayerState::Mla(mla) => mla.len,
+            LayerState::LinearAttn(_) => continue,
+        };
+        if len > max_len {
+            max_len = len;
         }
     }
     max_len
@@ -292,19 +322,30 @@ mod tests {
     }
 
     /// Synthetic: hand-set one full-attn layer's len, observe pos_max
-    /// pick it up, truncate, observe pos_max drop.
+    /// pick it up, truncate, observe pos_max drop. Handles both
+    /// flavors (`FullAttn` for GQA variants, `Mla` for DeepSeek-V3
+    /// variants); the test asserts the same observable behavior on
+    /// either side of the dispatch.
     #[test]
     fn truncate_drops_full_attn_len() {
         let mut layers = alloc_layer_states();
-        // Find the first full-attn layer and inject a synthetic length.
-        let target = layers
+        let injected = layers
             .iter_mut()
             .find_map(|l| match l {
-                LayerState::FullAttn(kv) => Some(kv),
-                _ => None,
-            })
-            .expect("variant must have at least one full-attn layer");
-        target.len = 7;
+                LayerState::FullAttn(kv) => {
+                    kv.len = 7;
+                    Some(())
+                }
+                LayerState::Mla(mla) => {
+                    mla.len = 7;
+                    Some(())
+                }
+                LayerState::LinearAttn(_) => None,
+            });
+        assert!(
+            injected.is_some(),
+            "variant must have at least one full-attn (GQA or MLA) layer",
+        );
         assert_eq!(pos_max(&layers), 7);
 
         truncate(&mut layers, 3, -1);

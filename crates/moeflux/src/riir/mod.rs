@@ -24,6 +24,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 
+pub mod cpu_matvec;
 pub mod cpu_ops;
 pub mod deferred;
 pub mod embedding;
@@ -41,6 +42,8 @@ pub mod linear_attn_forward;
 pub mod lm_head;
 pub mod metal;
 pub mod mla_attn_cpu;
+pub mod mlp_cpu;
+pub mod moe_cpu;
 pub mod moe_router;
 pub mod mtl_weight_buf;
 pub mod prefetch;
@@ -808,7 +811,10 @@ impl RsCtx {
         if is_full {
             let kv_state = match &mut layer_states[layer_idx_us] {
                 LayerState::FullAttn(kv) => kv,
-                LayerState::LinearAttn(_) => {
+                // MLA layers route through a separate dispatch (Phase F).
+                // Reaching the GPU GQA path with an MLA layer means the
+                // dispatch wasn't wired — fail loudly at runtime.
+                LayerState::Mla(_) | LayerState::LinearAttn(_) => {
                     return Err(RsError::EvalFailed);
                 }
             };
@@ -836,7 +842,7 @@ impl RsCtx {
         } else {
             let layer_state = match &mut layer_states[layer_idx_us] {
                 LayerState::LinearAttn(la) => la,
-                LayerState::FullAttn(_) => {
+                LayerState::FullAttn(_) | LayerState::Mla(_) => {
                     return Err(RsError::EvalFailed);
                 }
             };
@@ -946,6 +952,35 @@ impl RsCtx {
     /// Lazily build the Metal backend, weight buffer, layer caches,
     /// linear-attn persistent buffers, and MoE buffer set. Idempotent
     /// — subsequent calls are no-ops.
+    /// Slim sibling of [`Self::ensure_linear_resources`] for the
+    /// MLA / DeepSeek-V3 CPU path. The MLA pipeline runs entirely on
+    /// host buffers and only touches the GPU for the final
+    /// `lm_head` matvec. Skipping the GQA-specific
+    /// [`LayerWeightCache::build_all`] is load-bearing — it requires
+    /// `q_proj` / `k_proj` / `v_proj` tensor names that don't exist
+    /// on MLA variants (Cogito-V2 has `q_a_proj` / `q_b_proj` /
+    /// `kv_a_proj_with_mqa` / `kv_b_proj` instead).
+    fn ensure_mla_resources(&mut self) -> Result<(), RsError> {
+        if self.metal.is_none() {
+            self.metal =
+                Some(MetalBackend::new().map_err(|_| RsError::InitFailed)?);
+        }
+        if self.wf_buf.is_none() {
+            let device =
+                self.metal.as_ref().expect("just-set").device().to_owned();
+            self.wf_buf = Some(MtlWeightBuf::wrap(&self.wf, &device));
+        }
+        if self.lm_head_gpu.is_none() {
+            let metal = self.metal.as_mut().expect("just-set");
+            let wf_buf = self.wf_buf.as_ref().expect("just-set");
+            self.lm_head_gpu = Some(
+                GpuLmHead::new(metal, &self.wf, wf_buf)
+                    .map_err(|_| RsError::InitFailed)?,
+            );
+        }
+        Ok(())
+    }
+
     fn ensure_linear_resources(&mut self) -> Result<(), RsError> {
         if self.metal.is_none() {
             self.metal =
@@ -1028,6 +1063,141 @@ impl RsCtx {
         self.step_internal(token, pos as i32, Some(logits))
     }
 
+    /// Per-token CPU MLA forward for DeepSeek-V3 / Cogito-V2. Pure
+    /// host-side compute except for the final `lm_head` matvec. No
+    /// deferred dispatch, no GPU pipeline — just embed → 61× layers
+    /// → final norm → GPU lm_head.
+    ///
+    /// Each layer runs the standard transformer block: pre-norm →
+    /// MLA → +residual → post-norm → MLP-or-MoE → +residual. Layers
+    /// `[0, first_k_dense_replace)` use the dense MLP; the rest use
+    /// the routed-MoE path with shared expert added unconditionally.
+    ///
+    /// This is the baseline path for first-run validation. The folded
+    /// MLA form (q' = q_nope @ kv_b_proj, then `q' · latent_j` per
+    /// cached position) and a GPU MLA kernel are follow-up slices.
+    fn step_internal_mla_cpu(
+        &mut self,
+        token: i32,
+        pos: i32,
+        logits_out: Option<&mut [f32]>,
+    ) -> Result<(), RsError> {
+        use mla_attn_cpu::mla_attn_layer_forward_cpu;
+        use mlp_cpu::dense_mlp_swiglu_cpu;
+        use moe_cpu::deepseek_moe_cpu;
+        use rope::{compute_yarn_inv_freq, yarn_get_mscale_full};
+        use variants::ROPE_THETA;
+
+        self.ensure_mla_resources()?;
+        let v = VARIANT;
+
+        let Self {
+            wf,
+            metal,
+            experts,
+            layer_states,
+            wf_buf,
+            lm_head_gpu,
+            ..
+        } = self;
+        let metal = metal.as_mut().expect("ensure_mla_resources");
+        let wf_buf = wf_buf.as_ref().expect("ensure_mla_resources");
+        let lm_head_gpu =
+            lm_head_gpu.as_ref().expect("ensure_mla_resources");
+
+        // YaRN constants — recomputed per token; cache-worthy if perf
+        // matters but it's microseconds vs the per-layer matvec cost.
+        let yarn_inv_freq = compute_yarn_inv_freq(
+            v.qk_rope_head_dim,
+            ROPE_THETA,
+            v.yarn_factor,
+            v.yarn_original_max_pos as f32,
+            v.yarn_beta_fast,
+            v.yarn_beta_slow,
+        );
+        let yarn_mscale = yarn_get_mscale_full(
+            v.yarn_factor,
+            v.yarn_mscale,
+            v.yarn_mscale_all_dim,
+        );
+
+        // Embed → host hidden buffer.
+        let mut hidden = vec![0.0f32; v.hidden_dim];
+        embedding::embed_lookup(wf, token, &mut hidden)
+            .map_err(|_| RsError::EvalFailed)?;
+
+        // Per-layer scratch.
+        let mut residual = vec![0.0f32; v.hidden_dim];
+        let mut normed = vec![0.0f32; v.hidden_dim];
+        let mut block_out = vec![0.0f32; v.hidden_dim];
+
+        for layer_idx in 0..v.num_layers {
+            // ---- Attention sub-block: residual = h; h = h + mla(norm(h)) ----
+            residual.copy_from_slice(&hidden);
+            let pre_norm_name =
+                format!("model.layers.{layer_idx}.input_layernorm.weight");
+            rms_norm_cpu(wf, &pre_norm_name, &hidden, &mut normed)
+                .map_err(|_| RsError::EvalFailed)?;
+
+            let kv_cache = match &mut layer_states[layer_idx] {
+                LayerState::Mla(c) => c,
+                LayerState::FullAttn(_) | LayerState::LinearAttn(_) => {
+                    return Err(RsError::EvalFailed);
+                }
+            };
+            mla_attn_layer_forward_cpu(
+                wf,
+                layer_idx,
+                pos,
+                &normed,
+                kv_cache,
+                &yarn_inv_freq,
+                yarn_mscale,
+                &mut block_out,
+            )
+            .map_err(|_| RsError::EvalFailed)?;
+            for i in 0..v.hidden_dim {
+                hidden[i] = residual[i] + block_out[i];
+            }
+
+            // ---- MLP sub-block: residual = h; h = h + mlp(norm(h)) ----
+            residual.copy_from_slice(&hidden);
+            let post_norm_name = format!(
+                "model.layers.{layer_idx}.post_attention_layernorm.weight"
+            );
+            rms_norm_cpu(wf, &post_norm_name, &hidden, &mut normed)
+                .map_err(|_| RsError::EvalFailed)?;
+
+            if layer_idx < v.first_k_dense_replace {
+                dense_mlp_swiglu_cpu(wf, layer_idx, &normed, &mut block_out)
+                    .map_err(|_| RsError::EvalFailed)?;
+            } else {
+                deepseek_moe_cpu(
+                    wf, experts, layer_idx, &normed, &mut block_out,
+                )
+                .map_err(|_| RsError::EvalFailed)?;
+            }
+            for i in 0..v.hidden_dim {
+                hidden[i] = residual[i] + block_out[i];
+            }
+        }
+
+        // Final RMSNorm.
+        let mut hidden_normed = vec![0.0f32; v.hidden_dim];
+        rms_norm_cpu(wf, "model.norm.weight", &hidden, &mut hidden_normed)
+            .map_err(|_| RsError::EvalFailed)?;
+
+        // LM head — GPU (the only GPU dispatch on this path). Skipped
+        // when `logits_out` is None (prompt-prefix step).
+        if let Some(logits) = logits_out {
+            lm_head_gpu
+                .forward(metal, wf_buf, &hidden_normed, logits)
+                .map_err(|_| RsError::EvalFailed)?;
+        }
+
+        Ok(())
+    }
+
     /// Per-token forward orchestrator. Mirrors C `mf_step_internal`
     /// (infer.m:7687..7721): embed → layer loop → optional drain +
     /// final norm + lm_head. If `logits_out` is `Some`, the deferred
@@ -1057,6 +1227,14 @@ impl RsCtx {
             if l.len() != v.vocab_size {
                 return Err(RsError::EvalFailed);
             }
+        }
+
+        // MLA variants (DeepSeek-V3 / Cogito-V2) run a fully separate
+        // CPU pipeline that bypasses the GPU GQA dispatch entirely.
+        // GPU MLA is a follow-up slice; for first-run validation, CPU
+        // is the source-of-truth path.
+        if matches!(v.attn_kind, variants::AttnKind::Mla) {
+            return self.step_internal_mla_cpu(token, pos, logits_out);
         }
 
         self.ensure_linear_resources()?;
@@ -1182,7 +1360,11 @@ impl RsCtx {
             if is_full {
                 let kv_state = match &mut layer_states[layer_idx] {
                     LayerState::FullAttn(kv) => kv,
-                    LayerState::LinearAttn(_) => {
+                    // MLA layers route through a separate dispatch
+                    // (Phase F). Reaching the GPU GQA path with an
+                    // MLA layer means the dispatch wasn't wired —
+                    // fail loudly at runtime.
+                    LayerState::Mla(_) | LayerState::LinearAttn(_) => {
                         return Err(RsError::EvalFailed);
                     }
                 };
@@ -1210,7 +1392,7 @@ impl RsCtx {
             } else {
                 let layer_state = match &mut layer_states[layer_idx] {
                     LayerState::LinearAttn(la) => la,
-                    LayerState::FullAttn(_) => {
+                    LayerState::FullAttn(_) | LayerState::Mla(_) => {
                         return Err(RsError::EvalFailed);
                     }
                 };
