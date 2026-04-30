@@ -39,8 +39,9 @@ use super::gpu_matvec::{
     encode_matvec, MatvecPipelines, MatvecSpec,
 };
 use super::gpu_mla::{
-    encode_mla_out_per_head_4bit, encode_mla_q_prime_4bit,
-    encode_mla_sdpa_folded, GpuMlaError, MlaPipelines,
+    encode_mla_kv_cache_append, encode_mla_out_per_head_4bit,
+    encode_mla_q_prime_4bit, encode_mla_sdpa_folded,
+    encode_mla_split_q_kv, GpuMlaError, MlaPipelines,
 };
 use super::gpu_norm::{
     encode_rms_norm_bf16_into, RmsNormBf16Pipelines,
@@ -293,13 +294,21 @@ pub fn mla_attn_layer_forward_gpu(
     let pipe_qprime = pipes.mla.q_prime.clone();
     let pipe_sdpa = pipes.mla.sdpa.clone();
     let pipe_outhead = pipes.mla.out_per_head.clone();
+    let pipe_split = pipes.mla.split_q_kv.clone();
+    let pipe_cache_append = pipes.mla.cache_append.clone();
     let pipe_yarn = pipes.yarn_rope.clone();
 
+    // Phase 4a — single command buffer for the entire MLA forward.
+    // The three host-side scatters that used to require commit+wait
+    // sync points are replaced by `mla_split_q_kv` and
+    // `mla_kv_cache_append` Metal kernels. Within one cmdbuf the
+    // queue serializes encoder-internal dispatches, so all
+    // intra-buffer data dependencies (matvec → split → norm → RoPE →
+    // append → SDPA → o_proj) are honored without explicit barriers.
     let queue = metal.queue();
     let cmdbuf = queue.new_command_buffer();
 
-    // ---- Q chain ----
-    // q_lat = q_a_proj @ pre_norm
+    // ---- Q chain (pre-norm → q_lat → q_full) ----
     encode_matvec(
         cmdbuf,
         &pipes.matvec,
@@ -315,7 +324,6 @@ pub fn mla_attn_layer_forward_gpu(
             bits: 4,
         },
     );
-    // q_lat = rms_norm(q_lat)  in place via sum_sq scratch
     encode_rms_norm_bf16_into(
         cmdbuf,
         &pipes.norms,
@@ -327,7 +335,6 @@ pub fn mla_attn_layer_forward_gpu(
         q_lora_rank,
         RMS_NORM_EPS,
     );
-    // q_full = q_b_proj @ q_lat
     encode_matvec(
         cmdbuf,
         &pipes.matvec,
@@ -344,8 +351,7 @@ pub fn mla_attn_layer_forward_gpu(
         },
     );
 
-    // ---- KV chain ----
-    // kv_pre = kv_a_proj_with_mqa @ pre_norm
+    // ---- KV-A chain (pre-norm → kv_pre) ----
     encode_matvec(
         cmdbuf,
         &pipes.matvec,
@@ -361,55 +367,25 @@ pub fn mla_attn_layer_forward_gpu(
             bits: 4,
         },
     );
-    // kv_pre is laid out as [kv_lat | k_pe]. Copy halves out
-    // in-flight so the rms_norm + RoPE kernels can target separate
-    // buffers without a host bounce.
-    {
-        // kv_lat = kv_pre[..kv_lora_rank]; kv_lat = rms_norm(kv_lat)
-        // Two encodings: a copy (use buffer-to-buffer blit) and a
-        // norm. Simpler: write kv_pre's first half into kv_lat via a
-        // small kernel. Cheaper: stage kv_lat / k_pe via host since
-        // kv_pre is shared-storage. We use the host bounce — `kv_pre`
-        // is shared so `contents()` is valid; but we have to wait
-        // for the matvec to complete first. To keep this synchronous-
-        // simple, we commit the chain so far, wait, then resume.
-    }
-    // Commit + wait so we can host-split kv_pre into kv_lat / k_pe
-    // on shared-storage without racing the matvec.
-    cmdbuf.commit();
-    cmdbuf.wait_until_completed();
 
-    // SAFETY: shared-storage buffers; matvec dispatch has completed.
-    unsafe {
-        let kv_pre_p = bufs.kv_pre.contents() as *const f32;
-        let kv_lat_p = bufs.kv_lat.contents() as *mut f32;
-        let k_pe_p = bufs.k_pe.contents() as *mut f32;
-        std::ptr::copy_nonoverlapping(
-            kv_pre_p,
-            kv_lat_p,
-            v.kv_lora_rank,
-        );
-        std::ptr::copy_nonoverlapping(
-            kv_pre_p.add(v.kv_lora_rank),
-            k_pe_p,
-            v.qk_rope_head_dim,
-        );
-        // Also extract q_pe halves out of q_full (per-head [nope|pe]).
-        let q_full_p = bufs.q_full.contents() as *const f32;
-        let q_pe_p = bufs.q_pe.contents() as *mut f32;
-        for h in 0..v.num_attn_heads {
-            std::ptr::copy_nonoverlapping(
-                q_full_p.add(h * (v.qk_nope_head_dim + v.qk_rope_head_dim) + v.qk_nope_head_dim),
-                q_pe_p.add(h * v.qk_rope_head_dim),
-                v.qk_rope_head_dim,
-            );
-        }
-    }
+    // ---- Fan-out scatter: q_full → (q_nope, q_pe); kv_pre → (kv_lat, k_pe) ----
+    // Replaces sync point #1 of the pre-Phase-4a forward.
+    encode_mla_split_q_kv(
+        cmdbuf,
+        &pipe_split,
+        &bufs.q_full,
+        &bufs.kv_pre,
+        &bufs.q_nope,
+        &bufs.q_pe,
+        &bufs.kv_lat,
+        &bufs.k_pe,
+        num_heads,
+        nope,
+        rope_dim,
+        kv_lora_rank,
+    );
 
-    // Resume: norms + RoPE + cache append + folded SDPA + o_proj.
-    let cmdbuf = queue.new_command_buffer();
-
-    // kv_lat = rms_norm(kv_lat)
+    // ---- kv_lat = rms_norm(kv_lat) (kv_a_layernorm) ----
     encode_rms_norm_bf16_into(
         cmdbuf,
         &pipes.norms,
@@ -422,7 +398,7 @@ pub fn mla_attn_layer_forward_gpu(
         RMS_NORM_EPS,
     );
 
-    // ---- YaRN RoPE on q_pe and k_pe ----
+    // ---- YaRN RoPE on q_pe and k_pe (in-place rotation) ----
     encode_yarn_rope_apply(
         cmdbuf,
         &pipe_yarn,
@@ -446,63 +422,25 @@ pub fn mla_attn_layer_forward_gpu(
     )
     .map_err(|_| MlaForwardGpuError::Metal(MetalError::NoDevice))?;
 
-    cmdbuf.commit();
-    cmdbuf.wait_until_completed();
+    // ---- Cache append: write (kv_lat, k_pe) into row[pos] ----
+    // Replaces sync point #2. The kernel sees a kernel-correct write
+    // ordering (after RoPE and norm), so subsequent SDPA reads the
+    // freshly-appended row through the cache's shared-storage buffer.
+    encode_mla_kv_cache_append(
+        cmdbuf,
+        &pipe_cache_append,
+        &bufs.kv_lat,
+        &bufs.k_pe,
+        latent_buf,
+        rope_k_buf,
+        kv_lora_rank,
+        rope_dim,
+        pos,
+    );
 
-    // Write rotated q_pe back into q_full's pe slots, and append
-    // (kv_lat, k_pe) to the MLA cache. Both are host-side memcpys
-    // since we're already past a sync point.
-    let new_idx = pos as usize;
-    // SAFETY: shared-storage buffers; cmdbuf completed above.
-    unsafe {
-        let q_pe_p = bufs.q_pe.contents() as *const f32;
-        let q_full_p = bufs.q_full.contents() as *mut f32;
-        for h in 0..v.num_attn_heads {
-            std::ptr::copy_nonoverlapping(
-                q_pe_p.add(h * v.qk_rope_head_dim),
-                q_full_p.add(h * qk_head_dim as usize + v.qk_nope_head_dim),
-                v.qk_rope_head_dim,
-            );
-        }
-        // Append kv_lat + k_pe to kv_cache row[new_idx].
-        let lat_dst_p = (latent_buf.contents() as *mut f32)
-            .add(new_idx * v.kv_lora_rank);
-        std::ptr::copy_nonoverlapping(
-            bufs.kv_lat.contents() as *const f32,
-            lat_dst_p,
-            v.kv_lora_rank,
-        );
-        let rk_dst_p = (rope_k_buf.contents() as *mut f32)
-            .add(new_idx * v.qk_rope_head_dim);
-        std::ptr::copy_nonoverlapping(
-            bufs.k_pe.contents() as *const f32,
-            rk_dst_p,
-            v.qk_rope_head_dim,
-        );
-    }
-    kv_cache.len = pos + 1;
-    let cache_len = kv_cache.len as u32;
+    let cache_len = (pos + 1) as u32;
 
-    // ---- Folded SDPA chain ----
-    let cmdbuf = queue.new_command_buffer();
-
-    // q_prime = q_nope @ kv_b_proj_K_per_head
-    // Pack q_nope from q_full's per-head [nope|pe] layout into a
-    // contiguous [num_heads, nope] buffer that the kernel can index
-    // as `q_nope[h * nope + i]`.
-    // SAFETY: previous cmdbuf is committed; both buffers are shared-
-    // storage with no GPU work in flight.
-    unsafe {
-        let q_full_p = bufs.q_full.contents() as *const f32;
-        let q_nope_p = bufs.q_nope.contents() as *mut f32;
-        for h in 0..v.num_attn_heads {
-            std::ptr::copy_nonoverlapping(
-                q_full_p.add(h * qk_head_dim as usize),
-                q_nope_p.add(h * v.qk_nope_head_dim),
-                v.qk_nope_head_dim,
-            );
-        }
-    }
+    // ---- Folded SDPA chain (q_prime → SDPA → out_per_head → o_proj) ----
     encode_mla_q_prime_4bit(
         cmdbuf,
         &pipe_qprime,
@@ -521,7 +459,6 @@ pub fn mla_attn_layer_forward_gpu(
         64, // group_size
     );
 
-    // Folded SDPA inner.
     let softmax_scale =
         (1.0 / (qk_head_dim as f32).sqrt()) * yarn.mscale * yarn.mscale;
     encode_mla_sdpa_folded(
@@ -539,7 +476,6 @@ pub fn mla_attn_layer_forward_gpu(
         softmax_scale,
     )?;
 
-    // out_per_head = v_combine @ kv_b_proj_V_per_head
     encode_mla_out_per_head_4bit(
         cmdbuf,
         &pipe_outhead,
@@ -559,7 +495,6 @@ pub fn mla_attn_layer_forward_gpu(
         64,
     );
 
-    // o_proj final matvec: out = o_proj @ out_per_head_flat
     encode_matvec(
         cmdbuf,
         &pipes.matvec,
@@ -578,6 +513,8 @@ pub fn mla_attn_layer_forward_gpu(
 
     cmdbuf.commit();
     cmdbuf.wait_until_completed();
+    // GPU-side cache row is now populated; bump the Rust-side bookkeeping.
+    kv_cache.len = pos + 1;
     Ok(())
 }
 

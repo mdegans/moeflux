@@ -54,12 +54,17 @@ pub const MLA_MAX_CACHE_TG: u32 = 4096;
 /// `MLA_THREADS_PER_HEAD` Metal constant.
 pub const MLA_THREADS_PER_HEAD: u32 = 128;
 
-/// Pre-fetched compute pipelines for the three MLA kernels. Built
-/// once per `RsCtx` and threaded into per-token dispatch helpers.
+/// Pre-fetched compute pipelines for the MLA kernels. Built once per
+/// `RsCtx` and threaded into per-token dispatch helpers. Phase 4a
+/// added `split_q_kv` and `cache_append` so the whole MLA forward
+/// fits in one Metal command buffer (no host bounces between
+/// projections, RoPE, and SDPA).
 pub struct MlaPipelines {
     pub q_prime: ComputePipelineState,
     pub sdpa: ComputePipelineState,
     pub out_per_head: ComputePipelineState,
+    pub split_q_kv: ComputePipelineState,
+    pub cache_append: ComputePipelineState,
 }
 
 impl MlaPipelines {
@@ -68,6 +73,8 @@ impl MlaPipelines {
             q_prime: metal.pipeline("mla_q_prime_4bit")?.clone(),
             sdpa: metal.pipeline("mla_sdpa_folded")?.clone(),
             out_per_head: metal.pipeline("mla_out_per_head_4bit")?.clone(),
+            split_q_kv: metal.pipeline("mla_split_q_kv")?.clone(),
+            cache_append: metal.pipeline("mla_kv_cache_append")?.clone(),
         })
     }
 }
@@ -688,4 +695,88 @@ mod tests {
             "GPU/host drift {max_drift} on out_per_head"
         );
     }
+}
+
+/// Encode the Phase-4a fan-out scatter: split `q_full` into
+/// `(q_nope, q_pe)` per head and `kv_pre` into `(kv_lat, k_pe)`. Pure
+/// scatter — kills sync point #1 of the synchronous MLA forward by
+/// promoting the host-side memcpys at `mla_attn_forward.rs:380-407`
+/// into a Metal kernel.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_mla_split_q_kv(
+    cmdbuf: &CommandBufferRef,
+    pipe: &ComputePipelineState,
+    q_full: &Buffer,
+    kv_pre: &Buffer,
+    q_nope: &Buffer,
+    q_pe: &Buffer,
+    kv_lat: &Buffer,
+    k_pe: &Buffer,
+    num_heads: u32,
+    qk_nope: u32,
+    qk_rope: u32,
+    kv_lora_rank: u32,
+) {
+    let enc = cmdbuf.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(pipe);
+    enc.set_buffer(0, Some(q_full), 0);
+    enc.set_buffer(1, Some(kv_pre), 0);
+    enc.set_buffer(2, Some(q_nope), 0);
+    enc.set_buffer(3, Some(q_pe), 0);
+    enc.set_buffer(4, Some(kv_lat), 0);
+    enc.set_buffer(5, Some(k_pe), 0);
+    enc.set_bytes(6, 4, (&num_heads as *const u32).cast());
+    enc.set_bytes(7, 4, (&qk_nope as *const u32).cast());
+    enc.set_bytes(8, 4, (&qk_rope as *const u32).cast());
+    enc.set_bytes(9, 4, (&kv_lora_rank as *const u32).cast());
+    let q_nope_total = num_heads * qk_nope;
+    let q_pe_total = num_heads * qk_rope;
+    let max_out = q_nope_total
+        .max(q_pe_total)
+        .max(kv_lora_rank)
+        .max(qk_rope);
+    let num_tgs = max_out.div_ceil(256);
+    enc.dispatch_thread_groups(
+        MTLSize::new(num_tgs as NSUInteger, 1, 1),
+        MTLSize::new(256, 1, 1),
+    );
+    enc.end_encoding();
+}
+
+/// Encode the Phase-4a MLA cache append. Writes `kv_lat` →
+/// `latent_cache[pos, :]` and `k_pe` → `rope_k_cache[pos, :]`. Kills
+/// sync point #2 of the synchronous MLA forward (host-side memcpy at
+/// `mla_attn_forward.rs:467-481`).
+///
+/// Caller is still responsible for `kv_cache.len = pos + 1` after the
+/// cmdbuf commits — that's a Rust-side bookkeeping field the kernel
+/// can't see.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_mla_kv_cache_append(
+    cmdbuf: &CommandBufferRef,
+    pipe: &ComputePipelineState,
+    kv_lat: &Buffer,
+    k_pe: &Buffer,
+    latent_cache: &Buffer,
+    rope_k_cache: &Buffer,
+    kv_lora_rank: u32,
+    qk_rope: u32,
+    pos: i32,
+) {
+    let enc = cmdbuf.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(pipe);
+    enc.set_buffer(0, Some(kv_lat), 0);
+    enc.set_buffer(1, Some(k_pe), 0);
+    enc.set_buffer(2, Some(latent_cache), 0);
+    enc.set_buffer(3, Some(rope_k_cache), 0);
+    enc.set_bytes(4, 4, (&kv_lora_rank as *const u32).cast());
+    enc.set_bytes(5, 4, (&qk_rope as *const u32).cast());
+    enc.set_bytes(6, 4, (&pos as *const i32).cast());
+    let max_out = kv_lora_rank.max(qk_rope);
+    let num_tgs = max_out.div_ceil(256);
+    enc.dispatch_thread_groups(
+        MTLSize::new(num_tgs as NSUInteger, 1, 1),
+        MTLSize::new(256, 1, 1),
+    );
+    enc.end_encoding();
 }
