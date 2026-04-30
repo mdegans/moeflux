@@ -1433,3 +1433,269 @@ kernel void yarn_rope_apply(
     x[base + i]            = x0 * cos_a - x1 * sin_a;
     x[base + i + half_dim] = x0 * sin_a + x1 * cos_a;
 }
+
+// ============================================================================
+// Kernel 14: MLA folded — q' = q_nope @ kv_b_proj_K_per_head (4-bit)
+// ============================================================================
+// Computes per-head:
+//   q'[h, c] = Σ_{i=0..nope} q_nope[h, i] * dequant(W[h * kv_b_per_head + i, c])
+// where W is `kv_b_proj` (`[num_heads * kv_b_per_head, kv_lora_rank]`,
+// 4-bit affine MLX layout). The K-portion uses rows
+// `[h * kv_b_per_head, h * kv_b_per_head + nope)`; the V-portion sits
+// in the next `v_head_dim` rows and is consumed by `mla_out_per_head_4bit`.
+//
+// Dispatch:
+//   threadgroups = ((num_heads * kv_lora_rank + 255) / 256, 1, 1)
+//   threads      = (256, 1, 1)
+// Each thread owns one output element (h, c) and runs the full 128-step
+// dot product. With 65,536 outputs for Cogito-V2 the geometry is fine
+// without tiling.
+//
+// Memory access is "row-wise" relative to standard matvec (varying
+// row index inside the dot product), so we don't reuse
+// `dequant_matvec_4bit_v3`'s per-row-per-SIMD pattern. Each thread reads
+// 128 group-scale/bias pairs and 128 nibbles per output — uncoalesced
+// at the byte level but the working set per thread is small.
+//
+// Layout invariants (assumed):
+// - `group_size` divides `kv_lora_rank` (64 | 512 ✓)
+// - 8 nibbles per packed uint32 (4 bits × 8 = 32 bits ✓)
+// - scales/biases stored row-major `[num_heads * kv_b_per_head, num_groups]`
+
+kernel void mla_q_prime_4bit(
+    device const uint32_t* W_packed     [[buffer(0)]],   // [num_heads * kv_b_per_head, kv_lora_rank/8]
+    device const uint16_t* scales       [[buffer(1)]],   // [num_heads * kv_b_per_head, num_groups]
+    device const uint16_t* biases       [[buffer(2)]],   // [num_heads * kv_b_per_head, num_groups]
+    device const float*    q_nope       [[buffer(3)]],   // [num_heads, nope]
+    device float*          q_prime      [[buffer(4)]],   // [num_heads, kv_lora_rank]
+    constant uint&         num_heads    [[buffer(5)]],
+    constant uint&         nope         [[buffer(6)]],
+    constant uint&         kv_lora_rank [[buffer(7)]],
+    constant uint&         kv_b_per_head[[buffer(8)]],
+    constant uint&         group_size   [[buffer(9)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    uint total = num_heads * kv_lora_rank;
+    if (tid >= total) return;
+    uint h = tid / kv_lora_rank;
+    uint c = tid - h * kv_lora_rank;
+
+    uint num_groups   = kv_lora_rank / group_size;
+    uint packed_cols  = kv_lora_rank / 8;
+    uint g            = c / group_size;          // which group on the row
+    uint c_in_packed  = c >> 3;                  // = c / 8
+    uint c_nibble     = c & 7;                   // = c % 8
+    uint nibble_shift = c_nibble * 4;
+
+    float acc = 0.0f;
+    uint base_row = h * kv_b_per_head;
+    for (uint i = 0; i < nope; ++i) {
+        uint row = base_row + i;
+        float scale = bf16_to_f32(scales[row * num_groups + g]);
+        float bias  = bf16_to_f32(biases[row * num_groups + g]);
+        uint32_t packed = W_packed[row * packed_cols + c_in_packed];
+        float nib = float((packed >> nibble_shift) & 0xF);
+        float w = nib * scale + bias;
+        acc += q_nope[h * nope + i] * w;
+    }
+    q_prime[h * kv_lora_rank + c] = acc;
+}
+
+// ============================================================================
+// Kernel 15: MLA folded — out_per_head = V_combine @ kv_b_proj_V_per_head (4-bit)
+// ============================================================================
+// Computes per-head:
+//   out[h, f] = Σ_{c=0..kv_lora_rank}
+//                  V_combine[h, c] * dequant(W[h * kv_b_per_head + nope + f, c])
+// V-portion rows of `kv_b_proj` are contiguous per head — same packed
+// matrix as `mla_q_prime_4bit`, just different row offsets.
+//
+// Dispatch:
+//   threadgroups = ((num_heads * v_head_dim + 31) / 32, 1, 1)
+//   threads      = (32, 1, 1)        (one SIMD group per output element)
+// Threads in a SIMD group cooperate on the 512-wide dot product via
+// `simd_sum`. Lane k handles columns k, k+32, k+64, … (stride 32).
+
+kernel void mla_out_per_head_4bit(
+    device const uint32_t* W_packed      [[buffer(0)]],
+    device const uint16_t* scales        [[buffer(1)]],
+    device const uint16_t* biases        [[buffer(2)]],
+    device const float*    v_combine     [[buffer(3)]],   // [num_heads, kv_lora_rank]
+    device float*          out_per_head  [[buffer(4)]],   // [num_heads, v_head_dim]
+    constant uint&         num_heads     [[buffer(5)]],
+    constant uint&         nope          [[buffer(6)]],
+    constant uint&         kv_lora_rank  [[buffer(7)]],
+    constant uint&         v_head_dim    [[buffer(8)]],
+    constant uint&         kv_b_per_head [[buffer(9)]],
+    constant uint&         group_size    [[buffer(10)]],
+    uint tgid       [[threadgroup_position_in_grid]],
+    uint simd_lane  [[thread_index_in_simdgroup]]
+) {
+    uint total_outputs = num_heads * v_head_dim;
+    if (tgid >= total_outputs) return;
+    uint h = tgid / v_head_dim;
+    uint f = tgid - h * v_head_dim;
+
+    uint row = h * kv_b_per_head + nope + f;
+    uint num_groups  = kv_lora_rank / group_size;
+    uint packed_cols = kv_lora_rank / 8;
+
+    device const uint32_t* w_row = W_packed + row * packed_cols;
+    device const uint16_t* s_row = scales   + row * num_groups;
+    device const uint16_t* b_row = biases   + row * num_groups;
+    device const float*    v_h   = v_combine + h * kv_lora_rank;
+
+    // Lane k processes packed columns k, k+32, k+64, … (each carries
+    // 8 nibbles → 8 input dims).
+    float acc = 0.0f;
+    for (uint col = simd_lane; col < packed_cols; col += 32) {
+        uint g = col / (group_size / 8);
+        float scale = bf16_to_f32(s_row[g]);
+        float bias  = bf16_to_f32(b_row[g]);
+        uint32_t packed = w_row[col];
+        uint x_base = col * 8;
+        // Standard 8-nibble fused dequant·multiply (mirrors v3 kernel).
+        for (uint k = 0; k < 8; ++k) {
+            float nib = float((packed >> (k * 4)) & 0xF);
+            float w   = nib * scale + bias;
+            acc       = fma(v_h[x_base + k], w, acc);
+        }
+    }
+    float sum = simd_sum(acc);
+    if (simd_lane == 0) {
+        out_per_head[h * v_head_dim + f] = sum;
+    }
+}
+
+// ============================================================================
+// Kernel 16: MLA folded — SDPA over latent + rope-K cache
+// ============================================================================
+// One threadgroup per attention head. Inside the head:
+//
+//   scores[t] = q'[h] · latent_cache[t] + q_pe[h] · rope_k_cache[t]
+//   scores  *= scale         (= 1/sqrt(qk_head_dim) * mscale²)
+//   softmax(scores) over t in 0..cache_len
+//   v_combine[h, c] = Σ_t  scores[t] * latent_cache[t, c]
+//
+// Threads in the group cooperate on the dot products + softmax
+// reductions. Geometry is `(num_heads, 1, 1)` threadgroups with
+// `(THREADS_PER_HEAD = 128, 1, 1)` threads each — same as Cogito-V2's
+// `qk_nope_head_dim`, but the value is unrelated to that dim; it's
+// just chosen so each thread carries one cached-position slot for
+// short contexts (`cache_len ≤ 128`) and tiles for longer ones.
+//
+// Dispatch:
+//   threadgroups = (num_heads, 1, 1)
+//   threads      = (THREADS_PER_HEAD, 1, 1)
+//
+// Cache-length cap: `scores[]` lives in 32 KB threadgroup memory;
+// 4096 floats × 4 bytes = 16 KB leaves headroom for the
+// `lane0_acc[]` simd-broadcast scratch (one float per simdgroup,
+// 4 lanes/group max in this dispatch). Long-context tiling (100k+)
+// is a follow-up — at that point we'll dispatch the scores in
+// chunks instead of bumping the per-tg cap.
+constant uint MLA_THREADS_PER_HEAD = 128;
+constant uint MLA_MAX_CACHE_TG     = 4096;
+
+kernel void mla_sdpa_folded(
+    device const float* q_prime          [[buffer(0)]],   // [num_heads, kv_lora_rank]
+    device const float* q_pe             [[buffer(1)]],   // [num_heads, qk_rope_head_dim]
+    device const float* latent_cache     [[buffer(2)]],   // [cache_len, kv_lora_rank]
+    device const float* rope_k_cache     [[buffer(3)]],   // [cache_len, qk_rope_head_dim]
+    device float*       v_combine        [[buffer(4)]],   // [num_heads, kv_lora_rank]
+    constant uint&      num_heads        [[buffer(5)]],
+    constant uint&      kv_lora_rank     [[buffer(6)]],
+    constant uint&      qk_rope_head_dim [[buffer(7)]],
+    constant uint&      cache_len        [[buffer(8)]],
+    constant float&     softmax_scale    [[buffer(9)]],
+    uint tg  [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]]
+) {
+    if (tg >= num_heads) return;
+
+    uint h = tg;
+    threadgroup float scores[MLA_MAX_CACHE_TG];
+    // One float per simdgroup (max 4 simdgroups @ 32 lanes ⇒ 128
+    // threads). Used as the cross-simd scratch for max + sum
+    // reductions, so we don't need single-element tg-shared
+    // broadcasts that would push us over the 32 KB cap.
+    threadgroup float simd_scratch[8];
+
+    // ---- 1. scores[t] = q'[h] · latent[t] + q_pe[h] · rope_k[t] ----
+    device const float* q_h    = q_prime + h * kv_lora_rank;
+    device const float* q_pe_h = q_pe    + h * qk_rope_head_dim;
+    for (uint t = lid; t < cache_len; t += MLA_THREADS_PER_HEAD) {
+        device const float* lat_t = latent_cache  + t * kv_lora_rank;
+        device const float* rkt   = rope_k_cache  + t * qk_rope_head_dim;
+        float s = 0.0f;
+        for (uint c = 0; c < kv_lora_rank; ++c) {
+            s = fma(q_h[c], lat_t[c], s);
+        }
+        for (uint r = 0; r < qk_rope_head_dim; ++r) {
+            s = fma(q_pe_h[r], rkt[r], s);
+        }
+        scores[t] = s * softmax_scale;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- 2. softmax(scores) — two-stage reduction ----
+    // Stage A: each lane folds its strided slice; simd_max within
+    // simdgroup; lane 0 of each simdgroup writes to simd_scratch;
+    // lane 0 of simdgroup 0 reduces across simdgroups.
+    uint simd_lane  = lid & 31;
+    uint simd_group = lid >> 5;
+    uint num_simdgroups = MLA_THREADS_PER_HEAD / 32;
+    float local_max = -INFINITY;
+    for (uint t = lid; t < cache_len; t += MLA_THREADS_PER_HEAD) {
+        local_max = max(local_max, scores[t]);
+    }
+    float simd_max_v = simd_max(local_max);
+    if (simd_lane == 0) { simd_scratch[simd_group] = simd_max_v; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float maxv;
+    if (simd_group == 0) {
+        float v = (simd_lane < num_simdgroups)
+            ? simd_scratch[simd_lane]
+            : -INFINITY;
+        v = simd_max(v);
+        if (simd_lane == 0) { simd_scratch[0] = v; }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    maxv = simd_scratch[0];
+
+    // Stage B: exp + accumulate (same two-stage pattern for sum).
+    float local_sum = 0.0f;
+    for (uint t = lid; t < cache_len; t += MLA_THREADS_PER_HEAD) {
+        float e = exp(scores[t] - maxv);
+        scores[t] = e;
+        local_sum += e;
+    }
+    float simd_sum_v = simd_sum(local_sum);
+    if (simd_lane == 0) { simd_scratch[simd_group] = simd_sum_v; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float total_sum;
+    if (simd_group == 0) {
+        float v = (simd_lane < num_simdgroups)
+            ? simd_scratch[simd_lane]
+            : 0.0f;
+        v = simd_sum(v);
+        if (simd_lane == 0) { simd_scratch[1] = v; }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    total_sum = simd_scratch[1];
+    float inv_sum = 1.0f / total_sum;
+    for (uint t = lid; t < cache_len; t += MLA_THREADS_PER_HEAD) {
+        scores[t] *= inv_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- 3. v_combine[h, c] = Σ_t scores[t] * latent[t, c] ----
+    device float* vc_h = v_combine + h * kv_lora_rank;
+    for (uint c = lid; c < kv_lora_rank; c += MLA_THREADS_PER_HEAD) {
+        float acc = 0.0f;
+        for (uint t = 0; t < cache_len; ++t) {
+            acc = fma(scores[t], latent_cache[t * kv_lora_rank + c], acc);
+        }
+        vc_h[c] = acc;
+    }
+}

@@ -35,6 +35,7 @@ pub mod gpu_attn;
 pub mod gpu_linear_attn;
 pub mod gpu_lm_head;
 pub mod gpu_matvec;
+pub mod gpu_mla;
 pub mod gpu_norm;
 pub mod gpu_rope;
 pub mod layer_weight_cache;
