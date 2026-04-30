@@ -24,9 +24,11 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 
+pub mod cogito_moe_gpu;
 pub mod cpu_matvec;
 pub mod cpu_ops;
 pub mod deferred;
+pub mod dense_mlp_gpu;
 pub mod embedding;
 pub mod expert_forward;
 pub mod expert_io;
@@ -224,6 +226,12 @@ pub struct RsCtx {
     /// MLA per-kernel compute pipelines (q_prime / sdpa / out_per_head
     /// + matvec / norms / yarn_rope). Lazy.
     mla_pipes: Option<mla_attn_forward::MlaForwardPipelines>,
+    /// Phase 3 — Cogito-V2 / DeepSeek-V3 dense-MLP GPU buffers. One set
+    /// reused across the `first_k_dense_replace` dense layers. Allocated
+    /// only on MLA variants whose `dense_intermediate > 0`.
+    dense_mlp_bufs: Option<dense_mlp_gpu::DenseMlpBuffers>,
+    /// Phase 3 — pipelines for the dense MLP forward (matvec + swiglu).
+    dense_mlp_pipes: Option<dense_mlp_gpu::DenseMlpPipelines>,
     // Future phases populate: vocab.
 }
 
@@ -273,6 +281,8 @@ impl RsCtx {
             mla_buffers: None,
             mla_yarn: None,
             mla_pipes: None,
+            dense_mlp_bufs: None,
+            dense_mlp_pipes: None,
         })
     }
 
@@ -1022,6 +1032,24 @@ impl RsCtx {
                     .map_err(|_| RsError::InitFailed)?,
             );
         }
+        // Phase 3 — full-GPU dense MLP + MoE for the MLA path.
+        if VARIANT.first_k_dense_replace > 0 && self.dense_mlp_bufs.is_none()
+        {
+            self.dense_mlp_bufs =
+                Some(dense_mlp_gpu::DenseMlpBuffers::new(&device));
+        }
+        if VARIANT.first_k_dense_replace > 0
+            && self.dense_mlp_pipes.is_none()
+        {
+            let metal = self.metal.as_mut().expect("just-set");
+            self.dense_mlp_pipes = Some(
+                dense_mlp_gpu::DenseMlpPipelines::fetch(metal)
+                    .map_err(|_| RsError::InitFailed)?,
+            );
+        }
+        if self.moe_buffers.is_none() {
+            self.moe_buffers = Some(MoeBuffers::new(&device));
+        }
         Ok(())
     }
 
@@ -1255,9 +1283,9 @@ impl RsCtx {
         pos: i32,
         logits_out: Option<&mut [f32]>,
     ) -> Result<(), RsError> {
+        use cogito_moe_gpu::cogito_moe_layer_forward_gpu;
+        use dense_mlp_gpu::dense_mlp_layer_forward_gpu;
         use mla_attn_forward::mla_attn_layer_forward_gpu;
-        use mlp_cpu::dense_mlp_swiglu_cpu;
-        use moe_cpu::deepseek_moe_cpu;
 
         self.ensure_mla_resources()?;
         let v = VARIANT;
@@ -1272,6 +1300,10 @@ impl RsCtx {
             mla_buffers,
             mla_yarn,
             mla_pipes,
+            dense_mlp_bufs,
+            dense_mlp_pipes,
+            moe_buffers,
+            io_pool,
             ..
         } = self;
         let metal = metal.as_mut().expect("ensure_mla_resources");
@@ -1282,6 +1314,12 @@ impl RsCtx {
             mla_buffers.as_mut().expect("ensure_mla_resources");
         let mla_yarn = mla_yarn.as_ref().expect("ensure_mla_resources");
         let mla_pipes = mla_pipes.as_ref().expect("ensure_mla_resources");
+        let dense_mlp_bufs =
+            dense_mlp_bufs.as_mut().expect("ensure_mla_resources");
+        let dense_mlp_pipes =
+            dense_mlp_pipes.as_ref().expect("ensure_mla_resources");
+        let moe_buffers =
+            moe_buffers.as_mut().expect("ensure_mla_resources");
 
         // Embed → host hidden buffer.
         let mut hidden = vec![0.0f32; v.hidden_dim];
@@ -1356,11 +1394,27 @@ impl RsCtx {
                 .map_err(|_| RsError::EvalFailed)?;
 
             if layer_idx < v.first_k_dense_replace {
-                dense_mlp_swiglu_cpu(wf, layer_idx, &normed, &mut block_out)
-                    .map_err(|_| RsError::EvalFailed)?;
+                dense_mlp_layer_forward_gpu(
+                    metal,
+                    dense_mlp_pipes,
+                    dense_mlp_bufs,
+                    wf,
+                    wf_buf,
+                    layer_idx,
+                    &normed,
+                    &mut block_out,
+                )
+                .map_err(|_| RsError::EvalFailed)?;
             } else {
-                deepseek_moe_cpu(
-                    wf, experts, layer_idx, &normed, &mut block_out,
+                cogito_moe_layer_forward_gpu(
+                    metal,
+                    moe_buffers,
+                    wf,
+                    experts,
+                    io_pool,
+                    layer_idx,
+                    &normed,
+                    &mut block_out,
                 )
                 .map_err(|_| RsError::EvalFailed)?;
             }
