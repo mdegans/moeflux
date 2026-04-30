@@ -1,0 +1,1 @@
+{"id":"e4cca220-ca94-4f1c-be55-95371128885c","role":"assistant","content":[{"type":"text","text":"I'm doing well, thank you. How can I help you today?"}],"model":"cogito-v2-671b","stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":11,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":15}}
