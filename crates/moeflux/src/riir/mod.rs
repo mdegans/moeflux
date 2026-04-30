@@ -40,6 +40,7 @@ pub mod linear_attn;
 pub mod linear_attn_forward;
 pub mod lm_head;
 pub mod metal;
+pub mod mla_attn_cpu;
 pub mod moe_router;
 pub mod mtl_weight_buf;
 pub mod prefetch;

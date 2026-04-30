@@ -71,6 +71,83 @@ impl KvCache {
     }
 }
 
+/// Multi-head Latent Attention KV cache for one MLA layer (DeepSeek-V3
+/// architecture — Cogito-V2-Preview-671B).
+///
+/// MLA jointly compresses K and V to a `kv_lora_rank`-dim latent
+/// (512 for Cogito-V2) plus a shared `qk_rope_head_dim`-dim rope-K
+/// (64 for Cogito-V2) per token. Total cached width per token is
+/// `kv_lora_rank + qk_rope_head_dim` (= 576 for Cogito-V2), giving
+/// ~28× memory compression vs GQA at long context.
+///
+/// At use time, K_nope and V are reconstructed from the latent via
+/// `kv_b_proj` per cached position; only the rope-K is stored
+/// directly.
+///
+/// Allocated to [`MAX_SEQ_LEN`] capacity. Pages are lazy-committed
+/// via `alloc_zeroed`, so the initial reservation is virtual-only on
+/// macOS.
+///
+/// Phase C scaffold: type defined; allocation and dispatch into
+/// [`LayerState`] land alongside the MLA forward kernel in
+/// [`super::mla_attn_cpu`].
+#[derive(Debug)]
+pub struct MlaKvCache {
+    /// `kv_a_layernorm`-output cache: post-down-projection,
+    /// post-norm latent. Shape `[max_seq, kv_lora_rank]` row-major.
+    pub latent_cache: Box<[f32]>,
+    /// Pre-RoPE'd rope-K cache (already RoPE-applied at the position
+    /// it was stored at — broadcast across all heads at use time).
+    /// Shape `[max_seq, qk_rope_head_dim]`.
+    pub rope_k_cache: Box<[f32]>,
+    /// Number of populated positions.
+    pub len: i32,
+}
+
+impl MlaKvCache {
+    /// Allocate a zeroed MLA KV cache sized for the active variant.
+    /// Reads `kv_lora_rank` and `qk_rope_head_dim` from `VARIANT`.
+    /// On non-MLA variants these are 0 and the resulting cache is
+    /// empty — guarded against accidentally calling this at
+    /// allocation dispatch in [`alloc_layer_states`].
+    pub fn new() -> Self {
+        let latent_entries = MAX_SEQ_LEN * VARIANT.kv_lora_rank;
+        let rope_k_entries = MAX_SEQ_LEN * VARIANT.qk_rope_head_dim;
+        Self {
+            latent_cache: vec![0.0f32; latent_entries].into_boxed_slice(),
+            rope_k_cache: vec![0.0f32; rope_k_entries].into_boxed_slice(),
+            len: 0,
+        }
+    }
+
+    /// Reset to positions `[0, new_len)`. No-op if already shorter or
+    /// `new_len` is invalid.
+    pub fn truncate(&mut self, new_len: i32) {
+        if new_len < 0 || new_len > self.len {
+            return;
+        }
+        let old_len = self.len;
+        if new_len < old_len {
+            let l_start =
+                (new_len as usize) * VARIANT.kv_lora_rank;
+            let l_end = (old_len as usize) * VARIANT.kv_lora_rank;
+            self.latent_cache[l_start..l_end].fill(0.0);
+            let r_start =
+                (new_len as usize) * VARIANT.qk_rope_head_dim;
+            let r_end =
+                (old_len as usize) * VARIANT.qk_rope_head_dim;
+            self.rope_k_cache[r_start..r_end].fill(0.0);
+        }
+        self.len = new_len;
+    }
+}
+
+impl Default for MlaKvCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// GatedDeltaNet recurrent state for one linear-attention layer.
 /// `conv_state` holds the depthwise conv1d's last `(kernel_size - 1)`
 /// inputs; `ssm_state` holds the per-v-head outer-product state of
