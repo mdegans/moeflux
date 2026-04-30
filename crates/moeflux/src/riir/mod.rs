@@ -44,6 +44,7 @@ pub mod linear_attn_forward;
 pub mod lm_head;
 pub mod metal;
 pub mod mla_attn_cpu;
+pub mod mla_attn_forward;
 pub mod mlp_cpu;
 pub mod moe_cpu;
 pub mod moe_router;
@@ -214,6 +215,15 @@ pub struct RsCtx {
     /// cap aligns with the upstream contract by construction.
     /// Adjustable via [`Self::set_max_checkpoints`].
     max_checkpoints: usize,
+    /// MLA per-token GPU scratch (q/k chains, q_prime, v_combine,
+    /// out_per_head etc.). Built by `ensure_mla_gpu_resources` on
+    /// first GPU MLA eval; reused across every token.
+    mla_buffers: Option<mla_attn_forward::MlaForwardBuffers>,
+    /// MLA YaRN tables (inv_freq buffer + mscale scalar). Lazy.
+    mla_yarn: Option<mla_attn_forward::MlaYarnTables>,
+    /// MLA per-kernel compute pipelines (q_prime / sdpa / out_per_head
+    /// + matvec / norms / yarn_rope). Lazy.
+    mla_pipes: Option<mla_attn_forward::MlaForwardPipelines>,
     // Future phases populate: vocab.
 }
 
@@ -260,6 +270,9 @@ impl RsCtx {
             checkpoints: HashMap::new(),
             checkpoint_order: VecDeque::new(),
             max_checkpoints: DEFAULT_MAX_CHECKPOINTS,
+            mla_buffers: None,
+            mla_yarn: None,
+            mla_pipes: None,
         })
     }
 
@@ -991,6 +1004,24 @@ impl RsCtx {
                 mla.ensure_buffers(&device);
             }
         }
+        // GPU MLA forward resources — buffers + YaRN tables + pipelines.
+        // Used by `step_internal_mla_gpu`; absent on the env-gated CPU
+        // fallback path.
+        if self.mla_buffers.is_none() {
+            self.mla_buffers =
+                Some(mla_attn_forward::MlaForwardBuffers::new(&device));
+        }
+        if self.mla_yarn.is_none() {
+            self.mla_yarn =
+                Some(mla_attn_forward::MlaYarnTables::new(&device));
+        }
+        if self.mla_pipes.is_none() {
+            let metal = self.metal.as_mut().expect("just-set");
+            self.mla_pipes = Some(
+                mla_attn_forward::MlaForwardPipelines::new(metal)
+                    .map_err(|_| RsError::InitFailed)?,
+            );
+        }
         Ok(())
     }
 
@@ -1211,6 +1242,145 @@ impl RsCtx {
         Ok(())
     }
 
+    /// Per-token GPU MLA forward — same shape as
+    /// [`Self::step_internal_mla_cpu`] but runs the attention block on
+    /// Metal via [`mla_attn_forward::mla_attn_layer_forward_gpu`].
+    /// Dense MLP / MoE remain on CPU for first run; the GPU bounce
+    /// per layer is one shared-storage memcpy of `hidden_dim` floats,
+    /// cheap relative to the projections + SDPA we just moved off the
+    /// CPU. Full GPU MoE integration is a follow-up perf slice.
+    fn step_internal_mla_gpu(
+        &mut self,
+        token: i32,
+        pos: i32,
+        logits_out: Option<&mut [f32]>,
+    ) -> Result<(), RsError> {
+        use mla_attn_forward::mla_attn_layer_forward_gpu;
+        use mlp_cpu::dense_mlp_swiglu_cpu;
+        use moe_cpu::deepseek_moe_cpu;
+
+        self.ensure_mla_resources()?;
+        let v = VARIANT;
+
+        let Self {
+            wf,
+            metal,
+            wf_buf,
+            experts,
+            layer_states,
+            lm_head_gpu,
+            mla_buffers,
+            mla_yarn,
+            mla_pipes,
+            ..
+        } = self;
+        let metal = metal.as_mut().expect("ensure_mla_resources");
+        let wf_buf = wf_buf.as_ref().expect("ensure_mla_resources");
+        let lm_head_gpu =
+            lm_head_gpu.as_ref().expect("ensure_mla_resources");
+        let mla_buffers =
+            mla_buffers.as_mut().expect("ensure_mla_resources");
+        let mla_yarn = mla_yarn.as_ref().expect("ensure_mla_resources");
+        let mla_pipes = mla_pipes.as_ref().expect("ensure_mla_resources");
+
+        // Embed → host hidden buffer.
+        let mut hidden = vec![0.0f32; v.hidden_dim];
+        embedding::embed_lookup(wf, token, &mut hidden)
+            .map_err(|_| RsError::EvalFailed)?;
+
+        // Per-layer scratch.
+        let mut residual = vec![0.0f32; v.hidden_dim];
+        let mut normed = vec![0.0f32; v.hidden_dim];
+        let mut block_out = vec![0.0f32; v.hidden_dim];
+        let mut mla_out_host = vec![0.0f32; v.hidden_dim];
+
+        for layer_idx in 0..v.num_layers {
+            // ---- Attention sub-block: residual + MLA(norm(h)) ----
+            residual.copy_from_slice(&hidden);
+            let pre_norm_name =
+                format!("model.layers.{layer_idx}.input_layernorm.weight");
+            rms_norm_cpu(wf, &pre_norm_name, &hidden, &mut normed)
+                .map_err(|_| RsError::EvalFailed)?;
+
+            // Stage `normed` into the GPU buffer.
+            // SAFETY: shared-storage; no GPU work in flight (we're
+            // between layers and the previous mla_attn_layer_forward_gpu
+            // committed + waited).
+            unsafe {
+                let dst =
+                    mla_buffers.pre_norm.contents() as *mut f32;
+                std::ptr::copy_nonoverlapping(
+                    normed.as_ptr(),
+                    dst,
+                    v.hidden_dim,
+                );
+            }
+
+            let kv_cache = match &mut layer_states[layer_idx] {
+                LayerState::Mla(c) => c,
+                LayerState::FullAttn(_) | LayerState::LinearAttn(_) => {
+                    return Err(RsError::EvalFailed);
+                }
+            };
+            mla_attn_layer_forward_gpu(
+                metal,
+                mla_pipes,
+                wf,
+                wf_buf,
+                mla_yarn,
+                mla_buffers,
+                kv_cache,
+                layer_idx,
+                pos,
+            )
+            .map_err(|_| RsError::EvalFailed)?;
+
+            // Read MLA output back to host for the CPU MoE/dense path.
+            // SAFETY: shared-storage; the GPU forward committed +
+            // waited inside `mla_attn_layer_forward_gpu`.
+            unsafe {
+                let p = mla_buffers.out.contents() as *const f32;
+                let s = std::slice::from_raw_parts(p, v.hidden_dim);
+                mla_out_host.copy_from_slice(s);
+            }
+            for i in 0..v.hidden_dim {
+                hidden[i] = residual[i] + mla_out_host[i];
+            }
+
+            // ---- MLP sub-block: residual + MLP(norm(h)) ----
+            residual.copy_from_slice(&hidden);
+            let post_norm_name = format!(
+                "model.layers.{layer_idx}.post_attention_layernorm.weight"
+            );
+            rms_norm_cpu(wf, &post_norm_name, &hidden, &mut normed)
+                .map_err(|_| RsError::EvalFailed)?;
+
+            if layer_idx < v.first_k_dense_replace {
+                dense_mlp_swiglu_cpu(wf, layer_idx, &normed, &mut block_out)
+                    .map_err(|_| RsError::EvalFailed)?;
+            } else {
+                deepseek_moe_cpu(
+                    wf, experts, layer_idx, &normed, &mut block_out,
+                )
+                .map_err(|_| RsError::EvalFailed)?;
+            }
+            for i in 0..v.hidden_dim {
+                hidden[i] = residual[i] + block_out[i];
+            }
+        }
+
+        // Final RMSNorm + GPU lm_head.
+        let mut hidden_normed = vec![0.0f32; v.hidden_dim];
+        rms_norm_cpu(wf, "model.norm.weight", &hidden, &mut hidden_normed)
+            .map_err(|_| RsError::EvalFailed)?;
+        if let Some(logits) = logits_out {
+            lm_head_gpu
+                .forward(metal, wf_buf, &hidden_normed, logits)
+                .map_err(|_| RsError::EvalFailed)?;
+        }
+        Ok(())
+    }
+
     /// Per-token forward orchestrator. Mirrors C `mf_step_internal`
     /// (infer.m:7687..7721): embed → layer loop → optional drain +
     /// final norm + lm_head. If `logits_out` is `Some`, the deferred
@@ -1242,12 +1412,20 @@ impl RsCtx {
             }
         }
 
-        // MLA variants (DeepSeek-V3 / Cogito-V2) run a fully separate
-        // CPU pipeline that bypasses the GPU GQA dispatch entirely.
-        // GPU MLA is a follow-up slice; for first-run validation, CPU
-        // is the source-of-truth path.
+        // MLA variants (DeepSeek-V3 / Cogito-V2) run a separate
+        // pipeline that bypasses the GPU GQA dispatch. The GPU
+        // attention path is the default; setting
+        // `MOEFLUX_FORCE_CPU_MLA=1` falls back to the original
+        // host-only path (used as a diff oracle and as a last-resort
+        // fallback if the GPU path regresses).
         if matches!(v.attn_kind, variants::AttnKind::Mla) {
-            return self.step_internal_mla_cpu(token, pos, logits_out);
+            let force_cpu =
+                std::env::var_os("MOEFLUX_FORCE_CPU_MLA").is_some();
+            return if force_cpu {
+                self.step_internal_mla_cpu(token, pos, logits_out)
+            } else {
+                self.step_internal_mla_gpu(token, pos, logits_out)
+            };
         }
 
         self.ensure_linear_resources()?;
