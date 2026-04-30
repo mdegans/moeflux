@@ -9,6 +9,18 @@
 //!
 //! Integration tests pick this up via `mod common; use
 //! common::c_backend::Ctx;`.
+//!
+//! ## Variant gating
+//!
+//! Only the C-supported variants compile this module. Variants
+//! without a C-side oracle (e.g. `model-cogito-v2-671b`) make this
+//! file empty — `moeflux-sys`'s build.rs writes an empty bindings.rs
+//! in that case, and the diff_oracle test target is gated likewise.
+
+#![cfg(any(
+    feature = "model-qwen3-5-a17b",
+    feature = "model-qwen3-6-35b-a3b",
+))]
 
 use std::ffi::{CStr, CString};
 use std::fmt;

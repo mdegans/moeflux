@@ -20,7 +20,13 @@ fn main() {
         return;
     }
 
-    // Exactly one model variant must be selected by the consuming crate.
+    // Exactly one C-supported model variant must be selected by the
+    // consuming crate when the C oracle is wanted. Variants without a
+    // C counterpart (e.g. `model-cogito-v2-671b`) skip the C build:
+    // we still compile this crate as a no-op so the diff-oracle test
+    // target compiles, but lib.rs's `include!()` reads an empty
+    // bindings.rs and the c_backend wrapper is gated to only the
+    // C-supported variants.
     let model_defines: Vec<(&str, &str)> = [
         ("CARGO_FEATURE_MODEL_QWEN3_5_A17B",    "MOEFLUX_MODEL_QWEN3_5_A17B"),
         ("CARGO_FEATURE_MODEL_QWEN3_6_35B_A3B", "MOEFLUX_MODEL_QWEN3_6_35B_A3B"),
@@ -29,13 +35,21 @@ fn main() {
     .filter(|(feat, _)| env::var(feat).is_ok())
     .collect();
     let model_define = match model_defines.len() {
-        0 => panic!(
-            "moeflux-sys: no model variant feature enabled. Enable exactly one of: \
-             `model-qwen3-5-a17b`, `model-qwen3-6-35b-a3b`."
-        ),
+        0 => {
+            println!(
+                "cargo:warning=moeflux-sys: no C-side model variant enabled \
+                 (only Rust-side variants like `model-cogito-v2-671b`); \
+                 skipping C build. Empty bindings.rs will be emitted."
+            );
+            // Write an empty bindings.rs so lib.rs's `include!()` succeeds.
+            let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+            std::fs::write(out_dir.join("bindings.rs"), b"")
+                .expect("writing empty bindings.rs");
+            return;
+        }
         1 => model_defines[0].1,
         _ => panic!(
-            "moeflux-sys: multiple model variants enabled ({model_defines:?}). \
+            "moeflux-sys: multiple C-side model variants enabled ({model_defines:?}). \
              Exactly one must be selected."
         ),
     };

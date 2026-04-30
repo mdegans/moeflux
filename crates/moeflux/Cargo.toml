@@ -17,6 +17,11 @@ default = []
 # the matching `MOEFLUX_MODEL_*` define when integration tests run.
 model-qwen3-5-a17b      = ["moeflux-sys/model-qwen3-5-a17b"]
 model-qwen3-6-35b-a3b   = ["moeflux-sys/model-qwen3-6-35b-a3b"]
+# Cogito-V2-Preview-671B (DeepSeek-V3 architecture). No C-side
+# oracle today — moeflux-sys gets the feature for symmetry but its
+# build.rs skips the C compile (no model_variant.h block exists for
+# this variant).
+model-cogito-v2-671b    = ["moeflux-sys/model-cogito-v2-671b"]
 
 [dependencies]
 thiserror   = { workspace = true }

@@ -1,5 +1,9 @@
 //! Differential test harness for the RIIR port.
 //!
+//! Gated to C-supported variants — variants without a C-side oracle
+//! (`model-cogito-v2-671b`) skip this whole test file, since the
+//! oracle backend doesn't exist for them.
+//!
 //! Two implementations of [`DiffBackend`]:
 //!
 //! - **`CBackend`** wraps the existing C-via-`moeflux-sys` path
@@ -53,7 +57,13 @@
 //!     -- --ignored --nocapture --test-threads=1
 //! ```
 
-#![cfg(target_os = "macos")]
+#![cfg(all(
+    target_os = "macos",
+    any(
+        feature = "model-qwen3-5-a17b",
+        feature = "model-qwen3-6-35b-a3b",
+    ),
+))]
 
 use std::path::{Path, PathBuf};
 
