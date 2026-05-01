@@ -47,11 +47,11 @@ use super::variants::{Variant, VARIANT};
 ///
 /// **Variant-gated to `model-cogito-v2-671b` only.** Theoretical
 /// rationale: when the expert working set is *much larger* than
-/// physical RAM (Cogito-V2 ≈ 340 GB at 4-bit on a 32 GB UMA Mac),
+/// physical RAM (Cogito-V2 ≈ 340 GB at 4-bit on a 96 GB UMA Mac),
 /// kernel readahead is wasteful — adjacent pages get pulled into
 /// the page cache, evicting other expert pages we still need.
 /// When the working set fits (Qwen3.5-397B-A17B streams from
-/// per-layer files into a ~24 MB pool, comfortably under 32 GB),
+/// per-layer files into a ~24 MB pool, comfortably resident),
 /// readahead might help warm-token cache hits. The C path
 /// applied F_RDAHEAD=0 unconditionally; we gate it because the
 /// Rust port spans a wider variant range than the C path was
