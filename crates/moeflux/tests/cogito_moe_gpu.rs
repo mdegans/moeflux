@@ -20,11 +20,16 @@
 
 use std::path::Path;
 
-use moeflux::riir::cogito_moe_gpu::cogito_moe_layer_forward_gpu;
+use moeflux::riir::cogito_moe_gpu::{
+    cogito_moe_layer_forward_gpu, SharedExpertBuffers,
+};
+use moeflux::riir::dense_mlp_gpu::DenseMlpPipelines;
 use moeflux::riir::expert_forward::MoeBuffers;
 use moeflux::riir::expert_io::ExpertFiles;
+use moeflux::riir::gpu_matvec::BfMatvecPipelines;
 use moeflux::riir::metal::MetalBackend;
 use moeflux::riir::moe_cpu::deepseek_moe_cpu;
+use moeflux::riir::mtl_weight_buf::MtlWeightBuf;
 use moeflux::riir::variants::VARIANT;
 use moeflux::riir::weight_file::WeightFile;
 
@@ -49,6 +54,12 @@ fn cogito_moe_layer3_gpu_matches_cpu() {
     let mut metal = MetalBackend::new().expect("open Metal");
     let device = metal.device().clone();
     let mut bufs = MoeBuffers::new(&device);
+    let shared_bufs = SharedExpertBuffers::new(&device);
+    let dense_pipes =
+        DenseMlpPipelines::fetch(&mut metal).expect("fetch DenseMlpPipelines");
+    let bf_pipes =
+        BfMatvecPipelines::fetch(&mut metal).expect("fetch BfMatvecPipelines");
+    let wf_buf = MtlWeightBuf::wrap(&wf, &device);
 
     // ---- Synthetic input (sin pattern; same as moe_layer3_smoke) ----
     let mut hidden = vec![0.0f32; hidden_dim];
@@ -80,7 +91,11 @@ fn cogito_moe_layer3_gpu_matches_cpu() {
     cogito_moe_layer_forward_gpu(
         &mut metal,
         &mut bufs,
+        &shared_bufs,
+        &dense_pipes,
+        &bf_pipes,
         &wf,
+        &wf_buf,
         &ef,
         &pool,
         layer_idx,

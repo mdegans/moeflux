@@ -27,6 +27,9 @@ serde_json  = "1"
 metal       = "0.32"
 # Work-stealing thread pool for parallel K-expert pread (slice 5d-6).
 rayon       = "1.10"
+# Used for `fcntl(F_RDAHEAD, 0)` on layer fds — disables kernel
+# readahead for the random per-token expert access pattern.
+libc        = "0.2"
 
 [profile.release]
 opt-level = 3

@@ -133,6 +133,17 @@ impl MlaKvCacheGpu {
     /// `128k * 64 * 4 = 32 MB` for the rope-K cache, per layer.
     /// Both are virtual reservations until pages are touched.
     pub fn ensure_buffers(&mut self, device: &Device) {
+        // Phase 3 (cogito-v2 full-GPU): drop the explicit
+        // `zero_shared_buffer` here. macOS Metal `StorageModeShared`
+        // buffers come from the Mach VM via the same anonymous-mapping
+        // path `mmap(MAP_ANON)` uses — pages are zero-filled on first
+        // touch by the kernel. The 17.5 GB explicit memset that
+        // dominated cold-eval profiles was redundant: every byte was
+        // about to be implicitly zero-paged anyway when the per-layer
+        // append wrote into it. Removing it drops cold init from ~23s
+        // to ~1s on cogito-v2-671b without changing kernel-visible
+        // values (writes still see zero on first read of unwritten
+        // pages, matching the explicit-memset behavior bit-for-bit).
         if self.latent_cache.is_none() {
             let bytes = (MAX_SEQ_LEN * VARIANT.kv_lora_rank
                 * std::mem::size_of::<f32>())
@@ -141,7 +152,6 @@ impl MlaKvCacheGpu {
                 bytes,
                 MTLResourceOptions::StorageModeShared,
             );
-            zero_shared_buffer(&buf);
             self.latent_cache = Some(buf);
         }
         if self.rope_k_cache.is_none() {
@@ -152,7 +162,6 @@ impl MlaKvCacheGpu {
                 bytes,
                 MTLResourceOptions::StorageModeShared,
             );
-            zero_shared_buffer(&buf);
             self.rope_k_cache = Some(buf);
         }
     }

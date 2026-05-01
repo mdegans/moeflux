@@ -908,6 +908,58 @@ kernel void residual_add(
 
 
 // ============================================================================
+// Kernel: BF16 matvec (un-dequantized weights)
+// ============================================================================
+// output[r] = Σ_i input[i] * bf16_to_f32(w[r, i])
+//
+// Used by the Cogito-V2 / DeepSeek-V3 MoE router-gate matvec where the
+// gate weights are stored as bf16 (not 4-bit) — `model.layers.{i}.mlp
+// .gate.weight` at shape [num_experts=256, hidden_dim=7168].
+//
+// Threadgroup-per-output-row layout: tg_idx selects the output row
+// (= expert index); lanes within the threadgroup parallelize over the
+// in_dim and reduce via threadgroup memory. 256 threads/group is the
+// sweet spot for partials reduction on Apple Silicon.
+
+kernel void bf16_matvec(
+    device const uint16_t* w        [[buffer(0)]],   // bf16 weights, row-major [out_dim, in_dim]
+    device const float*    input    [[buffer(1)]],   // [in_dim] f32
+    device float*          output   [[buffer(2)]],   // [out_dim] f32
+    constant uint&         in_dim   [[buffer(3)]],
+    constant uint&         out_dim  [[buffer(4)]],
+    uint tg_idx  [[threadgroup_position_in_grid]],
+    uint lid     [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    if (tg_idx >= out_dim) return;
+
+    threadgroup float partials[256];
+
+    const device uint16_t* row = w + (size_t)tg_idx * (size_t)in_dim;
+
+    float sum = 0.0;
+    for (uint i = lid; i < in_dim; i += tg_size) {
+        sum += input[i] * bf16_to_f32(row[i]);
+    }
+    partials[lid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Tree reduce over partials[0..tg_size). Assumes tg_size is a
+    // power of two (we dispatch with 256, satisfies it).
+    for (uint stride = tg_size / 2; stride > 0; stride /= 2) {
+        if (lid < stride) {
+            partials[lid] += partials[lid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (lid == 0) {
+        output[tg_idx] = partials[0];
+    }
+}
+
+
+// ============================================================================
 // Kernel 6: Batched GPU attention scores (Q @ K^T, scaled) — all heads at once
 // ============================================================================
 //
@@ -1763,6 +1815,175 @@ kernel void mla_sdpa_folded(
         }
         vc_h[c] = acc;
     }
+}
+
+
+// ============================================================================
+// Phase 6 — tiled folded SDPA for cache_len > MLA_MAX_CACHE_TG
+// ============================================================================
+//
+// Flash-Attention-style online softmax across `cache_len` positions
+// processed in chunks of `MLA_TILE_SIZE`. Two kernels:
+//
+//   1. `mla_sdpa_tile_accumulate` — process one tile, update the
+//      running (max, denom, v_combine_partial) per head.
+//   2. `mla_sdpa_tile_finalize` — divide v_combine_partial by denom
+//      to produce the final v_combine.
+//
+// The running-state buffers must be sized [num_heads] (max, denom)
+// and [num_heads, kv_lora_rank] (v_combine_partial). The dispatcher
+// loops over tiles and dispatches `accumulate` per tile, then
+// `finalize` once.
+//
+// Bit-exact-against-single-shot only for `cache_len == MLA_TILE_SIZE`
+// (one tile, no merging). Multi-tile output is mathematically
+// equivalent up to floating-point reordering — cosine ≥ 0.9999 vs
+// the single-shot reference is the validation target.
+
+constant uint MLA_TILE_SIZE = 4096;
+
+kernel void mla_sdpa_tile_accumulate(
+    device const float* q_prime              [[buffer(0)]],
+    device const float* q_pe                 [[buffer(1)]],
+    device const float* latent_cache         [[buffer(2)]],
+    device const float* rope_k_cache         [[buffer(3)]],
+    device float*       running_max          [[buffer(4)]],
+    device float*       running_denom        [[buffer(5)]],
+    device float*       v_combine_partial    [[buffer(6)]],
+    constant uint&      num_heads            [[buffer(7)]],
+    constant uint&      kv_lora_rank         [[buffer(8)]],
+    constant uint&      qk_rope_head_dim     [[buffer(9)]],
+    constant uint&      tile_start           [[buffer(10)]],
+    constant uint&      tile_end             [[buffer(11)]],
+    constant float&     softmax_scale        [[buffer(12)]],
+    constant uint&      is_first_tile        [[buffer(13)]],
+    uint tg  [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]]
+) {
+    if (tg >= num_heads) return;
+    uint h = tg;
+    uint tile_size = tile_end - tile_start;
+    if (tile_size == 0) return;
+
+    threadgroup float scores[MLA_TILE_SIZE];
+    threadgroup float simd_scratch[8];
+
+    device const float* q_h    = q_prime + h * kv_lora_rank;
+    device const float* q_pe_h = q_pe    + h * qk_rope_head_dim;
+
+    // 1. scores[i] = (q'_h · latent[tile_start+i]) + (q_pe_h · rope_k[tile_start+i])
+    for (uint i = lid; i < tile_size; i += MLA_THREADS_PER_HEAD) {
+        uint t = tile_start + i;
+        device const float* lat_t = latent_cache + t * kv_lora_rank;
+        device const float* rkt   = rope_k_cache + t * qk_rope_head_dim;
+        float s = 0.0f;
+        for (uint c = 0; c < kv_lora_rank; ++c) {
+            s = fma(q_h[c], lat_t[c], s);
+        }
+        for (uint r = 0; r < qk_rope_head_dim; ++r) {
+            s = fma(q_pe_h[r], rkt[r], s);
+        }
+        scores[i] = s * softmax_scale;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 2. tile_max = max over scores[0..tile_size)
+    uint simd_lane  = lid & 31;
+    uint simd_group = lid >> 5;
+    uint num_simdgroups = MLA_THREADS_PER_HEAD / 32;
+    float local_max = -INFINITY;
+    for (uint i = lid; i < tile_size; i += MLA_THREADS_PER_HEAD) {
+        local_max = max(local_max, scores[i]);
+    }
+    float simd_max_v = simd_max(local_max);
+    if (simd_lane == 0) { simd_scratch[simd_group] = simd_max_v; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float tile_max;
+    if (simd_group == 0) {
+        float v = (simd_lane < num_simdgroups)
+            ? simd_scratch[simd_lane]
+            : -INFINITY;
+        v = simd_max(v);
+        if (simd_lane == 0) { simd_scratch[0] = v; }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    tile_max = simd_scratch[0];
+
+    // 3. exp(scores - tile_max) into scores[], tile_sum.
+    float local_sum = 0.0f;
+    for (uint i = lid; i < tile_size; i += MLA_THREADS_PER_HEAD) {
+        float e = exp(scores[i] - tile_max);
+        scores[i] = e;
+        local_sum += e;
+    }
+    float simd_sum_v = simd_sum(local_sum);
+    if (simd_lane == 0) { simd_scratch[simd_group] = simd_sum_v; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float tile_sum;
+    if (simd_group == 0) {
+        float v = (simd_lane < num_simdgroups)
+            ? simd_scratch[simd_lane]
+            : 0.0f;
+        v = simd_sum(v);
+        if (simd_lane == 0) { simd_scratch[1] = v; }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    tile_sum = simd_scratch[1];
+
+    // 4. Merge with running state.
+    //    new_max   = max(prev_max, tile_max)
+    //    scale_old = exp(prev_max - new_max)
+    //    scale_new = exp(tile_max  - new_max)
+    //    new_denom = prev_denom * scale_old + tile_sum * scale_new
+    //    V[c]      = prev_V[c]  * scale_old + tile_partial[c] * scale_new
+    float prev_max   = (is_first_tile != 0u) ? -INFINITY : running_max[h];
+    float prev_denom = (is_first_tile != 0u) ? 0.0f      : running_denom[h];
+    float new_max    = max(prev_max, tile_max);
+    // exp(-INFINITY - new_max) = 0 by IEEE — covers the first-tile
+    // branch without needing a special case. tile_max <= new_max so
+    // scale_new is in [0, 1].
+    float scale_old  = exp(prev_max - new_max);
+    float scale_new  = exp(tile_max  - new_max);
+    float new_denom  = prev_denom * scale_old + tile_sum * scale_new;
+
+    device float* v_partial_h = v_combine_partial + h * kv_lora_rank;
+    for (uint c = lid; c < kv_lora_rank; c += MLA_THREADS_PER_HEAD) {
+        // Tile partial for this c: Σ_i exp(scores[i]-tile_max) * latent[tile_start+i, c].
+        // scores[i] currently holds exp(scores[i] - tile_max).
+        float tile_partial = 0.0f;
+        for (uint i = 0; i < tile_size; ++i) {
+            uint t = tile_start + i;
+            tile_partial = fma(
+                scores[i],
+                latent_cache[t * kv_lora_rank + c],
+                tile_partial);
+        }
+        float prev_v = (is_first_tile != 0u) ? 0.0f : v_partial_h[c];
+        v_partial_h[c] = prev_v * scale_old + tile_partial * scale_new;
+    }
+
+    if (lid == 0) {
+        running_max[h]   = new_max;
+        running_denom[h] = new_denom;
+    }
+}
+
+kernel void mla_sdpa_tile_finalize(
+    device const float* v_combine_partial [[buffer(0)]],
+    device const float* running_denom     [[buffer(1)]],
+    device float*       v_combine         [[buffer(2)]],
+    constant uint&      num_heads         [[buffer(3)]],
+    constant uint&      kv_lora_rank      [[buffer(4)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    uint total = num_heads * kv_lora_rank;
+    if (tid >= total) return;
+    uint h = tid / kv_lora_rank;
+    float d = running_denom[h];
+    // Defensive: guard against denom=0 (would only happen on
+    // cache_len=0 which the dispatcher filters).
+    float inv = (d > 0.0f) ? (1.0f / d) : 0.0f;
+    v_combine[tid] = v_combine_partial[tid] * inv;
 }
 
 // ============================================================================

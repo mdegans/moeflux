@@ -338,6 +338,11 @@ pub struct MoeBuffers {
     shared_out: MtlBuffer<f32>,
     moe_hidden: MtlBuffer<f32>,
     combine_params: MtlBuffer<f32>,
+    /// Phase 2 (cogito-v2 full-GPU): MoE router-gate logits buffer,
+    /// `[num_experts]` f32. The GPU `bf16_matvec` dispatch writes
+    /// here; CPU `noaux_tc` routing reads it back via
+    /// [`Self::gate_logits_to_vec`]. ~1 KB at num_experts=256.
+    gate_logits: MtlBuffer<f32>,
 }
 
 impl MoeBuffers {
@@ -348,38 +353,46 @@ impl MoeBuffers {
     /// dispatch.
     pub fn new(device: &metal::Device) -> Self {
         let v: Variant = VARIANT;
-        // Build arrays without requiring Default on MtlBuffer.
+        // Slice 5d-6 / Phase 0 (cogito-v2 full-GPU plan): explicit 2 MB
+        // alignment on the pread DMA destinations. The C path documents
+        // a 3.6× DMA improvement over 16 KB alignment
+        // (`metal_infer/infer.m:1196`); Apple's allocator only lands
+        // large allocations on 2 MB boundaries incidentally, and a
+        // probe at this site previously fired on cogito-v2's expert
+        // size (~24 MB), so we control it explicitly via
+        // `MtlBuffer::with_aligned_len_u8` (posix-memalign-equivalent +
+        // `newBufferWithBytesNoCopy:`).
+        const TWO_MIB: usize = 2 * 1024 * 1024;
         let data_synced = std::array::from_fn(|_| {
-            MtlBuffer::<u8>::with_len(device, v.expert_size_4bit())
+            MtlBuffer::<u8>::with_aligned_len_u8(
+                device,
+                v.expert_size_4bit(),
+                TWO_MIB,
+            )
         });
         let data_prefetch: [[MtlBuffer<u8>; MAX_K]; 2] =
             std::array::from_fn(|_| {
                 std::array::from_fn(|_| {
-                    MtlBuffer::<u8>::with_len(device, v.expert_size_4bit())
+                    MtlBuffer::<u8>::with_aligned_len_u8(
+                        device,
+                        v.expert_size_4bit(),
+                        TWO_MIB,
+                    )
                 })
             });
-        // Slice 5d-6: probe 2 MB DMA alignment on the data slots.
-        // Apple's malloc-via-mmap path *often* lands large (>= 1 MB)
-        // shared-storage allocations on 2 MB boundaries; the C path
-        // claims a 3.6× DMA improvement over 16 KB alignment for the
-        // pread destination (`metal_infer/infer.m:1196`). We rely on
-        // that incidental behavior rather than a custom allocator;
-        // warn once if it ever fails so we can revisit (fallback
-        // would be `posix_memalign + new_buffer_with_bytes_no_copy`).
-        const TWO_MIB: usize = 2 * 1024 * 1024;
+        // Defense-in-depth: assert alignment held. Using debug_assert
+        // because the constructor returns aligned bytes by construction
+        // (posix_memalign-equivalent); a release-mode failure would
+        // indicate a bug in the global allocator's alignment handling,
+        // which we don't try to recover from.
         let probe = |label: &str, set: &[MtlBuffer<u8>]| {
             for (slot, buf) in set.iter().enumerate() {
                 let addr = buf.raw().contents() as usize;
-                if addr % TWO_MIB != 0 {
-                    eprintln!(
-                        "[moe] WARNING: data_{label} slot {slot} not 2 MB \
-                         aligned (contents=0x{addr:x}, off=0x{off:x}); \
-                         pread DMA may use scatter-gather. See slice 5d-6 \
-                         plan.",
-                        off = addr % TWO_MIB
-                    );
-                    return;
-                }
+                debug_assert_eq!(
+                    addr % TWO_MIB,
+                    0,
+                    "data_{label} slot {slot} not 2 MB aligned (contents=0x{addr:x})",
+                );
             }
         };
         probe("synced", &data_synced[..]);
@@ -407,6 +420,7 @@ impl MoeBuffers {
             shared_out: MtlBuffer::with_len(device, v.hidden_dim),
             moe_hidden: MtlBuffer::with_len(device, v.hidden_dim),
             combine_params: MtlBuffer::with_len(device, 18),
+            gate_logits: MtlBuffer::with_len(device, v.num_experts.max(1)),
         }
     }
 
@@ -463,6 +477,72 @@ impl MoeBuffers {
     ) -> [&mut [u8]; MAX_K] {
         debug_assert!(set < 2, "prefetch set index must be 0 or 1");
         self.data_prefetch[set].each_mut().map(|b| b.as_mut_slice())
+    }
+
+    /// Owned-form accessor for the post-attn-norm input buffer
+    /// (`bufs.input`). Used by callers (Cogito MoE path) that pre-stage
+    /// the input host-side via [`Self::stage_host_input`] and then bind
+    /// the same buffer into a GPU dispatch — avoids the second copy
+    /// the host-slice variant of `gpu_batched_experts_encode` does.
+    /// Returns `&metal::Buffer` (not `&BufferRef`) so callers can
+    /// satisfy APIs that need `&Buffer` (e.g. `MatvecSpec`).
+    pub(crate) fn input_buffer(&self) -> &metal::Buffer {
+        self.input.buffer()
+    }
+
+    /// Owned-form accessor for the residual-input buffer (`bufs.h_mid`).
+    /// See [`Self::input_buffer`].
+    pub(crate) fn h_mid_buffer(&self) -> &metal::Buffer {
+        self.h_mid.buffer()
+    }
+
+    /// Owned-form accessor for the shared-expert output buffer
+    /// (`bufs.shared_out`). The Cogito MoE path encodes the GPU shared
+    /// expert into this buffer and binds the same buffer into the
+    /// pre-staged combine — no host roundtrip.
+    pub(crate) fn shared_out_buffer(&self) -> &metal::Buffer {
+        self.shared_out.buffer()
+    }
+
+    /// Stage `hidden` into `bufs.input` (host copy into shared-storage
+    /// Metal buffer). Caller must ensure no GPU work in flight on
+    /// `bufs.input`.
+    pub(crate) fn stage_host_input(&mut self, hidden: &[f32]) {
+        debug_assert_eq!(hidden.len(), VARIANT.hidden_dim);
+        self.input.as_mut_slice().copy_from_slice(hidden);
+    }
+
+    /// Zero `bufs.h_mid`. Used when the layer's residual contribution
+    /// should equal `Σ moe + shared_out` exactly (no h_mid term added
+    /// by the combine kernel).
+    pub(crate) fn stage_host_h_mid_zero(&mut self) {
+        self.h_mid.as_mut_slice().fill(0.0);
+    }
+
+    /// Read back `bufs.moe_hidden` to a host `Vec<f32>`. Caller must
+    /// ensure the cmdbuf that wrote it has completed.
+    pub(crate) fn moe_hidden_to_vec(&self) -> Vec<f32> {
+        self.moe_hidden.to_vec()
+    }
+
+    /// Owned-form accessor for the post-combine hidden buffer
+    /// (`bufs.moe_hidden`). Phase 5 GPU residual stream uses this to
+    /// read the MoE output directly into a downstream `residual_add`
+    /// dispatch without a host bounce.
+    pub fn moe_hidden_ref(&self) -> &metal::Buffer {
+        self.moe_hidden.buffer()
+    }
+
+    /// Owned-form accessor for the router-gate-logits buffer. Used as
+    /// the output target by the GPU `bf16_matvec` dispatch.
+    pub(crate) fn gate_logits_buffer(&self) -> &metal::Buffer {
+        self.gate_logits.buffer()
+    }
+
+    /// Read back `bufs.gate_logits` to a host `Vec<f32>`. Caller must
+    /// ensure the cmdbuf that wrote it has completed.
+    pub(crate) fn gate_logits_to_vec(&self) -> Vec<f32> {
+        self.gate_logits.to_vec()
     }
 }
 

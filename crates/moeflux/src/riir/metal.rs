@@ -67,6 +67,7 @@ pub const ALL_KERNELS: &[&str] = &[
     "attn_scores_batched",
     "attn_softmax_batched",
     "attn_values_batched",
+    "bf16_matvec",
     "compute_decay_beta",
     "conv1d_step",
     "dequant_matvec_2bit",
@@ -80,6 +81,8 @@ pub const ALL_KERNELS: &[&str] = &[
     "fused_gate_up_swiglu",
     "gated_delta_net_step",
     "gated_rms_norm",
+    "mla_sdpa_tile_accumulate",
+    "mla_sdpa_tile_finalize",
     "moe_combine_residual",
     "residual_add",
     "rms_norm_apply",
@@ -197,6 +200,40 @@ impl std::fmt::Debug for MetalBackend {
 // MtlBuffer — typed RAII wrapper around metal::Buffer
 // ---------------------------------------------------------------------------
 
+/// Owned, custom-aligned heap allocation backing an [`MtlBuffer`]
+/// constructed via [`MtlBuffer::with_aligned_len_u8`]. Frees on drop.
+///
+/// The Metal buffer that wraps this allocation uses `deallocator=None`
+/// (Metal does not own the bytes). Drop order in [`MtlBuffer`] runs
+/// fields in declaration order, so `inner` drops first (releasing the
+/// GPU-side reference), then `_backing` drops here (freeing the
+/// allocation). Reordering the field list would corrupt this.
+struct AlignedBacking {
+    ptr: std::ptr::NonNull<u8>,
+    layout: std::alloc::Layout,
+}
+
+// SAFETY: `AlignedBacking` is a logically-owned heap region. The
+// `NonNull<u8>` is the unique owner (no aliasing); access is
+// serialized by the enclosing `MtlBuffer` which moeflux holds via
+// the single-`&mut Ctx` discipline. `metal::Buffer`'s `Send` bound
+// (it's Objective-C reference-counted, thread-safe per Apple docs)
+// is what makes `MtlBuffer<u8>` useful across rayon boundaries; the
+// backing must match it.
+unsafe impl Send for AlignedBacking {}
+unsafe impl Sync for AlignedBacking {}
+
+impl Drop for AlignedBacking {
+    fn drop(&mut self) {
+        // SAFETY: `ptr` was allocated by the global allocator with
+        // `layout` in `MtlBuffer::with_aligned_len_u8`. This is the
+        // only `dealloc` site for it, and the matching `MtlBuffer`'s
+        // `inner` (Buffer) field drops before this (declaration
+        // order), so no GPU work can still reference the bytes.
+        unsafe { std::alloc::dealloc(self.ptr.as_ptr(), self.layout) }
+    }
+}
+
 /// Typed wrapper around a Metal buffer. Tracks element count and
 /// element type for type-safe `to_vec` round-trips. All buffers use
 /// shared storage mode (CPU+GPU accessible) — moeflux's working set
@@ -205,6 +242,13 @@ impl std::fmt::Debug for MetalBackend {
 pub struct MtlBuffer<T> {
     inner: metal::Buffer,
     len: usize,
+    /// Owned backing for the [`MtlBuffer::with_aligned_len_u8`] path,
+    /// where Metal wraps externally-allocated bytes via
+    /// `newBufferWithBytesNoCopy:` with `deallocator=None`. `None` for
+    /// the standard `with_len` / `with_data` paths where Metal owns
+    /// the allocation. **Field order matters** — `inner` must drop
+    /// before this so the Buffer releases its borrow first.
+    _backing: Option<AlignedBacking>,
     _phantom: std::marker::PhantomData<T>,
 }
 
@@ -218,6 +262,7 @@ impl<T: Copy> MtlBuffer<T> {
         Self {
             inner,
             len,
+            _backing: None,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -234,12 +279,23 @@ impl<T: Copy> MtlBuffer<T> {
         Self {
             inner,
             len: data.len(),
+            _backing: None,
             _phantom: std::marker::PhantomData,
         }
     }
 
     /// Underlying `metal::Buffer` for passing to encoder calls.
     pub fn raw(&self) -> &metal::BufferRef {
+        &self.inner
+    }
+
+    /// Owned-buffer accessor — same value as [`Self::raw`] but at
+    /// `&metal::Buffer` rather than `&metal::BufferRef`. Useful when
+    /// downstream APIs (e.g. [`super::gpu_matvec::MatvecSpec`]) want
+    /// `&Buffer` specifically. `Buffer` derefs to `BufferRef`, so
+    /// callers expecting either can use this; some can't take `&BufferRef`
+    /// because their lifetimes are tied to `&Buffer`.
+    pub fn buffer(&self) -> &metal::Buffer {
         &self.inner
     }
 
@@ -279,6 +335,51 @@ impl<T: Copy> MtlBuffer<T> {
         let ptr = self.inner.contents() as *mut T;
         // SAFETY: see method docs.
         unsafe { std::slice::from_raw_parts_mut(ptr, self.len) }
+    }
+}
+
+impl MtlBuffer<u8> {
+    /// Allocate `len` bytes with explicit alignment (e.g. 2 MB for
+    /// pread DMA destinations) and wrap as a Metal shared-storage
+    /// buffer via `newBufferWithBytesNoCopy:`. Apple's allocator only
+    /// lands large allocations on 2 MB boundaries incidentally — for
+    /// the expert-pool buffers the C path documents a 3.6× DMA
+    /// throughput cliff if we miss the alignment, so we control it
+    /// explicitly here.
+    ///
+    /// `align` must be a power of two and a multiple of `T`'s native
+    /// alignment (trivially true for `u8`). The Metal buffer holds a
+    /// non-owning reference to the bytes; the [`AlignedBacking`] in
+    /// the returned [`MtlBuffer`] frees on drop after `inner` releases.
+    pub fn with_aligned_len_u8(
+        device: &Device,
+        len: usize,
+        align: usize,
+    ) -> Self {
+        assert!(align.is_power_of_two(), "align must be power of two");
+        assert!(len > 0, "with_aligned_len_u8 len must be > 0");
+        let layout = std::alloc::Layout::from_size_align(len, align)
+            .expect("invalid alignment for len");
+        // SAFETY: `layout` has nonzero size; OOM is handled by aborting
+        // via `handle_alloc_error`, matching Box / Vec behavior.
+        let raw = unsafe { std::alloc::alloc(layout) };
+        let ptr = std::ptr::NonNull::new(raw)
+            .unwrap_or_else(|| std::alloc::handle_alloc_error(layout));
+        // Wrap as a Metal buffer with deallocator=None — Metal does
+        // not own the allocation; `AlignedBacking::drop` does, and
+        // runs strictly after `inner` (declaration order).
+        let inner = device.new_buffer_with_bytes_no_copy(
+            ptr.as_ptr() as *const std::ffi::c_void,
+            len as NSUInteger,
+            MTLResourceOptions::StorageModeShared,
+            None,
+        );
+        Self {
+            inner,
+            len,
+            _backing: Some(AlignedBacking { ptr, layout }),
+            _phantom: std::marker::PhantomData,
+        }
     }
 }
 

@@ -35,9 +35,36 @@
 use std::fs::File;
 use std::io;
 use std::os::unix::fs::FileExt;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use super::variants::{Variant, VARIANT};
+
+/// Disable kernel readahead on a successfully-opened layer fd.
+/// Expert access is random per token (different routed expert each
+/// step), so kernel readahead pulls in adjacent pages we never read
+/// — wasting SSD bandwidth. Mirrors `fcntl(fd, F_RDAHEAD, 0)` in
+/// the C path at `metal_infer/infer.m:7593`.
+fn disable_readahead(file: &File) {
+    // SAFETY: `file.as_raw_fd()` is owned by `file` for the duration
+    // of this call; `F_RDAHEAD` with arg=0 has no failure modes that
+    // affect correctness — if it errors (e.g. on a non-macOS unix
+    // where the cmd is unsupported), readahead just stays at default
+    // and we eat a tiny perf loss. We log the failure for diagnostics
+    // but don't propagate.
+    #[cfg(target_os = "macos")]
+    unsafe {
+        let rc = libc::fcntl(file.as_raw_fd(), libc::F_RDAHEAD, 0i32);
+        if rc < 0 {
+            let err = std::io::Error::last_os_error();
+            eprintln!("[experts] fcntl(F_RDAHEAD, 0) failed: {err}");
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = file;
+    }
+}
 
 /// Errors from expert-blob I/O.
 #[derive(Debug, thiserror::Error)]
@@ -97,7 +124,10 @@ impl ExpertFiles {
         for i in 0..v.num_layers {
             let path = subdir.join(format!("layer_{i:02}.bin"));
             match File::open(&path) {
-                Ok(f) => layers.push(Some(f)),
+                Ok(f) => {
+                    disable_readahead(&f);
+                    layers.push(Some(f));
+                }
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
                     layers.push(None);
                 }

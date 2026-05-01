@@ -26,7 +26,8 @@
 //! (slice 9d). Per-call alloc is ~µs.
 
 use metal::{
-    Buffer, CommandBufferRef, ComputePipelineState, MTLSize, NSUInteger,
+    Buffer, CommandBufferRef, ComputePipelineState, Device, MTLResourceOptions,
+    MTLSize, NSUInteger,
 };
 
 use super::metal::{MetalBackend, MetalError, MtlBuffer};
@@ -210,5 +211,95 @@ pub fn encode_rms_norm_bf16_into(
             MTLSize::new(256, 1, 1),
         );
         enc.end_encoding();
+    }
+}
+
+/// Encode a GPU-side buffer-to-buffer memcpy via Metal's blit encoder.
+/// `dim` floats from `src` → `dst`. Used by the orchestrator's GPU
+/// residual stream (Phase 5) to snapshot `hidden → residual` at the
+/// top of each sub-block without a CPU bounce.
+pub fn encode_buffer_copy_f32(
+    cmdbuf: &CommandBufferRef,
+    src: &Buffer,
+    dst: &Buffer,
+    dim: u32,
+) {
+    let bytes = (dim as NSUInteger) * std::mem::size_of::<f32>() as NSUInteger;
+    let blit = cmdbuf.new_blit_command_encoder();
+    blit.copy_from_buffer(src, 0, dst, 0, bytes);
+    blit.end_encoding();
+}
+
+/// Public wrapper for the `residual_add` Metal kernel. `out[i] = a[i]
+/// + b[i]`. Used by the orchestrator's GPU residual stream (Phase 5)
+/// to avoid CPU host-bounces for per-layer residual additions.
+pub fn encode_residual_add_into(
+    cmdbuf: &CommandBufferRef,
+    pipeline: &ComputePipelineState,
+    a: &Buffer,
+    b: &Buffer,
+    out: &Buffer,
+    dim: u32,
+) {
+    let enc = cmdbuf.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(pipeline);
+    enc.set_buffer(0, Some(a), 0);
+    enc.set_buffer(1, Some(b), 0);
+    enc.set_buffer(2, Some(out), 0);
+    enc.set_bytes(3, 4, (&dim as *const u32).cast());
+    let num_tgs = (dim + 255) / 256;
+    enc.dispatch_thread_groups(
+        MTLSize::new(num_tgs as NSUInteger, 1, 1),
+        MTLSize::new(256, 1, 1),
+    );
+    enc.end_encoding();
+}
+
+/// Persistent GPU scratch for the orchestrator's residual + norm
+/// stream across an MLA-variant token-step. One set lives on RsCtx
+/// and is reused across every layer + every token (Phase 5 — full-GPU
+/// residual stream landing for cogito-v2/DeepSeek-V3).
+///
+/// `hidden` is the per-token accumulator. It's staged once from
+/// embedding host-side at the top of the step, then the layer loop
+/// reads + writes it via GPU dispatches (rms_norm, attention,
+/// residual_add). It's read back once at the end of the step for the
+/// final lm_head matvec (which still takes a host slice today).
+///
+/// `residual`, `normed`, and `block_out` are per-layer scratch.
+/// `sum_sq` is the 1-float scratch needed by `rms_norm_sum_sq` /
+/// `rms_norm_apply_bf16`.
+pub struct MlaForwardScratch {
+    /// Per-token accumulator carried across the layer loop. After the
+    /// embedding lookup, every per-layer residual_add updates this.
+    pub hidden: Buffer,
+    /// Snapshot of `hidden` taken at the top of each sub-block (pre-
+    /// attn or pre-MLP), used as the residual addend.
+    pub residual: Buffer,
+    /// Output of the per-layer rms_norm — input to attention or MLP.
+    pub normed: Buffer,
+    /// Output of the post-attn MLP / MoE — addend for the post-MLP
+    /// residual_add.
+    pub block_out: Buffer,
+    /// 1-float scratch for the rms_norm reduction.
+    pub sum_sq: Buffer,
+}
+
+impl MlaForwardScratch {
+    pub fn new(device: &Device) -> Self {
+        let v = VARIANT;
+        let f32_buf = |n: usize| {
+            device.new_buffer(
+                (n * std::mem::size_of::<f32>()) as NSUInteger,
+                MTLResourceOptions::StorageModeShared,
+            )
+        };
+        Self {
+            hidden: f32_buf(v.hidden_dim),
+            residual: f32_buf(v.hidden_dim),
+            normed: f32_buf(v.hidden_dim),
+            block_out: f32_buf(v.hidden_dim),
+            sum_sq: f32_buf(1),
+        }
     }
 }

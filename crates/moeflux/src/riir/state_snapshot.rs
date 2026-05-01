@@ -39,24 +39,38 @@
 //! returning, but a defensive `discard_deferred_experts_in` in
 //! `state_save` keeps the contract robust against a buggy caller.
 
-use metal::Buffer;
+use metal::{Buffer, Device, MTLResourceOptions, NSUInteger};
 
 use super::deferred;
 use super::linear_attn_forward::{
     full_attn_layer_idx_for, linear_layer_idx_for, LayerForwardBuffers,
 };
-use super::state::LayerState;
-use super::variants::{LayerKind, Variant, GPU_KV_SEQ, VARIANT};
+use super::state::{LayerState, MlaKvCacheGpu};
+use super::variants::{
+    AttnKind, LayerKind, Variant, GPU_KV_SEQ, MAX_SEQ_LEN, VARIANT,
+};
 
 /// `'MFLX'` little-endian. Wire-compatible with the C side's
 /// `MF_SNAPSHOT_MAGIC` (infer.m:8487).
 pub const SNAPSHOT_MAGIC: u32 = 0x4D464C58;
 /// Format version. Bumped when wire layout changes; load() rejects
 /// any version it doesn't understand.
-pub const SNAPSHOT_VERSION: u32 = 1;
+///
+/// - **v1**: full-attn + linear-attn layers. C-compatible.
+/// - **v2**: adds MLA layers (`LayerKind::FullAttn` with
+///   `AttnKind::Mla`). Per-layer body is `i32 len`, `len ×
+///   kv_lora_rank × 4` latent bytes, `len × qk_rope_head_dim × 4`
+///   rope-K bytes. Header gains `kv_lora_rank` and `qk_rope_head_dim`
+///   trailing the v1 header (so v1 readers in C see the same first
+///   8 words). Loader accepts v1 for backward compat with Qwen
+///   variants.
+pub const SNAPSHOT_VERSION: u32 = 2;
 /// Header is exactly this many `u32` fields. Mirrors C
-/// `MF_SNAPSHOT_HEADER_U32`.
-pub const SNAPSHOT_HEADER_U32: usize = 8;
+/// `MF_SNAPSHOT_HEADER_U32`. **v2 adds two trailing words**:
+/// `kv_lora_rank` and `qk_rope_head_dim`.
+pub const SNAPSHOT_HEADER_U32: usize = 10;
+/// v1 header size — kept for the backward-compat reader path.
+pub const SNAPSHOT_HEADER_V1_U32: usize = 8;
 
 /// Errors from the snapshot save/load path.
 #[derive(Debug, thiserror::Error)]
@@ -124,14 +138,60 @@ fn linear_ssm_bytes(v: &Variant) -> usize {
         * std::mem::size_of::<f32>()
 }
 
+#[inline]
+fn mla_latent_bytes(v: &Variant, len: usize) -> usize {
+    len * v.kv_lora_rank * std::mem::size_of::<f32>()
+}
+
+#[inline]
+fn mla_rope_k_bytes(v: &Variant, len: usize) -> usize {
+    len * v.qk_rope_head_dim * std::mem::size_of::<f32>()
+}
+
+/// Read `n` floats from a Metal shared-storage `Buffer` into the
+/// given byte slice. Caller ensures no GPU work is in flight.
+fn read_buffer_bytes_n_f32(buf: &Buffer, dst: &mut [u8], n_f32: usize) {
+    let bytes = n_f32 * std::mem::size_of::<f32>();
+    debug_assert_eq!(dst.len(), bytes);
+    // SAFETY: shared-storage; caller honors the no-GPU-in-flight contract.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            buf.contents() as *const u8,
+            dst.as_mut_ptr(),
+            bytes,
+        );
+    }
+}
+
+/// Write the byte slice into the first `bytes` of a Metal shared-
+/// storage `Buffer`. Caller ensures no GPU work is in flight.
+fn write_buffer_bytes_n_f32(buf: &Buffer, src: &[u8], n_f32: usize) {
+    let bytes = n_f32 * std::mem::size_of::<f32>();
+    debug_assert_eq!(src.len(), bytes);
+    // SAFETY: shared-storage; caller honors the no-GPU-in-flight contract.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            src.as_ptr(),
+            buf.contents() as *mut u8,
+            bytes,
+        );
+    }
+}
+
+/// Allocate the MLA cache buffers if missing. Mirrors the lazy alloc
+/// done by `MlaKvCacheGpu::ensure_buffers`, just from the load path
+/// where `state_load` doesn't otherwise hold the device.
+fn ensure_mla_buffers(cache: &mut MlaKvCacheGpu, device: &Device) {
+    cache.ensure_buffers(device);
+}
+
 /// Bytes the caller must allocate to hold the current snapshot.
 /// Mirrors C `mf_state_size` (infer.m:8505..8523). Re-query after
 /// every evaluation: the value grows with KV length.
 ///
-/// Returns 0 (a non-meaningful sentinel) if any layer is MLA — the
-/// v1 wire format can't encode the compressed cache. The actual
-/// rejection lives in `state_save` / `state_load` where it surfaces
-/// as a typed `MlaUnsupported` error.
+/// **v2** (cogito-v2 full-GPU plan, Phase 7): MLA layers are now
+/// supported — per-layer body is `i32 len + len × kv_lora_rank × 4`
+/// latent bytes + `len × qk_rope_head_dim × 4` rope-K bytes.
 pub fn state_size(layer_states: &[LayerState]) -> usize {
     let v = VARIANT;
     let mut n = SNAPSHOT_HEADER_U32 * std::mem::size_of::<u32>();
@@ -144,10 +204,18 @@ pub fn state_size(layer_states: &[LayerState]) -> usize {
                 n += std::mem::size_of::<i32>();
                 let len = match layer {
                     LayerState::FullAttn(kv) => kv.len.max(0) as usize,
-                    LayerState::Mla(_) => return 0,
+                    LayerState::Mla(c) => c.len.max(0) as usize,
                     LayerState::LinearAttn(_) => 0,
                 };
-                n += 2 * len * fa_stride;
+                match v.attn_kind {
+                    AttnKind::Gqa => {
+                        n += 2 * len * fa_stride;
+                    }
+                    AttnKind::Mla => {
+                        n += mla_latent_bytes(&v, len)
+                            + mla_rope_k_bytes(&v, len);
+                    }
+                }
             }
             LayerKind::LinearAttn => {
                 n += la_conv + la_ssm;
@@ -168,7 +236,7 @@ pub fn state_size(layer_states: &[LayerState]) -> usize {
 pub fn state_save(
     buf: &mut [u8],
     layer_states: &[LayerState],
-    linear_buffers: &LayerForwardBuffers,
+    linear_buffers: Option<&LayerForwardBuffers>,
 ) -> Result<usize, StateSnapshotError> {
     let v = VARIANT;
     let need = state_size(layer_states);
@@ -185,7 +253,7 @@ pub fn state_save(
 
     let mut off = 0usize;
 
-    // Header.
+    // Header (v2 — 10 u32 fields).
     let header: [u32; SNAPSHOT_HEADER_U32] = [
         SNAPSHOT_MAGIC,
         SNAPSHOT_VERSION,
@@ -195,6 +263,8 @@ pub fn state_save(
         v.head_dim as u32,
         la_conv as u32,
         la_ssm as u32,
+        v.kv_lora_rank as u32,
+        v.qk_rope_head_dim as u32,
     ];
     for word in header.iter() {
         buf[off..off + 4].copy_from_slice(&word.to_le_bytes());
@@ -204,55 +274,81 @@ pub fn state_save(
     // Per-layer body.
     for (i, layer) in layer_states.iter().enumerate().take(v.num_layers) {
         match v.layer_kind(i) {
-            LayerKind::FullAttn => {
-                let kv = match layer {
-                    LayerState::FullAttn(kv) => kv,
-                    LayerState::Mla(_) => {
-                        return Err(StateSnapshotError::MlaUnsupported {
-                            layer: i,
-                        });
+            LayerKind::FullAttn => match (v.attn_kind, layer) {
+                (AttnKind::Gqa, LayerState::FullAttn(kv)) => {
+                    let len = kv.len.max(0);
+                    buf[off..off + 4].copy_from_slice(&len.to_le_bytes());
+                    off += 4;
+                    if len > 0 {
+                        let bytes = (len as usize) * fa_stride;
+                        let k_src = unsafe {
+                            std::slice::from_raw_parts(
+                                kv.k_cache.as_ptr() as *const u8,
+                                bytes,
+                            )
+                        };
+                        let v_src = unsafe {
+                            std::slice::from_raw_parts(
+                                kv.v_cache.as_ptr() as *const u8,
+                                bytes,
+                            )
+                        };
+                        buf[off..off + bytes].copy_from_slice(k_src);
+                        off += bytes;
+                        buf[off..off + bytes].copy_from_slice(v_src);
+                        off += bytes;
                     }
-                    LayerState::LinearAttn(_) => {
-                        return Err(StateSnapshotError::ShapeMismatch {
-                            field: "layer_state_kind",
-                            got: 0,
-                            want: 1,
-                        });
-                    }
-                };
-                let len = kv.len.max(0);
-                buf[off..off + 4].copy_from_slice(&len.to_le_bytes());
-                off += 4;
-                if len > 0 {
-                    let bytes = (len as usize) * fa_stride;
-                    let k_src = unsafe {
-                        std::slice::from_raw_parts(
-                            kv.k_cache.as_ptr() as *const u8,
-                            bytes,
-                        )
-                    };
-                    let v_src = unsafe {
-                        std::slice::from_raw_parts(
-                            kv.v_cache.as_ptr() as *const u8,
-                            bytes,
-                        )
-                    };
-                    buf[off..off + bytes].copy_from_slice(k_src);
-                    off += bytes;
-                    buf[off..off + bytes].copy_from_slice(v_src);
-                    off += bytes;
                 }
-            }
+                (AttnKind::Mla, LayerState::Mla(cache)) => {
+                    let len = cache.len.max(0);
+                    buf[off..off + 4].copy_from_slice(&len.to_le_bytes());
+                    off += 4;
+                    if len > 0 {
+                        let lat_bytes = mla_latent_bytes(&v, len as usize);
+                        let rope_bytes =
+                            mla_rope_k_bytes(&v, len as usize);
+                        let lat_buf = cache.latent_cache.as_ref().ok_or(
+                            StateSnapshotError::BuffersNotReady,
+                        )?;
+                        let rope_buf = cache.rope_k_cache.as_ref().ok_or(
+                            StateSnapshotError::BuffersNotReady,
+                        )?;
+                        let n_lat = (len as usize) * v.kv_lora_rank;
+                        let n_rope = (len as usize) * v.qk_rope_head_dim;
+                        read_buffer_bytes_n_f32(
+                            lat_buf,
+                            &mut buf[off..off + lat_bytes],
+                            n_lat,
+                        );
+                        off += lat_bytes;
+                        read_buffer_bytes_n_f32(
+                            rope_buf,
+                            &mut buf[off..off + rope_bytes],
+                            n_rope,
+                        );
+                        off += rope_bytes;
+                    }
+                }
+                _ => {
+                    return Err(StateSnapshotError::ShapeMismatch {
+                        field: "layer_state_kind",
+                        got: 0,
+                        want: 1,
+                    });
+                }
+            },
             LayerKind::LinearAttn => {
+                let lb = linear_buffers
+                    .ok_or(StateSnapshotError::BuffersNotReady)?;
                 let linear_idx = linear_layer_idx_for(i)
                     .expect("layer_kind says LinearAttn");
                 read_buffer_bytes(
-                    &linear_buffers.conv_state[linear_idx],
+                    &lb.conv_state[linear_idx],
                     &mut buf[off..off + la_conv],
                 );
                 off += la_conv;
                 read_buffer_bytes(
-                    &linear_buffers.delta_state[linear_idx],
+                    &lb.delta_state[linear_idx],
                     &mut buf[off..off + la_ssm],
                 );
                 off += la_ssm;
@@ -271,22 +367,23 @@ pub fn state_save(
 pub fn state_load(
     buf: &[u8],
     layer_states: &mut [LayerState],
-    linear_buffers: &mut LayerForwardBuffers,
+    mut linear_buffers: Option<&mut LayerForwardBuffers>,
+    device: &Device,
 ) -> Result<(), StateSnapshotError> {
     let v = VARIANT;
-    let header_bytes = SNAPSHOT_HEADER_U32 * std::mem::size_of::<u32>();
-    if buf.len() < header_bytes {
+
+    // Read magic + version up front so we can choose v1 vs v2 header
+    // size.
+    if buf.len() < 8 {
         return Err(StateSnapshotError::Truncated {
             layer: 0,
-            need: header_bytes,
+            need: 8,
             got: buf.len(),
         });
     }
-
     let read_u32 = |off: usize| -> u32 {
         u32::from_le_bytes(buf[off..off + 4].try_into().unwrap())
     };
-
     let magic = read_u32(0);
     if magic != SNAPSHOT_MAGIC {
         return Err(StateSnapshotError::BadMagic {
@@ -295,12 +392,34 @@ pub fn state_load(
         });
     }
     let version = read_u32(4);
-    if version != SNAPSHOT_VERSION {
+    let header_words = match version {
+        1 => SNAPSHOT_HEADER_V1_U32,
+        2 => SNAPSHOT_HEADER_U32,
+        _ => {
+            return Err(StateSnapshotError::BadVersion {
+                got: version,
+                want: SNAPSHOT_VERSION,
+            });
+        }
+    };
+    let header_bytes = header_words * std::mem::size_of::<u32>();
+    if buf.len() < header_bytes {
+        return Err(StateSnapshotError::Truncated {
+            layer: 0,
+            need: header_bytes,
+            got: buf.len(),
+        });
+    }
+
+    // v1 snapshots can only be loaded into v1-compatible variants
+    // (full-attn / linear-attn). MLA variants need v2.
+    if version == 1 && v.attn_kind == AttnKind::Mla {
         return Err(StateSnapshotError::BadVersion {
             got: version,
             want: SNAPSHOT_VERSION,
         });
     }
+
     let check = |off: usize, field: &'static str, want: u32| -> Result<(), StateSnapshotError> {
         let got = read_u32(off);
         if got != want {
@@ -316,6 +435,10 @@ pub fn state_load(
     let la_ssm = linear_ssm_bytes(&v);
     check(24, "linear_conv_bytes", la_conv as u32)?;
     check(28, "linear_ssm_bytes", la_ssm as u32)?;
+    if version == 2 {
+        check(32, "kv_lora_rank", v.kv_lora_rank as u32)?;
+        check(36, "qk_rope_head_dim", v.qk_rope_head_dim as u32)?;
+    }
 
     let fa_stride = full_attn_stride_bytes(&v);
 
@@ -345,14 +468,20 @@ pub fn state_load(
                             len,
                         });
                     }
-                    if (len as usize) > super::variants::MAX_SEQ_LEN {
+                    if (len as usize) > MAX_SEQ_LEN {
                         return Err(StateSnapshotError::LenOverflow {
                             layer: i,
                             len,
-                            max: super::variants::MAX_SEQ_LEN,
+                            max: MAX_SEQ_LEN,
                         });
                     }
-                    let bytes = 2 * (len as usize) * fa_stride;
+                    let bytes = match v.attn_kind {
+                        AttnKind::Gqa => 2 * (len as usize) * fa_stride,
+                        AttnKind::Mla => {
+                            mla_latent_bytes(&v, len as usize)
+                                + mla_rope_k_bytes(&v, len as usize)
+                        }
+                    };
                     if buf.len() - q < bytes {
                         return Err(StateSnapshotError::Truncated {
                             layer: i,
@@ -386,12 +515,55 @@ pub fn state_load(
                     buf[off..off + 4].try_into().unwrap(),
                 );
                 off += 4;
+                // MLA path — populate latent + rope_k Metal buffers.
+                if v.attn_kind == AttnKind::Mla {
+                    let cache = match &mut layer_states[i] {
+                        LayerState::Mla(c) => c,
+                        _ => {
+                            return Err(
+                                StateSnapshotError::ShapeMismatch {
+                                    field: "layer_state_kind",
+                                    got: 0,
+                                    want: 1,
+                                },
+                            );
+                        }
+                    };
+                    ensure_mla_buffers(cache, device);
+                    if len > 0 {
+                        let lat_bytes = mla_latent_bytes(&v, len as usize);
+                        let rope_bytes =
+                            mla_rope_k_bytes(&v, len as usize);
+                        let n_lat = (len as usize) * v.kv_lora_rank;
+                        let n_rope = (len as usize) * v.qk_rope_head_dim;
+                        let lat_buf = cache
+                            .latent_cache
+                            .as_ref()
+                            .expect("ensure_mla_buffers just ran");
+                        let rope_buf = cache
+                            .rope_k_cache
+                            .as_ref()
+                            .expect("ensure_mla_buffers just ran");
+                        write_buffer_bytes_n_f32(
+                            lat_buf,
+                            &buf[off..off + lat_bytes],
+                            n_lat,
+                        );
+                        off += lat_bytes;
+                        write_buffer_bytes_n_f32(
+                            rope_buf,
+                            &buf[off..off + rope_bytes],
+                            n_rope,
+                        );
+                        off += rope_bytes;
+                    }
+                    cache.len = len;
+                    continue;
+                }
                 let kv = match &mut layer_states[i] {
                     LayerState::FullAttn(kv) => kv,
                     LayerState::Mla(_) => {
-                        return Err(StateSnapshotError::MlaUnsupported {
-                            layer: i,
-                        });
+                        unreachable!("attn_kind branch handled above")
                     }
                     LayerState::LinearAttn(_) => {
                         return Err(StateSnapshotError::ShapeMismatch {
@@ -438,6 +610,9 @@ pub fn state_load(
                 if let Some(fa_idx) = full_attn_layer_idx_for(i) {
                     let mirror_len = (len as usize).min(GPU_KV_SEQ);
                     if mirror_len > 0 {
+                        let lb = linear_buffers
+                            .as_deref_mut()
+                            .ok_or(StateSnapshotError::BuffersNotReady)?;
                         let n = mirror_len * stride;
                         // SAFETY: shared-storage GPU buffer; called at a
                         // token boundary (per moeflux.h:481 contract +
@@ -445,10 +620,10 @@ pub fn state_load(
                         // top of state_load callers), so no GPU work is
                         // in flight on the mirror.
                         unsafe {
-                            let k_dst = linear_buffers.gpu_kv_k[fa_idx]
+                            let k_dst = lb.gpu_kv_k[fa_idx]
                                 .contents()
                                 as *mut f32;
-                            let v_dst = linear_buffers.gpu_kv_v[fa_idx]
+                            let v_dst = lb.gpu_kv_v[fa_idx]
                                 .contents()
                                 as *mut f32;
                             std::ptr::copy_nonoverlapping(
@@ -466,15 +641,18 @@ pub fn state_load(
                 }
             }
             LayerKind::LinearAttn => {
+                let lb = linear_buffers
+                    .as_deref_mut()
+                    .ok_or(StateSnapshotError::BuffersNotReady)?;
                 let linear_idx = linear_layer_idx_for(i)
                     .expect("layer_kind says LinearAttn");
                 write_buffer_bytes(
-                    &linear_buffers.conv_state[linear_idx],
+                    &lb.conv_state[linear_idx],
                     &buf[off..off + la_conv],
                 );
                 off += la_conv;
                 write_buffer_bytes(
-                    &linear_buffers.delta_state[linear_idx],
+                    &lb.delta_state[linear_idx],
                     &buf[off..off + la_ssm],
                 );
                 off += la_ssm;

@@ -65,6 +65,11 @@ pub struct MlaPipelines {
     pub out_per_head: ComputePipelineState,
     pub split_q_kv: ComputePipelineState,
     pub cache_append: ComputePipelineState,
+    /// Phase 6 — tiled SDPA accumulator + finalize, used when
+    /// `cache_len > MLA_MAX_CACHE_TG` to keep `scores[]` within the
+    /// 32 KB threadgroup-memory budget.
+    pub sdpa_tile_accumulate: ComputePipelineState,
+    pub sdpa_tile_finalize: ComputePipelineState,
 }
 
 impl MlaPipelines {
@@ -75,6 +80,12 @@ impl MlaPipelines {
             out_per_head: metal.pipeline("mla_out_per_head_4bit")?.clone(),
             split_q_kv: metal.pipeline("mla_split_q_kv")?.clone(),
             cache_append: metal.pipeline("mla_kv_cache_append")?.clone(),
+            sdpa_tile_accumulate: metal
+                .pipeline("mla_sdpa_tile_accumulate")?
+                .clone(),
+            sdpa_tile_finalize: metal
+                .pipeline("mla_sdpa_tile_finalize")?
+                .clone(),
         })
     }
 }
@@ -169,6 +180,92 @@ pub fn encode_mla_sdpa_folded(
         MTLSize::new(MLA_THREADS_PER_HEAD as NSUInteger, 1, 1),
     );
     enc.end_encoding();
+    Ok(())
+}
+
+/// Phase 6 — encode the tiled folded SDPA into `cmdbuf`. Uses the
+/// online-softmax accumulator to support `cache_len > MLA_MAX_CACHE_TG`
+/// (the threadgroup-memory cap of the single-shot kernel).
+///
+/// Running state buffers (`running_max`, `running_denom`,
+/// `v_combine_partial`) are caller-owned and must be sized
+/// `[num_heads]`, `[num_heads]`, `[num_heads * kv_lora_rank]`. They're
+/// internally consistent across tile dispatches via Metal's implicit
+/// device-memory ordering between consecutive compute encoders in
+/// the same cmdbuf.
+///
+/// Multi-tile output is mathematically equivalent to single-shot up
+/// to floating-point reordering — bit-exact only at `cache_len ==
+/// MLA_TILE_SIZE` (one tile, no merging). Cosine ≥ 0.9999 vs the
+/// single-shot reference is the validation target for cache_len > tile_size.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_mla_sdpa_folded_tiled(
+    cmdbuf: &CommandBufferRef,
+    pipe_accumulate: &ComputePipelineState,
+    pipe_finalize: &ComputePipelineState,
+    q_prime: &Buffer,
+    q_pe: &Buffer,
+    latent_cache: &Buffer,
+    rope_k_cache: &Buffer,
+    v_combine: &Buffer,
+    running_max: &Buffer,
+    running_denom: &Buffer,
+    v_combine_partial: &Buffer,
+    num_heads: u32,
+    kv_lora_rank: u32,
+    qk_rope_head_dim: u32,
+    cache_len: u32,
+    softmax_scale: f32,
+) -> Result<(), GpuMlaError> {
+    if cache_len == 0 {
+        return Ok(());
+    }
+    let tile_size = MLA_MAX_CACHE_TG;
+    let num_tiles = cache_len.div_ceil(tile_size);
+
+    for tile_idx in 0..num_tiles {
+        let tile_start = tile_idx * tile_size;
+        let tile_end = (tile_start + tile_size).min(cache_len);
+        let is_first: u32 = if tile_idx == 0 { 1 } else { 0 };
+        let enc = cmdbuf.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(pipe_accumulate);
+        enc.set_buffer(0, Some(q_prime), 0);
+        enc.set_buffer(1, Some(q_pe), 0);
+        enc.set_buffer(2, Some(latent_cache), 0);
+        enc.set_buffer(3, Some(rope_k_cache), 0);
+        enc.set_buffer(4, Some(running_max), 0);
+        enc.set_buffer(5, Some(running_denom), 0);
+        enc.set_buffer(6, Some(v_combine_partial), 0);
+        enc.set_bytes(7, 4, (&num_heads as *const u32).cast());
+        enc.set_bytes(8, 4, (&kv_lora_rank as *const u32).cast());
+        enc.set_bytes(9, 4, (&qk_rope_head_dim as *const u32).cast());
+        enc.set_bytes(10, 4, (&tile_start as *const u32).cast());
+        enc.set_bytes(11, 4, (&tile_end as *const u32).cast());
+        enc.set_bytes(12, 4, (&softmax_scale as *const f32).cast());
+        enc.set_bytes(13, 4, (&is_first as *const u32).cast());
+        enc.dispatch_thread_groups(
+            MTLSize::new(num_heads as NSUInteger, 1, 1),
+            MTLSize::new(MLA_THREADS_PER_HEAD as NSUInteger, 1, 1),
+        );
+        enc.end_encoding();
+    }
+
+    // Finalize: v_combine[h, c] = v_combine_partial[h, c] / running_denom[h].
+    let enc = cmdbuf.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(pipe_finalize);
+    enc.set_buffer(0, Some(v_combine_partial), 0);
+    enc.set_buffer(1, Some(running_denom), 0);
+    enc.set_buffer(2, Some(v_combine), 0);
+    enc.set_bytes(3, 4, (&num_heads as *const u32).cast());
+    enc.set_bytes(4, 4, (&kv_lora_rank as *const u32).cast());
+    let total = num_heads * kv_lora_rank;
+    let num_tgs = total.div_ceil(256);
+    enc.dispatch_thread_groups(
+        MTLSize::new(num_tgs as NSUInteger, 1, 1),
+        MTLSize::new(256, 1, 1),
+    );
+    enc.end_encoding();
+
     Ok(())
 }
 

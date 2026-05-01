@@ -120,3 +120,52 @@ pub fn encode_matvec(
     }
     enc.end_encoding();
 }
+
+// ---------------------------------------------------------------------------
+// BF16-weight matvec (no dequant) — Cogito-V2 / DeepSeek-V3 router gate
+// ---------------------------------------------------------------------------
+
+/// Pipelines for the BF16-weight matvec. Used by the MoE router gate
+/// (`model.layers.{i}.mlp.gate.weight`, `[num_experts, hidden_dim]`
+/// BF16) which the 4-bit dequant matvec can't handle. Sibling of
+/// [`MatvecPipelines`].
+pub struct BfMatvecPipelines {
+    pub bf16: ComputePipelineState,
+}
+
+impl BfMatvecPipelines {
+    pub fn fetch(metal: &mut MetalBackend) -> Result<Self, MetalError> {
+        Ok(Self {
+            bf16: metal.pipeline("bf16_matvec")?.clone(),
+        })
+    }
+}
+
+/// One BF16-weight matvec dispatch. Reads `out_dim × in_dim` BF16
+/// weights row-major from `w_buf` at `w_off` byte offset (typically
+/// the shared [`MtlWeightBuf`]), input from `input`, writes f32
+/// output to `output`. Threadgroup-per-output-row, 256 threads/group.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_bf16_matvec(
+    cmdbuf: &CommandBufferRef,
+    pipes: &BfMatvecPipelines,
+    w_buf: &Buffer,
+    w_off: u64,
+    input: &Buffer,
+    output: &Buffer,
+    in_dim: u32,
+    out_dim: u32,
+) {
+    let enc = cmdbuf.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipes.bf16);
+    enc.set_buffer(0, Some(w_buf), w_off as NSUInteger);
+    enc.set_buffer(1, Some(input), 0);
+    enc.set_buffer(2, Some(output), 0);
+    enc.set_bytes(3, 4, (&in_dim as *const u32).cast());
+    enc.set_bytes(4, 4, (&out_dim as *const u32).cast());
+    enc.dispatch_thread_groups(
+        MTLSize::new(out_dim as NSUInteger, 1, 1),
+        MTLSize::new(256, 1, 1),
+    );
+    enc.end_encoding();
+}

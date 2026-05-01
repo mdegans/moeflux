@@ -81,3 +81,67 @@ fn cogito_v2_eval_token_smoke() -> Result<(), Error> {
     );
     Ok(())
 }
+
+/// Phase 4 warm-token wrapper: runs `eval_token` twice and asserts on
+/// the second call. The first call pays one-time costs (Metal pipeline
+/// JIT, expert-page first-touch, KV-cache buffer first-fault) that
+/// dominate any single-eval profile and obscure per-token compute. By
+/// timing only the second call we capture the steady-state warm-token
+/// path — the workload Phase 5 (ring + GPU residual stream) and Phase
+/// 8 (perf measurement) target.
+///
+/// Run via `./scripts/profile_smoke.sh cogito_v2_smoke
+/// cogito_v2_eval_token_warm` — the script wraps samply with
+/// frame-pointer + presymbolicate setup so the resulting profile has
+/// usable stacks.
+#[test]
+#[ignore]
+fn cogito_v2_eval_token_warm() -> Result<(), Error> {
+    let mut ctx = Ctx::open(
+        &art("model_weights.bin"),
+        &art("model_weights.json"),
+        &PathBuf::from(ROOT).join("mlx/tokenizer.json"),
+        &PathBuf::from(ROOT).join("root"),
+        /* experts_per_tok = */ 8,
+        /* use_2bit       = */ false,
+    )?;
+
+    let vocab = 128_815usize;
+    let mut logits = vec![0.0f32; vocab];
+
+    // Warmup eval — eats one-time init costs.
+    eprintln!("[cogito-warm] eval_token #1 (cold init pass)…");
+    let t0 = std::time::Instant::now();
+    ctx.eval_token(0, 0, 0, &mut logits)?;
+    eprintln!(
+        "[cogito-warm] cold pass finished in {:.2}s",
+        t0.elapsed().as_secs_f64()
+    );
+
+    // Warm eval — the one we actually profile. Token 1 (different from
+    // BOS=0) at pos=1 so the KV cache append exercises a real position.
+    eprintln!("[cogito-warm] eval_token #2 (warm pass)…");
+    let t1 = std::time::Instant::now();
+    ctx.eval_token(1, 1, 0, &mut logits)?;
+    let warm_elapsed = t1.elapsed();
+    eprintln!(
+        "[cogito-warm] warm pass finished in {:.2}s ({:.2} tok/s)",
+        warm_elapsed.as_secs_f64(),
+        1.0 / warm_elapsed.as_secs_f64(),
+    );
+
+    let finite = logits.iter().all(|v| v.is_finite());
+    let max = logits.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v));
+    let min = logits.iter().fold(f32::INFINITY, |m, &v| m.min(v));
+    let argmax = logits
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    eprintln!(
+        "[cogito-warm] warm logits: min={min:.3} max={max:.3} argmax={argmax}",
+    );
+    assert!(finite, "warm logits contain NaN/Inf");
+    Ok(())
+}

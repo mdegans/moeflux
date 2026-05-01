@@ -174,16 +174,11 @@ impl DenseMlpPipelines {
     }
 }
 
-/// Encode one dense-MLP layer forward into `cmdbuf`. Synchronous: all
-/// dispatches encode in order; the caller commits + waits (or chains
-/// the cmdbuf in Phase 4b's deferred-ring path).
-///
-/// Buffer contract:
-/// - `hidden`: post-rms-norm input, `[hidden_dim]` f32, shared.
-/// - `gate_out`, `up_out`, `act`: scratch, `[dense_intermediate]` f32
-///   each. May not alias each other.
-/// - `out`: post-down-proj output, `[hidden_dim]` f32. May not alias
-///   `hidden`.
+/// Encode one dense-MLP layer forward into `cmdbuf`. Thin wrapper
+/// around [`encode_swiglu_ffn_layer_forward_gpu`] that resolves the
+/// dense-MLP prefix + intermediate from [`VARIANT`] and adds the
+/// `first_k_dense_replace == 0` guard. See the generalized helper for
+/// buffer contract details.
 ///
 /// Reads tensors `model.layers.{layer_idx}.mlp.{gate_proj,up_proj,
 /// down_proj}` from `wf_buf`; layer_idx must be `< first_k_dense_replace`.
@@ -200,13 +195,63 @@ pub fn encode_dense_mlp_layer_forward_gpu(
     out: &Buffer,
 ) -> Result<(), DenseMlpGpuError> {
     let v = VARIANT;
-    let hidden_dim = v.hidden_dim as u32;
-    let intermediate = v.dense_intermediate as u32;
-    if intermediate == 0 {
+    if v.dense_intermediate == 0 {
         return Err(DenseMlpGpuError::NoDenseMlp {
             got: v.dense_intermediate,
         });
     }
+    let prefix = format!("model.layers.{layer_idx}.mlp");
+    encode_swiglu_ffn_layer_forward_gpu(
+        cmdbuf,
+        pipes,
+        wf,
+        wf_buf,
+        &prefix,
+        v.dense_intermediate as u32,
+        hidden,
+        gate_out,
+        up_out,
+        act,
+        out,
+    )
+}
+
+/// Encode one SwiGLU FFN layer forward into `cmdbuf` — the generic
+/// shape used by both the dense MLP path (prefix
+/// `"model.layers.{i}.mlp"`, intermediate `dense_intermediate`) and
+/// the Cogito-V2 / DeepSeek-V3 shared-expert path (prefix
+/// `"model.layers.{i}.mlp.shared_experts"`, intermediate
+/// `shared_intermediate`). Synchronous: all dispatches encode in
+/// order; the caller commits + waits (or chains the cmdbuf in Phase
+/// 4b's deferred-ring path).
+///
+/// Buffer contract:
+/// - `hidden`: post-rms-norm input, `[hidden_dim]` f32, shared.
+/// - `gate_out`, `up_out`, `act`: scratch, `[intermediate]` f32 each.
+///   May not alias each other.
+/// - `out`: post-down-proj output, `[hidden_dim]` f32. May not alias
+///   `hidden`.
+///
+/// Reads tensors `{tensor_prefix}.{gate_proj,up_proj,down_proj}.
+/// {weight,scales,biases}` from `wf_buf`. The caller must verify that
+/// these tensors exist for the requested prefix (e.g. don't dispatch
+/// the dense path for a layer past `first_k_dense_replace`).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_swiglu_ffn_layer_forward_gpu(
+    cmdbuf: &CommandBufferRef,
+    pipes: &DenseMlpPipelines,
+    wf: &WeightFile,
+    wf_buf: &MtlWeightBuf,
+    tensor_prefix: &str,
+    intermediate: u32,
+    hidden: &Buffer,
+    gate_out: &Buffer,
+    up_out: &Buffer,
+    act: &Buffer,
+    out: &Buffer,
+) -> Result<(), DenseMlpGpuError> {
+    let v = VARIANT;
+    let hidden_dim = v.hidden_dim as u32;
 
     let resolve_proj =
         |name: &str| -> Result<(u64, u64, u64), DenseMlpGpuError> {
@@ -225,10 +270,9 @@ pub fn encode_dense_mlp_layer_forward_gpu(
             Ok((w_off, s_off, b_off))
         };
 
-    let prefix = format!("model.layers.{layer_idx}.mlp");
-    let gate_off = resolve_proj(&format!("{prefix}.gate_proj"))?;
-    let up_off = resolve_proj(&format!("{prefix}.up_proj"))?;
-    let down_off = resolve_proj(&format!("{prefix}.down_proj"))?;
+    let gate_off = resolve_proj(&format!("{tensor_prefix}.gate_proj"))?;
+    let up_off = resolve_proj(&format!("{tensor_prefix}.up_proj"))?;
+    let down_off = resolve_proj(&format!("{tensor_prefix}.down_proj"))?;
 
     // gate_out = gate_proj @ hidden
     encode_matvec(

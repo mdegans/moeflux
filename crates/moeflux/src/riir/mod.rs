@@ -24,6 +24,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 
+use ::metal::Buffer;
+
 pub mod cogito_moe_gpu;
 pub mod cpu_matvec;
 pub mod cpu_ops;
@@ -232,6 +234,30 @@ pub struct RsCtx {
     dense_mlp_bufs: Option<dense_mlp_gpu::DenseMlpBuffers>,
     /// Phase 3 — pipelines for the dense MLP forward (matvec + swiglu).
     dense_mlp_pipes: Option<dense_mlp_gpu::DenseMlpPipelines>,
+    /// Cogito-V2 / DeepSeek-V3 GPU shared-expert SwiGLU scratch
+    /// (gate_out / up_out / act at `shared_intermediate=2048`). One set
+    /// reused across every MoE layer. Allocated lazily in
+    /// `ensure_mla_resources`.
+    shared_expert_bufs: Option<cogito_moe_gpu::SharedExpertBuffers>,
+    /// Phase 2 (cogito-v2 full-GPU): pipelines for the BF16-weight
+    /// matvec used by the MoE router gate. Sibling of `dense_mlp_pipes`
+    /// — only present on variants whose router gate is BF16 (today:
+    /// Cogito-V2 / DeepSeek-V3).
+    bf_matvec_pipes: Option<gpu_matvec::BfMatvecPipelines>,
+    /// Phase 5 (cogito-v2 full-GPU): persistent GPU scratch for the
+    /// orchestrator's residual + norm stream — keeps `hidden`,
+    /// `residual`, `normed`, and `sum_sq` resident across layers so
+    /// the per-layer pre/post-norm + residual_add stay on GPU. ~112 KB
+    /// total at hidden_dim=7168.
+    mla_residual_scratch: Option<gpu_norm::MlaForwardScratch>,
+    /// Phase 5 (cogito-v2 full-GPU): pipelines for the per-layer
+    /// rms_norm + residual_add the orchestrator dispatches. Compiled
+    /// once on first MLA eval.
+    mla_norm_pipes: Option<gpu_norm::RmsNormBf16Pipelines>,
+    /// Phase 5 (cogito-v2 full-GPU): pre-fetched `residual_add`
+    /// pipeline for the GPU residual stream. Same kernel the
+    /// linear-attn path uses internally.
+    residual_add_pipe: Option<::metal::ComputePipelineState>,
     // Future phases populate: vocab.
 }
 
@@ -283,6 +309,11 @@ impl RsCtx {
             mla_pipes: None,
             dense_mlp_bufs: None,
             dense_mlp_pipes: None,
+            shared_expert_bufs: None,
+            bf_matvec_pipes: None,
+            mla_residual_scratch: None,
+            mla_norm_pipes: None,
+            residual_add_pipe: None,
         })
     }
 
@@ -1050,6 +1081,54 @@ impl RsCtx {
         if self.moe_buffers.is_none() {
             self.moe_buffers = Some(MoeBuffers::new(&device));
         }
+        if self.shared_expert_bufs.is_none() && VARIANT.shared_intermediate > 0
+        {
+            self.shared_expert_bufs =
+                Some(cogito_moe_gpu::SharedExpertBuffers::new(&device));
+        }
+        // Phase 1 (cogito-v2 full-GPU): the GPU shared-expert SwiGLU
+        // reuses `DenseMlpPipelines` (matvec + swiglu_fused are
+        // dim-parametric), so even variants with `first_k_dense_replace
+        // == 0` need the dense pipes if they have a shared expert.
+        if self.dense_mlp_pipes.is_none() && VARIANT.shared_intermediate > 0 {
+            let metal = self.metal.as_mut().expect("just-set");
+            self.dense_mlp_pipes = Some(
+                dense_mlp_gpu::DenseMlpPipelines::fetch(metal)
+                    .map_err(|_| RsError::InitFailed)?,
+            );
+        }
+        // Phase 2 (cogito-v2 full-GPU): BF16 matvec PSO for the MoE
+        // router gate. Only allocated for MLA variants (the linear-attn
+        // path's gate is 8-bit dequant via the existing MatvecPipelines).
+        if self.bf_matvec_pipes.is_none() {
+            let metal = self.metal.as_mut().expect("just-set");
+            self.bf_matvec_pipes = Some(
+                gpu_matvec::BfMatvecPipelines::fetch(metal)
+                    .map_err(|_| RsError::InitFailed)?,
+            );
+        }
+        // Phase 5 (cogito-v2 full-GPU): persistent GPU scratch + norm
+        // pipelines for the orchestrator's residual stream.
+        if self.mla_residual_scratch.is_none() {
+            self.mla_residual_scratch =
+                Some(gpu_norm::MlaForwardScratch::new(&device));
+        }
+        if self.mla_norm_pipes.is_none() {
+            let metal = self.metal.as_mut().expect("just-set");
+            self.mla_norm_pipes = Some(
+                gpu_norm::RmsNormBf16Pipelines::fetch(metal)
+                    .map_err(|_| RsError::InitFailed)?,
+            );
+        }
+        if self.residual_add_pipe.is_none() {
+            let metal = self.metal.as_mut().expect("just-set");
+            self.residual_add_pipe = Some(
+                metal
+                    .pipeline("residual_add")
+                    .map_err(|_| RsError::InitFailed)?
+                    .clone(),
+            );
+        }
         Ok(())
     }
 
@@ -1283,8 +1362,12 @@ impl RsCtx {
         pos: i32,
         logits_out: Option<&mut [f32]>,
     ) -> Result<(), RsError> {
-        use cogito_moe_gpu::cogito_moe_layer_forward_gpu;
-        use dense_mlp_gpu::dense_mlp_layer_forward_gpu;
+        use cogito_moe_gpu::cogito_moe_layer_forward_gpu_buf_io;
+        use dense_mlp_gpu::encode_dense_mlp_layer_forward_gpu;
+        use gpu_norm::{
+            encode_buffer_copy_f32, encode_residual_add_into,
+            encode_rms_norm_bf16_into,
+        };
         use mla_attn_forward::mla_attn_layer_forward_gpu;
 
         self.ensure_mla_resources()?;
@@ -1302,7 +1385,12 @@ impl RsCtx {
             mla_pipes,
             dense_mlp_bufs,
             dense_mlp_pipes,
+            shared_expert_bufs,
+            bf_matvec_pipes,
             moe_buffers,
+            mla_residual_scratch,
+            mla_norm_pipes,
+            residual_add_pipe,
             io_pool,
             ..
         } = self;
@@ -1318,40 +1406,84 @@ impl RsCtx {
             dense_mlp_bufs.as_mut().expect("ensure_mla_resources");
         let dense_mlp_pipes =
             dense_mlp_pipes.as_ref().expect("ensure_mla_resources");
+        let shared_expert_bufs =
+            shared_expert_bufs.as_ref().expect("ensure_mla_resources");
+        let bf_matvec_pipes =
+            bf_matvec_pipes.as_ref().expect("ensure_mla_resources");
         let moe_buffers =
             moe_buffers.as_mut().expect("ensure_mla_resources");
+        let scratch =
+            mla_residual_scratch.as_ref().expect("ensure_mla_resources");
+        let norm_pipes =
+            mla_norm_pipes.as_ref().expect("ensure_mla_resources");
+        let residual_add_pipe = residual_add_pipe
+            .as_ref()
+            .expect("ensure_mla_resources");
 
-        // Embed → host hidden buffer.
-        let mut hidden = vec![0.0f32; v.hidden_dim];
-        embedding::embed_lookup(wf, token, &mut hidden)
+        // Embed → host hidden vec → GPU scratch.hidden buffer (one
+        // host->GPU bounce per token; the layer loop is fully GPU
+        // resident from here).
+        let mut hidden_host = vec![0.0f32; v.hidden_dim];
+        embedding::embed_lookup(wf, token, &mut hidden_host)
             .map_err(|_| RsError::EvalFailed)?;
+        // SAFETY: shared-storage GPU buffer; no GPU work in flight at
+        // top of step (caller honors the moeflux.h:481 contract).
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                hidden_host.as_ptr(),
+                scratch.hidden.contents() as *mut f32,
+                v.hidden_dim,
+            );
+        }
 
-        // Per-layer scratch.
-        let mut residual = vec![0.0f32; v.hidden_dim];
-        let mut normed = vec![0.0f32; v.hidden_dim];
-        let mut block_out = vec![0.0f32; v.hidden_dim];
-        let mut mla_out_host = vec![0.0f32; v.hidden_dim];
+        let dim = v.hidden_dim as u32;
 
         for layer_idx in 0..v.num_layers {
-            // ---- Attention sub-block: residual + MLA(norm(h)) ----
-            residual.copy_from_slice(&hidden);
-            let pre_norm_name =
-                format!("model.layers.{layer_idx}.input_layernorm.weight");
-            rms_norm_cpu(wf, &pre_norm_name, &hidden, &mut normed)
-                .map_err(|_| RsError::EvalFailed)?;
-
-            // Stage `normed` into the GPU buffer.
-            // SAFETY: shared-storage; no GPU work in flight (we're
-            // between layers and the previous mla_attn_layer_forward_gpu
-            // committed + waited).
-            unsafe {
-                let dst =
-                    mla_buffers.pre_norm.contents() as *mut f32;
-                std::ptr::copy_nonoverlapping(
-                    normed.as_ptr(),
-                    dst,
-                    v.hidden_dim,
+            // ---- Pre-attn block: residual := hidden, normed := rms_norm(hidden) ----
+            // Single cmdbuf for the residual snapshot + pre-norm. We
+            // commit + wait here because mla_attn_layer_forward_gpu
+            // (called next) builds its own cmdbuf and the synchronous
+            // `mla_buffers.pre_norm` host stage further down would race
+            // with our normed write if we didn't wait.
+            let pre_norm_name = format!(
+                "model.layers.{layer_idx}.input_layernorm.weight"
+            );
+            let pre_norm_off = wf_buf
+                .tensor_offset(wf, &pre_norm_name)
+                .map_err(|_| RsError::EvalFailed)?
+                .ok_or(RsError::EvalFailed)?;
+            {
+                let cmdbuf = metal.queue().new_command_buffer();
+                encode_buffer_copy_f32(
+                    cmdbuf,
+                    &scratch.hidden,
+                    &scratch.residual,
+                    dim,
                 );
+                encode_rms_norm_bf16_into(
+                    cmdbuf,
+                    norm_pipes,
+                    &scratch.hidden,
+                    wf_buf.buffer(),
+                    pre_norm_off,
+                    &scratch.sum_sq,
+                    &scratch.normed,
+                    dim,
+                    variants::RMS_NORM_EPS,
+                );
+                // Mirror normed into `mla_buffers.pre_norm` so the
+                // existing `mla_attn_layer_forward_gpu` (which reads
+                // from there) sees our normed input. Phase 5b refactor
+                // would parameterize mla_attn's input buffer; for now
+                // we add one GPU buffer-copy per layer.
+                encode_buffer_copy_f32(
+                    cmdbuf,
+                    &scratch.normed,
+                    &mla_buffers.pre_norm,
+                    dim,
+                );
+                cmdbuf.commit();
+                cmdbuf.wait_until_completed();
             }
 
             let kv_cache = match &mut layer_states[layer_idx] {
@@ -1373,59 +1505,123 @@ impl RsCtx {
             )
             .map_err(|_| RsError::EvalFailed)?;
 
-            // Read MLA output back to host for the CPU MoE/dense path.
-            // SAFETY: shared-storage; the GPU forward committed +
-            // waited inside `mla_attn_layer_forward_gpu`.
-            unsafe {
-                let p = mla_buffers.out.contents() as *const f32;
-                let s = std::slice::from_raw_parts(p, v.hidden_dim);
-                mla_out_host.copy_from_slice(s);
-            }
-            for i in 0..v.hidden_dim {
-                hidden[i] = residual[i] + mla_out_host[i];
+            // Post-attn residual_add: hidden := residual + mla_buffers.out.
+            {
+                let cmdbuf = metal.queue().new_command_buffer();
+                encode_residual_add_into(
+                    cmdbuf,
+                    residual_add_pipe,
+                    &scratch.residual,
+                    &mla_buffers.out,
+                    &scratch.hidden,
+                    dim,
+                );
+                cmdbuf.commit();
+                cmdbuf.wait_until_completed();
             }
 
-            // ---- MLP sub-block: residual + MLP(norm(h)) ----
-            residual.copy_from_slice(&hidden);
+            // ---- Pre-MLP block: residual := hidden, normed := rms_norm(hidden) ----
             let post_norm_name = format!(
                 "model.layers.{layer_idx}.post_attention_layernorm.weight"
             );
-            rms_norm_cpu(wf, &post_norm_name, &hidden, &mut normed)
-                .map_err(|_| RsError::EvalFailed)?;
+            let post_norm_off = wf_buf
+                .tensor_offset(wf, &post_norm_name)
+                .map_err(|_| RsError::EvalFailed)?
+                .ok_or(RsError::EvalFailed)?;
+            {
+                let cmdbuf = metal.queue().new_command_buffer();
+                encode_buffer_copy_f32(
+                    cmdbuf,
+                    &scratch.hidden,
+                    &scratch.residual,
+                    dim,
+                );
+                encode_rms_norm_bf16_into(
+                    cmdbuf,
+                    norm_pipes,
+                    &scratch.hidden,
+                    wf_buf.buffer(),
+                    post_norm_off,
+                    &scratch.sum_sq,
+                    &scratch.normed,
+                    dim,
+                    variants::RMS_NORM_EPS,
+                );
+                cmdbuf.commit();
+                cmdbuf.wait_until_completed();
+            }
 
-            if layer_idx < v.first_k_dense_replace {
-                dense_mlp_layer_forward_gpu(
-                    metal,
-                    dense_mlp_pipes,
-                    dense_mlp_bufs,
-                    wf,
-                    wf_buf,
-                    layer_idx,
-                    &normed,
-                    &mut block_out,
-                )
-                .map_err(|_| RsError::EvalFailed)?;
+            // ---- MLP / MoE: read scratch.normed, write to mlp output buf ----
+            // The post-MLP residual_add reads from whichever buffer the
+            // dispatch wrote to (dense_mlp_bufs.out for dense, or
+            // moe_buffers.moe_hidden for MoE).
+            let mlp_out: &Buffer = if layer_idx < v.first_k_dense_replace
+            {
+                {
+                    let cmdbuf = metal.queue().new_command_buffer();
+                    encode_dense_mlp_layer_forward_gpu(
+                        cmdbuf,
+                        dense_mlp_pipes,
+                        wf,
+                        wf_buf,
+                        layer_idx,
+                        &scratch.normed,
+                        &dense_mlp_bufs.gate_out,
+                        &dense_mlp_bufs.up_out,
+                        &dense_mlp_bufs.act,
+                        &dense_mlp_bufs.out,
+                    )
+                    .map_err(|_| RsError::EvalFailed)?;
+                    cmdbuf.commit();
+                    cmdbuf.wait_until_completed();
+                }
+                &dense_mlp_bufs.out
             } else {
-                cogito_moe_layer_forward_gpu(
+                cogito_moe_layer_forward_gpu_buf_io(
                     metal,
                     moe_buffers,
+                    shared_expert_bufs,
+                    dense_mlp_pipes,
+                    bf_matvec_pipes,
                     wf,
+                    wf_buf,
                     experts,
                     io_pool,
                     layer_idx,
-                    &normed,
-                    &mut block_out,
+                    &scratch.normed,
                 )
                 .map_err(|_| RsError::EvalFailed)?;
-            }
-            for i in 0..v.hidden_dim {
-                hidden[i] = residual[i] + block_out[i];
+                moe_buffers.moe_hidden_ref()
+            };
+
+            // Post-MLP residual_add: hidden := residual + mlp_out.
+            {
+                let cmdbuf = metal.queue().new_command_buffer();
+                encode_residual_add_into(
+                    cmdbuf,
+                    residual_add_pipe,
+                    &scratch.residual,
+                    mlp_out,
+                    &scratch.hidden,
+                    dim,
+                );
+                cmdbuf.commit();
+                cmdbuf.wait_until_completed();
             }
         }
 
-        // Final RMSNorm + GPU lm_head.
+        // Final RMSNorm + GPU lm_head. Stage hidden GPU → host → final
+        // norm CPU → lm_head host slice. lm_head_gpu currently takes a
+        // host slice; making it Buffer-IO is a follow-up.
+        let final_norm_name = "model.norm.weight";
+        // SAFETY: shared-storage; no GPU work in flight (the last
+        // residual_add committed + waited above).
+        let hidden_host: Vec<f32> = unsafe {
+            let p = scratch.hidden.contents() as *const f32;
+            std::slice::from_raw_parts(p, v.hidden_dim).to_vec()
+        };
         let mut hidden_normed = vec![0.0f32; v.hidden_dim];
-        rms_norm_cpu(wf, "model.norm.weight", &hidden, &mut hidden_normed)
+        rms_norm_cpu(wf, final_norm_name, &hidden_host, &mut hidden_normed)
             .map_err(|_| RsError::EvalFailed)?;
         if let Some(logits) = logits_out {
             lm_head_gpu
@@ -1924,11 +2120,15 @@ impl RsCtx {
         // the wire format — but we need to quiesce the worker pool
         // before any subsequent ctx mutation).
         self.prefetch.drain();
-        let linear_buffers = self
-            .linear_buffers
-            .as_ref()
-            .ok_or(state_snapshot::StateSnapshotError::BuffersNotReady)?;
-        state_snapshot::state_save(buf, &self.layer_states, linear_buffers)
+        // linear_buffers is optional — pure-MLA variants don't have
+        // LinearAttn layers and don't need it. The Option pattern
+        // here lets us serve both Gqa-with-LinearAttn (Qwen) and
+        // pure-Mla (Cogito-V2) variants from the same wrapper.
+        state_snapshot::state_save(
+            buf,
+            &self.layer_states,
+            self.linear_buffers.as_ref(),
+        )
     }
 
     /// Replace current state with the one encoded in `buf`. Mirrors
@@ -1955,18 +2155,37 @@ impl RsCtx {
         // the linear-attn recurrence into. Fresh-Ctx state_load
         // before any eval would otherwise hit BuffersNotReady; load
         // is supposed to be a stand-alone restoration primitive.
-        self.ensure_linear_resources().map_err(|_| {
-            state_snapshot::StateSnapshotError::BuffersNotReady
-        })?;
+        // For Mla variants, ensure_linear_resources fails (no
+        // linear-attn tensors); for Gqa variants we still need it to
+        // populate gpu_kv_k/v mirrors. Run it best-effort and pass
+        // linear_buffers as Option — the Mla path doesn't read it.
+        let _ = self.ensure_linear_resources();
+        // Always need a Metal device for MLA buffer alloc on load. It
+        // exists if either ensure_linear_resources or any prior eval
+        // ran, OR initialize a backend on demand.
+        if self.metal.is_none() {
+            self.metal = Some(
+                MetalBackend::new()
+                    .map_err(|_| state_snapshot::StateSnapshotError::BuffersNotReady)?,
+            );
+        }
+        let device = self
+            .metal
+            .as_ref()
+            .expect("just-set")
+            .device()
+            .to_owned();
         let Self {
             layer_states,
             linear_buffers,
             ..
         } = self;
-        let linear_buffers = linear_buffers
-            .as_mut()
-            .expect("ensure_linear_resources just ran");
-        state_snapshot::state_load(buf, layer_states, linear_buffers)
+        state_snapshot::state_load(
+            buf,
+            layer_states,
+            linear_buffers.as_mut(),
+            &device,
+        )
     }
 }
 
