@@ -53,18 +53,25 @@ use super::expert_forward::MAX_K;
 use super::expert_io::{ExpertFiles, ExpertIoError};
 
 /// Per-slot decision: which buffer the K-expert encoder reads from.
-/// Set by [`PrefetchState::wait_for`] (one entry per slot per layer)
-/// and consumed by `gpu_batched_experts_*` in
+/// Set by the per-slot resolution in
+/// `linear_attn_forward::post_attention_tail` (one entry per slot per
+/// layer) and consumed by `gpu_batched_experts_*` in
 /// [`super::expert_forward`].
+///
+/// Matching is set-based, not position-locked: an actual expert at
+/// slot `s` may have been prefetched into a *different* buffer index
+/// than `s`. The `Prefetched(buf_idx)` payload tells the encoder
+/// which prefetch buffer holds this slot's expert weights, regardless
+/// of the order the prefetch loaded them in.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SlotSource {
     /// Slot was sync-pread into `MoeBuffers.data_synced[slot]` (miss
     /// or first-touch). Encoder binds `data_synced[slot]`.
     Synced,
-    /// Slot was async-prefetched into `MoeBuffers.data_prefetch[slot]`
-    /// and the prediction matched the actual routing for this token.
-    /// Encoder binds `data_prefetch[slot]`.
-    Prefetched,
+    /// Slot's expert was found in the prefetch buffer at index
+    /// `buf_idx`. Encoder binds
+    /// `data_prefetch[prefetch_set][buf_idx]`.
+    Prefetched(usize),
 }
 
 /// State machine owned by `RsCtx`. Tracks per-layer predictions and

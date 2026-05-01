@@ -887,8 +887,8 @@ fn emit_batched_experts(
     let pick = |slot: usize| -> &MtlBuffer<u8> {
         match data_set_per_slot[slot] {
             super::SlotSource::Synced => &bufs.data_synced[slot],
-            super::SlotSource::Prefetched => {
-                &bufs.data_prefetch[prefetch_set][slot]
+            super::SlotSource::Prefetched(buf_idx) => {
+                &bufs.data_prefetch[prefetch_set][buf_idx]
             }
         }
     };

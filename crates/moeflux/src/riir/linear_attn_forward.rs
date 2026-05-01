@@ -1091,16 +1091,26 @@ pub(super) fn post_attention_tail(
         // was for this layer.
         let prefetch_status = prefetch.wait_for(layer_idx);
 
-        // Step 2: per-slot hit/miss decision. Counts are folded into
-        // PrefetchState so callers can read aggregate hit-rate stats.
+        // Step 2: per-slot hit/miss decision. Set-based, not
+        // position-locked — for each actual expert at slot `s`, scan
+        // the prefetched indices for a match and record the buffer
+        // index where it landed. The K active experts are picked by
+        // the router with no canonical ordering, so a position-locked
+        // match would fail even when the SET overlaps perfectly with
+        // last-token's experts.
         let mut data_set_per_slot: [SlotSource; MAX_K] =
             [SlotSource::Synced; MAX_K];
         let mut hit_count: u64 = 0;
         if let Some(status) = prefetch_status {
-            for slot in 0..k.min(status.k) {
-                if status.loaded_indices[slot] == indices[slot] {
-                    data_set_per_slot[slot] = SlotSource::Prefetched;
-                    hit_count += 1;
+            for slot in 0..k {
+                let actual = indices[slot];
+                for buf_idx in 0..status.k {
+                    if status.loaded_indices[buf_idx] == actual {
+                        data_set_per_slot[slot] =
+                            SlotSource::Prefetched(buf_idx);
+                        hit_count += 1;
+                        break;
+                    }
                 }
             }
         }
