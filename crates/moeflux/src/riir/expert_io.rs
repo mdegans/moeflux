@@ -35,23 +35,42 @@
 use std::fs::File;
 use std::io;
 use std::os::unix::fs::FileExt;
+#[cfg(feature = "model-cogito-v2-671b")]
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use super::variants::{Variant, VARIANT};
 
 /// Disable kernel readahead on a successfully-opened layer fd.
-/// Expert access is random per token (different routed expert each
-/// step), so kernel readahead pulls in adjacent pages we never read
-/// — wasting SSD bandwidth. Mirrors `fcntl(fd, F_RDAHEAD, 0)` in
-/// the C path at `metal_infer/infer.m:7593`.
+/// Mirrors `fcntl(fd, F_RDAHEAD, 0)` in the C path at
+/// `metal_infer/infer.m:7593`.
+///
+/// **Variant-gated to `model-cogito-v2-671b` only.** Theoretical
+/// rationale: when the expert working set is *much larger* than
+/// physical RAM (Cogito-V2 ≈ 340 GB at 4-bit on a 32 GB UMA Mac),
+/// kernel readahead is wasteful — adjacent pages get pulled into
+/// the page cache, evicting other expert pages we still need.
+/// When the working set fits (Qwen3.5-397B-A17B streams from
+/// per-layer files into a ~24 MB pool, comfortably under 32 GB),
+/// readahead might help warm-token cache hits. The C path
+/// applied F_RDAHEAD=0 unconditionally; we gate it because the
+/// Rust port spans a wider variant range than the C path was
+/// tuned for, and the disable was speculative for Cogito too —
+/// not driven by profiling on either model.
+///
+/// **Empirical note (2026-05-01):** A/B'd Qwen at max_tokens=512
+/// with and without this disable. Result was perf-neutral
+/// (1.7822 vs 1.7805 tok/s). Suspected as a regression vector
+/// vs the 1.96 baseline; turned out not to be. Gate stays as a
+/// documented variant difference; the rationale above remains
+/// theoretical and untested for Cogito.
+#[cfg(feature = "model-cogito-v2-671b")]
 fn disable_readahead(file: &File) {
     // SAFETY: `file.as_raw_fd()` is owned by `file` for the duration
     // of this call; `F_RDAHEAD` with arg=0 has no failure modes that
-    // affect correctness — if it errors (e.g. on a non-macOS unix
-    // where the cmd is unsupported), readahead just stays at default
-    // and we eat a tiny perf loss. We log the failure for diagnostics
-    // but don't propagate.
+    // affect correctness — if it errors, readahead stays at default
+    // and we eat a tiny perf loss. Log for diagnostics but don't
+    // propagate.
     #[cfg(target_os = "macos")]
     unsafe {
         let rc = libc::fcntl(file.as_raw_fd(), libc::F_RDAHEAD, 0i32);
@@ -65,6 +84,12 @@ fn disable_readahead(file: &File) {
         let _ = file;
     }
 }
+
+/// No-op for variants whose expert working set fits in RAM with
+/// headroom — kernel readahead is helpful there. See the
+/// cogito-gated sibling for the full rationale.
+#[cfg(not(feature = "model-cogito-v2-671b"))]
+fn disable_readahead(_file: &File) {}
 
 /// Errors from expert-blob I/O.
 #[derive(Debug, thiserror::Error)]
