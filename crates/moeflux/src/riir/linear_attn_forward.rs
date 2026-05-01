@@ -1091,16 +1091,20 @@ pub(super) fn post_attention_tail(
         // was for this layer.
         let prefetch_status = prefetch.wait_for(layer_idx);
 
-        // Step 2: per-slot hit/miss decision.
+        // Step 2: per-slot hit/miss decision. Counts are folded into
+        // PrefetchState so callers can read aggregate hit-rate stats.
         let mut data_set_per_slot: [SlotSource; MAX_K] =
             [SlotSource::Synced; MAX_K];
+        let mut hit_count: u64 = 0;
         if let Some(status) = prefetch_status {
             for slot in 0..k.min(status.k) {
                 if status.loaded_indices[slot] == indices[slot] {
                     data_set_per_slot[slot] = SlotSource::Prefetched;
+                    hit_count += 1;
                 }
             }
         }
+        prefetch.record_outcome(hit_count, k as u64 - hit_count);
 
         // Step 3: parallel sync-pread the misses into data_synced.
         let mut dsts = moe.data_synced_slots_mut_array();

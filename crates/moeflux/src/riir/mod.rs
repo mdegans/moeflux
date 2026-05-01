@@ -369,6 +369,20 @@ impl RsCtx {
         VARIANT.name
     }
 
+    /// Accumulated `(hits, misses)` for the speculative expert
+    /// prefetch. Each value is a count of K-expert *slots*, not tokens
+    /// — a single decode token contributes up to `K * num_layers` slot
+    /// outcomes. Useful for per-request hit-rate telemetry; pair with
+    /// [`Self::reset_prefetch_stats`] to scope to a single request.
+    pub fn prefetch_stats(&self) -> (u64, u64) {
+        self.prefetch.stats()
+    }
+
+    /// Zero the prefetch hit/miss counters.
+    pub fn reset_prefetch_stats(&self) {
+        self.prefetch.reset_stats();
+    }
+
     /// Embed a single token. Writes `HIDDEN_DIM` floats into `out`.
     /// First per-kernel entry point landed in Phase 3; bit-exact
     /// against the C `mf_embed_lookup`.

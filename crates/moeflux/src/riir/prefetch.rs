@@ -46,6 +46,7 @@
 //! don't enforce — same shape of contract as the deferred-experts
 //! state machine in [`super::deferred`].
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver};
 
 use super::expert_forward::MAX_K;
@@ -76,6 +77,17 @@ pub struct PrefetchState {
     last_token_indices: Vec<Option<[i32; MAX_K]>>,
     /// In-flight prefetch, if any.
     in_flight: Option<InFlight>,
+    /// Slot-level hit counter (per-slot prediction matched the
+    /// per-token routing). Accumulates across the lifetime of the
+    /// state; reset via [`PrefetchState::reset_stats`] for per-request
+    /// scoping. Atomic so the counters can be read from any thread,
+    /// though the increment site is single-threaded (the orchestrator
+    /// loop in `linear_attn_forward::post_attention_tail`).
+    hits: AtomicU64,
+    /// Slot-level miss counter (no in-flight prefetch, prefetch was
+    /// for a different layer, prediction didn't match, or the slot
+    /// index ran past the prefetch's K). Same lifecycle as `hits`.
+    misses: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -167,7 +179,36 @@ impl PrefetchState {
         Self {
             last_token_indices: vec![None; num_layers],
             in_flight: None,
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
         }
+    }
+
+    /// Record a per-layer outcome: how many of the K slots were
+    /// satisfied by a prefetch hit, and how many fell back to a sync
+    /// pread. Called from the orchestrator at the resolution site
+    /// (`linear_attn_forward::post_attention_tail`).
+    pub fn record_outcome(&self, hits: u64, misses: u64) {
+        if hits > 0 {
+            self.hits.fetch_add(hits, Ordering::Relaxed);
+        }
+        if misses > 0 {
+            self.misses.fetch_add(misses, Ordering::Relaxed);
+        }
+    }
+
+    /// Read the accumulated `(hits, misses)` counters.
+    pub fn stats(&self) -> (u64, u64) {
+        (
+            self.hits.load(Ordering::Relaxed),
+            self.misses.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Zero the counters (e.g. for per-request scoping).
+    pub fn reset_stats(&self) {
+        self.hits.store(0, Ordering::Relaxed);
+        self.misses.store(0, Ordering::Relaxed);
     }
 
     /// Drain any in-flight prefetch (wait for all K tasks). Used by
