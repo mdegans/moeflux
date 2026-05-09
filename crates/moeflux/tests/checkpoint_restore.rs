@@ -196,3 +196,55 @@ fn lru_protects_pos_zero() {
     // pos=0 must survive even though it's the oldest.
     ctx.restore_to(0).expect("pos=0 must remain restorable");
 }
+
+/// `forget_pos(P)` drops the snapshot at P without disturbing any
+/// other snapshot. After forgetting, `restore_to(P)` reports
+/// `NoCheckpoint`; siblings remain restorable.
+#[test]
+#[ignore]
+fn forget_pos_drops_one_entry() {
+    let mut ctx = open_ctx();
+    let mut logits = vec![0.0f32; ctx.n_vocab()];
+    ctx.eval_prompt(PROMPT, 0, 0, &mut logits).expect("eval_prompt");
+
+    for &pos in &[50, 100, 150] {
+        ctx.checkpoint_pos(pos).expect("checkpoint_pos");
+    }
+    assert_eq!(ctx.checkpoint_count(), 3);
+
+    ctx.forget_pos(100);
+    assert_eq!(ctx.checkpoint_count(), 2);
+    assert!(matches!(
+        ctx.restore_to(100),
+        Err(CheckpointError::NoCheckpoint { .. })
+    ));
+
+    // Siblings still restorable.
+    ctx.restore_to(150).expect("150 must survive forget_pos(100)");
+    // restore_to(150) drops keys > 150 (none here), so 50 still lives.
+    ctx.restore_to(50).expect("50 must survive forget_pos(100)");
+}
+
+/// `forget_pos` is idempotent: calling it on a position with no
+/// snapshot is a no-op (matches the `Decoder::forget_pos` contract
+/// drama_llama's `Session` relies on for double-eviction tolerance).
+#[test]
+#[ignore]
+fn forget_pos_idempotent_on_missing() {
+    let mut ctx = open_ctx();
+    let mut logits = vec![0.0f32; ctx.n_vocab()];
+    ctx.eval_prompt(PROMPT, 0, 0, &mut logits).expect("eval_prompt");
+
+    ctx.checkpoint_pos(100).expect("checkpoint_pos");
+    assert_eq!(ctx.checkpoint_count(), 1);
+
+    // No snapshot at 9999 — must not panic, must not touch the live entry.
+    ctx.forget_pos(9999);
+    assert_eq!(ctx.checkpoint_count(), 1);
+
+    // Calling twice on the same valid pos: first removes, second is no-op.
+    ctx.forget_pos(100);
+    assert_eq!(ctx.checkpoint_count(), 0);
+    ctx.forget_pos(100);
+    assert_eq!(ctx.checkpoint_count(), 0);
+}

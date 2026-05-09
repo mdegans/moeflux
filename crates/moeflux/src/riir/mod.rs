@@ -2086,6 +2086,25 @@ impl RsCtx {
         Ok(())
     }
 
+    /// Drop the snapshot stored at `pos` from the checkpoint map and
+    /// the LRU, without touching any other snapshot or the live ctx
+    /// state. Idempotent: returns silently if no entry exists at `pos`.
+    ///
+    /// Used by drama_llama's `Session` to evict a previous "internal
+    /// tip" snapshot being replaced by a fresher tip, and to prune
+    /// orphan breakpoints from prior calls — both essential for
+    /// keeping the most-valuable cross-agent anchor (system+tools at
+    /// pos-0) alive in the bounded LRU.
+    pub fn forget_pos(&mut self, pos: i32) {
+        if self.checkpoints.remove(&pos).is_some() {
+            if let Some(idx) =
+                self.checkpoint_order.iter().position(|&p| p == pos)
+            {
+                self.checkpoint_order.remove(idx);
+            }
+        }
+    }
+
     /// Set the snapshot count cap. Default is
     /// [`DEFAULT_MAX_CHECKPOINTS`] = 4. Lowering past the current
     /// `checkpoints.len()` triggers eviction at the next
