@@ -4125,3 +4125,96 @@ fn slot_reuse_race_regression_rust() {
         "slot-reuse race regression: cosine {cos:.7} below 0.9999"
     );
 }
+
+/// Phase 6 scaffolding: canonical `eval_prompt` produces last-token
+/// logits matching a tokenwise reference built from per-token
+/// `eval_token` calls (which route through
+/// `step_internal_per_token_oracle`).
+///
+/// Session-3 status: `RsCtx::step_internal` is currently a tokenwise
+/// loop calling the per-token oracle, so this test trivially passes
+/// on the per-PSO-determinism floor. When session 4 swaps the loop
+/// body for the GPU batched-prefill primitives landed in sessions 1-3
+/// (`encode_moe_batched_permute_fuse`, causal-masked tiled SDPA,
+/// batched matmul), the two paths diverge in implementation while
+/// staying equivalent in output — the FP-reorder envelope from
+/// per-bucket vs per-slot MoE accumulation should keep cosine ≥
+/// 0.9999, the same floor the synthetic Phase 4 diff test hit at
+/// cosine = 1.000000000.
+///
+/// Catches: (a) regressions in `eval_prompt`'s emission contract,
+/// (b) any future per-layer batched primitive that diverges from the
+/// per-token oracle beyond the FP-reorder envelope, (c) state
+/// advancement bugs (KV append position, deferred ring drain,
+/// prefetch interactions).
+#[test]
+#[ignore = "long running; needs moeflux artifacts"]
+fn eval_prompt_matches_per_token_oracle() {
+    let prompt: [i32; 16] = [
+        1, 200, 600, 1100, 2, 300, 700, 1200, 3, 400, 800, 1300, 4, 500,
+        900, 1400,
+    ];
+    let next_token = 7i32;
+    let next_pos = prompt.len();
+
+    // Reference path: per-token oracle via `eval_token` per position.
+    // `eval_token` always emits logits, so the buffer ends up holding
+    // the last token's logits after the loop.
+    let mut rs_ref: RsBackend = open_backend();
+    let n_vocab = rs_ref.0.n_vocab();
+    let mut ref_prompt_logits = vec![0.0f32; n_vocab];
+    for (i, &tok) in prompt.iter().enumerate() {
+        rs_ref
+            .0
+            .eval_token(tok, i, 0, &mut ref_prompt_logits)
+            .expect("oracle eval_token");
+    }
+    let ref_continuation = rs_ref.eval_token(next_token, next_pos);
+
+    // Test path: canonical `eval_prompt` (slice-taking).
+    let mut rs: RsBackend = open_backend();
+    let mut prompt_logits = vec![0.0f32; n_vocab];
+    rs.0.eval_prompt(&prompt, 0, 0, &mut prompt_logits)
+        .expect("canonical eval_prompt");
+    let test_continuation = rs.eval_token(next_token, next_pos);
+
+    // Compare both the end-of-prompt logits and the post-prompt
+    // continuation. End-of-prompt catches divergence inside the
+    // prefill path; continuation catches divergence in the KV state
+    // left behind after the prompt completes.
+    let prompt_cos = cosine_sim(&ref_prompt_logits, &prompt_logits);
+    let prompt_drift = ref_prompt_logits
+        .iter()
+        .zip(prompt_logits.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let cont_cos = cosine_sim(&ref_continuation, &test_continuation);
+    let cont_drift = ref_continuation
+        .iter()
+        .zip(test_continuation.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    eprintln!(
+        "[diff:eval_prompt_matches_per_token_oracle] \
+         prompt cosine={prompt_cos:.7} max_abs_diff={prompt_drift:.3e} | \
+         continuation cosine={cont_cos:.7} max_abs_diff={cont_drift:.3e}"
+    );
+    assert_eq!(
+        argmax(&ref_prompt_logits),
+        argmax(&prompt_logits),
+        "eval_prompt last-token argmax diverged from oracle"
+    );
+    assert_eq!(
+        argmax(&ref_continuation),
+        argmax(&test_continuation),
+        "post-prompt continuation argmax diverged from oracle"
+    );
+    assert!(
+        prompt_cos >= 0.9999,
+        "eval_prompt last-token cosine {prompt_cos:.7} below 0.9999"
+    );
+    assert!(
+        cont_cos >= 0.9999,
+        "post-prompt continuation cosine {cont_cos:.7} below 0.9999"
+    );
+}

@@ -1203,14 +1203,10 @@ impl RsCtx {
         if logits.len() != VARIANT.vocab_size {
             return Err(RsError::EvalFailed);
         }
-        for (i, &tok) in tokens.iter().enumerate() {
-            let pos = (start_pos + i) as i32;
-            let last = i + 1 == tokens.len();
-            let logits_arg: Option<&mut [f32]> =
-                if last { Some(&mut logits[..]) } else { None };
-            self.step_internal(tok, pos, logits_arg)?;
+        if tokens.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        self.step_internal(tokens, start_pos as i32, Some(&mut logits[..]))
     }
 
     /// Decode-style single-token step. Always emits logits. Mirrors C
@@ -1225,7 +1221,55 @@ impl RsCtx {
         if logits.len() != VARIANT.vocab_size {
             return Err(RsError::EvalFailed);
         }
-        self.step_internal(token, pos as i32, Some(logits))
+        self.step_internal_per_token_oracle(token, pos as i32, Some(logits))
+    }
+
+    /// Canonical multi-token forward orchestrator. Processes
+    /// `tokens` at positions `[start_pos, start_pos + tokens.len())`
+    /// and (when requested) writes the last token's logits.
+    ///
+    /// **Session-3 implementation:** wraps
+    /// [`Self::step_internal_per_token_oracle`] in a tokenwise loop;
+    /// behaviour is identical to the pre-rename `step_internal`. The
+    /// surface lives at this signature so session 4 can swap the
+    /// loop body for the GPU batched-prefill primitives landed in
+    /// sessions 1-3 ([`expert_forward::encode_moe_batched_permute_fuse`],
+    /// causal-masked tiled SDPA, batched matmul) without changing
+    /// callers.
+    ///
+    /// `eval_prompt` routes here; `eval_token` stays on the per-token
+    /// oracle since single-token decode doesn't benefit from
+    /// batching.
+    pub(crate) fn step_internal(
+        &mut self,
+        tokens: &[i32],
+        start_pos: i32,
+        logits_out: Option<&mut [f32]>,
+    ) -> Result<(), RsError> {
+        if tokens.is_empty() {
+            return Ok(());
+        }
+        if start_pos < 0 {
+            return Err(RsError::EvalFailed);
+        }
+        if let Some(ref l) = logits_out {
+            if l.len() != VARIANT.vocab_size {
+                return Err(RsError::EvalFailed);
+            }
+        }
+
+        let last_idx = tokens.len() - 1;
+        let mut logits_owned = logits_out;
+        for (i, &tok) in tokens.iter().enumerate() {
+            let pos = start_pos + i as i32;
+            let logits_arg: Option<&mut [f32]> = if i == last_idx {
+                logits_owned.take()
+            } else {
+                None
+            };
+            self.step_internal_per_token_oracle(tok, pos, logits_arg)?;
+        }
+        Ok(())
     }
 
     /// Per-token CPU MLA forward for DeepSeek-V3 / Cogito-V2. Pure
@@ -1660,7 +1704,22 @@ impl RsCtx {
     /// reads the correct hidden state. The final drain (after the
     /// loop) writes into a host scratch so the model.norm + lm_head
     /// pair don't have to share the GPU buffer.
-    fn step_internal(
+    ///
+    /// ## Role: per-token oracle for the batched-prefill path
+    ///
+    /// This is the tokenwise forward — it processes exactly one token
+    /// per call. The canonical multi-token orchestrator
+    /// [`Self::step_internal`] takes a slice and, after the
+    /// session-4 batched-primitive integration, will use GPU batched
+    /// kernels (MoE permute-and-fuse, tiled SDPA, batched matmul) to
+    /// amortize per-layer I/O across the prompt. This function stays
+    /// as the diff oracle so any future divergence in the batched
+    /// path is caught against the tokenwise reference.
+    ///
+    /// Production callers: [`Self::eval_token`] (decode) routes here
+    /// directly. The slice-taking [`Self::step_internal`] currently
+    /// wraps this in a loop.
+    pub(crate) fn step_internal_per_token_oracle(
         &mut self,
         token: i32,
         pos: i32,
