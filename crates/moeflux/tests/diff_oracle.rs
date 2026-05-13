@@ -66,6 +66,7 @@
 ))]
 
 use std::path::Path;
+use std::time::Instant;
 
 mod common;
 use common::c_backend::Ctx;
@@ -4300,6 +4301,72 @@ fn eval_prompt_chunked_matches_eval_prompt_whole_prompt() {
         cont_cos >= 0.9999,
         "post-chunked continuation cosine {cont_cos:.7} below 0.9999"
     );
+}
+
+/// Phase F headline — directional bench of batched eval_prompt vs
+/// per-token oracle on a 256-token synthetic prompt.
+///
+/// Run with `cargo test --release ... bench_batched_eval_prompt_vs_per_token
+/// -- --ignored --nocapture`. **Not a proper bench**: single iteration,
+/// no reboot between, no power-mode control. The proper bench protocol
+/// (n≥3, reboot between revisions, high-perf power) lives at
+/// drama_llama/.claude/memory/feedback_bench_discipline.md. Use this for
+/// in-session directional answers; the headline number for memos comes
+/// from the protocol-compliant bench.
+///
+/// Synthetic prompt = repeating token 200, 256 tokens. Real-world
+/// prompts have richer routing distributions; this is a controlled
+/// floor on the I/O-batching win since 256 repeated tokens still
+/// route to ~all experts via per-position routing.
+#[test]
+#[ignore = "long running; needs moeflux artifacts; directional only"]
+fn bench_batched_eval_prompt_vs_per_token() {
+    const N: usize = 256;
+    let prompt: Vec<i32> =
+        (0..N).map(|i| ((i * 37 + 5) % 50000 + 1) as i32).collect();
+
+    // Path A: per-token oracle via eval_token loop.
+    let mut rs_oracle: RsBackend = open_backend();
+    let n_vocab = rs_oracle.0.n_vocab();
+    let mut oracle_logits = vec![0.0f32; n_vocab];
+    let t0 = Instant::now();
+    for (i, &tok) in prompt.iter().enumerate() {
+        rs_oracle
+            .0
+            .eval_token(tok, i, 0, &mut oracle_logits)
+            .expect("oracle eval_token");
+    }
+    let oracle_elapsed = t0.elapsed();
+
+    // Path B: canonical batched eval_prompt (single chunk since N=256
+    // < CHUNK_SIZE=8192).
+    let mut rs_batched: RsBackend = open_backend();
+    let mut batched_logits = vec![0.0f32; n_vocab];
+    let t1 = Instant::now();
+    rs_batched
+        .0
+        .eval_prompt(&prompt, 0, 0, &mut batched_logits)
+        .expect("batched eval_prompt");
+    let batched_elapsed = t1.elapsed();
+
+    let oracle_tok_s = N as f64 / oracle_elapsed.as_secs_f64();
+    let batched_tok_s = N as f64 / batched_elapsed.as_secs_f64();
+    let speedup = batched_tok_s / oracle_tok_s;
+
+    eprintln!(
+        "[bench:eval_prompt_vs_per_token N={N}] \
+         per-token: {oracle_elapsed:?} ({oracle_tok_s:.2} tok/s) | \
+         batched: {batched_elapsed:?} ({batched_tok_s:.2} tok/s) | \
+         speedup: {speedup:.2}×"
+    );
+
+    // Cosine sanity — but we already verify this elsewhere with
+    // higher precision. Just make sure the bench wasn't a no-op.
+    let cos = cosine_sim(&oracle_logits, &batched_logits);
+    eprintln!(
+        "[bench:eval_prompt_vs_per_token] sanity cosine={cos:.7}"
+    );
+    assert!(cos >= 0.99, "bench cosine {cos:.7} below sanity floor");
 }
 
 /// Phase D — prompt-cache scenario. Eval a "cached prefix" on ctx_A,
