@@ -536,9 +536,18 @@ pub fn linear_attn_layer_forward(
     // nothing in this layer's forward writes to it (the next layer's
     // top-of-forward `complete_deferred_experts_into` is the next
     // mutation), so the dual-use is safe.
+    //
+    // Slice cmdbuf-fold-1: the cmdbuf is hoisted out of CMD1 and
+    // reused by `post_attention_tail` for CMD2+3, eliminating the
+    // CMD1 commit-wait. Encoders within a single cmdbuf serialize
+    // on Metal so the data flow is honored without the synchronous
+    // boundary. Net per-layer count: 3 → 2 cmdbufs for linear-attn.
+    //
+    // `queue_clone` (not `queue`) so the cmdbuf borrow doesn't pin
+    // `*metal` and block the `&mut metal` arg to `post_attention_tail`.
+    let queue = metal.queue_clone();
+    let cmdbuf = queue.new_command_buffer();
     {
-        let cmdbuf = metal.queue().new_command_buffer();
-
         // Slice 5d-8: skip the input-norm prelude when the previous
         // layer chained — `buffers.normed` is already populated by the
         // appended rms_norm at the tail of the previous K-expert cmdbuf
@@ -663,8 +672,8 @@ pub fn linear_attn_layer_forward(
             Variant::LINEAR_VALUE_DIM as u32,
         );
 
-        cmdbuf.commit();
-        cmdbuf.wait_until_completed();
+        // Slice cmdbuf-fold-1: CMD1's commit+wait is gone — the tail
+        // commits the same cmdbuf below after encoding CMD2+3.
     }
 
     // ── Hand off to the shared post-attention tail ───────────────
@@ -675,6 +684,7 @@ pub fn linear_attn_layer_forward(
     // pipeline), so `gpu_attn_args = None`.
     post_attention_tail(
         metal,
+        cmdbuf,
         wf,
         wf_buf,
         layer_cache,
@@ -728,6 +738,15 @@ pub fn linear_attn_layer_forward(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn post_attention_tail(
     metal: &mut MetalBackend,
+    // Caller-owned cmdbuf into which CMD2+3 work is encoded. The
+    // linear-attn caller passes its CMD1 cmdbuf so projections +
+    // linear-attn fused kernels share the same submit (slice
+    // cmdbuf-fold-1). Full-attn callers must create a fresh cmdbuf
+    // *after* the host-bounce (q/k/v readback + CPU per-head norm +
+    // RoPE + KV append) and pass it here. `commit + wait` of CMD2+3
+    // happens inside this function; the caller must not commit before
+    // returning.
+    cmdbuf: &CommandBufferRef,
     wf: &WeightFile,
     wf_buf: &MtlWeightBuf,
     layer_cache: &LayerWeightCache,
@@ -835,9 +854,12 @@ pub(super) fn post_attention_tail(
     // Encoders within one cmdbuf serialize on Metal, so the data
     // dependencies (o_proj → residual_add → rms_norm → projections →
     // swiglu → shared_down) are honored without per-encoder waits.
+    //
+    // The cmdbuf is now caller-owned (slice cmdbuf-fold-1). Linear-attn
+    // callers pass their CMD1 cmdbuf so projections + linear-attn fused
+    // kernels share the same submit; full-attn callers create a fresh
+    // cmdbuf after the host-bounce.
     {
-        let cmdbuf = metal.queue().new_command_buffer();
-
         // ── Slice 5d-7b: GPU full-attn fast path (Enc A1..A4) ──────
         //
         // When active, encode the 4 attn kernels at the head of CMD2
@@ -1034,8 +1056,7 @@ pub(super) fn post_attention_tail(
             },
         );
 
-        cmdbuf.commit();
-        cmdbuf.wait_until_completed();
+        metal.commit_and_wait_labeled(cmdbuf, "post_attn_tail.cmd2_3");
     }
 
     // ── CPU: MoE router on the gate logits ───────────────────────

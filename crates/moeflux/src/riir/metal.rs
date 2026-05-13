@@ -31,10 +31,11 @@
 //! non-issue at the public API layer.
 
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 use metal::{
-    CommandQueue, CompileOptions, ComputePipelineState, Device, Library,
-    MTLResourceOptions, NSUInteger,
+    CommandBufferRef, CommandQueue, CompileOptions, ComputePipelineState,
+    Device, Library, MTLResourceOptions, NSUInteger,
 };
 
 /// Errors from the Metal backend.
@@ -96,6 +97,19 @@ pub const ALL_KERNELS: &[&str] = &[
     "weighted_sum",
 ];
 
+/// Per-label cmdbuf submission stats. Aggregated under
+/// [`MetalBackend::cmdbuf_stats`] via the labeled commit+wait wrapper.
+///
+/// `gpu_ns` is reserved for a future port to a metal-rs version that
+/// surfaces `gpu_start_time` / `gpu_end_time`; for now it stays at
+/// zero and consumers should ignore it.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CmdbufStat {
+    pub count: u64,
+    pub cpu_wait_ns: u64,
+    pub gpu_ns: u64,
+}
+
 /// Single-owner Metal backend. One per `Ctx`. Owns the device,
 /// command queue, compiled library, and pipeline cache.
 pub struct MetalBackend {
@@ -106,6 +120,11 @@ pub struct MetalBackend {
     /// `&'static str` keys come from [`ALL_KERNELS`] or string literals
     /// in dispatcher helpers — never user input, never owned strings.
     pipelines: HashMap<&'static str, ComputePipelineState>,
+    /// Per-label cmdbuf timing accumulator. Populated by
+    /// [`Self::commit_and_wait_labeled`]. Behind a [`Mutex`] so the
+    /// helper can take `&self` — contention is irrelevant (one
+    /// lock per cmdbuf, dwarfed by the wait itself).
+    cmdbuf_stats: Mutex<HashMap<&'static str, CmdbufStat>>,
 }
 
 impl MetalBackend {
@@ -130,6 +149,7 @@ impl MetalBackend {
             queue,
             library,
             pipelines: HashMap::new(),
+            cmdbuf_stats: Mutex::new(HashMap::new()),
         })
     }
 
@@ -142,6 +162,21 @@ impl MetalBackend {
     /// Command queue. Reused across every forward pass.
     pub fn queue(&self) -> &CommandQueue {
         &self.queue
+    }
+
+    /// Clone the command-queue handle. `metal::CommandQueue` is an
+    /// NSObject-backed reference-counted handle, so this is cheap
+    /// (one Objective-C `retain`).
+    ///
+    /// Use this when a caller needs to allocate a cmdbuf from the queue
+    /// *and* hold `&mut MetalBackend` simultaneously for pipeline
+    /// fetches or labeled commit-waits. Calling
+    /// `metal.queue().new_command_buffer()` returns a `&CommandBufferRef`
+    /// whose lifetime is tied to `metal`, which conflicts with later
+    /// `&mut metal` use. Cloning the queue out severs that lifetime
+    /// dependency.
+    pub fn queue_clone(&self) -> CommandQueue {
+        self.queue.clone()
     }
 
     /// Get-or-compile the pipeline state for kernel `name`. The
@@ -184,6 +219,50 @@ impl MetalBackend {
     /// Number of pipelines currently cached. Diagnostics only.
     pub fn pipeline_count(&self) -> usize {
         self.pipelines.len()
+    }
+
+    /// Commit `cmdbuf`, wait for completion, and record the CPU wait
+    /// time under `label` in [`Self::cmdbuf_stats`].
+    ///
+    /// `label` must be `'static` so the stats map can key on it
+    /// without owning a string per call.
+    pub fn commit_and_wait_labeled(
+        &self,
+        cmdbuf: &CommandBufferRef,
+        label: &'static str,
+    ) {
+        let t0 = std::time::Instant::now();
+        cmdbuf.commit();
+        cmdbuf.wait_until_completed();
+        let cpu_wait_ns = t0.elapsed().as_nanos() as u64;
+        let mut stats = self
+            .cmdbuf_stats
+            .lock()
+            .expect("cmdbuf_stats mutex poisoned");
+        let entry = stats.entry(label).or_default();
+        entry.count += 1;
+        entry.cpu_wait_ns += cpu_wait_ns;
+    }
+
+    /// Snapshot the per-label cmdbuf stats. Returns `(label, stat)`
+    /// pairs sorted by label for deterministic reporting.
+    pub fn cmdbuf_stats(&self) -> Vec<(&'static str, CmdbufStat)> {
+        let stats = self
+            .cmdbuf_stats
+            .lock()
+            .expect("cmdbuf_stats mutex poisoned");
+        let mut out: Vec<_> = stats.iter().map(|(k, v)| (*k, *v)).collect();
+        out.sort_by_key(|(k, _)| *k);
+        out
+    }
+
+    /// Zero out the per-label cmdbuf stats. Call before a measured
+    /// segment (e.g. per-request) to get clean numbers.
+    pub fn reset_cmdbuf_stats(&self) {
+        self.cmdbuf_stats
+            .lock()
+            .expect("cmdbuf_stats mutex poisoned")
+            .clear();
     }
 }
 

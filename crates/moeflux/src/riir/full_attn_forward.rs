@@ -226,8 +226,7 @@ pub fn full_attn_layer_forward(
             encode_matvec(cmdbuf, &mv, wf_buf, s);
         }
 
-        cmdbuf.commit();
-        cmdbuf.wait_until_completed();
+        metal.commit_and_wait_labeled(cmdbuf, "full_attn.cmd1");
     }
 
     // ── Read q_proj_out, k, v back to host ───────────────────────
@@ -394,8 +393,20 @@ pub fn full_attn_layer_forward(
     // `gpu_attn_out`. Otherwise it reads from `batch_out[6]` (the
     // CPU-SDPA staging slot above). The tail leaves an in-flight
     // K-expert dispatch in `*deferred`; caller drains.
+    //
+    // Slice cmdbuf-fold-1: full-attn cannot fold CMD1 into CMD2+3
+    // because the host-bounce above (q/k/v readback + CPU per-head
+    // norm + RoPE + KV append) is interposed. A fresh cmdbuf for the
+    // tail is the correct shape until Phase 3b moves the host-bounce
+    // work to GPU.
+    //
+    // `queue_clone` (not `queue`) so the cmdbuf borrow doesn't pin
+    // `*metal` and block the `&mut metal` arg below.
+    let queue = metal.queue_clone();
+    let cmdbuf = queue.new_command_buffer();
     post_attention_tail(
         metal,
+        cmdbuf,
         wf,
         wf_buf,
         layer_cache,
