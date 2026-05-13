@@ -1241,6 +1241,14 @@ impl RsCtx {
 
     /// Decode-style single-token step. Always emits logits. Mirrors C
     /// `mf_eval_token` (infer.m:7746..7757).
+    ///
+    /// **Phase G (2026-05-13):** routed through
+    /// [`Self::step_internal`] with a 1-element slice instead of
+    /// [`Self::step_internal_per_token_oracle`] directly. The
+    /// directional decode bench at kv_start=32 / decode_n=32 showed
+    /// batched-N=1 is 17.6% FASTER than per-token oracle (12.09 vs
+    /// 14.22 tok/s, cosine=1.0), well past the +5% gate the Phase G
+    /// plan called for. The oracle stays as a diff target.
     pub fn eval_token(
         &mut self,
         token: i32,
@@ -1251,7 +1259,7 @@ impl RsCtx {
         if logits.len() != VARIANT.vocab_size {
             return Err(RsError::EvalFailed);
         }
-        self.step_internal_per_token_oracle(token, pos as i32, Some(logits))
+        self.step_internal(&[token], pos as i32, Some(logits))
     }
 
     /// Canonical multi-token forward orchestrator. Processes

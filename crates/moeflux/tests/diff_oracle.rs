@@ -4418,6 +4418,98 @@ fn bench_batched_eval_prompt_vs_per_token() {
     assert!(cos >= 0.99, "bench cosine {cos:.7} below sanity floor");
 }
 
+/// Phase G — decode regression bench. Compares the per-token oracle
+/// (`eval_token` loop hitting `step_internal_per_token_oracle` directly)
+/// against the batched-path-via-N=1 (`eval_prompt(&[tok], pos, ...)`
+/// hitting `step_internal_batched_gqa` with chunk size effectively 1
+/// since the prompt has length 1).
+///
+/// Phase G's go/no-go: if batched-decode is within 5% of per-token at
+/// small kv_len AND faster at large kv_len, route eval_token through
+/// the batched path and remove the per-token attn kernels.
+///
+/// **Not protocol-compliant** (n=1, no reboot). Directional only.
+#[test]
+#[ignore = "long running; needs moeflux artifacts; directional only"]
+fn bench_decode_per_token_vs_batched_n1() {
+    const PROMPT_LEN: usize = 32; // warm prefix
+    const DECODE_N: usize = 32;
+    let prompt: Vec<i32> = (0..PROMPT_LEN)
+        .map(|i| ((i * 37 + 5) % 50000 + 1) as i32)
+        .collect();
+
+    // Path A: per-token oracle via eval_token.
+    let mut rs_oracle: RsBackend = open_backend();
+    let n_vocab = rs_oracle.0.n_vocab();
+    // Warm-up prefill via the oracle path.
+    let mut prompt_logits = vec![0.0f32; n_vocab];
+    for (i, &tok) in prompt.iter().enumerate() {
+        rs_oracle
+            .0
+            .eval_token(tok, i, 0, &mut prompt_logits)
+            .expect("oracle warm-up");
+    }
+    let mut last_logits = prompt_logits.clone();
+    let t0 = Instant::now();
+    for d in 0..DECODE_N {
+        // Greedy next token.
+        let next_tok = argmax(&last_logits) as i32;
+        rs_oracle
+            .0
+            .eval_token(next_tok, PROMPT_LEN + d, 0, &mut last_logits)
+            .expect("oracle decode");
+    }
+    let oracle_elapsed = t0.elapsed();
+    let oracle_decode_tok_s = DECODE_N as f64 / oracle_elapsed.as_secs_f64();
+
+    // Path B: batched-path with N=1 chunks via eval_prompt(&[tok], pos).
+    let mut rs_batched: RsBackend = open_backend();
+    // Warm-up prefill via eval_prompt (batched path).
+    let mut prompt_logits_b = vec![0.0f32; n_vocab];
+    rs_batched
+        .0
+        .eval_prompt(&prompt, 0, 0, &mut prompt_logits_b)
+        .expect("batched warm-up");
+    let mut last_logits_b = prompt_logits_b.clone();
+    let t1 = Instant::now();
+    for d in 0..DECODE_N {
+        let next_tok = argmax(&last_logits_b) as i32;
+        rs_batched
+            .0
+            .eval_prompt(
+                &[next_tok],
+                PROMPT_LEN + d,
+                0,
+                &mut last_logits_b,
+            )
+            .expect("batched decode N=1");
+    }
+    let batched_elapsed = t1.elapsed();
+    let batched_decode_tok_s =
+        DECODE_N as f64 / batched_elapsed.as_secs_f64();
+
+    let regression = (oracle_decode_tok_s - batched_decode_tok_s)
+        / oracle_decode_tok_s
+        * 100.0;
+    eprintln!(
+        "[bench:decode_per_token_vs_batched_n1] kv_start={PROMPT_LEN} \
+         decode_n={DECODE_N} | per-token: {oracle_elapsed:?} \
+         ({oracle_decode_tok_s:.2} tok/s) | batched-N1: \
+         {batched_elapsed:?} ({batched_decode_tok_s:.2} tok/s) | \
+         regression: {regression:.1}%"
+    );
+    // Sanity: both should produce the same greedy trajectory.
+    let cos = cosine_sim(&last_logits, &last_logits_b);
+    eprintln!(
+        "[bench:decode_per_token_vs_batched_n1] final-logit cos={cos:.7}"
+    );
+    assert!(
+        cos >= 0.99,
+        "decode bench cosine {cos:.7} below sanity floor — \
+         per-token and batched-N1 diverged greedily"
+    );
+}
+
 /// Phase D — prompt-cache scenario. Eval a "cached prefix" on ctx_A,
 /// snapshot, reset, load, then eval the suffix with
 /// `start_pos = prefix.len()`. The resulting continuation logits must
