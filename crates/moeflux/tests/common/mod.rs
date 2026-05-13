@@ -6,3 +6,4 @@
 //! test scaffolding.
 
 pub mod c_backend;
+pub mod diff_helpers;

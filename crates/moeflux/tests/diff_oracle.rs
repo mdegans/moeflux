@@ -65,10 +65,14 @@
     ),
 ))]
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 mod common;
 use common::c_backend::Ctx;
+use common::diff_helpers::{
+    argmax, artifacts_dir, cosine_sim, default_a3b_paths, jaccard, topk,
+    TOPK_K,
+};
 use moeflux::riir::RsCtx;
 
 // ---------------------------------------------------------------------------
@@ -1135,134 +1139,23 @@ impl DiffBackend for RsBackend {
 }
 
 // ---------------------------------------------------------------------------
-// Comparison helpers
+// Backend opener (path resolution + tolerance constants live in
+// `tests/common/diff_helpers.rs` so they're sharable with the
+// `batched_diff_oracle.rs` test binary).
 // ---------------------------------------------------------------------------
-
-/// Argmax (id of largest logit). Ties broken by lowest id.
-pub fn argmax(logits: &[f32]) -> i32 {
-    let mut best_id = 0i32;
-    let mut best_v = f32::NEG_INFINITY;
-    for (i, &v) in logits.iter().enumerate() {
-        if v > best_v {
-            best_v = v;
-            best_id = i as i32;
-        }
-    }
-    best_id
-}
-
-/// Top-K ids by descending logit, ties broken by ascending id.
-pub fn topk(logits: &[f32], k: usize) -> Vec<i32> {
-    let mut idx: Vec<(i32, f32)> = logits
-        .iter()
-        .enumerate()
-        .map(|(i, &v)| (i as i32, v))
-        .collect();
-    idx.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.0.cmp(&b.0))
-    });
-    idx.truncate(k);
-    idx.into_iter().map(|(i, _)| i).collect()
-}
-
-/// Jaccard set overlap of two id lists.
-pub fn jaccard(a: &[i32], b: &[i32]) -> f32 {
-    use std::collections::HashSet;
-    let sa: HashSet<i32> = a.iter().copied().collect();
-    let sb: HashSet<i32> = b.iter().copied().collect();
-    let inter = sa.intersection(&sb).count() as f32;
-    let union = sa.union(&sb).count() as f32;
-    if union == 0.0 { 1.0 } else { inter / union }
-}
-
-/// Cosine similarity over the full logit vector. Robust to scale
-/// differences; catches both directional and magnitude drift up to
-/// a global multiplicative factor.
-pub fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
-    assert_eq!(a.len(), b.len(), "cosine_sim: length mismatch");
-    let mut dot = 0.0f64;
-    let mut na = 0.0f64;
-    let mut nb = 0.0f64;
-    for (&x, &y) in a.iter().zip(b.iter()) {
-        let xf = x as f64;
-        let yf = y as f64;
-        dot += xf * yf;
-        na += xf * xf;
-        nb += yf * yf;
-    }
-    let denom = (na * nb).sqrt();
-    if denom == 0.0 { 1.0 } else { (dot / denom) as f32 }
-}
-
-/// Tolerances applied at every diff-check site. Conservative defaults
-/// — Metal MoE atomic-op nondeterminism is the dominant noise source
-/// and stays well below these floors empirically.
-pub const TOPK_K: usize = 20;
-pub const TOPK_JACCARD_MIN: f32 = 0.95;
-pub const COSINE_SIM_MIN: f32 = 0.99;
-
-/// Full diff check on one logit vector. Asserts argmax match,
-/// top-K Jaccard floor, and cosine-sim floor; logs all three.
-pub fn assert_logits_close(label: &str, c: &[f32], rs: &[f32]) {
-    let c_arg = argmax(c);
-    let rs_arg = argmax(rs);
-    let c_top = topk(c, TOPK_K);
-    let rs_top = topk(rs, TOPK_K);
-    let jac = jaccard(&c_top, &rs_top);
-    let cos = cosine_sim(c, rs);
-
-    eprintln!(
-        "[diff:{label}] argmax c={c_arg} rs={rs_arg} \
-         top-{TOPK_K} jaccard={jac:.4} cosine={cos:.5}"
-    );
-
-    assert_eq!(
-        c_arg, rs_arg,
-        "[diff:{label}] argmax mismatch (c={c_arg} rs={rs_arg})"
-    );
-    assert!(
-        jac >= TOPK_JACCARD_MIN,
-        "[diff:{label}] top-{TOPK_K} jaccard {jac:.4} below {TOPK_JACCARD_MIN}"
-    );
-    assert!(
-        cos >= COSINE_SIM_MIN,
-        "[diff:{label}] cosine sim {cos:.5} below {COSINE_SIM_MIN}"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Path resolution (env-var override, mirrors smoke.rs)
-// ---------------------------------------------------------------------------
-
-fn artifacts_dir() -> PathBuf {
-    let default =
-        "/Volumes/Temp Backup/models/moeflux/qwen3-6-35b-a3b-artifacts";
-    PathBuf::from(
-        std::env::var("MOEFLUX_SMOKE_ARTIFACTS").unwrap_or(default.into()),
-    )
-}
-
-fn root_dir() -> PathBuf {
-    let default =
-        "/Volumes/Temp Backup/models/moeflux/qwen3-6-35b-a3b-root";
-    PathBuf::from(std::env::var("MOEFLUX_SMOKE_ROOT").unwrap_or(default.into()))
-}
 
 /// Open a backend with the standard A3B artifacts layout. Used by
 /// every test in the harness so the path resolution lives in one
 /// place.
 pub fn open_backend<B: DiffBackend>() -> B {
-    let art = artifacts_dir();
-    let root = root_dir();
+    let p = default_a3b_paths();
     B::open(
-        &art.join("model_weights.bin"),
-        &art.join("model_weights.json"),
-        &art.join("vocab.bin"),
-        &root,
-        /* experts_per_tok */ 4,
-        /* use_2bit */ false,
+        &p.weights,
+        &p.manifest,
+        &p.vocab,
+        &p.root,
+        p.experts_per_tok,
+        p.use_2bit,
     )
 }
 
