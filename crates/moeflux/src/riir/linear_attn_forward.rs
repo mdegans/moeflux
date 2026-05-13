@@ -1169,6 +1169,211 @@ pub(super) fn post_attention_pre_moe(
     })
 }
 
+/// Variant of [`post_attention_pre_moe`] used by the batched-prefill
+/// orchestrator (Phase B3+): assumes `buffers.output` already holds
+/// the o_proj result (typically populated via batched o_proj outside
+/// this function). Skips the o_proj matvec entirely, runs everything
+/// from residual_add onward into the caller-owned `cmdbuf`. The
+/// gpu_attn_args and o_proj args don't appear because o_proj is the
+/// caller's responsibility.
+///
+/// Layout contract on entry:
+/// - `buffers.input` = residual source (per-token hidden_in).
+/// - `buffers.output` = o_proj output.
+/// - `kv_state` already advanced (caller-managed).
+///
+/// Layout on return: same as [`post_attention_pre_moe`] — `buffers.h_mid`
+/// is the post-residual hidden, `buffers.normed` is the post-attn-norm
+/// h_post, `buffers.shared_out` is the shared FFN output, plus
+/// [`PostAttnIntermediates`] for routing + shared-gate.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn post_attention_post_o_proj_to_intermediates(
+    metal: &mut MetalBackend,
+    cmdbuf: &CommandBufferRef,
+    wf: &WeightFile,
+    wf_buf: &MtlWeightBuf,
+    layer_cache: &LayerWeightCache,
+    buffers: &mut LayerForwardBuffers,
+    layer_idx: usize,
+    k_active: usize,
+) -> Result<PostAttnIntermediates, LayerForwardError> {
+    let v = VARIANT;
+
+    let gate_bits =
+        bits_of(wf, &format!("model.layers.{layer_idx}.mlp.gate.weight"));
+    let seg_bits = bits_of(
+        wf,
+        &format!(
+            "model.layers.{layer_idx}.mlp.shared_expert_gate.weight"
+        ),
+    );
+    let s_gate_bits = bits_of(
+        wf,
+        &format!(
+            "model.layers.{layer_idx}.mlp.shared_expert.gate_proj.weight"
+        ),
+    );
+    let s_up_bits = bits_of(
+        wf,
+        &format!(
+            "model.layers.{layer_idx}.mlp.shared_expert.up_proj.weight"
+        ),
+    );
+    let s_down_bits = bits_of(
+        wf,
+        &format!(
+            "model.layers.{layer_idx}.mlp.shared_expert.down_proj.weight"
+        ),
+    );
+
+    let post_attn_norm_w = layer_cache.post_attention_layernorm_w;
+    let gate_w = layer_cache.gate.w;
+    let gate_s = layer_cache.gate.s;
+    let gate_b = layer_cache.gate.b;
+    let shared_up_w = layer_cache.shared.up_w;
+    let shared_up_s = layer_cache.shared.up_s;
+    let shared_up_b = layer_cache.shared.up_b;
+    let shared_gate_w = layer_cache.shared.gate_w;
+    let shared_gate_s = layer_cache.shared.gate_s;
+    let shared_gate_b = layer_cache.shared.gate_b;
+    let shared_down_w = layer_cache.shared.down_w;
+    let shared_down_s = layer_cache.shared.down_s;
+    let shared_down_b = layer_cache.shared.down_b;
+    let seg_w = layer_cache.shared.seg_w;
+    let seg_s = layer_cache.shared.seg_s;
+    let seg_b = layer_cache.shared.seg_b;
+
+    let mv = MatvecPipelines::fetch(metal)?;
+    let sum_sq = metal.pipeline("rms_norm_sum_sq")?.clone();
+    let apply = metal.pipeline("rms_norm_apply_bf16")?.clone();
+    let resid_add = metal.pipeline("residual_add")?.clone();
+    let swiglu = metal.pipeline("swiglu_fused")?.clone();
+
+    encode_residual_add(
+        cmdbuf,
+        &resid_add,
+        &buffers.output,
+        &buffers.input,
+        &buffers.h_mid,
+        v.hidden_dim as u32,
+    );
+    encode_rms_norm_pair(
+        cmdbuf,
+        &sum_sq,
+        &apply,
+        &buffers.h_mid,
+        wf_buf.buffer(),
+        post_attn_norm_w,
+        &buffers.normed,
+        &buffers.sum_sq,
+        v.hidden_dim as u32,
+    );
+    encode_matvec(
+        cmdbuf,
+        &mv,
+        wf_buf,
+        &MatvecSpec {
+            w_off: gate_w,
+            s_off: gate_s,
+            b_off: gate_b,
+            input: &buffers.normed,
+            output: &buffers.batch_out[4],
+            out_dim: v.num_experts as u32,
+            in_dim: v.hidden_dim as u32,
+            bits: gate_bits,
+        },
+    );
+    encode_matvec(
+        cmdbuf,
+        &mv,
+        wf_buf,
+        &MatvecSpec {
+            w_off: seg_w,
+            s_off: seg_s,
+            b_off: seg_b,
+            input: &buffers.normed,
+            output: &buffers.batch_out[5],
+            out_dim: 1,
+            in_dim: v.hidden_dim as u32,
+            bits: seg_bits,
+        },
+    );
+    encode_matvec(
+        cmdbuf,
+        &mv,
+        wf_buf,
+        &MatvecSpec {
+            w_off: shared_gate_w,
+            s_off: shared_gate_s,
+            b_off: shared_gate_b,
+            input: &buffers.normed,
+            output: &buffers.shared_gate_out,
+            out_dim: v.shared_intermediate as u32,
+            in_dim: v.hidden_dim as u32,
+            bits: s_gate_bits,
+        },
+    );
+    encode_matvec(
+        cmdbuf,
+        &mv,
+        wf_buf,
+        &MatvecSpec {
+            w_off: shared_up_w,
+            s_off: shared_up_s,
+            b_off: shared_up_b,
+            input: &buffers.normed,
+            output: &buffers.shared_up_out,
+            out_dim: v.shared_intermediate as u32,
+            in_dim: v.hidden_dim as u32,
+            bits: s_up_bits,
+        },
+    );
+    encode_swiglu_buf(
+        cmdbuf,
+        &swiglu,
+        &buffers.shared_gate_out,
+        &buffers.shared_up_out,
+        &buffers.shared_act,
+        v.shared_intermediate as u32,
+    );
+    encode_matvec(
+        cmdbuf,
+        &mv,
+        wf_buf,
+        &MatvecSpec {
+            w_off: shared_down_w,
+            s_off: shared_down_s,
+            b_off: shared_down_b,
+            input: &buffers.shared_act,
+            output: &buffers.shared_out,
+            out_dim: v.hidden_dim as u32,
+            in_dim: v.shared_intermediate as u32,
+            bits: s_down_bits,
+        },
+    );
+    metal.commit_and_wait_labeled(cmdbuf, "post_attn_post_oproj.cmd");
+
+    let mut scores =
+        read_buffer_to_vec(&buffers.batch_out[4], v.num_experts);
+    let mut routing_indices = vec![0i32; k_active];
+    let mut routing_weights = vec![0f32; k_active];
+    moe_router_cpu(
+        &mut scores,
+        k_active,
+        &mut routing_indices,
+        &mut routing_weights,
+    )?;
+    let shared_gate_score = {
+        let s = read_buffer_to_vec(&buffers.batch_out[5], 1);
+        s[0]
+    };
+    Ok(PostAttnIntermediates {
+        routing_indices,
+        routing_weights,
+        shared_gate_score,
+    })
+}
+
 /// Second half of [`post_attention_tail`]: K-expert FFN dispatch +
 /// combine (and optional chain-rms-norm into the next layer's input)
 /// against the [`PostAttnIntermediates`] from
