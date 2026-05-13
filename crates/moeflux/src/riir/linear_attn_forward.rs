@@ -710,24 +710,43 @@ pub fn linear_attn_layer_forward(
     )
 }
 
+/// Host-side bookkeeping captured by [`post_attention_pre_moe`] and
+/// consumed by [`moe_dispatch_per_token`] (per-token path) or by the
+/// batched-prefill orchestrator (Phase B+). The GPU buffers
+/// (`h_mid`, `normed`/`h_post`, `shared_out`) live in
+/// [`LayerForwardBuffers`] and are referenced by callers directly;
+/// this struct only carries the host-side values produced by the
+/// CPU MoE router + shared-gate readback.
+pub(super) struct PostAttnIntermediates {
+    /// Top-K expert indices from the CPU router, length = `k_active`.
+    pub routing_indices: Vec<i32>,
+    /// Top-K expert weights (normalized softmax), length = `k_active`.
+    pub routing_weights: Vec<f32>,
+    /// Pre-sigmoid shared-expert gate scalar.
+    pub shared_gate_score: f32,
+}
+
 /// Shared post-attention tail used by both linear- and full-attention
-/// layer forwards. Reads the attention output from
-/// `buffers.batch_out[6]` (caller-staged) and runs the rest of
-/// `fused_layer_forward`:
+/// layer forwards. Composed of [`post_attention_pre_moe`] (CMD2+3
+/// work up to and including the CPU MoE router) and
+/// [`moe_dispatch_per_token`] (K-expert dispatch + combine + optional
+/// chained rms_norm into the next layer's input). Reads the
+/// attention output from `buffers.batch_out[6]` (caller-staged) and
+/// runs the rest of `fused_layer_forward`:
 ///
 /// 1. CMD2: o_proj matvec → residual_add → post-attn rms_norm.
 /// 2. CMD3a: gate logits + shared-expert gate scalar + shared FFN
 ///    `gate_proj` + `up_proj`.
-/// 3. CPU swiglu of shared_gate × shared_up → `shared_act`.
+/// 3. GPU swiglu of shared_gate × shared_up → `shared_act`.
 /// 4. CMD3a-b: shared `down_proj` matvec.
 /// 5. CPU MoE router on the gate logits.
 /// 6. Load K expert blobs from disk via [`ExpertFiles::read_expert`].
 /// 7. CMD3b: K-expert FFN + combine — submits the dispatch via
-///    [`gpu_batched_experts_begin`] without waiting; ownership of the
-///    in-flight cmdbuf transfers to `*deferred`.
+///    [`gpu_batched_experts_begin`] without waiting; ownership of
+///    the in-flight cmdbuf transfers to `*deferred`.
 ///
-/// On return, `*deferred` holds the in-flight K-expert dispatch. The
-/// caller is responsible for either `complete_deferred_experts_into`
+/// On return, `*deferred` holds the in-flight K-expert dispatch.
+/// The caller is responsible for either `complete_deferred_experts_into`
 /// (drain into a host slice / next layer's `buffers.input`) or
 /// `discard_deferred_experts_in` (drop without readback) before the
 /// next `post_attention_tail` call. Slice 4f-3 wired this rewire;
@@ -735,6 +754,14 @@ pub fn linear_attn_layer_forward(
 /// and the result was written into `buffers.input` here. The async
 /// path matches the C-side `g_deferred` lifecycle and unlocks the
 /// fast/slow split landing in 4f-perf.
+///
+/// Session 4 split this function in two so the batched-prefill
+/// orchestrator can run [`post_attention_pre_moe`] in a per-token
+/// loop to populate the joint N×k_active routing CSR before
+/// [`super::expert_forward::encode_moe_batched_permute_fuse`], and
+/// then call a batched combine kernel instead of the per-token
+/// K-expert dispatch. The per-token path here remains identical in
+/// behaviour.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn post_attention_tail(
     metal: &mut MetalBackend,
@@ -772,6 +799,64 @@ pub(super) fn post_attention_tail(
     // CMD1. `None` (or CPU-combine) disables the chain.
     chain_next_norm_off: Option<u64>,
 ) -> Result<(), LayerForwardError> {
+    let intermediates = post_attention_pre_moe(
+        metal,
+        cmdbuf,
+        wf,
+        wf_buf,
+        layer_cache,
+        buffers,
+        layer_idx,
+        k_active,
+        o_proj,
+        gpu_attn_args,
+    )?;
+    moe_dispatch_per_token(
+        metal,
+        wf_buf,
+        buffers,
+        moe,
+        deferred,
+        layer_idx,
+        expert_files,
+        pool,
+        prefetch,
+        prefetch_set,
+        &intermediates,
+        gpu_combine,
+        chain_next_norm_off,
+    )
+}
+
+/// First half of [`post_attention_tail`]: encode CMD2+3 (o_proj →
+/// residual → post-attn rms_norm → gate logits + shared-gate scalar
+/// → shared FFN gate/up/swiglu/down) into the caller-owned `cmdbuf`,
+/// commit + wait, then run the CPU MoE router on the gate logits and
+/// read back the shared-gate scalar. Returns
+/// [`PostAttnIntermediates`] for the dispatch / combine stages.
+///
+/// Linear-attn callers pass their CMD1 cmdbuf so projections +
+/// linear-attn fused kernels share the same submit (slice
+/// cmdbuf-fold-1); full-attn callers create a fresh cmdbuf after the
+/// host-bounce (q/k/v readback + CPU per-head norm + RoPE + KV
+/// append).
+///
+/// Phase B's batched-prefill orchestrator runs this in a per-token
+/// loop to populate the joint N×k_active routing CSR before
+/// [`super::expert_forward::encode_moe_batched_permute_fuse`].
+#[allow(clippy::too_many_arguments)]
+pub(super) fn post_attention_pre_moe(
+    metal: &mut MetalBackend,
+    cmdbuf: &CommandBufferRef,
+    wf: &WeightFile,
+    wf_buf: &MtlWeightBuf,
+    layer_cache: &LayerWeightCache,
+    buffers: &mut LayerForwardBuffers,
+    layer_idx: usize,
+    k_active: usize,
+    o_proj: OProj,
+    gpu_attn_args: Option<GpuAttnEncodeArgs>,
+) -> Result<PostAttnIntermediates, LayerForwardError> {
     let v = VARIANT;
 
     // Per-tensor bit widths for the MoE-side matvecs.
@@ -1062,15 +1147,56 @@ pub(super) fn post_attention_tail(
     // ── CPU: MoE router on the gate logits ───────────────────────
     let mut scores =
         read_buffer_to_vec(&buffers.batch_out[4], v.num_experts);
-    let mut indices = vec![0i32; k_active];
-    let mut weights = vec![0f32; k_active];
-    moe_router_cpu(&mut scores, k_active, &mut indices, &mut weights)?;
+    let mut routing_indices = vec![0i32; k_active];
+    let mut routing_weights = vec![0f32; k_active];
+    moe_router_cpu(
+        &mut scores,
+        k_active,
+        &mut routing_indices,
+        &mut routing_weights,
+    )?;
 
     // Read shared-gate score scalar (pre-sigmoid).
     let shared_gate_score = {
         let s = read_buffer_to_vec(&buffers.batch_out[5], 1);
         s[0]
     };
+
+    Ok(PostAttnIntermediates {
+        routing_indices,
+        routing_weights,
+        shared_gate_score,
+    })
+}
+
+/// Second half of [`post_attention_tail`]: K-expert FFN dispatch +
+/// combine (and optional chain-rms-norm into the next layer's input)
+/// against the [`PostAttnIntermediates`] from
+/// [`post_attention_pre_moe`]. Handles the prefetch hit/miss state
+/// machine, sync-pread for misses, records actuals for the next
+/// token's prediction, and fires the async K-expert dispatch.
+///
+/// On return, `*deferred` holds the in-flight K-expert dispatch.
+/// The caller drains it (next layer's top-of-forward
+/// `complete_deferred_experts_into`, or `RsCtx::layer_forward_dump`'s
+/// post-dispatch drain).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn moe_dispatch_per_token(
+    metal: &mut MetalBackend,
+    wf_buf: &MtlWeightBuf,
+    buffers: &mut LayerForwardBuffers,
+    moe: &mut MoeBuffers,
+    deferred: &mut super::DeferredRing,
+    layer_idx: usize,
+    expert_files: &ExpertFiles,
+    pool: &rayon::ThreadPool,
+    prefetch: &mut super::PrefetchState,
+    prefetch_set: usize,
+    intermediates: &PostAttnIntermediates,
+    gpu_combine: bool,
+    chain_next_norm_off: Option<u64>,
+) -> Result<(), LayerForwardError> {
+    let v = VARIANT;
 
     // ── CMD3b: K-expert FFN + combine via slice 9b — async ───────
     //
@@ -1090,7 +1216,11 @@ pub(super) fn post_attention_tail(
     // CPU-combine fallback path (`gpu_combine = false`) still routes
     // through the host-slice variant — `DeferredMode::Cpu` needs host
     // snapshots of `h_mid` / `shared_out` for the finalize pass.
-    let k = k_active;
+    let indices = &intermediates.routing_indices;
+    let weights = &intermediates.routing_weights;
+    let shared_gate_score = intermediates.shared_gate_score;
+    let k = indices.len();
+
     if gpu_combine {
         // Slice 5d-6b: speculative-prefetch state machine.
         //
@@ -1175,13 +1305,18 @@ pub(super) fn post_attention_tail(
         // appends rms_norm_sum_sq + rms_norm_apply_bf16, leaving the
         // next layer's normed input in `buffers.normed`. Allocated only
         // when the chain is active so the borrow doesn't outlive the
-        // call.
-        let chain_rms_pipes = chain_next_norm_off.map(|_| {
-            super::gpu_norm::RmsNormBf16Pipelines {
-                sum: sum_sq.clone(),
-                apply: apply.clone(),
-            }
-        });
+        // call. Pipelines are re-fetched here (cheap HashMap lookup +
+        // PSO clone); the original fused tail held them in locals from
+        // the pre-MoE cmdbuf encode, which is no longer in scope after
+        // the split.
+        let chain_rms_pipes = if chain_next_norm_off.is_some() {
+            Some(super::gpu_norm::RmsNormBf16Pipelines {
+                sum: metal.pipeline("rms_norm_sum_sq")?.clone(),
+                apply: metal.pipeline("rms_norm_apply_bf16")?.clone(),
+            })
+        } else {
+            None
+        };
         let chain = chain_next_norm_off.and_then(|off| {
             chain_rms_pipes.as_ref().map(|pipes| ChainToNormed {
                 pipes,
@@ -1201,7 +1336,7 @@ pub(super) fn post_attention_tail(
             &buffers.normed,     // h_post (post-attn-norm input)
             &buffers.h_mid,      // residual hidden (combine input)
             &buffers.shared_out, // shared FFN output (combine input)
-            &weights,
+            weights,
             shared_gate_score,
             layer_idx as i32,
             &data_set_per_slot,
@@ -1230,17 +1365,13 @@ pub(super) fn post_attention_tail(
             &normed_host,
             &h_mid_host,
             &shared_out_host,
-            &weights,
+            weights,
             shared_gate_score,
             layer_idx as i32,
             /* gpu_combine = */ false,
         )?;
     }
 
-    // No write to `buffers.input` here — the dispatch is in flight.
-    // The caller drains it (next layer's top-of-forward
-    // `complete_deferred_experts_into`, or `RsCtx::layer_forward_dump`'s
-    // post-dispatch drain).
     Ok(())
 }
 
