@@ -21,11 +21,16 @@
 use metal::{Buffer, MTLResourceOptions, NSUInteger};
 
 use moeflux::riir::cpu_matvec::{bf16_matvec_cpu, dequant_matvec_4bit_cpu};
+use moeflux::riir::gpu_attn::{
+    encode_sdpa_causal_tiled, BatchedSdpaPipelines,
+};
 use moeflux::riir::gpu_matvec::{
     encode_bf16_matmul_n_tokens, encode_matvec_n_tokens, BfMatvecPipelines,
     MatvecPipelines,
 };
 use moeflux::riir::metal::MetalBackend;
+use moeflux::riir::sdpa::sdpa_cpu;
+use moeflux::riir::variants::VARIANT;
 
 const GROUP_SIZE: u32 = 64;
 
@@ -506,6 +511,341 @@ fn dequant_matvec_4bit_n_tokens_v3_n1_matches_single() {
             i,
             s,
             b
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: batched causal SDPA vs tokenwise sdpa_cpu loop.
+// ---------------------------------------------------------------------------
+
+/// Run the batched causal SDPA on a single command buffer and return
+/// the [N, H, head_dim] output as a Vec<f32>.
+#[allow(clippy::too_many_arguments)]
+fn run_batched_sdpa(
+    metal: &mut MetalBackend,
+    pipes: &BatchedSdpaPipelines,
+    q_data: &[f32],
+    k_data: &[f32],
+    v_data: &[f32],
+    n_tokens: u32,
+    num_heads: u32,
+    heads_per_kv: u32,
+    head_dim: u32,
+    kv_dim: u32,
+    start_pos: u32,
+    kv_len: u32,
+    scale: f32,
+) -> Vec<f32> {
+    let out_total =
+        n_tokens as usize * num_heads as usize * head_dim as usize;
+    let state_total = n_tokens as usize * num_heads as usize;
+
+    let q_buf = make_buf::<f32>(metal, q_data.len());
+    write_buf(&q_buf, q_data);
+    let k_buf = make_buf::<f32>(metal, k_data.len());
+    write_buf(&k_buf, k_data);
+    let v_buf = make_buf::<f32>(metal, v_data.len());
+    write_buf(&v_buf, v_data);
+    let out_buf = make_buf::<f32>(metal, out_total);
+    let rmax_buf = make_buf::<f32>(metal, state_total);
+    let rden_buf = make_buf::<f32>(metal, state_total);
+    let vpart_buf = make_buf::<f32>(metal, out_total);
+
+    let queue = metal.queue();
+    let cmdbuf = queue.new_command_buffer();
+    encode_sdpa_causal_tiled(
+        cmdbuf,
+        pipes,
+        &q_buf,
+        &k_buf,
+        &v_buf,
+        &out_buf,
+        &rmax_buf,
+        &rden_buf,
+        &vpart_buf,
+        n_tokens,
+        num_heads,
+        heads_per_kv,
+        head_dim,
+        kv_dim,
+        start_pos,
+        kv_len,
+        scale,
+    );
+    cmdbuf.commit();
+    cmdbuf.wait_until_completed();
+
+    read_buf_f32(&out_buf, out_total)
+}
+
+/// q_gate filled with 1000.0 so sigmoid(1000) = 1.0 exactly in f32 —
+/// turns sdpa_cpu's gate into a no-op, matching our gate-free batched
+/// kernel.
+fn gate_off(q_dim: usize) -> Vec<f32> {
+    vec![1000.0f32; q_dim]
+}
+
+/// Phase 3c: N=1 against single-shot sdpa_cpu (no-gate via large q_gate).
+/// Single tile (kv_len ≤ TILE_SIZE) — kernel arithmetic should be very
+/// close to the CPU reference. Floor: cosine ≥ 0.9999.
+#[test]
+#[ignore = "long-running GPU test"]
+fn sdpa_causal_tiled_n1_matches_cpu_single_tile() {
+    let num_heads = VARIANT.num_attn_heads as u32;
+    let num_kv_heads = VARIANT.num_kv_heads as u32;
+    let head_dim = VARIANT.head_dim as u32;
+    let heads_per_kv = num_heads / num_kv_heads;
+    let kv_dim = num_kv_heads * head_dim;
+    let q_dim = num_heads as usize * head_dim as usize;
+
+    let n_tokens: u32 = 1;
+    let kv_len: u32 = 64;
+    let start_pos: u32 = kv_len - 1; // query attends to [0, kv_len)
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+    let mut rng = XorShift64::new(0x5DA0_5D5D_C0FE_AAAA);
+
+    let q_data: Vec<f32> = (0..q_dim).map(|_| rng.next_f32() * 0.1).collect();
+    let k_data: Vec<f32> = (0..(kv_len as usize * kv_dim as usize))
+        .map(|_| rng.next_f32() * 0.1)
+        .collect();
+    let v_data: Vec<f32> = (0..(kv_len as usize * kv_dim as usize))
+        .map(|_| rng.next_f32() * 0.1)
+        .collect();
+
+    let gate = gate_off(q_dim);
+    let mut cpu_out = vec![0.0f32; q_dim];
+    sdpa_cpu(
+        kv_len as i32,
+        &q_data,
+        &gate,
+        &k_data,
+        &v_data,
+        &mut cpu_out,
+    )
+    .expect("sdpa_cpu");
+
+    let mut metal = MetalBackend::new().expect("open Metal");
+    let pipes = BatchedSdpaPipelines::fetch(&mut metal)
+        .expect("fetch BatchedSdpaPipelines");
+
+    let gpu_out = run_batched_sdpa(
+        &mut metal,
+        &pipes,
+        &q_data,
+        &k_data,
+        &v_data,
+        n_tokens,
+        num_heads,
+        heads_per_kv,
+        head_dim,
+        kv_dim,
+        start_pos,
+        kv_len,
+        scale,
+    );
+
+    let cos = cosine_sim(&gpu_out, &cpu_out);
+    let max_abs: f32 = gpu_out
+        .iter()
+        .zip(cpu_out.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0, f32::max);
+    eprintln!(
+        "N=1 single-tile: cosine = {:.9}, max_abs_diff = {:.6}",
+        cos, max_abs
+    );
+    assert!(
+        gpu_out.iter().all(|x| x.is_finite()),
+        "GPU output has non-finite values"
+    );
+    assert!(
+        cos >= COSINE_FLOOR,
+        "N=1 single-tile cosine {} below floor {}",
+        cos,
+        COSINE_FLOOR
+    );
+}
+
+/// Phase 3c multi-tile: N=1, kv_len > TILE_SIZE. Exercises the
+/// online-softmax merge across multiple tile dispatches.
+#[test]
+#[ignore = "long-running GPU test"]
+fn sdpa_causal_tiled_n1_matches_cpu_multi_tile() {
+    let num_heads = VARIANT.num_attn_heads as u32;
+    let num_kv_heads = VARIANT.num_kv_heads as u32;
+    let head_dim = VARIANT.head_dim as u32;
+    let heads_per_kv = num_heads / num_kv_heads;
+    let kv_dim = num_kv_heads * head_dim;
+    let q_dim = num_heads as usize * head_dim as usize;
+
+    let n_tokens: u32 = 1;
+    let kv_len: u32 = 5000; // > 4096 tile size → multi-tile
+    let start_pos: u32 = kv_len - 1;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+    let mut rng = XorShift64::new(0x5DA0_5D5D_C0FE_BBBB);
+
+    let q_data: Vec<f32> = (0..q_dim).map(|_| rng.next_f32() * 0.1).collect();
+    let k_data: Vec<f32> = (0..(kv_len as usize * kv_dim as usize))
+        .map(|_| rng.next_f32() * 0.1)
+        .collect();
+    let v_data: Vec<f32> = (0..(kv_len as usize * kv_dim as usize))
+        .map(|_| rng.next_f32() * 0.1)
+        .collect();
+
+    let gate = gate_off(q_dim);
+    let mut cpu_out = vec![0.0f32; q_dim];
+    sdpa_cpu(
+        kv_len as i32,
+        &q_data,
+        &gate,
+        &k_data,
+        &v_data,
+        &mut cpu_out,
+    )
+    .expect("sdpa_cpu");
+
+    let mut metal = MetalBackend::new().expect("open Metal");
+    let pipes = BatchedSdpaPipelines::fetch(&mut metal)
+        .expect("fetch BatchedSdpaPipelines");
+
+    let gpu_out = run_batched_sdpa(
+        &mut metal,
+        &pipes,
+        &q_data,
+        &k_data,
+        &v_data,
+        n_tokens,
+        num_heads,
+        heads_per_kv,
+        head_dim,
+        kv_dim,
+        start_pos,
+        kv_len,
+        scale,
+    );
+
+    let cos = cosine_sim(&gpu_out, &cpu_out);
+    let max_abs: f32 = gpu_out
+        .iter()
+        .zip(cpu_out.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0, f32::max);
+    eprintln!(
+        "N=1 multi-tile (kv_len=5000): cosine = {:.9}, max_abs_diff = {:.6}",
+        cos, max_abs
+    );
+    assert!(
+        gpu_out.iter().all(|x| x.is_finite()),
+        "GPU output has non-finite values"
+    );
+    assert!(
+        cos >= COSINE_FLOOR,
+        "N=1 multi-tile cosine {} below floor {}",
+        cos,
+        COSINE_FLOOR
+    );
+}
+
+/// Phase 3d: N>1 with per-query causal cutoff. Diff target is a
+/// tokenwise sdpa_cpu loop where each query attends to a growing prefix
+/// of the K/V cache.
+#[test]
+#[ignore = "long-running GPU test"]
+fn sdpa_causal_tiled_n4_matches_tokenwise_cpu() {
+    let num_heads = VARIANT.num_attn_heads as u32;
+    let num_kv_heads = VARIANT.num_kv_heads as u32;
+    let head_dim = VARIANT.head_dim as u32;
+    let heads_per_kv = num_heads / num_kv_heads;
+    let kv_dim = num_kv_heads * head_dim;
+    let q_dim = num_heads as usize * head_dim as usize;
+
+    let n_tokens: u32 = 4;
+    let start_pos: u32 = 4;
+    let kv_len: u32 = start_pos + n_tokens; // 8
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+    let mut rng = XorShift64::new(0x5DA0_5D5D_C0FE_CCCC);
+
+    let q_data: Vec<f32> = (0..(n_tokens as usize * q_dim))
+        .map(|_| rng.next_f32() * 0.1)
+        .collect();
+    let k_data: Vec<f32> = (0..(kv_len as usize * kv_dim as usize))
+        .map(|_| rng.next_f32() * 0.1)
+        .collect();
+    let v_data: Vec<f32> = (0..(kv_len as usize * kv_dim as usize))
+        .map(|_| rng.next_f32() * 0.1)
+        .collect();
+
+    // Tokenwise CPU oracle: for each query q at absolute position
+    // start_pos + q, attend to KV[0..start_pos+q+1].
+    let gate = gate_off(q_dim);
+    let mut cpu_out_all = vec![0.0f32; n_tokens as usize * q_dim];
+    for q in 0..(n_tokens as usize) {
+        let kv_max = start_pos as usize + q + 1;
+        let q_slice = &q_data[q * q_dim..(q + 1) * q_dim];
+        let k_slice =
+            &k_data[..kv_max * kv_dim as usize];
+        let v_slice =
+            &v_data[..kv_max * kv_dim as usize];
+        let out_slice = &mut cpu_out_all[q * q_dim..(q + 1) * q_dim];
+        sdpa_cpu(
+            kv_max as i32,
+            q_slice,
+            &gate,
+            k_slice,
+            v_slice,
+            out_slice,
+        )
+        .expect("sdpa_cpu");
+    }
+
+    let mut metal = MetalBackend::new().expect("open Metal");
+    let pipes = BatchedSdpaPipelines::fetch(&mut metal)
+        .expect("fetch BatchedSdpaPipelines");
+
+    let gpu_out = run_batched_sdpa(
+        &mut metal,
+        &pipes,
+        &q_data,
+        &k_data,
+        &v_data,
+        n_tokens,
+        num_heads,
+        heads_per_kv,
+        head_dim,
+        kv_dim,
+        start_pos,
+        kv_len,
+        scale,
+    );
+
+    assert!(
+        gpu_out.iter().all(|x| x.is_finite()),
+        "GPU output has non-finite values"
+    );
+
+    for q in 0..(n_tokens as usize) {
+        let g = &gpu_out[q * q_dim..(q + 1) * q_dim];
+        let c = &cpu_out_all[q * q_dim..(q + 1) * q_dim];
+        let cos = cosine_sim(g, c);
+        let max_abs: f32 = g
+            .iter()
+            .zip(c.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
+        eprintln!(
+            "N=4 token {}: cosine = {:.9}, max_abs_diff = {:.6}",
+            q, cos, max_abs
+        );
+        assert!(
+            cos >= COSINE_FLOOR,
+            "token {} cosine {} below floor {}",
+            q,
+            cos,
+            COSINE_FLOOR
         );
     }
 }

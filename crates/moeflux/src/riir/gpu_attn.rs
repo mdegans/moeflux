@@ -37,7 +37,8 @@
 //! after slicing.
 
 use metal::{
-    BufferRef, CommandBufferRef, ComputePipelineState, MTLSize, NSUInteger,
+    Buffer, BufferRef, CommandBufferRef, ComputePipelineState, MTLSize,
+    NSUInteger,
 };
 
 use super::metal::{MetalBackend, MetalError, MtlBuffer};
@@ -413,4 +414,153 @@ pub fn gpu_sigmoid_gate(
 
     x_inout.copy_from_slice(&buf_x.to_vec());
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Batched-prefill causal SDPA (Phase 3) — tiled flash-attention.
+// ---------------------------------------------------------------------------
+
+const BATCHED_SDPA_TILE_SIZE: u32 = 4096;
+const BATCHED_SDPA_THREADS: u32 = 128;
+
+/// Pipelines for the Phase 3 batched-prefill causal SDPA kernels.
+/// Tiled online-softmax: `init` zeros running state, `accumulate`
+/// processes one tile and updates the running (max, denom, v_partial),
+/// `finalize` divides v_partial by denom for the final output.
+pub struct BatchedSdpaPipelines {
+    pub init: ComputePipelineState,
+    pub accumulate: ComputePipelineState,
+    pub finalize: ComputePipelineState,
+}
+
+impl BatchedSdpaPipelines {
+    pub fn fetch(metal: &mut MetalBackend) -> Result<Self, MetalError> {
+        Ok(Self {
+            init: metal.pipeline("attn_sdpa_causal_init_running")?.clone(),
+            accumulate: metal
+                .pipeline("attn_sdpa_causal_tile_accumulate")?
+                .clone(),
+            finalize: metal
+                .pipeline("attn_sdpa_causal_tile_finalize")?
+                .clone(),
+        })
+    }
+}
+
+/// Encode the full Phase 3 batched-prefill causal SDPA into `cmdbuf`.
+///
+/// Inputs:
+///  - `q [N, num_heads, head_dim]` f32, contiguous row-major.
+///  - `k_cache [kv_len, kv_dim]` f32 with `kv_dim = num_kv_heads *
+///    head_dim`. Production callers will pass the persistent KV cache
+///    buffer with `kv_len = start_pos + N` after the batched append.
+///  - `v_cache [kv_len, kv_dim]` same shape.
+///  - `out [N, num_heads, head_dim]` f32, written.
+///  - `running_max [N, num_heads]`, `running_denom [N, num_heads]`,
+///    `v_partial [N, num_heads, head_dim]` — scratch buffers owned by
+///    the caller (typically reused across layers).
+///
+/// `start_pos` is the absolute position of `q[0]`. Per-query causal
+/// mask is `kv_max(i) = start_pos + i + 1`.
+///
+/// Tiles the kv axis at `BATCHED_SDPA_TILE_SIZE = 4096`. The `init`
+/// kernel pre-fills running state regardless of the first-tile branch
+/// in the accumulate kernel, so tiles whose entire query is masked can
+/// no-op safely.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_sdpa_causal_tiled(
+    cmdbuf: &CommandBufferRef,
+    pipes: &BatchedSdpaPipelines,
+    q: &Buffer,
+    k_cache: &Buffer,
+    v_cache: &Buffer,
+    out: &Buffer,
+    running_max: &Buffer,
+    running_denom: &Buffer,
+    v_partial: &Buffer,
+    n_tokens: u32,
+    num_heads: u32,
+    heads_per_kv: u32,
+    head_dim: u32,
+    kv_dim: u32,
+    start_pos: u32,
+    kv_len: u32,
+    softmax_scale: f32,
+) {
+    if n_tokens == 0 || kv_len == 0 {
+        return;
+    }
+
+    // 1. Pre-init running state.
+    let state_total = n_tokens * num_heads;
+    {
+        let enc = cmdbuf.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipes.init);
+        enc.set_buffer(0, Some(running_max), 0);
+        enc.set_buffer(1, Some(running_denom), 0);
+        enc.set_bytes(2, 4, (&state_total as *const u32).cast());
+        let tg_size: u32 = 256;
+        let num_tgs = (state_total + tg_size - 1) / tg_size;
+        enc.dispatch_thread_groups(
+            MTLSize::new(num_tgs as NSUInteger, 1, 1),
+            MTLSize::new(tg_size as NSUInteger, 1, 1),
+        );
+        enc.end_encoding();
+    }
+
+    // 2. Dispatch one accumulate per tile.
+    let max_kv = kv_len;
+    let mut tile_start: u32 = 0;
+    let mut is_first_tile: u32 = 1;
+    while tile_start < max_kv {
+        let tile_end = (tile_start + BATCHED_SDPA_TILE_SIZE).min(max_kv);
+
+        let enc = cmdbuf.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipes.accumulate);
+        enc.set_buffer(0, Some(q), 0);
+        enc.set_buffer(1, Some(k_cache), 0);
+        enc.set_buffer(2, Some(v_cache), 0);
+        enc.set_buffer(3, Some(running_max), 0);
+        enc.set_buffer(4, Some(running_denom), 0);
+        enc.set_buffer(5, Some(v_partial), 0);
+        enc.set_bytes(6, 4, (&n_tokens as *const u32).cast());
+        enc.set_bytes(7, 4, (&num_heads as *const u32).cast());
+        enc.set_bytes(8, 4, (&heads_per_kv as *const u32).cast());
+        enc.set_bytes(9, 4, (&head_dim as *const u32).cast());
+        enc.set_bytes(10, 4, (&kv_dim as *const u32).cast());
+        enc.set_bytes(11, 4, (&start_pos as *const u32).cast());
+        enc.set_bytes(12, 4, (&tile_start as *const u32).cast());
+        enc.set_bytes(13, 4, (&tile_end as *const u32).cast());
+        enc.set_bytes(14, 4, (&softmax_scale as *const f32).cast());
+        enc.set_bytes(15, 4, (&is_first_tile as *const u32).cast());
+        let total_tgs = n_tokens * num_heads;
+        enc.dispatch_thread_groups(
+            MTLSize::new(total_tgs as NSUInteger, 1, 1),
+            MTLSize::new(BATCHED_SDPA_THREADS as NSUInteger, 1, 1),
+        );
+        enc.end_encoding();
+
+        tile_start = tile_end;
+        is_first_tile = 0;
+    }
+
+    // 3. Finalize: out = v_partial / running_denom.
+    let total = n_tokens * num_heads * head_dim;
+    {
+        let enc = cmdbuf.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipes.finalize);
+        enc.set_buffer(0, Some(v_partial), 0);
+        enc.set_buffer(1, Some(running_denom), 0);
+        enc.set_buffer(2, Some(out), 0);
+        enc.set_bytes(3, 4, (&n_tokens as *const u32).cast());
+        enc.set_bytes(4, 4, (&num_heads as *const u32).cast());
+        enc.set_bytes(5, 4, (&head_dim as *const u32).cast());
+        let tg_size: u32 = 256;
+        let num_tgs = (total + tg_size - 1) / tg_size;
+        enc.dispatch_thread_groups(
+            MTLSize::new(num_tgs as NSUInteger, 1, 1),
+            MTLSize::new(tg_size as NSUInteger, 1, 1),
+        );
+        enc.end_encoding();
+    }
 }
