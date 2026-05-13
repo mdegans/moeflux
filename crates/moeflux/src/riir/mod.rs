@@ -1242,13 +1242,21 @@ impl RsCtx {
     /// Decode-style single-token step. Always emits logits. Mirrors C
     /// `mf_eval_token` (infer.m:7746..7757).
     ///
-    /// **Phase G (2026-05-13):** routed through
-    /// [`Self::step_internal`] with a 1-element slice instead of
-    /// [`Self::step_internal_per_token_oracle`] directly. The
-    /// directional decode bench at kv_start=32 / decode_n=32 showed
-    /// batched-N=1 is 17.6% FASTER than per-token oracle (12.09 vs
-    /// 14.22 tok/s, cosine=1.0), well past the +5% gate the Phase G
-    /// plan called for. The oracle stays as a diff target.
+    /// **Stays on the per-token oracle path** — Phase G's attempt to
+    /// route this through `step_internal(&[tok], pos, ...)` looked
+    /// like a +17.6% win on a directional 32-token decode bench but
+    /// regressed bench.py's essay+512-decode workload from ~10.5 tok/s
+    /// to 7.66 tok/s (-27%) because the batched orchestrator
+    /// (`step_internal_batched_gqa`) doesn't fire
+    /// [`PrefetchState::dispatch`] for the next layer's experts.
+    /// Decode-time MoE I/O is bound by the prefetch hit rate (0.396
+    /// on the oracle path), and a 32-token bench is too short for
+    /// the prediction state to warm up enough to show that.
+    ///
+    /// Phase G's real shape is: add prefetch to
+    /// `step_internal_batched_gqa`, then route eval_token through it.
+    /// Session-5 follow-up. Until then, eval_token stays on the
+    /// oracle — diff-target and decode-perf both.
     pub fn eval_token(
         &mut self,
         token: i32,
@@ -1259,7 +1267,7 @@ impl RsCtx {
         if logits.len() != VARIANT.vocab_size {
             return Err(RsError::EvalFailed);
         }
-        self.step_internal(&[token], pos as i32, Some(logits))
+        self.step_internal_per_token_oracle(token, pos as i32, Some(logits))
     }
 
     /// Canonical multi-token forward orchestrator. Processes
