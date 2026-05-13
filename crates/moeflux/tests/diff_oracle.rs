@@ -4303,6 +4303,55 @@ fn eval_prompt_chunked_matches_eval_prompt_whole_prompt() {
     );
 }
 
+/// Diagnostic: B2 batched-SDPA cosine at chunk_size=1. If this passes
+/// but multi-token N fails, the bug is in cross-token state (Phase 1
+/// pre-SDPA per-token, Phase 2 batched SDPA across tokens, or Phase 3
+/// post-SDPA per-token). If this fails, the bug is in single-token
+/// orchestration of pre-SDPA + tiled SDPA + post-SDPA.
+#[test]
+#[ignore = "long running; needs moeflux artifacts; diagnostic"]
+fn diag_b2_eval_prompt_chunk_1() {
+    let prompt: [i32; 16] = [
+        1, 200, 600, 1100, 2, 300, 700, 1200, 3, 400, 800, 1300, 4, 500,
+        900, 1400,
+    ];
+    let next_token = 7i32;
+    let next_pos = prompt.len();
+
+    let mut rs_ref: RsBackend = open_backend();
+    let n_vocab = rs_ref.0.n_vocab();
+    let mut ref_logits = vec![0.0f32; n_vocab];
+    for (i, &tok) in prompt.iter().enumerate() {
+        rs_ref
+            .0
+            .eval_token(tok, i, 0, &mut ref_logits)
+            .expect("oracle eval_token");
+    }
+    let ref_cont = rs_ref.eval_token(next_token, next_pos);
+
+    moeflux::riir::set_batched_chunk_size_for_test(Some(1));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut rs: RsBackend = open_backend();
+        let mut prompt_logits = vec![0.0f32; n_vocab];
+        rs.0.eval_prompt(&prompt, 0, 0, &mut prompt_logits)
+            .expect("chunked eval_prompt @ chunk=1");
+        let cont = rs.eval_token(next_token, next_pos);
+        (prompt_logits, cont)
+    }));
+    moeflux::riir::set_batched_chunk_size_for_test(None);
+    let (prompt_logits, test_cont) = match result {
+        Ok(t) => t,
+        Err(payload) => std::panic::resume_unwind(payload),
+    };
+    let prompt_cos = cosine_sim(&ref_logits, &prompt_logits);
+    let cont_cos = cosine_sim(&ref_cont, &test_cont);
+    eprintln!(
+        "[diag:b2_chunk_1] prompt_cos={prompt_cos:.7} cont_cos={cont_cos:.7}"
+    );
+    assert!(prompt_cos >= 0.9999, "chunk_size=1 prompt cosine {prompt_cos:.7}");
+    assert!(cont_cos >= 0.9999, "chunk_size=1 cont cosine {cont_cos:.7}");
+}
+
 /// Phase F headline — directional bench of batched eval_prompt vs
 /// per-token oracle on a 256-token synthetic prompt.
 ///

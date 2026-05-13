@@ -46,6 +46,7 @@ use metal::NSUInteger;
 
 use super::expert_forward::MoeBuffers;
 use super::expert_io::ExpertFiles;
+use super::gpu_attn::{encode_sdpa_causal_tiled, BatchedSdpaPipelines};
 use super::gpu_matvec::{encode_matvec, MatvecPipelines, MatvecSpec};
 use super::gpu_norm::{encode_rms_norm_bf16_into, RmsNormBf16Pipelines};
 use super::layer_weight_cache::LayerWeightCache;
@@ -475,6 +476,161 @@ pub(super) fn full_attn_layer_forward(
     )
 }
 
+/// Pre-SDPA half for the batched prefill orchestrator. Runs the
+/// per-token CMD1 (input rms_norm + Q/K/V projections), host-bounces
+/// q/k/v, applies per-head Q/K rms_norm + RoPE, and appends the new
+/// K/V row to `kv_state`. Returns per-token (q_host, q_gate_host)
+/// for the caller to stack into a batched-SDPA input.
+///
+/// Mirrors lines ~106-313 of [`full_attn_pre_moe_layer_forward`] but
+/// skips the SDPA decision (`gpu_attn_args` setup, sdpa_cpu fallback)
+/// since the batched path replaces those with a single tiled SDPA
+/// dispatch over all N tokens. Also skips populating
+/// `buffers.gpu_kv_k/v` mirrors — those are decode-only after Phase G.
+#[allow(clippy::too_many_arguments)]
+fn full_attn_pre_sdpa_capture(
+    metal: &mut MetalBackend,
+    wf: &WeightFile,
+    wf_buf: &MtlWeightBuf,
+    layer_cache: &LayerWeightCache,
+    buffers: &mut LayerForwardBuffers,
+    layer_idx: usize,
+    pos: i32,
+    kv_state: &mut KvCache,
+) -> Result<(Vec<f32>, Vec<f32>), LayerForwardError> {
+    let v = VARIANT;
+    if v.layer_kind(layer_idx) != super::variants::LayerKind::FullAttn {
+        return Err(LayerForwardError::MissingTensor {
+            layer: layer_idx,
+            tensor: "full_attn_pre_sdpa_capture called on linear-attn layer",
+        });
+    }
+
+    let q_bits = bits_of(
+        wf,
+        &format!("model.layers.{layer_idx}.self_attn.q_proj.weight"),
+    );
+    let k_bits = bits_of(
+        wf,
+        &format!("model.layers.{layer_idx}.self_attn.k_proj.weight"),
+    );
+    let v_bits = bits_of(
+        wf,
+        &format!("model.layers.{layer_idx}.self_attn.v_proj.weight"),
+    );
+    let attn = layer_cache.attn.full().ok_or(
+        LayerForwardError::MissingTensor {
+            layer: layer_idx,
+            tensor: "full_attn weights (batched pre-SDPA)",
+        },
+    )?;
+    let q_dim = v.num_attn_heads * v.head_dim;
+    let q_proj_dim = q_dim * 2;
+    let kv_dim = v.num_kv_heads * v.head_dim;
+
+    let mv = MatvecPipelines::fetch(metal)?;
+    let rms_pipes = RmsNormBf16Pipelines::fetch(metal)?;
+
+    {
+        let cmdbuf = metal.queue().new_command_buffer();
+        encode_rms_norm_bf16_into(
+            cmdbuf,
+            &rms_pipes,
+            &buffers.input,
+            wf_buf.buffer(),
+            layer_cache.input_layernorm_w,
+            &buffers.sum_sq,
+            &buffers.normed,
+            v.hidden_dim as u32,
+            super::variants::RMS_NORM_EPS,
+        );
+        let specs = [
+            MatvecSpec {
+                w_off: attn.q_proj_w,
+                s_off: attn.q_proj_s,
+                b_off: attn.q_proj_b,
+                input: &buffers.normed,
+                output: &buffers.q_proj_out,
+                out_dim: q_proj_dim as u32,
+                in_dim: v.hidden_dim as u32,
+                bits: q_bits,
+            },
+            MatvecSpec {
+                w_off: attn.k_proj_w,
+                s_off: attn.k_proj_s,
+                b_off: attn.k_proj_b,
+                input: &buffers.normed,
+                output: &buffers.k_out,
+                out_dim: kv_dim as u32,
+                in_dim: v.hidden_dim as u32,
+                bits: k_bits,
+            },
+            MatvecSpec {
+                w_off: attn.v_proj_w,
+                s_off: attn.v_proj_s,
+                b_off: attn.v_proj_b,
+                input: &buffers.normed,
+                output: &buffers.v_out,
+                out_dim: kv_dim as u32,
+                in_dim: v.hidden_dim as u32,
+                bits: v_bits,
+            },
+        ];
+        for s in &specs {
+            encode_matvec(cmdbuf, &mv, wf_buf, s);
+        }
+        metal.commit_and_wait_labeled(cmdbuf, "batched_full_attn.cmd1");
+    }
+
+    let q_proj_host = read_buffer_to_vec(&buffers.q_proj_out, q_proj_dim);
+    let mut k_host = read_buffer_to_vec(&buffers.k_out, kv_dim);
+    let v_host = read_buffer_to_vec(&buffers.v_out, kv_dim);
+
+    let mut q_host = vec![0.0f32; q_dim];
+    let mut q_gate_host = vec![0.0f32; q_dim];
+    for h in 0..v.num_attn_heads {
+        let src_off = h * (2 * v.head_dim);
+        let dst_off = h * v.head_dim;
+        q_host[dst_off..dst_off + v.head_dim].copy_from_slice(
+            &q_proj_host[src_off..src_off + v.head_dim],
+        );
+        q_gate_host[dst_off..dst_off + v.head_dim].copy_from_slice(
+            &q_proj_host[src_off + v.head_dim..src_off + 2 * v.head_dim],
+        );
+    }
+
+    rms_norm_per_head_cpu(
+        wf,
+        &format!("model.layers.{layer_idx}.self_attn.q_norm.weight"),
+        v.num_attn_heads,
+        v.head_dim,
+        &mut q_host,
+    )?;
+    rms_norm_per_head_cpu(
+        wf,
+        &format!("model.layers.{layer_idx}.self_attn.k_norm.weight"),
+        v.num_kv_heads,
+        v.head_dim,
+        &mut k_host,
+    )?;
+    apply_rotary_emb(pos, &mut q_host, &mut k_host)?;
+
+    let cache_pos = kv_state.len as usize;
+    if cache_pos + 1 > super::variants::MAX_SEQ_LEN {
+        return Err(LayerForwardError::MissingTensor {
+            layer: layer_idx,
+            tensor: "kv cache overflow",
+        });
+    }
+    let row_start = cache_pos * kv_dim;
+    let row_end = row_start + kv_dim;
+    kv_state.k_cache[row_start..row_end].copy_from_slice(&k_host);
+    kv_state.v_cache[row_start..row_end].copy_from_slice(&v_host);
+    kv_state.len += 1;
+
+    Ok((q_host, q_gate_host))
+}
+
 /// Batched full-attention layer forward for chunked prefill.
 ///
 /// Runs the per-token pre-MoE forward in a loop (steps 1-14 of the
@@ -524,6 +680,9 @@ pub(super) fn batched_full_attn_layer_forward(
     debug_assert_eq!(hidden_out.len(), n_tokens * v.hidden_dim);
 
     let hidden_dim = v.hidden_dim;
+    let q_dim = v.num_attn_heads * v.head_dim;
+    let kv_dim = v.num_kv_heads * v.head_dim;
+
     let mut h_mid_stack = vec![0.0f32; n_tokens * hidden_dim];
     let mut h_post_stack = vec![0.0f32; n_tokens * hidden_dim];
     let mut shared_out_stack = vec![0.0f32; n_tokens * hidden_dim];
@@ -531,12 +690,119 @@ pub(super) fn batched_full_attn_layer_forward(
     let mut all_routing_weights = Vec::with_capacity(n_tokens * k_active);
     let mut shared_gate_scores = Vec::with_capacity(n_tokens);
 
+    // ── Phase 1: per-token pre-SDPA. Capture q + q_gate per token,
+    //    append k/v to kv_state. KV state advances by n_tokens. ──
+    let mut q_stack = vec![0.0f32; n_tokens * q_dim];
+    let mut q_gate_stack = vec![0.0f32; n_tokens * q_dim];
+    let kv_start = kv_state.len;
     for t in 0..n_tokens {
         let pos = start_pos + t as i32;
+        // SAFETY: shared-storage buffer; pre-SDPA's CMD1 ends in
+        // commit_and_wait, so no GPU work is in flight on
+        // buffers.input by the next iteration.
+        unsafe {
+            let dst = buffers.input.contents() as *mut f32;
+            std::ptr::copy_nonoverlapping(
+                hidden_in[t * hidden_dim..].as_ptr(),
+                dst,
+                hidden_dim,
+            );
+        }
+        let (q_host, q_gate_host) = full_attn_pre_sdpa_capture(
+            metal,
+            wf,
+            wf_buf,
+            layer_cache,
+            buffers,
+            layer_idx,
+            pos,
+            kv_state,
+        )?;
+        q_stack[t * q_dim..(t + 1) * q_dim].copy_from_slice(&q_host);
+        q_gate_stack[t * q_dim..(t + 1) * q_dim].copy_from_slice(&q_gate_host);
+    }
 
-        // SAFETY: shared-storage buffer; pre_moe ends in
-        // commit_and_wait so no GPU work is in flight on buffers.input
-        // by the next iteration.
+    // ── Phase 2: batched tiled SDPA over the joint q stack against
+    //    the (now-extended) kv state. ──────────────────────────────
+    let device = metal.device().clone();
+    let kv_len_total = kv_state.len as u32;
+    let kv_floats = (kv_len_total as usize) * kv_dim;
+    let q_buf = MtlBuffer::<f32>::with_data(&device, &q_stack);
+    let k_gpu = MtlBuffer::<f32>::with_data(
+        &device,
+        &kv_state.k_cache[..kv_floats],
+    );
+    let v_gpu = MtlBuffer::<f32>::with_data(
+        &device,
+        &kv_state.v_cache[..kv_floats],
+    );
+    let attn_out_buf =
+        MtlBuffer::<f32>::with_len(&device, n_tokens * q_dim);
+    let state_total = (n_tokens as u32) * (v.num_attn_heads as u32);
+    let running_max = MtlBuffer::<f32>::with_len(&device, state_total as usize);
+    let running_denom =
+        MtlBuffer::<f32>::with_len(&device, state_total as usize);
+    let v_partial = MtlBuffer::<f32>::with_len(
+        &device,
+        (state_total as usize) * v.head_dim,
+    );
+
+    let sdpa_pipes = BatchedSdpaPipelines::fetch(metal)?;
+    let softmax_scale = 1.0f32 / (v.head_dim as f32).sqrt();
+    let heads_per_kv = (v.num_attn_heads / v.num_kv_heads) as u32;
+    let queue = metal.queue_clone();
+    let cmdbuf = queue.new_command_buffer();
+    encode_sdpa_causal_tiled(
+        cmdbuf,
+        &sdpa_pipes,
+        q_buf.buffer(),
+        k_gpu.buffer(),
+        v_gpu.buffer(),
+        attn_out_buf.buffer(),
+        running_max.buffer(),
+        running_denom.buffer(),
+        v_partial.buffer(),
+        n_tokens as u32,
+        v.num_attn_heads as u32,
+        heads_per_kv,
+        v.head_dim as u32,
+        kv_dim as u32,
+        kv_start as u32,
+        kv_len_total,
+        softmax_scale,
+    );
+    metal.commit_and_wait_labeled(cmdbuf, "batched_sdpa_causal_tiled");
+    // Tiled SDPA output is gate-free (per session-2 Phase 3 design).
+    // Apply sigmoid_gate per token on host below.
+    let attn_out_stack = attn_out_buf.to_vec();
+
+    // ── Phase 3: per-token post-SDPA. Apply sigmoid gate, stage into
+    //    batch_out[6], run post_attention_pre_moe (gpu_attn_args=None),
+    //    snapshot intermediates + per-token GPU outputs. ────────────
+    for t in 0..n_tokens {
+        let q_gate = &q_gate_stack[t * q_dim..(t + 1) * q_dim];
+        let attn_raw = &attn_out_stack[t * q_dim..(t + 1) * q_dim];
+        let mut attn_with_gate = vec![0.0f32; q_dim];
+        for i in 0..q_dim {
+            let sg = 1.0f32 / (1.0f32 + (-q_gate[i]).exp());
+            attn_with_gate[i] = sg * attn_raw[i];
+        }
+        // SAFETY: shared-storage; no GPU work in flight on
+        // batch_out[6] (Phase 2 committed+waited, Phase 3 hasn't
+        // dispatched yet for token t).
+        unsafe {
+            let dst = buffers.batch_out[6].contents() as *mut f32;
+            std::ptr::copy_nonoverlapping(
+                attn_with_gate.as_ptr(),
+                dst,
+                q_dim,
+            );
+        }
+        // Re-stage hidden_in[t] into buffers.input — it's the residual
+        // source consumed by post_attention_pre_moe's residual_add.
+        // Each Phase 3 iteration overwrites buffers.input for the
+        // CURRENT token, so the previous iteration's value is no
+        // longer reliable. Always restage.
         unsafe {
             let dst = buffers.input.contents() as *mut f32;
             std::ptr::copy_nonoverlapping(
@@ -546,17 +812,39 @@ pub(super) fn batched_full_attn_layer_forward(
             );
         }
 
-        let intermediates = full_attn_pre_moe_layer_forward(
+        // Reproduce the post-SDPA tail of `full_attn_pre_moe_layer_forward`:
+        // create a fresh cmdbuf for the o_proj-onward CMD2+3, pass to
+        // post_attention_pre_moe with gpu_attn_args=None (reads attn
+        // input from batch_out[6]).
+        let attn_full = layer_cache.attn.full().ok_or(
+            LayerForwardError::MissingTensor {
+                layer: layer_idx,
+                tensor: "full_attn weights (B2 batched path)",
+            },
+        )?;
+        let o_bits = bits_of(
+            wf,
+            &format!("model.layers.{layer_idx}.self_attn.o_proj.weight"),
+        );
+        let tail_queue = metal.queue_clone();
+        let tail_cmdbuf = tail_queue.new_command_buffer();
+        let intermediates = post_attention_pre_moe(
             metal,
+            tail_cmdbuf,
             wf,
             wf_buf,
             layer_cache,
             buffers,
             layer_idx,
-            pos,
             k_active,
-            kv_state,
-            /* prev_layer_chained = */ false,
+            OProj {
+                w_off: attn_full.o_proj_w,
+                s_off: attn_full.o_proj_s,
+                b_off: attn_full.o_proj_b,
+                bits: o_bits,
+                in_dim: q_dim as u32,
+            },
+            /* gpu_attn_args = */ None,
         )?;
 
         h_mid_stack[t * hidden_dim..(t + 1) * hidden_dim]
