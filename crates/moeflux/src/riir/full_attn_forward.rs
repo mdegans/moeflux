@@ -50,9 +50,9 @@ use super::gpu_matvec::{encode_matvec, MatvecPipelines, MatvecSpec};
 use super::gpu_norm::{encode_rms_norm_bf16_into, RmsNormBf16Pipelines};
 use super::layer_weight_cache::LayerWeightCache;
 use super::linear_attn_forward::{
-    bits_of, full_attn_layer_idx_for, post_attention_tail,
-    read_buffer_to_vec, GpuAttnEncodeArgs, LayerForwardBuffers,
-    LayerForwardError, OProj,
+    bits_of, full_attn_layer_idx_for, moe_dispatch_per_token,
+    post_attention_pre_moe, read_buffer_to_vec, GpuAttnEncodeArgs,
+    LayerForwardBuffers, LayerForwardError, OProj, PostAttnIntermediates,
 };
 use super::metal::MetalBackend;
 use super::mtl_weight_buf::MtlWeightBuf;
@@ -63,43 +63,35 @@ use super::state::KvCache;
 use super::variants::VARIANT;
 use super::weight_file::WeightFile;
 
-/// Run one full-attention layer's forward pass.
+/// Run one full-attention layer's forward pass — the pre-MoE half.
+///
+/// Returns the [`PostAttnIntermediates`] needed by either
+/// [`moe_dispatch_per_token`] (per-token path; called by the
+/// [`full_attn_layer_forward`] wrapper) or by the batched-prefill
+/// orchestrator (Phase B+) which collects intermediates across all
+/// tokens in a chunk before dispatching MoE in batch.
 ///
 /// Pre: `buffers.input` holds the input hidden state (HIDDEN_DIM
-/// floats). Post: `buffers.input` holds the output hidden state.
-/// `kv_state.len` advances by 1 and the new K/V row is appended at
-/// the previous-`len` position.
+/// floats). Post: `buffers.h_mid`, `buffers.normed` (= h_post), and
+/// `buffers.shared_out` hold the per-token GPU outputs; KV cache
+/// advances by 1.
 ///
 /// `pos` is the absolute KV position (matches the C side's `pos`
-/// argument to `apply_rotary_emb`). Today the dump-hook test calls
-/// this at `pos=0` against a `memory_clear`-reset KV cache, so
-/// `kv_state.len` starts at 0 and `pos` matches `kv_state.len`.
-/// Once 4f wires `eval_prompt`, callers will pre-set `pos` to the
-/// absolute sequence position.
+/// argument to `apply_rotary_emb`).
 #[allow(clippy::too_many_arguments)]
-pub fn full_attn_layer_forward(
+pub(super) fn full_attn_pre_moe_layer_forward(
     metal: &mut MetalBackend,
     wf: &WeightFile,
     wf_buf: &MtlWeightBuf,
     layer_cache: &LayerWeightCache,
     buffers: &mut LayerForwardBuffers,
-    moe: &mut MoeBuffers,
-    deferred: &mut super::deferred::DeferredRing,
     layer_idx: usize,
     pos: i32,
     k_active: usize,
-    expert_files: &ExpertFiles,
-    pool: &rayon::ThreadPool,
-    prefetch: &mut super::PrefetchState,
-    // Slice 5d-9: which `data_prefetch` set this layer reads from
-    // (parity ping-pong: `layer_idx % 2`).
-    prefetch_set: usize,
     kv_state: &mut KvCache,
-    gpu_combine: bool,
     // Slice 5d-8: see `linear_attn_layer_forward` for the contract.
     prev_layer_chained: bool,
-    chain_next_norm_off: Option<u64>,
-) -> Result<(), LayerForwardError> {
+) -> Result<PostAttnIntermediates, LayerForwardError> {
     let v = VARIANT;
 
     // Reject linear-attn layers up front. Mirror the symmetric guard
@@ -387,38 +379,31 @@ pub fn full_attn_layer_forward(
         None
     };
 
-    // ── Hand off to the shared post-attention tail ───────────────
-    // When `gpu_attn_args` is `Some`, the tail encodes the 4 attn
+    // ── Hand off to the shared pre-MoE tail ──────────────────────
+    // When `gpu_attn_args` is `Some`, pre_moe encodes the 4 attn
     // kernels at the head of CMD2 and reads o_proj from
     // `gpu_attn_out`. Otherwise it reads from `batch_out[6]` (the
-    // CPU-SDPA staging slot above). The tail leaves an in-flight
-    // K-expert dispatch in `*deferred`; caller drains.
+    // CPU-SDPA staging slot above).
     //
     // Slice cmdbuf-fold-1: full-attn cannot fold CMD1 into CMD2+3
     // because the host-bounce above (q/k/v readback + CPU per-head
-    // norm + RoPE + KV append) is interposed. A fresh cmdbuf for the
-    // tail is the correct shape until Phase 3b moves the host-bounce
-    // work to GPU.
+    // norm + RoPE + KV append) is interposed. A fresh cmdbuf for
+    // the tail is the correct shape until Phase 3b moves the host-
+    // bounce work to GPU.
     //
     // `queue_clone` (not `queue`) so the cmdbuf borrow doesn't pin
     // `*metal` and block the `&mut metal` arg below.
     let queue = metal.queue_clone();
     let cmdbuf = queue.new_command_buffer();
-    post_attention_tail(
+    let intermediates = post_attention_pre_moe(
         metal,
         cmdbuf,
         wf,
         wf_buf,
         layer_cache,
         buffers,
-        moe,
-        deferred,
         layer_idx,
         k_active,
-        expert_files,
-        pool,
-        prefetch,
-        prefetch_set,
         OProj {
             w_off: o_w,
             s_off: o_s,
@@ -426,8 +411,259 @@ pub fn full_attn_layer_forward(
             bits: o_bits,
             in_dim: q_dim as u32,
         },
-        gpu_combine,
         gpu_attn_args,
+    )?;
+    Ok(intermediates)
+}
+
+/// Run one full-attention layer's forward pass — per-token wrapper.
+/// Composes [`full_attn_pre_moe_layer_forward`] with
+/// [`moe_dispatch_per_token`]. Behaviour mirrors the pre-Phase-B
+/// `full_attn_layer_forward`: `buffers.input` in, post-combine
+/// hidden state in `buffers.input` after the deferred dispatch
+/// completes (drained at the top of the next layer's forward).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn full_attn_layer_forward(
+    metal: &mut MetalBackend,
+    wf: &WeightFile,
+    wf_buf: &MtlWeightBuf,
+    layer_cache: &LayerWeightCache,
+    buffers: &mut LayerForwardBuffers,
+    moe: &mut MoeBuffers,
+    deferred: &mut super::deferred::DeferredRing,
+    layer_idx: usize,
+    pos: i32,
+    k_active: usize,
+    expert_files: &ExpertFiles,
+    pool: &rayon::ThreadPool,
+    prefetch: &mut super::PrefetchState,
+    // Slice 5d-9: which `data_prefetch` set this layer reads from
+    // (parity ping-pong: `layer_idx % 2`).
+    prefetch_set: usize,
+    kv_state: &mut KvCache,
+    gpu_combine: bool,
+    // Slice 5d-8: see `linear_attn_layer_forward` for the contract.
+    prev_layer_chained: bool,
+    chain_next_norm_off: Option<u64>,
+) -> Result<(), LayerForwardError> {
+    let intermediates = full_attn_pre_moe_layer_forward(
+        metal,
+        wf,
+        wf_buf,
+        layer_cache,
+        buffers,
+        layer_idx,
+        pos,
+        k_active,
+        kv_state,
+        prev_layer_chained,
+    )?;
+    moe_dispatch_per_token(
+        metal,
+        wf_buf,
+        buffers,
+        moe,
+        deferred,
+        layer_idx,
+        expert_files,
+        pool,
+        prefetch,
+        prefetch_set,
+        &intermediates,
+        gpu_combine,
         chain_next_norm_off,
     )
+}
+
+/// Batched full-attention layer forward for chunked prefill.
+///
+/// Runs the per-token pre-MoE forward in a loop (steps 1-14 of the
+/// Phase B plan), capturing per-token intermediates and the GPU
+/// outputs (`h_mid`, `h_post`, `shared_out`) to host stacks. Then
+/// builds the joint N×k_active expert-bucket CSR and runs
+/// [`super::expert_forward::encode_moe_batched_permute_fuse`] once
+/// for the whole chunk — one expert blob read per non-empty bucket
+/// instead of K reads per token. The per-token combine
+/// (h_mid + moe_sum + sigmoid(shared_gate) * shared_out) runs on
+/// CPU; B4 batches it via a GPU kernel.
+///
+/// **B1 sub-step:** steps 1-14 per-token, step 16 (MoE permute-fuse)
+/// batched. Sub-steps B2-B4 progressively batch SDPA, projections,
+/// shared FFN, and combine.
+///
+/// Pre: `hidden_in[t*hidden_dim..(t+1)*hidden_dim]` holds token t's
+/// input hidden state. Post: `hidden_out[t*hidden_dim..]` holds the
+/// post-combine hidden state. `kv_state.len` advances by `n_tokens`.
+///
+/// **No deferred dispatch, no prefetch.** The batched path reads
+/// expert blobs synchronously per bucket; the per-token prefetch
+/// state machine is decode-only after Phase H.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn batched_full_attn_layer_forward(
+    metal: &mut MetalBackend,
+    wf: &WeightFile,
+    wf_buf: &MtlWeightBuf,
+    layer_cache: &LayerWeightCache,
+    buffers: &mut LayerForwardBuffers,
+    layer_idx: usize,
+    start_pos: i32,
+    n_tokens: usize,
+    k_active: usize,
+    expert_files: &ExpertFiles,
+    kv_state: &mut KvCache,
+    hidden_in: &[f32],
+    hidden_out: &mut [f32],
+) -> Result<(), LayerForwardError> {
+    use super::expert_forward::{encode_moe_batched_permute_fuse, MAX_K};
+    use super::metal::MtlBuffer;
+    use super::moe_router::build_expert_buckets;
+
+    let v = VARIANT;
+    debug_assert!(k_active <= MAX_K);
+    debug_assert_eq!(hidden_in.len(), n_tokens * v.hidden_dim);
+    debug_assert_eq!(hidden_out.len(), n_tokens * v.hidden_dim);
+
+    let hidden_dim = v.hidden_dim;
+    let mut h_mid_stack = vec![0.0f32; n_tokens * hidden_dim];
+    let mut h_post_stack = vec![0.0f32; n_tokens * hidden_dim];
+    let mut shared_out_stack = vec![0.0f32; n_tokens * hidden_dim];
+    let mut all_routing_indices = Vec::with_capacity(n_tokens * k_active);
+    let mut all_routing_weights = Vec::with_capacity(n_tokens * k_active);
+    let mut shared_gate_scores = Vec::with_capacity(n_tokens);
+
+    for t in 0..n_tokens {
+        let pos = start_pos + t as i32;
+
+        // SAFETY: shared-storage buffer; pre_moe ends in
+        // commit_and_wait so no GPU work is in flight on buffers.input
+        // by the next iteration.
+        unsafe {
+            let dst = buffers.input.contents() as *mut f32;
+            std::ptr::copy_nonoverlapping(
+                hidden_in[t * hidden_dim..].as_ptr(),
+                dst,
+                hidden_dim,
+            );
+        }
+
+        let intermediates = full_attn_pre_moe_layer_forward(
+            metal,
+            wf,
+            wf_buf,
+            layer_cache,
+            buffers,
+            layer_idx,
+            pos,
+            k_active,
+            kv_state,
+            /* prev_layer_chained = */ false,
+        )?;
+
+        h_mid_stack[t * hidden_dim..(t + 1) * hidden_dim]
+            .copy_from_slice(&read_buffer_to_vec(&buffers.h_mid, hidden_dim));
+        h_post_stack[t * hidden_dim..(t + 1) * hidden_dim]
+            .copy_from_slice(&read_buffer_to_vec(&buffers.normed, hidden_dim));
+        shared_out_stack[t * hidden_dim..(t + 1) * hidden_dim]
+            .copy_from_slice(&read_buffer_to_vec(
+                &buffers.shared_out,
+                hidden_dim,
+            ));
+        all_routing_indices.extend_from_slice(&intermediates.routing_indices);
+        all_routing_weights.extend_from_slice(&intermediates.routing_weights);
+        shared_gate_scores.push(intermediates.shared_gate_score);
+    }
+
+    let buckets = build_expert_buckets(
+        &all_routing_indices,
+        &all_routing_weights,
+        n_tokens,
+        k_active,
+        v.num_experts,
+    );
+
+    let device = metal.device().clone();
+    let total_assignments = buckets.token_idx.len();
+    debug_assert_eq!(total_assignments, n_tokens * k_active);
+
+    let expert_size = v.expert_size_4bit();
+    let mut expert_blobs: Vec<MtlBuffer<u8>> =
+        Vec::with_capacity(buckets.expert_ids.len());
+    let mut blob_scratch = vec![0u8; expert_size];
+    for &expert_id in &buckets.expert_ids {
+        expert_files
+            .read_expert(layer_idx, expert_id as usize, &mut blob_scratch)?;
+        expert_blobs
+            .push(MtlBuffer::<u8>::with_data(&device, &blob_scratch));
+    }
+
+    let mut bucket_input_host = vec![0.0f32; total_assignments * hidden_dim];
+    for assignment_idx in 0..total_assignments {
+        let t = buckets.token_idx[assignment_idx] as usize;
+        let src = &h_post_stack[t * hidden_dim..(t + 1) * hidden_dim];
+        let dst_off = assignment_idx * hidden_dim;
+        bucket_input_host[dst_off..dst_off + hidden_dim].copy_from_slice(src);
+    }
+
+    let bucket_input =
+        MtlBuffer::<f32>::with_data(&device, &bucket_input_host);
+    let bucket_gate = MtlBuffer::<f32>::with_len(
+        &device,
+        total_assignments * v.moe_intermediate,
+    );
+    let bucket_up = MtlBuffer::<f32>::with_len(
+        &device,
+        total_assignments * v.moe_intermediate,
+    );
+    let bucket_act = MtlBuffer::<f32>::with_len(
+        &device,
+        total_assignments * v.moe_intermediate,
+    );
+    let bucket_out =
+        MtlBuffer::<f32>::with_len(&device, total_assignments * hidden_dim);
+    let bucket_token_idx =
+        MtlBuffer::<i32>::with_data(&device, &buckets.token_idx);
+    let bucket_weights =
+        MtlBuffer::<f32>::with_data(&device, &buckets.weights);
+    let out_sum_zeros = vec![0.0f32; n_tokens * hidden_dim];
+    let out_sum = MtlBuffer::<f32>::with_data(&device, &out_sum_zeros);
+
+    let matvec = MatvecPipelines::fetch(metal)?;
+    let swiglu = metal.pipeline("swiglu_fused")?.clone();
+    let bucket_accumulate =
+        metal.pipeline("moe_bucket_accumulate")?.clone();
+    let queue = metal.queue_clone();
+    let cmdbuf = queue.new_command_buffer();
+    encode_moe_batched_permute_fuse(
+        cmdbuf,
+        &matvec,
+        &swiglu,
+        &bucket_accumulate,
+        &expert_blobs,
+        bucket_input.buffer(),
+        bucket_gate.buffer(),
+        bucket_up.buffer(),
+        bucket_act.buffer(),
+        bucket_out.buffer(),
+        bucket_token_idx.buffer(),
+        bucket_weights.buffer(),
+        out_sum.buffer(),
+        &buckets,
+        v,
+    );
+    metal.commit_and_wait_labeled(cmdbuf, "batched_moe_permute_fuse");
+
+    let moe_sum_host = out_sum.to_vec();
+    for t in 0..n_tokens {
+        let sg = shared_gate_scores[t];
+        let sigmoid_sg = 1.0f32 / (1.0f32 + (-sg).exp());
+        let h_mid = &h_mid_stack[t * hidden_dim..(t + 1) * hidden_dim];
+        let moe = &moe_sum_host[t * hidden_dim..(t + 1) * hidden_dim];
+        let shared = &shared_out_stack[t * hidden_dim..(t + 1) * hidden_dim];
+        let out = &mut hidden_out[t * hidden_dim..(t + 1) * hidden_dim];
+        for i in 0..hidden_dim {
+            out[i] = h_mid[i] + moe[i] + sigmoid_sg * shared[i];
+        }
+    }
+
+    Ok(())
 }

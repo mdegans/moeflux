@@ -84,7 +84,10 @@ pub use moe_router::{moe_router_cpu, MoeRouterError};
 pub use rms_norm::{rms_norm_cpu, rms_norm_per_head_cpu, RmsNormError};
 pub use rope::{apply_rotary_emb, RopeError};
 pub use layer_weight_cache::LayerWeightCache;
-pub use full_attn_forward::full_attn_layer_forward;
+// full_attn_layer_forward dropped from pub re-export with the Phase A/B
+// refactor — it's now pub(super) inside riir, and the only external
+// callers in this crate use it transitively via eval_prompt / eval_token.
+use full_attn_forward::full_attn_layer_forward;
 pub use linear_attn_forward::{
     linear_attn_layer_forward, linear_layer_idx_for, LayerForwardBuffers,
     LayerForwardError,
@@ -1228,18 +1231,23 @@ impl RsCtx {
     /// `tokens` at positions `[start_pos, start_pos + tokens.len())`
     /// and (when requested) writes the last token's logits.
     ///
-    /// **Session-3 implementation:** wraps
-    /// [`Self::step_internal_per_token_oracle`] in a tokenwise loop;
-    /// behaviour is identical to the pre-rename `step_internal`. The
-    /// surface lives at this signature so session 4 can swap the
-    /// loop body for the GPU batched-prefill primitives landed in
-    /// sessions 1-3 ([`expert_forward::encode_moe_batched_permute_fuse`],
-    /// causal-masked tiled SDPA, batched matmul) without changing
-    /// callers.
+    /// **Session-4 implementation (Gqa variants):** batched MoE
+    /// permute-fuse path. For each layer:
+    /// - Full-attention layers (Qwen3 GQA) route through
+    ///   [`full_attn_forward::batched_full_attn_layer_forward`], which
+    ///   runs the per-token pre-MoE forward (B1 sub-step: tokenwise)
+    ///   then a single batched MoE dispatch over the joint N×K_active
+    ///   routing CSR.
+    /// - Linear-attention layers stay tokenwise: each token gets a
+    ///   `linear_attn_layer_forward` call with sync deferred drain,
+    ///   advancing the recurrent state position-by-position. Chunkwise
+    ///   linear-attn is a future-work primitive.
+    ///
+    /// MLA variants fall back to a tokenwise loop over the per-token
+    /// oracle — batched MLA is out of scope for session 4.
     ///
     /// `eval_prompt` routes here; `eval_token` stays on the per-token
-    /// oracle since single-token decode doesn't benefit from
-    /// batching.
+    /// oracle since single-token decode doesn't benefit from batching.
     pub(crate) fn step_internal(
         &mut self,
         tokens: &[i32],
@@ -1258,16 +1266,192 @@ impl RsCtx {
             }
         }
 
-        let last_idx = tokens.len() - 1;
-        let mut logits_owned = logits_out;
-        for (i, &tok) in tokens.iter().enumerate() {
-            let pos = start_pos + i as i32;
-            let logits_arg: Option<&mut [f32]> = if i == last_idx {
-                logits_owned.take()
+        // MLA: tokenwise oracle for now (batched MLA = session-5+).
+        if matches!(VARIANT.attn_kind, variants::AttnKind::Mla) {
+            let last_idx = tokens.len() - 1;
+            let mut logits_owned = logits_out;
+            for (i, &tok) in tokens.iter().enumerate() {
+                let pos = start_pos + i as i32;
+                let logits_arg: Option<&mut [f32]> = if i == last_idx {
+                    logits_owned.take()
+                } else {
+                    None
+                };
+                self.step_internal_per_token_oracle(tok, pos, logits_arg)?;
+            }
+            return Ok(());
+        }
+
+        self.step_internal_batched_gqa(tokens, start_pos, logits_out)
+    }
+
+    /// GQA batched orchestrator — the Phase B+C implementation that
+    /// `step_internal` dispatches to when the variant is Qwen3-shape
+    /// (full-attn + linear-attn layers). Sub-steps B1-B4 progressively
+    /// batch more operations inside
+    /// [`full_attn_forward::batched_full_attn_layer_forward`]; this
+    /// orchestrator stays stable across sub-steps.
+    fn step_internal_batched_gqa(
+        &mut self,
+        tokens: &[i32],
+        start_pos: i32,
+        logits_out: Option<&mut [f32]>,
+    ) -> Result<(), RsError> {
+        use full_attn_forward::batched_full_attn_layer_forward;
+
+        let v = VARIANT;
+        let n = tokens.len();
+        let hidden_dim = v.hidden_dim;
+
+        self.ensure_linear_resources()?;
+        let k_active = self.k_active;
+
+        // Field-disjoint mutable borrows.
+        let Self {
+            wf,
+            metal,
+            moe_buffers,
+            experts,
+            layer_states,
+            wf_buf,
+            layer_caches,
+            linear_buffers,
+            deferred,
+            lm_head_gpu,
+            io_pool,
+            prefetch,
+            ..
+        } = self;
+        let metal = metal.as_mut().expect("ensure_linear_resources");
+        let wf_buf = wf_buf.as_ref().expect("ensure_linear_resources");
+        let layer_caches =
+            layer_caches.as_ref().expect("ensure_linear_resources");
+        let linear_buffers =
+            linear_buffers.as_mut().expect("ensure_linear_resources");
+        let moe_buffers =
+            moe_buffers.as_mut().expect("ensure_linear_resources");
+        let lm_head_gpu =
+            lm_head_gpu.as_ref().expect("ensure_linear_resources");
+        let io_pool: &rayon::ThreadPool = &*io_pool;
+
+        // Drain any stale deferred state — batched path doesn't use
+        // the ring, but the per-token linear-attn fallback below does,
+        // and the per-token oracle's drain discipline assumes a clean
+        // start.
+        deferred::discard_deferred_experts_in(deferred);
+
+        // Embed all tokens into a stacked host buffer.
+        let mut hidden_in_stack = vec![0.0f32; n * hidden_dim];
+        for (t, &tok) in tokens.iter().enumerate() {
+            embedding::embed_lookup(
+                wf,
+                tok,
+                &mut hidden_in_stack[t * hidden_dim..(t + 1) * hidden_dim],
+            )
+            .map_err(|_| RsError::EvalFailed)?;
+        }
+        let mut hidden_out_stack = vec![0.0f32; n * hidden_dim];
+
+        for layer_idx in 0..v.num_layers {
+            let is_full = v.layer_kind(layer_idx)
+                == variants::LayerKind::FullAttn;
+            if is_full {
+                let kv_state = match &mut layer_states[layer_idx] {
+                    LayerState::FullAttn(kv) => kv,
+                    LayerState::Mla(_) | LayerState::LinearAttn(_) => {
+                        return Err(RsError::EvalFailed);
+                    }
+                };
+                batched_full_attn_layer_forward(
+                    metal,
+                    wf,
+                    wf_buf,
+                    &layer_caches[layer_idx],
+                    linear_buffers,
+                    layer_idx,
+                    start_pos,
+                    n,
+                    k_active,
+                    experts,
+                    kv_state,
+                    &hidden_in_stack,
+                    &mut hidden_out_stack,
+                )
+                .map_err(|_| RsError::EvalFailed)?;
             } else {
-                None
-            };
-            self.step_internal_per_token_oracle(tok, pos, logits_arg)?;
+                let layer_state = match &mut layer_states[layer_idx] {
+                    LayerState::LinearAttn(la) => la,
+                    LayerState::FullAttn(_) | LayerState::Mla(_) => {
+                        return Err(RsError::EvalFailed);
+                    }
+                };
+                // Per-token linear-attn fallback. Each token's
+                // dispatch lands in `moe_buffers.moe_hidden`; we drain
+                // synchronously to per-token slots of hidden_out_stack.
+                for t in 0..n {
+                    // Stage token t's input.
+                    // SAFETY: shared-storage; prior token's dispatch
+                    // was drained (next iteration's drain or the
+                    // discard above for t=0).
+                    unsafe {
+                        let dst = linear_buffers.input.contents()
+                            as *mut f32;
+                        std::ptr::copy_nonoverlapping(
+                            hidden_in_stack[t * hidden_dim..].as_ptr(),
+                            dst,
+                            hidden_dim,
+                        );
+                    }
+                    linear_attn_forward::linear_attn_layer_forward(
+                        metal,
+                        wf,
+                        wf_buf,
+                        &layer_caches[layer_idx],
+                        linear_buffers,
+                        moe_buffers,
+                        deferred,
+                        layer_idx,
+                        k_active,
+                        experts,
+                        io_pool,
+                        prefetch,
+                        /* prefetch_set = */ layer_idx % 2,
+                        layer_state,
+                        /* gpu_combine = */ true,
+                        /* prev_layer_chained = */ false,
+                        /* chain_next_norm_off = */ None,
+                    )
+                    .map_err(|_| RsError::EvalFailed)?;
+                    deferred::complete_deferred_experts_into(
+                        deferred,
+                        moe_buffers,
+                        &mut hidden_out_stack
+                            [t * hidden_dim..(t + 1) * hidden_dim],
+                    )
+                    .map_err(|_| RsError::EvalFailed)?;
+                }
+            }
+            // Swap stacks: this layer's output becomes next layer's
+            // input. The previously-input stack is reused as next
+            // layer's output buffer (saves alloc).
+            std::mem::swap(&mut hidden_in_stack, &mut hidden_out_stack);
+        }
+
+        // Final norm + lm_head on the LAST token's hidden state.
+        if let Some(logits) = logits_out {
+            let last_row = &hidden_in_stack
+                [(n - 1) * hidden_dim..n * hidden_dim];
+            let mut hidden_normed = vec![0.0f32; hidden_dim];
+            rms_norm_cpu(
+                wf,
+                "model.norm.weight",
+                last_row,
+                &mut hidden_normed,
+            )
+            .map_err(|_| RsError::EvalFailed)?;
+            lm_head_gpu
+                .forward(metal, wf_buf, &hidden_normed, logits)
+                .map_err(|_| RsError::EvalFailed)?;
         }
         Ok(())
     }
