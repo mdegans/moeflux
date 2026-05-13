@@ -314,6 +314,109 @@ pub fn noaux_tc_router_cpu(
     Ok(())
 }
 
+/// CSR-style assignment of (token, weight) tuples bucketed by expert id.
+///
+/// For batched MoE permute-and-fuse: given the routing decisions for
+/// `n_tokens` tokens (each with `k_active` top-K experts), produce a sparse
+/// view where each non-empty bucket lists which tokens picked that expert
+/// and with what weight. Empty buckets are omitted.
+///
+/// Layout:
+/// - `expert_ids[b]`: the expert this bucket dispatches to.
+/// - `offsets[b]..offsets[b+1]`: the slice of `token_idx` and `weights`
+///   belonging to bucket `b`. `offsets[0] == 0`,
+///   `offsets[num_non_empty] == n_tokens * k_active`.
+/// - `token_idx[i]`: which row of the batched input to gather (0..n_tokens).
+/// - `weights[i]`: routing weight to multiply this expert's output by.
+///
+/// Within a single bucket, every `token_idx[i]` is distinct: top-K returns
+/// distinct expert ids per token, so the same token can't appear twice in
+/// the same bucket. This is what lets the GPU scatter-accumulate avoid
+/// atomics (`moe_bucket_accumulate` reads each (token, hidden_dim) slot
+/// at most once per dispatch).
+///
+/// `expert_ids` is sorted ascending so the dispatch order is deterministic
+/// across runs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExpertBuckets {
+    pub expert_ids: Vec<i32>,
+    pub offsets: Vec<u32>,
+    pub token_idx: Vec<i32>,
+    pub weights: Vec<f32>,
+}
+
+/// Build [`ExpertBuckets`] from per-token (indices, weights) arrays.
+///
+/// `per_token_indices` and `per_token_weights` are flat arrays of length
+/// `n_tokens * k_active` in row-major order: position
+/// `(t, s) = t * k_active + s`.
+///
+/// `num_experts` is the model's full expert count. Output buckets only
+/// mention experts that were actually selected by ≥1 token.
+pub fn build_expert_buckets(
+    per_token_indices: &[i32],
+    per_token_weights: &[f32],
+    n_tokens: usize,
+    k_active: usize,
+    num_experts: usize,
+) -> ExpertBuckets {
+    debug_assert_eq!(per_token_indices.len(), n_tokens * k_active);
+    debug_assert_eq!(per_token_weights.len(), n_tokens * k_active);
+
+    let mut counts: Vec<u32> = vec![0; num_experts];
+    for &e in per_token_indices {
+        debug_assert!(
+            e >= 0 && (e as usize) < num_experts,
+            "expert id {e} out of range [0, {num_experts})"
+        );
+        counts[e as usize] += 1;
+    }
+
+    let num_non_empty: usize = counts.iter().filter(|&&c| c > 0).count();
+    let total_assignments: usize = n_tokens * k_active;
+
+    let mut expert_ids: Vec<i32> = Vec::with_capacity(num_non_empty);
+    let mut offsets: Vec<u32> = Vec::with_capacity(num_non_empty + 1);
+    let mut expert_to_bucket: Vec<i32> = vec![-1; num_experts];
+
+    let mut running: u32 = 0;
+    offsets.push(0);
+    for (e, &c) in counts.iter().enumerate() {
+        if c == 0 {
+            continue;
+        }
+        expert_to_bucket[e] = expert_ids.len() as i32;
+        expert_ids.push(e as i32);
+        running += c;
+        offsets.push(running);
+    }
+    debug_assert_eq!(running as usize, total_assignments);
+
+    let mut cursors: Vec<u32> = offsets[..num_non_empty].to_vec();
+
+    let mut token_idx: Vec<i32> = vec![0; total_assignments];
+    let mut weights: Vec<f32> = vec![0.0; total_assignments];
+
+    for t in 0..n_tokens {
+        for s in 0..k_active {
+            let flat = t * k_active + s;
+            let e = per_token_indices[flat];
+            let b = expert_to_bucket[e as usize] as usize;
+            let pos = cursors[b] as usize;
+            token_idx[pos] = t as i32;
+            weights[pos] = per_token_weights[flat];
+            cursors[b] += 1;
+        }
+    }
+
+    ExpertBuckets {
+        expert_ids,
+        offsets,
+        token_idx,
+        weights,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -481,5 +584,110 @@ mod tests {
         let unique: std::collections::HashSet<i32> =
             indices.iter().copied().collect();
         assert_eq!(unique.len(), k, "duplicate expert indices in output");
+    }
+
+    /// Reconstructing per-token (expert, weight) pairs from the CSR
+    /// buckets must reproduce the input arrays modulo within-token
+    /// ordering. Exercises the basic invariant of `build_expert_buckets`.
+    #[test]
+    fn build_expert_buckets_round_trips() {
+        // N=3 tokens, K=2 active, num_experts=4.
+        //   token 0 → (expert 0, w=0.7), (expert 3, w=0.3)
+        //   token 1 → (expert 0, w=0.4), (expert 2, w=0.6)
+        //   token 2 → (expert 3, w=0.5), (expert 0, w=0.5)
+        let indices: [i32; 6] = [0, 3, 0, 2, 3, 0];
+        let weights: [f32; 6] = [0.7, 0.3, 0.4, 0.6, 0.5, 0.5];
+        let b = build_expert_buckets(&indices, &weights, 3, 2, 4);
+
+        // Expert 1 is empty → three non-empty buckets sorted ascending:
+        // 0, 2, 3.
+        assert_eq!(b.expert_ids, vec![0, 2, 3]);
+        // bucket 0 (expert 0): tokens 0, 1, 2 → 3 entries
+        // bucket 1 (expert 2): token 1       → 1 entry
+        // bucket 2 (expert 3): tokens 0, 2   → 2 entries
+        assert_eq!(b.offsets, vec![0, 3, 4, 6]);
+
+        // Reconstruct per-token (expert, weight) sets from the CSR view.
+        let mut got: Vec<Vec<(i32, f32)>> = vec![vec![]; 3];
+        for (bi, &e) in b.expert_ids.iter().enumerate() {
+            let start = b.offsets[bi] as usize;
+            let end = b.offsets[bi + 1] as usize;
+            for j in start..end {
+                let t = b.token_idx[j] as usize;
+                got[t].push((e, b.weights[j]));
+            }
+        }
+        for t in 0..3 {
+            let mut want: Vec<(i32, f32)> = (0..2)
+                .map(|s| (indices[t * 2 + s], weights[t * 2 + s]))
+                .collect();
+            want.sort_by_key(|&(e, _)| e);
+            got[t].sort_by_key(|&(e, _)| e);
+            assert_eq!(got[t].len(), 2, "token {t} count");
+            for (g, w) in got[t].iter().zip(want.iter()) {
+                assert_eq!(g.0, w.0, "token {t} expert");
+                assert!((g.1 - w.1).abs() < 1e-9, "token {t} weight");
+            }
+        }
+    }
+
+    /// Top-K guarantees distinct experts per token, so within a single
+    /// bucket every token_idx entry must be unique. The
+    /// `moe_bucket_accumulate` kernel relies on this invariant to avoid
+    /// atomic stores into the per-token accumulator.
+    #[test]
+    fn build_expert_buckets_distinct_tokens_per_bucket() {
+        // N=4, K=2. All (token, slot) pairs map to distinct experts
+        // within each token (the top-K contract).
+        let indices: [i32; 8] = [0, 1, 1, 2, 0, 2, 1, 3];
+        let weights: [f32; 8] = [0.5, 0.5, 0.4, 0.6, 0.7, 0.3, 0.5, 0.5];
+        let b = build_expert_buckets(&indices, &weights, 4, 2, 4);
+        for bi in 0..b.expert_ids.len() {
+            let start = b.offsets[bi] as usize;
+            let end = b.offsets[bi + 1] as usize;
+            let mut sorted: Vec<i32> = b.token_idx[start..end].to_vec();
+            sorted.sort();
+            let len = sorted.len();
+            sorted.dedup();
+            assert_eq!(
+                sorted.len(),
+                len,
+                "duplicate token in bucket {bi}"
+            );
+        }
+    }
+
+    /// Empty buckets are not emitted: experts that no token picked do
+    /// not appear in `expert_ids`.
+    #[test]
+    fn build_expert_buckets_empty_skipped() {
+        // num_experts=10, only experts 2 and 7 selected.
+        let indices: [i32; 4] = [2, 7, 7, 2];
+        let weights: [f32; 4] = [0.5; 4];
+        let b = build_expert_buckets(&indices, &weights, 2, 2, 10);
+        assert_eq!(b.expert_ids, vec![2, 7]);
+        assert_eq!(b.offsets, vec![0, 2, 4]);
+        // Bucket 0 (expert 2): tokens 0, 1; bucket 1 (expert 7): tokens 0, 1.
+        let b0_tokens = &b.token_idx[0..2];
+        let b1_tokens = &b.token_idx[2..4];
+        let mut s0 = b0_tokens.to_vec();
+        s0.sort();
+        let mut s1 = b1_tokens.to_vec();
+        s1.sort();
+        assert_eq!(s0, vec![0, 1]);
+        assert_eq!(s1, vec![0, 1]);
+    }
+
+    /// Degenerate single-expert case: every token picks the same expert.
+    /// Exactly one bucket emerges with all N tokens in order.
+    #[test]
+    fn build_expert_buckets_single_expert() {
+        let indices: [i32; 4] = [3, 3, 3, 3];
+        let weights: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+        let b = build_expert_buckets(&indices, &weights, 4, 1, 8);
+        assert_eq!(b.expert_ids, vec![3]);
+        assert_eq!(b.offsets, vec![0, 4]);
+        assert_eq!(b.token_idx, vec![0, 1, 2, 3]);
+        assert_eq!(b.weights, vec![1.0; 4]);
     }
 }

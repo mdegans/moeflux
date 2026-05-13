@@ -145,6 +145,11 @@ pub fn encode_matvec(
 /// Per-(row, token) arithmetic matches the corresponding single-row
 /// kernel exactly, so N=1 is bit-exact vs [`encode_matvec`] on the
 /// same path. The 8-bit case panics — caller must not pass `bits=8`.
+///
+/// `input_off` / `output_off` are byte offsets into `input` / `output`,
+/// letting one big buffer hold multiple sub-batches (used by MoE
+/// permute-and-fuse to keep all buckets in a single packed buffer).
+/// Pass 0 for plain `[n_tokens, dim]` layouts.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_matvec_n_tokens(
     cmdbuf: &CommandBufferRef,
@@ -154,7 +159,9 @@ pub fn encode_matvec_n_tokens(
     s_off: u64,
     b_off: u64,
     input: &Buffer,
+    input_off: u64,
     output: &Buffer,
+    output_off: u64,
     in_dim: u32,
     out_dim: u32,
     n_tokens: u32,
@@ -181,8 +188,8 @@ pub fn encode_matvec_n_tokens(
     enc.set_buffer(0, Some(w_buf), w_off as NSUInteger);
     enc.set_buffer(1, Some(w_buf), s_off as NSUInteger);
     enc.set_buffer(2, Some(w_buf), b_off as NSUInteger);
-    enc.set_buffer(3, Some(input), 0);
-    enc.set_buffer(4, Some(output), 0);
+    enc.set_buffer(3, Some(input), input_off as NSUInteger);
+    enc.set_buffer(4, Some(output), output_off as NSUInteger);
     enc.set_bytes(5, 4, (&out_dim as *const u32).cast());
     enc.set_bytes(6, 4, (&in_dim as *const u32).cast());
     enc.set_bytes(7, 4, (&group_size as *const u32).cast());

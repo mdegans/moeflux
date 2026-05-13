@@ -21,6 +21,9 @@
 use metal::{Buffer, MTLResourceOptions, NSUInteger};
 
 use moeflux::riir::cpu_matvec::{bf16_matvec_cpu, dequant_matvec_4bit_cpu};
+use moeflux::riir::expert_forward::{
+    encode_moe_batched_permute_fuse, gpu_expert_forward,
+};
 use moeflux::riir::gpu_attn::{
     encode_sdpa_causal_tiled, BatchedSdpaPipelines,
 };
@@ -29,8 +32,10 @@ use moeflux::riir::gpu_matvec::{
     MatvecPipelines,
 };
 use moeflux::riir::metal::MetalBackend;
+use moeflux::riir::moe_router::build_expert_buckets;
 use moeflux::riir::sdpa::sdpa_cpu;
 use moeflux::riir::variants::VARIANT;
+use moeflux::riir::MtlBuffer;
 
 const GROUP_SIZE: u32 = 64;
 
@@ -393,8 +398,8 @@ fn run_4bit_n_tokens_test(in_dim: u32, out_dim: u32, n_tokens: u32, seed: u64) {
     let queue = metal.queue();
     let cmdbuf = queue.new_command_buffer();
     encode_matvec_n_tokens(
-        cmdbuf, &pipes, &w_buf, w_off, s_off, b_off, &in_buf, &out_buf,
-        in_dim, out_dim, n_tokens, 4,
+        cmdbuf, &pipes, &w_buf, w_off, s_off, b_off, &in_buf, 0,
+        &out_buf, 0, in_dim, out_dim, n_tokens, 4,
     );
     cmdbuf.commit();
     cmdbuf.wait_until_completed();
@@ -495,8 +500,8 @@ fn dequant_matvec_4bit_n_tokens_v3_n1_matches_single() {
         enc.end_encoding();
     }
     encode_matvec_n_tokens(
-        cmdbuf, &pipes, &w_buf, w_off, s_off, b_off, &in_buf,
-        &out_batched, in_dim, out_dim, 1, 4,
+        cmdbuf, &pipes, &w_buf, w_off, s_off, b_off, &in_buf, 0,
+        &out_batched, 0, in_dim, out_dim, 1, 4,
     );
     cmdbuf.commit();
     cmdbuf.wait_until_completed();
@@ -844,6 +849,260 @@ fn sdpa_causal_tiled_n4_matches_tokenwise_cpu() {
             cos >= COSINE_FLOOR,
             "token {} cosine {} below floor {}",
             q,
+            cos,
+            COSINE_FLOOR
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4: MoE permute-and-fuse vs tokenwise gpu_expert_forward + sum.
+// ---------------------------------------------------------------------------
+
+/// Build a synthetic 4-bit expert blob with the same on-disk layout the
+/// production weight pipeline emits. Uses `VARIANT`'s offsets so the
+/// produced bytes are consumed unchanged by `gpu_expert_forward` and
+/// `encode_moe_batched_permute_fuse`.
+fn gen_synth_expert_blob(rng: &mut XorShift64) -> Vec<u8> {
+    let v = VARIANT;
+    let h = v.hidden_dim;
+    let mi = v.moe_intermediate;
+    let mut buf = vec![0u8; v.expert_size_4bit()];
+
+    let write_at = |buf: &mut Vec<u8>, off: usize, src_bytes: &[u8]| {
+        buf[off..off + src_bytes.len()].copy_from_slice(src_bytes);
+    };
+    let as_bytes_u32 = |v: &[u32]| -> &[u8] {
+        unsafe {
+            std::slice::from_raw_parts(
+                v.as_ptr() as *const u8,
+                std::mem::size_of_val(v),
+            )
+        }
+    };
+    let as_bytes_u16 = |v: &[u16]| -> &[u8] {
+        unsafe {
+            std::slice::from_raw_parts(
+                v.as_ptr() as *const u8,
+                std::mem::size_of_val(v),
+            )
+        }
+    };
+
+    // gate: [mi, h]
+    let (packed, scales, biases) = gen_4bit_weights(rng, mi, h);
+    write_at(&mut buf, v.gate_w_off_4bit(), as_bytes_u32(&packed));
+    write_at(&mut buf, v.gate_s_off_4bit(), as_bytes_u16(&scales));
+    write_at(&mut buf, v.gate_b_off_4bit(), as_bytes_u16(&biases));
+
+    // up: [mi, h]
+    let (packed, scales, biases) = gen_4bit_weights(rng, mi, h);
+    write_at(&mut buf, v.up_w_off_4bit(), as_bytes_u32(&packed));
+    write_at(&mut buf, v.up_s_off_4bit(), as_bytes_u16(&scales));
+    write_at(&mut buf, v.up_b_off_4bit(), as_bytes_u16(&biases));
+
+    // down: [h, mi]
+    let (packed, scales, biases) = gen_4bit_weights(rng, h, mi);
+    write_at(&mut buf, v.down_w_off_4bit(), as_bytes_u32(&packed));
+    write_at(&mut buf, v.down_s_off_4bit(), as_bytes_u16(&scales));
+    write_at(&mut buf, v.down_b_off_4bit(), as_bytes_u16(&biases));
+
+    buf
+}
+
+/// Diff `encode_moe_batched_permute_fuse` against a tokenwise loop of
+/// `gpu_expert_forward` summed per-token with the routing weights. Same
+/// expert blobs, same routing weights, same arithmetic — only the
+/// dispatch order differs (per-expert bucket vs per-token slot). The
+/// FP-reorder envelope keeps cosine ≥ COSINE_FLOOR per token.
+///
+/// Fixture: N=4 tokens, K=4 active experts each, num_experts=12 (with 4
+/// experts empty by construction — exercises the empty-bucket skip).
+/// Routing creates 8 non-empty buckets, each of size 2.
+#[test]
+#[ignore = "long-running GPU test"]
+fn moe_permute_fuse_n_tokens_matches_tokenwise() {
+    let v = VARIANT;
+    let n_tokens: usize = 4;
+    let k_active: usize = 4;
+    let num_experts: usize = 12;
+    let h = v.hidden_dim;
+    let mi = v.moe_intermediate;
+
+    let mut rng = XorShift64::new(0xCAFE_BABE_DEAD_BEEF);
+
+    // Routing fixture: 8 distinct experts in use (0..7), 4 empty (8..11).
+    // Each (token, slot) pair distinct within a token (top-K invariant).
+    // Bucket sizes: every non-empty bucket has 2 tokens.
+    let routing_experts: [[i32; 4]; 4] = [
+        [0, 1, 2, 3],
+        [2, 3, 4, 5],
+        [4, 5, 6, 7],
+        [6, 7, 0, 1],
+    ];
+
+    let mut per_token_indices = vec![0i32; n_tokens * k_active];
+    let mut per_token_weights = vec![0.0f32; n_tokens * k_active];
+    for t in 0..n_tokens {
+        for s in 0..k_active {
+            per_token_indices[t * k_active + s] = routing_experts[t][s];
+            // Bounded positive weights — keep arithmetic well-conditioned
+            // for the FP-reorder envelope.
+            per_token_weights[t * k_active + s] =
+                rng.next_f32() * 0.4 + 0.3;
+        }
+    }
+
+    // Post-attn-norm hidden states per token. Synthesized in (-1, 1).
+    let mut h_post = vec![0.0f32; n_tokens * h];
+    for x in h_post.iter_mut() {
+        *x = rng.next_f32();
+    }
+
+    // Generate one blob per unique selected expert (parallel to a sorted
+    // unique_experts list, which matches buckets.expert_ids order).
+    let unique_experts: Vec<i32> = {
+        let mut seen = std::collections::BTreeSet::new();
+        for &e in &per_token_indices {
+            seen.insert(e);
+        }
+        seen.into_iter().collect()
+    };
+    assert_eq!(unique_experts.len(), 8);
+
+    let synth_blobs: Vec<Vec<u8>> = (0..unique_experts.len())
+        .map(|_| gen_synth_expert_blob(&mut rng))
+        .collect();
+    let expert_to_blob_idx: std::collections::HashMap<i32, usize> =
+        unique_experts
+            .iter()
+            .enumerate()
+            .map(|(i, &e)| (e, i))
+            .collect();
+
+    // ---- Tokenwise reference: gpu_expert_forward per (t, s), sum
+    // weighted into per_token_ref[t].
+    let mut metal = MetalBackend::new().expect("open Metal");
+    let mut per_token_ref = vec![0.0f32; n_tokens * h];
+    for t in 0..n_tokens {
+        let h_post_t = &h_post[t * h..(t + 1) * h];
+        for s in 0..k_active {
+            let e = per_token_indices[t * k_active + s];
+            let w = per_token_weights[t * k_active + s];
+            let blob_idx = expert_to_blob_idx[&e];
+            let mut out_expert = vec![0.0f32; h];
+            gpu_expert_forward(
+                &mut metal,
+                &synth_blobs[blob_idx],
+                h_post_t,
+                &mut out_expert,
+            )
+            .expect("gpu_expert_forward");
+            let dst = &mut per_token_ref[t * h..(t + 1) * h];
+            for (d, &x) in dst.iter_mut().zip(out_expert.iter()) {
+                *d += w * x;
+            }
+        }
+    }
+
+    // ---- Batched (system under test): build CSR, pack inputs, dispatch.
+    let buckets = build_expert_buckets(
+        &per_token_indices,
+        &per_token_weights,
+        n_tokens,
+        k_active,
+        num_experts,
+    );
+    assert_eq!(buckets.expert_ids, unique_experts);
+    let total_assignments = buckets.token_idx.len();
+    assert_eq!(total_assignments, n_tokens * k_active);
+
+    // Upload per-bucket expert blobs (parallel to buckets.expert_ids).
+    let blobs_mtl: Vec<MtlBuffer<u8>> = buckets
+        .expert_ids
+        .iter()
+        .map(|&e| {
+            let idx = expert_to_blob_idx[&e];
+            MtlBuffer::<u8>::with_data(metal.device(), &synth_blobs[idx])
+        })
+        .collect();
+
+    // Host gather: pack post-attn-norm rows into bucket-major layout.
+    let mut packed_input = vec![0.0f32; total_assignments * h];
+    for (i, &t) in buckets.token_idx.iter().enumerate() {
+        let src = &h_post[(t as usize) * h..((t as usize) + 1) * h];
+        packed_input[i * h..(i + 1) * h].copy_from_slice(src);
+    }
+
+    let in_buf = make_buf::<f32>(&metal, packed_input.len());
+    write_buf(&in_buf, &packed_input);
+    let gate_buf = make_buf::<f32>(&metal, total_assignments * mi);
+    let up_buf = make_buf::<f32>(&metal, total_assignments * mi);
+    let act_buf = make_buf::<f32>(&metal, total_assignments * mi);
+    let out_buf = make_buf::<f32>(&metal, total_assignments * h);
+    let idx_buf = make_buf::<i32>(&metal, total_assignments);
+    write_buf(&idx_buf, &buckets.token_idx);
+    let w_buf = make_buf::<f32>(&metal, total_assignments);
+    write_buf(&w_buf, &buckets.weights);
+    let out_sum_buf = make_buf::<f32>(&metal, n_tokens * h);
+    write_buf(&out_sum_buf, &vec![0.0f32; n_tokens * h]);
+
+    let matvec_pipes =
+        MatvecPipelines::fetch(&mut metal).expect("fetch MatvecPipelines");
+    let swiglu = metal
+        .pipeline("swiglu_fused")
+        .expect("swiglu_fused pipeline")
+        .clone();
+    let bucket_accumulate = metal
+        .pipeline("moe_bucket_accumulate")
+        .expect("moe_bucket_accumulate pipeline")
+        .clone();
+
+    let queue = metal.queue();
+    let cmdbuf = queue.new_command_buffer();
+    encode_moe_batched_permute_fuse(
+        cmdbuf,
+        &matvec_pipes,
+        &swiglu,
+        &bucket_accumulate,
+        &blobs_mtl,
+        &in_buf,
+        &gate_buf,
+        &up_buf,
+        &act_buf,
+        &out_buf,
+        &idx_buf,
+        &w_buf,
+        &out_sum_buf,
+        &buckets,
+        v,
+    );
+    cmdbuf.commit();
+    cmdbuf.wait_until_completed();
+
+    let gpu_out = read_buf_f32(&out_sum_buf, n_tokens * h);
+    assert!(
+        gpu_out.iter().all(|x| x.is_finite()),
+        "permute-fuse output has non-finite values"
+    );
+
+    for t in 0..n_tokens {
+        let g = &gpu_out[t * h..(t + 1) * h];
+        let c = &per_token_ref[t * h..(t + 1) * h];
+        let cos = cosine_sim(g, c);
+        let max_abs: f32 = g
+            .iter()
+            .zip(c.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
+        eprintln!(
+            "[diff:moe_permute_fuse] token={} cosine={:.9} max_abs={:.3e}",
+            t, cos, max_abs
+        );
+        assert!(
+            cos >= COSINE_FLOOR,
+            "token {} cosine {:.9} below floor {}",
+            t,
             cos,
             COSINE_FLOOR
         );

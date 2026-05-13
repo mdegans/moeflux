@@ -1942,6 +1942,46 @@ kernel void moe_combine_residual_unscaled(
 }
 
 // ============================================================================
+// Kernel 12c: MoE bucket-accumulate (batched permute-and-fuse)
+// ============================================================================
+// Scatter-weighted add for the batched MoE permute-and-fuse path:
+//   out_sum[token_idx[b] * hidden_dim + h]
+//       += weights[b] * bucket_out[b * hidden_dim + h]
+//
+// One dispatch per non-empty expert bucket. `bucket_size` is the number
+// of (token, slot) tuples that picked this expert; `bucket_out` is the
+// stacked expert outputs `[bucket_size, hidden_dim]` produced by the
+// gate/up/swiglu/down sequence over the bucket's stacked inputs.
+//
+// Atomic-free: top-K returns distinct experts per token, so the same
+// `token_idx[b]` value never appears twice within one bucket — no two
+// threads write to the same `out_sum` slot within a single dispatch.
+// Cross-bucket accumulation is handled by Metal's encoder-internal
+// serialization (we dispatch buckets sequentially in one cmdbuf).
+//
+// Dispatch:
+//   threadgroups = (bucket_size, ceil(hidden_dim / 256), 1)
+//   threads      = (1, 256, 1)
+
+kernel void moe_bucket_accumulate(
+    device const float* bucket_out  [[buffer(0)]],   // [bucket_size, hidden_dim]
+    device const int*   token_idx   [[buffer(1)]],   // [bucket_size]
+    device const float* weights     [[buffer(2)]],   // [bucket_size]
+    device float*       out_sum     [[buffer(3)]],   // [n_tokens, hidden_dim]
+    constant uint&      hidden_dim  [[buffer(4)]],
+    constant uint&      bucket_size [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint b = gid.x;
+    uint h = gid.y;
+    if (b >= bucket_size || h >= hidden_dim) return;
+
+    float val = bucket_out[b * hidden_dim + h] * weights[b];
+    uint  t   = (uint)token_idx[b];
+    out_sum[t * hidden_dim + h] += val;
+}
+
+// ============================================================================
 // Kernel 13: YaRN RoPE (DeepSeek-V3 / Cogito-V2 MLA)
 // ============================================================================
 // In-place rotation of a `[num_heads, rotary_dim]` buffer using a
