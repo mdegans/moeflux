@@ -960,6 +960,64 @@ kernel void bf16_matvec(
 
 
 // ============================================================================
+// Kernel 5b: BF16-weight matmul, N tokens (same weights, different inputs).
+// ============================================================================
+//
+// Batched-prefill primitive. Applies a single [out_dim, in_dim] BF16
+// weight matrix to a run of N token activations [n_tokens, in_dim] and
+// writes [n_tokens, out_dim] f32.
+//
+// Per-(row, token) reduction matches `bf16_matvec` exactly: same
+// stride-by-tg_size traversal, same tree reduce. Running N calls of
+// `bf16_matvec` and one call of this with n_tokens=N must produce
+// bit-exact-mod-fp-reorder identical output — they are the same
+// arithmetic.
+//
+// Grid: linearized (row + token * out_dim). 256 threads/group.
+// out_dim × n_tokens threadgroups total. Fits comfortably in MTLSize
+// width for any (hidden_dim, prefill_batch) we ship.
+
+kernel void bf16_matmul_n_tokens(
+    device const uint16_t* w        [[buffer(0)]],   // [out_dim, in_dim] bf16 row-major
+    device const float*    input    [[buffer(1)]],   // [n_tokens, in_dim] f32
+    device float*          output   [[buffer(2)]],   // [n_tokens, out_dim] f32
+    constant uint&         in_dim   [[buffer(3)]],
+    constant uint&         out_dim  [[buffer(4)]],
+    constant uint&         n_tokens [[buffer(5)]],
+    uint tg_idx_flat [[threadgroup_position_in_grid]],
+    uint lid         [[thread_position_in_threadgroup]],
+    uint tg_size     [[threads_per_threadgroup]]
+) {
+    uint token = tg_idx_flat / out_dim;
+    uint row   = tg_idx_flat % out_dim;
+    if (token >= n_tokens) return;
+
+    threadgroup float partials[256];
+
+    const device uint16_t* w_row = w + (size_t)row * (size_t)in_dim;
+    const device float*    x_row = input + (size_t)token * (size_t)in_dim;
+
+    float sum = 0.0;
+    for (uint i = lid; i < in_dim; i += tg_size) {
+        sum += x_row[i] * bf16_to_f32(w_row[i]);
+    }
+    partials[lid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = tg_size / 2; stride > 0; stride /= 2) {
+        if (lid < stride) {
+            partials[lid] += partials[lid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (lid == 0) {
+        output[(size_t)token * (size_t)out_dim + row] = partials[0];
+    }
+}
+
+
+// ============================================================================
 // Kernel 6: Batched GPU attention scores (Q @ K^T, scaled) — all heads at once
 // ============================================================================
 //

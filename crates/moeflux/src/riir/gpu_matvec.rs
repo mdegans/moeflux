@@ -129,14 +129,19 @@ pub fn encode_matvec(
 /// (`model.layers.{i}.mlp.gate.weight`, `[num_experts, hidden_dim]`
 /// BF16) which the 4-bit dequant matvec can't handle. Sibling of
 /// [`MatvecPipelines`].
+///
+/// `bf16_n` is the batched-prefill variant: same weights applied to N
+/// token activations in one dispatch. See [`encode_bf16_matmul_n_tokens`].
 pub struct BfMatvecPipelines {
     pub bf16: ComputePipelineState,
+    pub bf16_n: ComputePipelineState,
 }
 
 impl BfMatvecPipelines {
     pub fn fetch(metal: &mut MetalBackend) -> Result<Self, MetalError> {
         Ok(Self {
             bf16: metal.pipeline("bf16_matvec")?.clone(),
+            bf16_n: metal.pipeline("bf16_matmul_n_tokens")?.clone(),
         })
     }
 }
@@ -165,6 +170,44 @@ pub fn encode_bf16_matvec(
     enc.set_bytes(4, 4, (&out_dim as *const u32).cast());
     enc.dispatch_thread_groups(
         MTLSize::new(out_dim as NSUInteger, 1, 1),
+        MTLSize::new(256, 1, 1),
+    );
+    enc.end_encoding();
+}
+
+/// BF16-weight matmul over N tokens (same weights, different inputs).
+///
+/// Applies `[out_dim, in_dim]` BF16 weights at `w_off` to `n_tokens`
+/// stacked `in_dim`-wide f32 activations and writes `[n_tokens, out_dim]`
+/// f32. Per-(row, token) arithmetic matches [`encode_bf16_matvec`]
+/// exactly, so the two are bit-exact-mod-fp-reorder when fed identical
+/// inputs. Grid: `out_dim * n_tokens` threadgroups, 256 threads/group.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_bf16_matmul_n_tokens(
+    cmdbuf: &CommandBufferRef,
+    pipes: &BfMatvecPipelines,
+    w_buf: &Buffer,
+    w_off: u64,
+    input: &Buffer,
+    output: &Buffer,
+    in_dim: u32,
+    out_dim: u32,
+    n_tokens: u32,
+) {
+    if n_tokens == 0 {
+        return;
+    }
+    let enc = cmdbuf.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipes.bf16_n);
+    enc.set_buffer(0, Some(w_buf), w_off as NSUInteger);
+    enc.set_buffer(1, Some(input), 0);
+    enc.set_buffer(2, Some(output), 0);
+    enc.set_bytes(3, 4, (&in_dim as *const u32).cast());
+    enc.set_bytes(4, 4, (&out_dim as *const u32).cast());
+    enc.set_bytes(5, 4, (&n_tokens as *const u32).cast());
+    let total_tgs = (out_dim as u64).saturating_mul(n_tokens as u64);
+    enc.dispatch_thread_groups(
+        MTLSize::new(total_tgs as NSUInteger, 1, 1),
         MTLSize::new(256, 1, 1),
     );
     enc.end_encoding();
