@@ -137,6 +137,33 @@ pub enum CheckpointError {
 /// Phase 1b / Phase 4 alongside the kernels that actually consume
 /// them. Calling an unported method panics with a `todo!()` pinned
 /// to the phase that will implement it.
+/// Chunked-prefill default for the batched-GQA orchestrator. Hardware-
+/// tuned for 96 GB unified RAM + SSD profile per the Phase D plan;
+/// Phase F sweep will validate / refine the value. Production callers
+/// don't override; tests that need to exercise multi-chunk boundary
+/// math at small N use [`set_batched_chunk_size_for_test`].
+pub const BATCHED_CHUNK_SIZE: usize = 8192;
+
+std::thread_local! {
+    static BATCHED_CHUNK_OVERRIDE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Set / clear the per-thread chunk-size override for
+/// [`RsCtx::step_internal`]. **Test-only.** Production callers must
+/// not call this — the only purpose is exercising chunk-boundary
+/// arithmetic at small N from integration tests. Pass `None` to
+/// restore the default.
+pub fn set_batched_chunk_size_for_test(n: Option<usize>) {
+    BATCHED_CHUNK_OVERRIDE.with(|c| c.set(n));
+}
+
+fn batched_chunk_size() -> usize {
+    BATCHED_CHUNK_OVERRIDE
+        .with(|c| c.get())
+        .unwrap_or(BATCHED_CHUNK_SIZE)
+}
+
 pub struct RsCtx {
     wf: WeightFile,
     /// Lazily-built Metal backend. CPU-only kernels skip the cost; GPU
@@ -1282,7 +1309,37 @@ impl RsCtx {
             return Ok(());
         }
 
-        self.step_internal_batched_gqa(tokens, start_pos, logits_out)
+        // Chunked iteration over the batched-GQA path. Phase D fixes
+        // CHUNK_SIZE = 8192 — the Phase F sweep will validate this
+        // hardware-tuned default. Only the last chunk's last token
+        // emits logits. `start_pos` advances by `CHUNK_SIZE` per
+        // chunk so the KV cache reflects the cumulative position.
+        //
+        // Tests can override CHUNK_SIZE via [`BATCHED_CHUNK_OVERRIDE`]
+        // (thread-local) so multi-chunk boundary math is exercisable
+        // at small N without paying long-prompt wall-clock.
+        let chunk_size = batched_chunk_size();
+        let n = tokens.len();
+        let mut chunk_start = 0usize;
+        let mut logits_owned = logits_out;
+        while chunk_start < n {
+            let chunk_end = (chunk_start + chunk_size).min(n);
+            let is_last_chunk = chunk_end == n;
+            let chunk_tokens = &tokens[chunk_start..chunk_end];
+            let chunk_start_pos = start_pos + chunk_start as i32;
+            let chunk_logits = if is_last_chunk {
+                logits_owned.take()
+            } else {
+                None
+            };
+            self.step_internal_batched_gqa(
+                chunk_tokens,
+                chunk_start_pos,
+                chunk_logits,
+            )?;
+            chunk_start = chunk_end;
+        }
+        Ok(())
     }
 
     /// GQA batched orchestrator — the Phase B+C implementation that

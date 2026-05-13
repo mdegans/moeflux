@@ -4218,3 +4218,174 @@ fn eval_prompt_matches_per_token_oracle() {
         "post-prompt continuation cosine {cont_cos:.7} below 0.9999"
     );
 }
+
+/// Phase D — chunkwise iteration. With `BATCHED_CHUNK_SIZE` overridden
+/// to 4 via the test hook, a 16-token prompt evaluates as 4 chunks of
+/// 4 tokens each (instead of one chunk of 16). The end-of-prompt
+/// logits must match the per-token oracle within the same FP-reorder
+/// envelope that single-chunk eval_prompt achieves. Catches:
+/// chunk-boundary `start_pos` arithmetic, KV state advance across
+/// chunks, scratch buffer reuse, last-chunk logits emission gating.
+#[test]
+#[ignore = "long running; needs moeflux artifacts"]
+fn eval_prompt_chunked_matches_eval_prompt_whole_prompt() {
+    let prompt: [i32; 16] = [
+        1, 200, 600, 1100, 2, 300, 700, 1200, 3, 400, 800, 1300, 4, 500,
+        900, 1400,
+    ];
+    let next_token = 7i32;
+    let next_pos = prompt.len();
+
+    let mut rs_ref: RsBackend = open_backend();
+    let n_vocab = rs_ref.0.n_vocab();
+    let mut ref_prompt_logits = vec![0.0f32; n_vocab];
+    for (i, &tok) in prompt.iter().enumerate() {
+        rs_ref
+            .0
+            .eval_token(tok, i, 0, &mut ref_prompt_logits)
+            .expect("oracle eval_token");
+    }
+    let ref_continuation = rs_ref.eval_token(next_token, next_pos);
+
+    // Test path: chunk size = 4, so the 16-token prompt evaluates as
+    // 4 chunks of 4 tokens each. Restore the override at the end so
+    // later tests on the same thread use the production default.
+    moeflux::riir::set_batched_chunk_size_for_test(Some(4));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut rs: RsBackend = open_backend();
+        let mut prompt_logits = vec![0.0f32; n_vocab];
+        rs.0.eval_prompt(&prompt, 0, 0, &mut prompt_logits)
+            .expect("chunked eval_prompt");
+        let test_continuation = rs.eval_token(next_token, next_pos);
+        (prompt_logits, test_continuation)
+    }));
+    moeflux::riir::set_batched_chunk_size_for_test(None);
+    let (prompt_logits, test_continuation) = match result {
+        Ok(t) => t,
+        Err(payload) => std::panic::resume_unwind(payload),
+    };
+
+    let prompt_cos = cosine_sim(&ref_prompt_logits, &prompt_logits);
+    let prompt_drift = ref_prompt_logits
+        .iter()
+        .zip(prompt_logits.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let cont_cos = cosine_sim(&ref_continuation, &test_continuation);
+    let cont_drift = ref_continuation
+        .iter()
+        .zip(test_continuation.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    eprintln!(
+        "[diff:eval_prompt_chunked_matches_eval_prompt_whole_prompt] \
+         chunk=4 prompt cosine={prompt_cos:.7} max_abs={prompt_drift:.3e} | \
+         continuation cosine={cont_cos:.7} max_abs={cont_drift:.3e}"
+    );
+    assert_eq!(
+        argmax(&ref_prompt_logits),
+        argmax(&prompt_logits),
+        "chunked eval_prompt last-token argmax diverged from oracle"
+    );
+    assert_eq!(
+        argmax(&ref_continuation),
+        argmax(&test_continuation),
+        "post-chunked-prompt continuation argmax diverged from oracle"
+    );
+    assert!(
+        prompt_cos >= 0.9999,
+        "chunked eval_prompt cosine {prompt_cos:.7} below 0.9999"
+    );
+    assert!(
+        cont_cos >= 0.9999,
+        "post-chunked continuation cosine {cont_cos:.7} below 0.9999"
+    );
+}
+
+/// Phase D — prompt-cache scenario. Eval a "cached prefix" on ctx_A,
+/// snapshot, reset, load, then eval the suffix with
+/// `start_pos = prefix.len()`. The resulting continuation logits must
+/// match a control: eval the full `prefix ++ suffix` on a fresh ctx_B
+/// from `start_pos = 0`.
+///
+/// This is the cache-hit pattern drama_llama's prefix-reuse layer
+/// uses (Session: hash-keyed lookup → state_load → eval_prompt(suffix,
+/// cached_pos)). Failure mode: KV state at `start_pos` doesn't quite
+/// match what a fresh forward at the same position produces — could
+/// be a snapshot serialization bug, a chunk-boundary arithmetic bug,
+/// or a linear-attn recurrent-state issue.
+#[test]
+#[ignore = "long running; needs moeflux artifacts"]
+fn prompt_cache_start_pos_nonzero_matches() {
+    let prefix: [i32; 4] = [1, 200, 600, 1100];
+    let suffix: [i32; 5] = [2, 300, 700, 1200, 3];
+    let next_token = 7i32;
+    let full_pos = prefix.len() + suffix.len();
+
+    // Control: full prompt from start_pos=0.
+    let mut rs_ctrl: RsBackend = open_backend();
+    let mut full_prompt = Vec::with_capacity(full_pos);
+    full_prompt.extend_from_slice(&prefix);
+    full_prompt.extend_from_slice(&suffix);
+    let n_vocab = rs_ctrl.0.n_vocab();
+    let mut ctrl_prompt_logits = vec![0.0f32; n_vocab];
+    rs_ctrl
+        .0
+        .eval_prompt(&full_prompt, 0, 0, &mut ctrl_prompt_logits)
+        .expect("control eval_prompt");
+    let ctrl_continuation = rs_ctrl.eval_token(next_token, full_pos);
+
+    // Test: prefix → snapshot → reset → load → suffix at start_pos=4.
+    let mut rs: RsBackend = open_backend();
+    let mut _prefix_logits = vec![0.0f32; n_vocab];
+    rs.0.eval_prompt(&prefix, 0, 0, &mut _prefix_logits)
+        .expect("prefix eval_prompt");
+
+    let snap_size = rs.0.state_size();
+    let mut snap = vec![0u8; snap_size];
+    rs.0.state_save(&mut snap).expect("state_save");
+
+    rs.memory_clear();
+    rs.0.state_load(&snap).expect("state_load");
+
+    let mut test_prompt_logits = vec![0.0f32; n_vocab];
+    rs.0.eval_prompt(
+        &suffix,
+        prefix.len(),
+        0,
+        &mut test_prompt_logits,
+    )
+    .expect("suffix eval_prompt at start_pos != 0");
+    let test_continuation = rs.eval_token(next_token, full_pos);
+
+    let prompt_cos = cosine_sim(&ctrl_prompt_logits, &test_prompt_logits);
+    let prompt_drift = ctrl_prompt_logits
+        .iter()
+        .zip(test_prompt_logits.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let cont_cos = cosine_sim(&ctrl_continuation, &test_continuation);
+    let cont_drift = ctrl_continuation
+        .iter()
+        .zip(test_continuation.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    eprintln!(
+        "[diff:prompt_cache_start_pos_nonzero_matches] \
+         prompt cosine={prompt_cos:.7} max_abs={prompt_drift:.3e} | \
+         continuation cosine={cont_cos:.7} max_abs={cont_drift:.3e}"
+    );
+    assert_eq!(
+        argmax(&ctrl_prompt_logits),
+        argmax(&test_prompt_logits),
+        "prompt-cache last-token argmax diverged from control"
+    );
+    assert!(
+        prompt_cos >= 0.9999,
+        "prompt-cache prompt cosine {prompt_cos:.7} below 0.9999"
+    );
+    assert!(
+        cont_cos >= 0.9999,
+        "prompt-cache continuation cosine {cont_cos:.7} below 0.9999"
+    );
+}
