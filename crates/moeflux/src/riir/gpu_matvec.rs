@@ -60,10 +60,19 @@ pub struct MatvecSpec<'a> {
 
 /// Pre-fetched matvec pipelines. All three flavors compile lazily on
 /// first request via [`MetalBackend::pipeline`].
+///
+/// `*_n_tokens` variants are the batched-prefill versions: same weights
+/// applied to N stacked input vectors in one dispatch. See
+/// [`encode_matvec_n_tokens`]. 8-bit batched is not implemented yet —
+/// the 8-bit projections (gate logits etc.) on Qwen3-A3B are small
+/// enough that per-token dispatch is cheap; revisit if measurement
+/// flags it.
 pub struct MatvecPipelines {
     pub v3_4bit: ComputePipelineState,
     pub fast_4bit: ComputePipelineState,
     pub v3_8bit: ComputePipelineState,
+    pub v3_4bit_n: ComputePipelineState,
+    pub fast_4bit_n: ComputePipelineState,
 }
 
 impl MatvecPipelines {
@@ -72,6 +81,12 @@ impl MatvecPipelines {
             v3_4bit: metal.pipeline("dequant_matvec_4bit_v3")?.clone(),
             fast_4bit: metal.pipeline("dequant_matvec_4bit_fast")?.clone(),
             v3_8bit: metal.pipeline("dequant_matvec_8bit_v3")?.clone(),
+            v3_4bit_n: metal
+                .pipeline("dequant_matvec_4bit_v3_n_tokens")?
+                .clone(),
+            fast_4bit_n: metal
+                .pipeline("dequant_matvec_4bit_fast_n_tokens")?
+                .clone(),
         })
     }
 }
@@ -115,6 +130,77 @@ pub fn encode_matvec(
     } else {
         enc.dispatch_thread_groups(
             MTLSize::new(spec.out_dim as NSUInteger, 1, 1),
+            MTLSize::new(64, 1, 1),
+        );
+    }
+    enc.end_encoding();
+}
+
+/// Batched-prefill variant: apply one 4-bit-quantized weight matrix to
+/// `n_tokens` stacked f32 input vectors, writing `[n_tokens, out_dim]`
+/// f32 output. Mirrors [`encode_matvec`]'s pipeline selection: v3 when
+/// `in_dim ≤ 4096`, fast otherwise. 8-bit is not (yet) batched — see
+/// [`MatvecPipelines`] doc.
+///
+/// Per-(row, token) arithmetic matches the corresponding single-row
+/// kernel exactly, so N=1 is bit-exact vs [`encode_matvec`] on the
+/// same path. The 8-bit case panics — caller must not pass `bits=8`.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_matvec_n_tokens(
+    cmdbuf: &CommandBufferRef,
+    pipes: &MatvecPipelines,
+    w_buf: &Buffer,
+    w_off: u64,
+    s_off: u64,
+    b_off: u64,
+    input: &Buffer,
+    output: &Buffer,
+    in_dim: u32,
+    out_dim: u32,
+    n_tokens: u32,
+    bits: u32,
+) {
+    assert!(
+        bits == 4,
+        "encode_matvec_n_tokens: only 4-bit supported (got bits={})",
+        bits
+    );
+    if n_tokens == 0 {
+        return;
+    }
+    let group_size = GROUP_SIZE as u32;
+    let use_v3 = in_dim <= 4096;
+    let pipeline = if use_v3 {
+        &pipes.v3_4bit_n
+    } else {
+        &pipes.fast_4bit_n
+    };
+
+    let enc = cmdbuf.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(pipeline);
+    enc.set_buffer(0, Some(w_buf), w_off as NSUInteger);
+    enc.set_buffer(1, Some(w_buf), s_off as NSUInteger);
+    enc.set_buffer(2, Some(w_buf), b_off as NSUInteger);
+    enc.set_buffer(3, Some(input), 0);
+    enc.set_buffer(4, Some(output), 0);
+    enc.set_bytes(5, 4, (&out_dim as *const u32).cast());
+    enc.set_bytes(6, 4, (&in_dim as *const u32).cast());
+    enc.set_bytes(7, 4, (&group_size as *const u32).cast());
+    enc.set_bytes(8, 4, (&n_tokens as *const u32).cast());
+
+    if use_v3 {
+        let num_row_tiles = (out_dim + 7) / 8;
+        enc.set_bytes(9, 4, (&num_row_tiles as *const u32).cast());
+        let total_tgs =
+            (num_row_tiles as u64).saturating_mul(n_tokens as u64);
+        enc.dispatch_thread_groups(
+            MTLSize::new(total_tgs as NSUInteger, 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
+    } else {
+        let total_tgs = (out_dim as u64).saturating_mul(n_tokens as u64);
+        enc.dispatch_thread_groups(
+            MTLSize::new(total_tgs as NSUInteger, 1, 1),
             MTLSize::new(64, 1, 1),
         );
     }

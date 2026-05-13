@@ -341,6 +341,188 @@ kernel void dequant_matvec_4bit_v3(
 
 
 // ============================================================================
+// Kernel 1d-v3-n: 4-bit dequant matvec, N tokens (in_dim ≤ 4096 path).
+// ============================================================================
+//
+// Batched-prefill variant of `dequant_matvec_4bit_v3`. Same weights
+// applied to `n_tokens` stacked input vectors. Per-(row, token)
+// arithmetic matches v3 exactly: ROWS_PER_TG=8, 256 threads/TG,
+// per-row simd_sum reduction. So N=1 is bit-exact vs encode_matvec
+// on the v3 path.
+//
+// Each threadgroup caches one token's input in 16KB threadgroup memory
+// (same as v3 — in_dim ≤ 4096 floats fits in 16KB). Output layout
+// `[n_tokens, out_dim]`.
+//
+// Grid linearization: tg_idx_flat = row_tile + token * num_row_tiles.
+// Threadgroups total = num_row_tiles * n_tokens.
+
+kernel void dequant_matvec_4bit_v3_n_tokens(
+    device const uint32_t* W_packed   [[buffer(0)]],  // [out_dim, in_dim/8]
+    device const uint16_t* scales     [[buffer(1)]],  // [out_dim, num_groups] bf16
+    device const uint16_t* biases     [[buffer(2)]],  // [out_dim, num_groups] bf16
+    device const float*    x_inputs   [[buffer(3)]],  // [n_tokens, in_dim]
+    device float*          out        [[buffer(4)]],  // [n_tokens, out_dim]
+    constant uint&         out_dim    [[buffer(5)]],
+    constant uint&         in_dim     [[buffer(6)]],
+    constant uint&         group_size [[buffer(7)]],
+    constant uint&         n_tokens   [[buffer(8)]],
+    constant uint&         num_row_tiles [[buffer(9)]],  // (out_dim + 7) / 8
+    uint tgid_flat  [[threadgroup_position_in_grid]],
+    uint lid        [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint token    = tgid_flat / num_row_tiles;
+    uint row_tile = tgid_flat % num_row_tiles;
+    uint row      = row_tile * ROWS_PER_TG + simd_group;
+
+    uint packed_cols = in_dim / 8;
+    uint num_groups  = in_dim / group_size;
+
+    threadgroup float x_shared[4096];
+
+    device const float* x_token =
+        x_inputs + (size_t)token * (size_t)in_dim;
+
+    // Cooperative load: all threads participate before bailing on row OOB.
+    for (uint i = lid; i < in_dim; i += 256) {
+        x_shared[i] = x_token[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (token >= n_tokens) return;
+    if (row >= out_dim) return;
+
+    device const uint32_t* w_row = W_packed + row * packed_cols;
+    device const uint16_t* s_row = scales   + row * num_groups;
+    device const uint16_t* b_row = biases   + row * num_groups;
+
+    float acc = 0.0f;
+    for (uint col = simd_lane; col < packed_cols; col += 32) {
+        uint g = col / (group_size / 8);
+        float scale = bf16_to_f32(s_row[g]);
+        float bias  = bf16_to_f32(b_row[g]);
+
+        uint32_t packed = w_row[col];
+        uint x_base = col * 8;
+
+        float sx0 = scale * x_shared[x_base + 0];  float bx0 = bias * x_shared[x_base + 0];
+        float sx1 = scale * x_shared[x_base + 1];  float bx1 = bias * x_shared[x_base + 1];
+        float sx2 = scale * x_shared[x_base + 2];  float bx2 = bias * x_shared[x_base + 2];
+        float sx3 = scale * x_shared[x_base + 3];  float bx3 = bias * x_shared[x_base + 3];
+        float sx4 = scale * x_shared[x_base + 4];  float bx4 = bias * x_shared[x_base + 4];
+        float sx5 = scale * x_shared[x_base + 5];  float bx5 = bias * x_shared[x_base + 5];
+        float sx6 = scale * x_shared[x_base + 6];  float bx6 = bias * x_shared[x_base + 6];
+        float sx7 = scale * x_shared[x_base + 7];  float bx7 = bias * x_shared[x_base + 7];
+
+        acc += fma(float((packed >>  0) & 0xF), sx0, bx0);
+        acc += fma(float((packed >>  4) & 0xF), sx1, bx1);
+        acc += fma(float((packed >>  8) & 0xF), sx2, bx2);
+        acc += fma(float((packed >> 12) & 0xF), sx3, bx3);
+        acc += fma(float((packed >> 16) & 0xF), sx4, bx4);
+        acc += fma(float((packed >> 20) & 0xF), sx5, bx5);
+        acc += fma(float((packed >> 24) & 0xF), sx6, bx6);
+        acc += fma(float((packed >> 28) & 0xF), sx7, bx7);
+    }
+
+    float sum = simd_sum(acc);
+    if (simd_lane == 0) {
+        out[(size_t)token * (size_t)out_dim + row] = sum;
+    }
+}
+
+
+// ============================================================================
+// Kernel 1d-fast-n: 4-bit dequant matvec, N tokens (in_dim > 4096 path).
+// ============================================================================
+//
+// Batched-prefill variant of `dequant_matvec_4bit_fast`. Used when the
+// input vector doesn't fit in 16KB threadgroup memory. Reads x directly
+// from device memory.
+//
+// One threadgroup per (output row, token). Each TG has tg_size (64)
+// threads that stride over the row's groups, accumulating into
+// `acc`, then reduce via simd_sum + cross-simd shared-memory pass —
+// same tail as `dequant_matvec_4bit_fast`. Per-(row, token)
+// arithmetic matches the single-row fast kernel exactly, so N=1 is
+// bit-exact vs encode_matvec on the fast path.
+//
+// Grid linearization: tg_idx_flat = row + token * out_dim.
+
+kernel void dequant_matvec_4bit_fast_n_tokens(
+    device const uint32_t* W_packed   [[buffer(0)]],
+    device const uint16_t* scales     [[buffer(1)]],
+    device const uint16_t* biases     [[buffer(2)]],
+    device const float*    x_inputs   [[buffer(3)]],   // [n_tokens, in_dim]
+    device float*          out        [[buffer(4)]],   // [n_tokens, out_dim]
+    constant uint&         out_dim    [[buffer(5)]],
+    constant uint&         in_dim     [[buffer(6)]],
+    constant uint&         group_size [[buffer(7)]],
+    constant uint&         n_tokens   [[buffer(8)]],
+    uint tgid_flat [[threadgroup_position_in_grid]],
+    uint lid       [[thread_position_in_threadgroup]],
+    uint tg_size   [[threads_per_threadgroup]]
+) {
+    uint token = tgid_flat / out_dim;
+    uint row   = tgid_flat % out_dim;
+    if (token >= n_tokens) return;
+
+    uint num_groups = in_dim / group_size;
+    uint packed_per_group = group_size / 8;
+    uint packed_cols = in_dim / 8;
+
+    device const uint32_t* w_row = W_packed + (size_t)row * (size_t)packed_cols;
+    device const uint16_t* s_row = scales   + (size_t)row * (size_t)num_groups;
+    device const uint16_t* b_row = biases   + (size_t)row * (size_t)num_groups;
+    device const float*    x_tok = x_inputs + (size_t)token * (size_t)in_dim;
+
+    float acc = 0.0f;
+    for (uint g = lid; g < num_groups; g += tg_size) {
+        float scale = bf16_to_f32(s_row[g]);
+        float bias  = bf16_to_f32(b_row[g]);
+
+        uint base_packed = g * packed_per_group;
+        uint base_x = g * group_size;
+
+        for (uint p = 0; p < packed_per_group; p++) {
+            uint32_t packed = w_row[base_packed + p];
+            uint x_base = base_x + p * 8;
+
+            acc += (float((packed >>  0) & 0xF) * scale + bias) * x_tok[x_base + 0];
+            acc += (float((packed >>  4) & 0xF) * scale + bias) * x_tok[x_base + 1];
+            acc += (float((packed >>  8) & 0xF) * scale + bias) * x_tok[x_base + 2];
+            acc += (float((packed >> 12) & 0xF) * scale + bias) * x_tok[x_base + 3];
+            acc += (float((packed >> 16) & 0xF) * scale + bias) * x_tok[x_base + 4];
+            acc += (float((packed >> 20) & 0xF) * scale + bias) * x_tok[x_base + 5];
+            acc += (float((packed >> 24) & 0xF) * scale + bias) * x_tok[x_base + 6];
+            acc += (float((packed >> 28) & 0xF) * scale + bias) * x_tok[x_base + 7];
+        }
+    }
+
+    threadgroup float shared[32];
+    float simd_val = simd_sum(acc);
+
+    uint simd_lane = lid % 32;
+    uint simd_group = lid / 32;
+    uint num_simd_groups = (tg_size + 31) / 32;
+
+    if (simd_lane == 0) {
+        shared[simd_group] = simd_val;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_group == 0 && simd_lane < num_simd_groups) {
+        float val = shared[simd_lane];
+        val = simd_sum(val);
+        if (simd_lane == 0) {
+            out[(size_t)token * (size_t)out_dim + row] = val;
+        }
+    }
+}
+
+
+// ============================================================================
 // Kernel 1c-8bit: fully optimized 8-bit dequant matvec
 // ============================================================================
 // Mirrors dequant_matvec_4bit_v3 but unpacks 4 bytes per uint32 instead of
