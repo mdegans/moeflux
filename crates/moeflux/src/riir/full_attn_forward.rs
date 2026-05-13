@@ -53,7 +53,7 @@ use super::layer_weight_cache::LayerWeightCache;
 use super::gpu_matvec::encode_matvec_n_tokens;
 use super::linear_attn_forward::{
     bits_of, full_attn_layer_idx_for, moe_dispatch_per_token,
-    post_attention_post_o_proj_to_intermediates, post_attention_pre_moe,
+    post_attention_pre_moe, post_attention_residual_norm_route,
     read_buffer_to_vec, GpuAttnEncodeArgs, LayerForwardBuffers,
     LayerForwardError, OProj, PostAttnIntermediates,
 };
@@ -532,7 +532,6 @@ pub(super) fn batched_full_attn_layer_forward(
 
     let mut h_mid_stack = vec![0.0f32; n_tokens * hidden_dim];
     let mut h_post_stack = vec![0.0f32; n_tokens * hidden_dim];
-    let mut shared_out_stack = vec![0.0f32; n_tokens * hidden_dim];
     let mut all_routing_indices = Vec::with_capacity(n_tokens * k_active);
     let mut all_routing_weights = Vec::with_capacity(n_tokens * k_active);
     let mut shared_gate_scores = Vec::with_capacity(n_tokens);
@@ -803,10 +802,9 @@ pub(super) fn batched_full_attn_layer_forward(
     metal.commit_and_wait_labeled(cmdbuf, "batched_o_proj");
     let o_proj_stack = o_proj_buf.to_vec();
 
-    // ── Phase 3c: per-token post-O-proj. Stage o_proj[t] into
-    //    buffers.output + hidden_in[t] into buffers.input, then run
-    //    post_attention_post_o_proj_to_intermediates (skips o_proj
-    //    matvec since buffers.output is already populated). ──────
+    // ── Phase 3c: per-token residual_add + post-attn rms_norm + gate
+    //    logits + shared-gate scalar + CPU routing. No shared FFN —
+    //    that's batched externally in Phase 3d. ──────────────────
     for t in 0..n_tokens {
         // SAFETY: shared-storage; previous iteration's cmdbuf
         // committed and waited so no GPU work is in flight on these
@@ -828,7 +826,7 @@ pub(super) fn batched_full_attn_layer_forward(
 
         let tail_queue = metal.queue_clone();
         let tail_cmdbuf = tail_queue.new_command_buffer();
-        let intermediates = post_attention_post_o_proj_to_intermediates(
+        let intermediates = post_attention_residual_norm_route(
             metal,
             tail_cmdbuf,
             wf,
@@ -843,15 +841,126 @@ pub(super) fn batched_full_attn_layer_forward(
             .copy_from_slice(&read_buffer_to_vec(&buffers.h_mid, hidden_dim));
         h_post_stack[t * hidden_dim..(t + 1) * hidden_dim]
             .copy_from_slice(&read_buffer_to_vec(&buffers.normed, hidden_dim));
-        shared_out_stack[t * hidden_dim..(t + 1) * hidden_dim]
-            .copy_from_slice(&read_buffer_to_vec(
-                &buffers.shared_out,
-                hidden_dim,
-            ));
         all_routing_indices.extend_from_slice(&intermediates.routing_indices);
         all_routing_weights.extend_from_slice(&intermediates.routing_weights);
         shared_gate_scores.push(intermediates.shared_gate_score);
     }
+
+    // ── Phase 3d: batched shared FFN (gate matvec, up matvec,
+    //    flat-element-wise swiglu, down matvec) over h_post_stack. ─
+    let s_gate_bits = bits_of(
+        wf,
+        &format!(
+            "model.layers.{layer_idx}.mlp.shared_expert.gate_proj.weight"
+        ),
+    );
+    let s_up_bits = bits_of(
+        wf,
+        &format!(
+            "model.layers.{layer_idx}.mlp.shared_expert.up_proj.weight"
+        ),
+    );
+    let s_down_bits = bits_of(
+        wf,
+        &format!(
+            "model.layers.{layer_idx}.mlp.shared_expert.down_proj.weight"
+        ),
+    );
+    let shared_gate_w = layer_cache.shared.gate_w;
+    let shared_gate_s = layer_cache.shared.gate_s;
+    let shared_gate_b = layer_cache.shared.gate_b;
+    let shared_up_w = layer_cache.shared.up_w;
+    let shared_up_s = layer_cache.shared.up_s;
+    let shared_up_b = layer_cache.shared.up_b;
+    let shared_down_w = layer_cache.shared.down_w;
+    let shared_down_s = layer_cache.shared.down_s;
+    let shared_down_b = layer_cache.shared.down_b;
+    let h_post_buf =
+        MtlBuffer::<f32>::with_data(&device, &h_post_stack);
+    let shared_gate_buf = MtlBuffer::<f32>::with_len(
+        &device,
+        n_tokens * v.shared_intermediate,
+    );
+    let shared_up_buf = MtlBuffer::<f32>::with_len(
+        &device,
+        n_tokens * v.shared_intermediate,
+    );
+    let shared_act_buf = MtlBuffer::<f32>::with_len(
+        &device,
+        n_tokens * v.shared_intermediate,
+    );
+    let shared_down_buf =
+        MtlBuffer::<f32>::with_len(&device, n_tokens * hidden_dim);
+    let swiglu_pso = metal.pipeline("swiglu_fused")?.clone();
+    let queue = metal.queue_clone();
+    let cmdbuf = queue.new_command_buffer();
+    encode_matvec_n_tokens(
+        cmdbuf,
+        &mv,
+        wf_buf.buffer(),
+        shared_gate_w,
+        shared_gate_s,
+        shared_gate_b,
+        h_post_buf.buffer(),
+        0,
+        shared_gate_buf.buffer(),
+        0,
+        hidden_dim as u32,
+        v.shared_intermediate as u32,
+        n_tokens as u32,
+        s_gate_bits,
+    );
+    encode_matvec_n_tokens(
+        cmdbuf,
+        &mv,
+        wf_buf.buffer(),
+        shared_up_w,
+        shared_up_s,
+        shared_up_b,
+        h_post_buf.buffer(),
+        0,
+        shared_up_buf.buffer(),
+        0,
+        hidden_dim as u32,
+        v.shared_intermediate as u32,
+        n_tokens as u32,
+        s_up_bits,
+    );
+    // swiglu_fused is element-wise → flat dispatch over
+    // n_tokens * shared_intermediate.
+    {
+        let enc = cmdbuf.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&swiglu_pso);
+        enc.set_buffer(0, Some(shared_gate_buf.buffer()), 0);
+        enc.set_buffer(1, Some(shared_up_buf.buffer()), 0);
+        enc.set_buffer(2, Some(shared_act_buf.buffer()), 0);
+        let dim = (n_tokens * v.shared_intermediate) as u32;
+        enc.set_bytes(3, 4, (&dim as *const u32).cast());
+        let num_tgs = (dim + 255) / 256;
+        enc.dispatch_thread_groups(
+            metal::MTLSize::new(num_tgs as NSUInteger, 1, 1),
+            metal::MTLSize::new(256, 1, 1),
+        );
+        enc.end_encoding();
+    }
+    encode_matvec_n_tokens(
+        cmdbuf,
+        &mv,
+        wf_buf.buffer(),
+        shared_down_w,
+        shared_down_s,
+        shared_down_b,
+        shared_act_buf.buffer(),
+        0,
+        shared_down_buf.buffer(),
+        0,
+        v.shared_intermediate as u32,
+        hidden_dim as u32,
+        n_tokens as u32,
+        s_down_bits,
+    );
+    metal.commit_and_wait_labeled(cmdbuf, "batched_shared_ffn");
+    let shared_out_stack = shared_down_buf.to_vec();
 
     let buckets = build_expert_buckets(
         &all_routing_indices,

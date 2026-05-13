@@ -1169,24 +1169,20 @@ pub(super) fn post_attention_pre_moe(
     })
 }
 
-/// Variant of [`post_attention_pre_moe`] used by the batched-prefill
-/// orchestrator (Phase B3+): assumes `buffers.output` already holds
-/// the o_proj result (typically populated via batched o_proj outside
-/// this function). Skips the o_proj matvec entirely, runs everything
-/// from residual_add onward into the caller-owned `cmdbuf`. The
-/// gpu_attn_args and o_proj args don't appear because o_proj is the
-/// caller's responsibility.
+/// B3-era variant of [`post_attention_pre_moe`] that assumes
+/// `buffers.output` already holds the o_proj result (typically
+/// populated via batched o_proj outside this function). Skips the
+/// o_proj matvec entirely; runs residual_add → post-attn rms_norm →
+/// gate logits → shared-gate scalar → shared FFN inside the caller-
+/// owned `cmdbuf`.
 ///
-/// Layout contract on entry:
-/// - `buffers.input` = residual source (per-token hidden_in).
-/// - `buffers.output` = o_proj output.
-/// - `kv_state` already advanced (caller-managed).
-///
-/// Layout on return: same as [`post_attention_pre_moe`] — `buffers.h_mid`
-/// is the post-residual hidden, `buffers.normed` is the post-attn-norm
-/// h_post, `buffers.shared_out` is the shared FFN output, plus
-/// [`PostAttnIntermediates`] for routing + shared-gate.
-#[allow(clippy::too_many_arguments)]
+/// B4 superseded this for `batched_full_attn_layer_forward` by also
+/// batching the shared FFN externally via
+/// [`post_attention_residual_norm_route`] — the routing-only helper.
+/// Kept here as a forward-looking building block for callers (e.g.
+/// a future eval_token path) that want o_proj batched but per-token
+/// shared FFN inside one cmdbuf.
+#[allow(dead_code, clippy::too_many_arguments)]
 pub(super) fn post_attention_post_o_proj_to_intermediates(
     metal: &mut MetalBackend,
     cmdbuf: &CommandBufferRef,
@@ -1352,6 +1348,123 @@ pub(super) fn post_attention_post_o_proj_to_intermediates(
         },
     );
     metal.commit_and_wait_labeled(cmdbuf, "post_attn_post_oproj.cmd");
+
+    let mut scores =
+        read_buffer_to_vec(&buffers.batch_out[4], v.num_experts);
+    let mut routing_indices = vec![0i32; k_active];
+    let mut routing_weights = vec![0f32; k_active];
+    moe_router_cpu(
+        &mut scores,
+        k_active,
+        &mut routing_indices,
+        &mut routing_weights,
+    )?;
+    let shared_gate_score = {
+        let s = read_buffer_to_vec(&buffers.batch_out[5], 1);
+        s[0]
+    };
+    Ok(PostAttnIntermediates {
+        routing_indices,
+        routing_weights,
+        shared_gate_score,
+    })
+}
+
+/// Routing-only variant of [`post_attention_pre_moe`] (skipping o_proj
+/// + shared FFN) for the Phase B4 batched-shared-FFN path. Runs residual_add +
+/// post-attn rms_norm + gate logits matvec + shared-gate scalar
+/// matvec + CPU MoE router. Skips the shared FFN entirely so the
+/// caller can batch it across N tokens externally.
+///
+/// On return, `buffers.h_mid` and `buffers.normed` (= h_post) hold the
+/// per-token values; `buffers.shared_out` is untouched (caller fills
+/// it from the batched shared FFN). [`PostAttnIntermediates`] carries
+/// routing + `shared_gate_score`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn post_attention_residual_norm_route(
+    metal: &mut MetalBackend,
+    cmdbuf: &CommandBufferRef,
+    wf: &WeightFile,
+    wf_buf: &MtlWeightBuf,
+    layer_cache: &LayerWeightCache,
+    buffers: &mut LayerForwardBuffers,
+    layer_idx: usize,
+    k_active: usize,
+) -> Result<PostAttnIntermediates, LayerForwardError> {
+    let v = VARIANT;
+
+    let gate_bits =
+        bits_of(wf, &format!("model.layers.{layer_idx}.mlp.gate.weight"));
+    let seg_bits = bits_of(
+        wf,
+        &format!(
+            "model.layers.{layer_idx}.mlp.shared_expert_gate.weight"
+        ),
+    );
+
+    let post_attn_norm_w = layer_cache.post_attention_layernorm_w;
+    let gate_w = layer_cache.gate.w;
+    let gate_s = layer_cache.gate.s;
+    let gate_b = layer_cache.gate.b;
+    let seg_w = layer_cache.shared.seg_w;
+    let seg_s = layer_cache.shared.seg_s;
+    let seg_b = layer_cache.shared.seg_b;
+
+    let mv = MatvecPipelines::fetch(metal)?;
+    let sum_sq = metal.pipeline("rms_norm_sum_sq")?.clone();
+    let apply = metal.pipeline("rms_norm_apply_bf16")?.clone();
+    let resid_add = metal.pipeline("residual_add")?.clone();
+
+    encode_residual_add(
+        cmdbuf,
+        &resid_add,
+        &buffers.output,
+        &buffers.input,
+        &buffers.h_mid,
+        v.hidden_dim as u32,
+    );
+    encode_rms_norm_pair(
+        cmdbuf,
+        &sum_sq,
+        &apply,
+        &buffers.h_mid,
+        wf_buf.buffer(),
+        post_attn_norm_w,
+        &buffers.normed,
+        &buffers.sum_sq,
+        v.hidden_dim as u32,
+    );
+    encode_matvec(
+        cmdbuf,
+        &mv,
+        wf_buf,
+        &MatvecSpec {
+            w_off: gate_w,
+            s_off: gate_s,
+            b_off: gate_b,
+            input: &buffers.normed,
+            output: &buffers.batch_out[4],
+            out_dim: v.num_experts as u32,
+            in_dim: v.hidden_dim as u32,
+            bits: gate_bits,
+        },
+    );
+    encode_matvec(
+        cmdbuf,
+        &mv,
+        wf_buf,
+        &MatvecSpec {
+            w_off: seg_w,
+            s_off: seg_s,
+            b_off: seg_b,
+            input: &buffers.normed,
+            output: &buffers.batch_out[5],
+            out_dim: 1,
+            in_dim: v.hidden_dim as u32,
+            bits: seg_bits,
+        },
+    );
+    metal.commit_and_wait_labeled(cmdbuf, "post_attn_residual_norm_route");
 
     let mut scores =
         read_buffer_to_vec(&buffers.batch_out[4], v.num_experts);
