@@ -628,3 +628,83 @@ fn graph_metal_matches_cpu_colored() {
         "CPU and Metal pools disagree on physical_buffer_count"
     );
 }
+
+// ============================================================================
+// Test: RmsNormQkNTokens through both backends (S7-6b)
+// ============================================================================
+
+#[test]
+#[ignore = "long-running GPU test"]
+fn graph_metal_matches_cpu_rms_norm_qk() {
+    let n_tokens: u32 = 4;
+    let num_k_heads: u32 = 8;
+    let key_dim: u32 = 32;
+    // No gap between q and k (key_offset_per_token == q region size).
+    let key_offset_per_token: u32 = num_k_heads * key_dim;
+    let per_token_elems =
+        (key_offset_per_token + num_k_heads * key_dim) as usize;
+    let total = n_tokens as usize * per_token_elems;
+    let mut rng = Rng::new(0xA3B_BB01);
+    let x_data: Vec<f32> = (0..total).map(|_| rng.next_f32_unit()).collect();
+
+    // CPU path
+    let mut cpu_wf = dummy_weight_file("rms_norm_qk_cpu");
+    let mut cpu = CpuBackend::new(cpu_wf.take());
+    let cpu_x = cpu.pool_mut().alloc(total * 4, "x", false).unwrap();
+    cpu.pool_mut().upload(cpu_x, bytes_of_f32(&x_data)).unwrap();
+    let mut g_cpu = Graph::new();
+    g_cpu.push(Op::RmsNormQkNTokens {
+        label: "test_rms_norm_qk",
+        x: cpu_x,
+        num_k_heads,
+        key_dim,
+        key_offset_per_token,
+        n_tokens,
+    });
+    cpu.execute(&g_cpu).unwrap();
+    let mut cpu_out_bytes = vec![0u8; total * 4];
+    cpu.pool().download(cpu_x, &mut cpu_out_bytes).unwrap();
+    let cpu_out_f32 = f32_of_bytes(&cpu_out_bytes);
+
+    // GPU path
+    let mut gpu_wf = dummy_weight_file("rms_norm_qk_gpu");
+    let metal_ctx = MetalContext::new().expect("MetalContext::new");
+    let wf_ref = gpu_wf.wf.as_ref().unwrap();
+    let wf_buf = MtlWeightBuf::wrap(wf_ref, metal_ctx.device());
+    let _ = gpu_wf.take();
+    let mut gpu = MetalBackend::new(metal_ctx, wf_buf).expect("MetalBackend::new");
+    let gpu_x = gpu.pool_mut().alloc(total * 4, "x", false).unwrap();
+    gpu.pool_mut().upload(gpu_x, bytes_of_f32(&x_data)).unwrap();
+    let mut g_gpu = Graph::new();
+    g_gpu.push(Op::RmsNormQkNTokens {
+        label: "test_rms_norm_qk",
+        x: gpu_x,
+        num_k_heads,
+        key_dim,
+        key_offset_per_token,
+        n_tokens,
+    });
+    gpu.execute(&g_gpu).unwrap();
+    let mut gpu_out_bytes = vec![0u8; total * 4];
+    gpu.pool().download(gpu_x, &mut gpu_out_bytes).unwrap();
+    let gpu_out_f32 = f32_of_bytes(&gpu_out_bytes);
+
+    // Compare
+    let cos = cosine_sim(&cpu_out_f32, &gpu_out_f32);
+    let max_abs = cpu_out_f32
+        .iter()
+        .zip(gpu_out_f32.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    eprintln!(
+        "[s7-6b rms_norm_qk] N={} h={} kd={} kop={}: cos={:.9}, max_abs={:.3e}",
+        n_tokens, num_k_heads, key_dim, key_offset_per_token, cos, max_abs
+    );
+    assert!(
+        cos >= COSINE_FLOOR,
+        "cosine {} below floor {} (max_abs={})",
+        cos,
+        COSINE_FLOOR,
+        max_abs
+    );
+}

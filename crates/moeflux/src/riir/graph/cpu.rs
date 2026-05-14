@@ -408,13 +408,13 @@ fn rms_norm_qk_n_tokens_cpu(
     eps: f32,
 ) {
     // Apply per-head RMSNorm to the q region [base..base+num_k_heads*key_dim]
-    // AND the k region [base+key_offset_per_token..]. Unweighted —
-    // matches the Metal kernel which uses an inv_scale = 1/sqrt(key_dim)
-    // (the kernel doesn't multiply by a separate `weight` tensor).
+    // AND the k region [base+key_offset_per_token..]. Matches the
+    // Metal `rms_norm_qk` shader (shaders.metal:1773): q is scaled by
+    // `inv_scale * inv_scale` (absorbs 1/sqrt(key_dim) of the attention
+    // pre-softmax scaling); k is scaled by `inv_scale` once.
     let inv_scale = 1.0f32 / (key_dim as f32).sqrt();
-    // q stride per token mirrors what the encoder binds; we assume both
-    // q and k regions are within one per-token slot of size
-    // `key_offset_per_token + num_k_heads * key_dim`.
+    let q_scale = inv_scale * inv_scale;
+    let k_scale = inv_scale;
     let per_token_stride = key_offset_per_token + num_k_heads * key_dim;
     debug_assert_eq!(x_inout.len(), n_tokens * per_token_stride);
     for t in 0..n_tokens {
@@ -423,13 +423,13 @@ fn rms_norm_qk_n_tokens_cpu(
         for h in 0..num_k_heads {
             let off = base + h * key_dim;
             let row = &mut x_inout[off..off + key_dim];
-            normalize_unweighted(row, eps, inv_scale);
+            normalize_unweighted(row, eps, q_scale);
         }
         // K region
         for h in 0..num_k_heads {
             let off = base + key_offset_per_token + h * key_dim;
             let row = &mut x_inout[off..off + key_dim];
-            normalize_unweighted(row, eps, inv_scale);
+            normalize_unweighted(row, eps, k_scale);
         }
     }
 }

@@ -532,10 +532,46 @@ impl Backend for MetalBackend {
                     "LmHead encode_op: needs a persistent workspace BufId in Op shape for the intermediate (post-final-norm) hidden bytes; defer to S7-7 producer wire-up where the orchestrator can allocate it"
                 );
             }
-            Op::RmsNormQkNTokens { .. } => {
-                todo!(
-                    "RmsNormQkNTokens encode_op: per-token loop with existing encode_rms_norm_qk; defer to S7-6 producer wire-up"
-                )
+            Op::RmsNormQkNTokens {
+                x,
+                num_k_heads,
+                key_dim,
+                key_offset_per_token,
+                n_tokens,
+                ..
+            } => {
+                // In-place per-head RMS-norm on q and k regions of `x`.
+                // Layout: each token spans `key_offset_per_token +
+                // num_k_heads*key_dim` floats — q region at offset 0,
+                // k region at offset `key_offset_per_token`. Matches
+                // `rms_norm_qk_n_tokens_cpu`.
+                let inv_scale = 1.0f32 / (*key_dim as f32).sqrt();
+                let per_token_elems =
+                    *key_offset_per_token + *num_k_heads * *key_dim;
+                let per_token_bytes = (per_token_elems as u64) * 4;
+                let k_byte_off = (*key_offset_per_token as u64) * 4;
+                let x_buf = self.pool.handle(*x);
+                let key_dim_arg = *key_dim;
+                for t in 0..*n_tokens {
+                    let token_base = (t as u64) * per_token_bytes;
+                    let enc = cmd.new_compute_command_encoder();
+                    enc.set_compute_pipeline_state(
+                        &self.linear_attn_pipes.rms_norm_qk,
+                    );
+                    enc.set_buffer(0, Some(x_buf), token_base as NSUInteger);
+                    enc.set_buffer(
+                        1,
+                        Some(x_buf),
+                        (token_base + k_byte_off) as NSUInteger,
+                    );
+                    enc.set_bytes(2, 4, (&key_dim_arg as *const u32).cast());
+                    enc.set_bytes(3, 4, (&inv_scale as *const f32).cast());
+                    enc.dispatch_thread_groups(
+                        MTLSize::new(*num_k_heads as NSUInteger, 1, 1),
+                        MTLSize::new(*key_dim as NSUInteger, 1, 1),
+                    );
+                    enc.end_encoding();
+                }
             }
             Op::SdpaCausalTiled { .. } => {
                 todo!(
