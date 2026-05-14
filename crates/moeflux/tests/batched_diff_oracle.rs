@@ -38,7 +38,7 @@ use moeflux::riir::gpu_norm::{
     encode_residual_add_n_tokens_into, encode_rms_norm_bf16_fused_n_tokens,
     RmsNormBf16FusedNTokensPipeline,
 };
-use moeflux::riir::metal::MetalBackend;
+use moeflux::riir::metal::MetalContext;
 use moeflux::riir::moe_router::{build_expert_buckets, moe_router_cpu};
 use moeflux::riir::sdpa::sdpa_cpu;
 use moeflux::riir::variants::VARIANT;
@@ -54,7 +54,7 @@ use common::diff_helpers::{cosine_sim, COSINE_FLOOR};
 // Local helpers — buffer plumbing + deterministic synthetic data.
 // ---------------------------------------------------------------------------
 
-fn make_buf<T>(metal: &MetalBackend, n: usize) -> Buffer {
+fn make_buf<T>(metal: &MetalContext, n: usize) -> Buffer {
     let bytes = (n * std::mem::size_of::<T>()) as NSUInteger;
     metal
         .device()
@@ -179,7 +179,7 @@ fn bf16_matmul_n_tokens_matches_cpu() {
     let _ = weights_f32_decoded;
 
     // ---- GPU dispatch ----
-    let mut metal = MetalBackend::new().expect("open Metal");
+    let mut metal = MetalContext::new().expect("open Metal");
     let device = metal.device().clone();
     let pipes = BfMatvecPipelines::fetch(&mut metal)
         .expect("fetch BfMatvecPipelines");
@@ -250,7 +250,7 @@ fn bf16_matmul_n_tokens_n1_matches_single_matvec() {
     let input_f32: Vec<f32> =
         (0..in_dim as usize).map(|_| rng.next_f32()).collect();
 
-    let mut metal = MetalBackend::new().expect("open Metal");
+    let mut metal = MetalContext::new().expect("open Metal");
     let device = metal.device().clone();
     let pipes = BfMatvecPipelines::fetch(&mut metal)
         .expect("fetch BfMatvecPipelines");
@@ -324,7 +324,7 @@ fn gen_4bit_weights(
 /// section. uint32 packed first (natural 4-byte alignment), then
 /// uint16 scales, then uint16 biases.
 fn pack_weights_into_buf(
-    metal: &MetalBackend,
+    metal: &MetalContext,
     packed: &[u32],
     scales: &[u16],
     biases: &[u16],
@@ -391,7 +391,7 @@ fn run_4bit_n_tokens_test(in_dim: u32, out_dim: u32, n_tokens: u32, seed: u64) {
     );
 
     // ---- GPU dispatch ----
-    let mut metal = MetalBackend::new().expect("open Metal");
+    let mut metal = MetalContext::new().expect("open Metal");
     let pipes = MatvecPipelines::fetch(&mut metal)
         .expect("fetch MatvecPipelines");
 
@@ -470,7 +470,7 @@ fn dequant_matvec_4bit_n_tokens_v3_n1_matches_single() {
     let input: Vec<f32> =
         (0..in_dim as usize).map(|_| rng.next_f32()).collect();
 
-    let mut metal = MetalBackend::new().expect("open Metal");
+    let mut metal = MetalContext::new().expect("open Metal");
     let pipes = MatvecPipelines::fetch(&mut metal)
         .expect("fetch MatvecPipelines");
 
@@ -535,7 +535,7 @@ fn dequant_matvec_4bit_n_tokens_v3_n1_matches_single() {
 /// the [N, H, head_dim] output as a Vec<f32>.
 #[allow(clippy::too_many_arguments)]
 fn run_batched_sdpa(
-    metal: &mut MetalBackend,
+    metal: &mut MetalContext,
     pipes: &BatchedSdpaPipelines,
     q_data: &[f32],
     k_data: &[f32],
@@ -638,7 +638,7 @@ fn sdpa_causal_tiled_n1_matches_cpu_single_tile() {
     )
     .expect("sdpa_cpu");
 
-    let mut metal = MetalBackend::new().expect("open Metal");
+    let mut metal = MetalContext::new().expect("open Metal");
     let pipes = BatchedSdpaPipelines::fetch(&mut metal)
         .expect("fetch BatchedSdpaPipelines");
 
@@ -719,7 +719,7 @@ fn sdpa_causal_tiled_n1_matches_cpu_multi_tile() {
     )
     .expect("sdpa_cpu");
 
-    let mut metal = MetalBackend::new().expect("open Metal");
+    let mut metal = MetalContext::new().expect("open Metal");
     let pipes = BatchedSdpaPipelines::fetch(&mut metal)
         .expect("fetch BatchedSdpaPipelines");
 
@@ -814,7 +814,7 @@ fn sdpa_causal_tiled_n4_matches_tokenwise_cpu() {
         .expect("sdpa_cpu");
     }
 
-    let mut metal = MetalBackend::new().expect("open Metal");
+    let mut metal = MetalContext::new().expect("open Metal");
     let pipes = BatchedSdpaPipelines::fetch(&mut metal)
         .expect("fetch BatchedSdpaPipelines");
 
@@ -989,7 +989,7 @@ fn moe_permute_fuse_n_tokens_matches_tokenwise() {
 
     // ---- Tokenwise reference: gpu_expert_forward per (t, s), sum
     // weighted into per_token_ref[t].
-    let mut metal = MetalBackend::new().expect("open Metal");
+    let mut metal = MetalContext::new().expect("open Metal");
     let mut per_token_ref = vec![0.0f32; n_tokens * h];
     for t in 0..n_tokens {
         let h_post_t = &h_post[t * h..(t + 1) * h];
@@ -1160,7 +1160,7 @@ fn run_moe_router_diff(n_tokens: usize, n_experts: usize, k: usize, seed: u64) {
     }
 
     // --- GPU ---
-    let mut metal = MetalBackend::new().expect("MetalBackend::new");
+    let mut metal = MetalContext::new().expect("MetalContext::new");
     let pipes = MoeRouterPipelines::fetch(&mut metal).expect("router pipes");
 
     let logits_buf = make_buf::<f32>(&metal, n_tokens * n_experts);
@@ -1337,7 +1337,7 @@ fn rms_norm_bf16_fused_n_tokens_matches_cpu() {
     }
 
     // GPU: single fused dispatch.
-    let mut metal = MetalBackend::new().expect("MetalBackend::new");
+    let mut metal = MetalContext::new().expect("MetalContext::new");
     let pipe = RmsNormBf16FusedNTokensPipeline::fetch(&mut metal)
         .expect("rms_norm fused pipe");
 
@@ -1407,7 +1407,7 @@ fn residual_add_n_tokens_matches_cpu() {
     // CPU ref: element-wise add.
     let cpu_out: Vec<f32> = a.iter().zip(b.iter()).map(|(x, y)| x + y).collect();
 
-    let metal = MetalBackend::new().expect("MetalBackend::new");
+    let metal = MetalContext::new().expect("MetalContext::new");
     let mut metal = metal;
     let pso = metal
         .pipeline("residual_add_n_tokens")

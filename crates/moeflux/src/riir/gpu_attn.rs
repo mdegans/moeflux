@@ -41,7 +41,7 @@ use metal::{
     NSUInteger,
 };
 
-use super::metal::{MetalBackend, MetalError, MtlBuffer};
+use super::metal::{MetalContext, MetalError, MtlBuffer};
 
 /// Errors from the GPU attention kernels.
 #[derive(Debug, thiserror::Error)]
@@ -96,7 +96,7 @@ pub struct GpuAttnPipelines {
 }
 
 impl GpuAttnPipelines {
-    pub fn fetch(metal: &mut MetalBackend) -> Result<Self, MetalError> {
+    pub fn fetch(metal: &mut MetalContext) -> Result<Self, MetalError> {
         Ok(Self {
             scores: metal.pipeline("attn_scores_batched")?.clone(),
             softmax: metal.pipeline("attn_softmax_batched")?.clone(),
@@ -246,7 +246,7 @@ pub fn encode_sigmoid_gate_into(
 /// (`seq_stride = seq_len`).
 #[allow(clippy::too_many_arguments)]
 pub fn gpu_attn_scores_batched(
-    metal: &mut MetalBackend,
+    metal: &mut MetalContext,
     num_heads: u32,
     num_kv_heads: u32,
     head_dim: u32,
@@ -303,7 +303,7 @@ pub fn gpu_attn_scores_batched(
 /// `attn_softmax_batched`: per-head softmax over `[0, seq_len)`,
 /// in-place. Stride-tight.
 pub fn gpu_attn_softmax_batched(
-    metal: &mut MetalBackend,
+    metal: &mut MetalContext,
     num_heads: u32,
     seq_len: u32,
     scores_inout: &mut [f32],
@@ -339,7 +339,7 @@ pub fn gpu_attn_softmax_batched(
 /// `attn_values_batched`: per-head scores · V. Stride-tight.
 #[allow(clippy::too_many_arguments)]
 pub fn gpu_attn_values_batched(
-    metal: &mut MetalBackend,
+    metal: &mut MetalContext,
     num_heads: u32,
     num_kv_heads: u32,
     head_dim: u32,
@@ -393,7 +393,7 @@ pub fn gpu_attn_values_batched(
 
 /// `sigmoid_gate`: `x_inout[i] *= sigmoid(gate[i])`, in place.
 pub fn gpu_sigmoid_gate(
-    metal: &mut MetalBackend,
+    metal: &mut MetalContext,
     dim: u32,
     gate: &[f32],
     x_inout: &mut [f32],
@@ -434,7 +434,7 @@ pub struct BatchedSdpaPipelines {
 }
 
 impl BatchedSdpaPipelines {
-    pub fn fetch(metal: &mut MetalBackend) -> Result<Self, MetalError> {
+    pub fn fetch(metal: &mut MetalContext) -> Result<Self, MetalError> {
         Ok(Self {
             init: metal.pipeline("attn_sdpa_causal_init_running")?.clone(),
             accumulate: metal

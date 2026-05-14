@@ -30,7 +30,7 @@ use metal::{
     Buffer, CommandBufferRef, ComputePipelineState, MTLSize, NSUInteger,
 };
 
-use super::metal::{MetalBackend, MetalError};
+use super::metal::{MetalContext, MetalError};
 
 /// Pipelines used by [`encode_moe_router`]. Fetch once per orchestrator
 /// scope so subsequent calls are O(1).
@@ -40,7 +40,7 @@ pub struct MoeRouterPipelines {
 }
 
 impl MoeRouterPipelines {
-    pub fn fetch(metal: &mut MetalBackend) -> Result<Self, MetalError> {
+    pub fn fetch(metal: &mut MetalContext) -> Result<Self, MetalError> {
         let softmax_topk = metal.pipeline("moe_softmax_topk")?.clone();
         let normalize = metal.pipeline("moe_normalize_weights")?.clone();
         Ok(Self {

@@ -20,8 +20,8 @@
 
 use metal::{Buffer, MTLResourceOptions, NSUInteger};
 
-use super::gpu_matvec::{encode_matvec, MatvecPipelines, MatvecSpec};
-use super::metal::{MetalBackend, MetalError};
+use super::gpu_matvec::{MatvecPipelines, MatvecSpec, encode_matvec};
+use super::metal::{MetalContext, MetalError};
 use super::mtl_weight_buf::{MtlWeightBuf, MtlWeightBufError};
 use super::variants::VARIANT;
 use super::weight_file::WeightFile;
@@ -65,7 +65,7 @@ pub struct GpuLmHead {
 }
 
 // metal-rs's `Buffer` and `ComputePipelineState` are not auto-`Send`.
-// `MetalBackend` opts in for the same reason: single-owner discipline
+// `MetalContext` opts in for the same reason: single-owner discipline
 // makes cross-thread move safe; concurrent access on the same `RsCtx`
 // is forbidden by the public API contract.
 unsafe impl Send for GpuLmHead {}
@@ -76,7 +76,7 @@ impl GpuLmHead {
     /// [`crate::riir::RsCtx::step_internal`] when logits are first
     /// requested.
     pub fn new(
-        metal: &mut MetalBackend,
+        metal: &mut MetalContext,
         wf: &WeightFile,
         wf_buf: &MtlWeightBuf,
     ) -> Result<Self, GpuLmHeadError> {
@@ -122,7 +122,7 @@ impl GpuLmHead {
     /// after every layer's deferred dispatch has been drained.
     pub fn forward(
         &self,
-        metal: &MetalBackend,
+        metal: &MetalContext,
         wf_buf: &MtlWeightBuf,
         hidden: &[f32],
         logits: &mut [f32],

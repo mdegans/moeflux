@@ -34,7 +34,7 @@ use metal::{
     Buffer, CommandBufferRef, ComputePipelineState, MTLSize, NSUInteger,
 };
 
-use super::metal::{MetalBackend, MetalError};
+use super::metal::{MetalContext, MetalError};
 
 /// Errors from the GPU MLA dispatchers.
 #[derive(Debug, thiserror::Error)]
@@ -73,7 +73,7 @@ pub struct MlaPipelines {
 }
 
 impl MlaPipelines {
-    pub fn new(metal: &mut MetalBackend) -> Result<Self, MetalError> {
+    pub fn new(metal: &mut MetalContext) -> Result<Self, MetalError> {
         Ok(Self {
             q_prime: metal.pipeline("mla_q_prime_4bit")?.clone(),
             sdpa: metal.pipeline("mla_sdpa_folded")?.clone(),
@@ -463,7 +463,7 @@ mod tests {
     /// the GPU `mla_q_prime_4bit` output matches.
     #[test]
     fn mla_q_prime_4bit_matches_host() {
-        let mut metal = match MetalBackend::new() {
+        let mut metal = match MetalContext::new() {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("[gpu_mla] skipping: Metal init failed: {e:?}");
@@ -571,7 +571,7 @@ mod tests {
     /// reference math on the host.
     #[test]
     fn mla_sdpa_folded_matches_host() {
-        let mut metal = match MetalBackend::new() {
+        let mut metal = match MetalContext::new() {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("[gpu_mla] skipping: Metal init failed: {e:?}");
@@ -690,7 +690,7 @@ mod tests {
     /// Synthetic 3c check — same machinery as 3a, different stride.
     #[test]
     fn mla_out_per_head_4bit_matches_host() {
-        let mut metal = match MetalBackend::new() {
+        let mut metal = match MetalContext::new() {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("[gpu_mla] skipping: Metal init failed: {e:?}");

@@ -28,7 +28,7 @@ use metal::{
     Buffer, CommandBufferRef, ComputePipelineState, MTLSize, NSUInteger,
 };
 
-use super::metal::{MetalBackend, MetalError};
+use super::metal::{MetalContext, MetalError};
 use super::mtl_weight_buf::MtlWeightBuf;
 use super::variants::GROUP_SIZE;
 
@@ -59,7 +59,7 @@ pub struct MatvecSpec<'a> {
 }
 
 /// Pre-fetched matvec pipelines. All three flavors compile lazily on
-/// first request via [`MetalBackend::pipeline`].
+/// first request via [`MetalContext::pipeline`].
 ///
 /// `*_n_tokens` variants are the batched-prefill versions: same weights
 /// applied to N stacked input vectors in one dispatch. See
@@ -77,7 +77,7 @@ pub struct MatvecPipelines {
 }
 
 impl MatvecPipelines {
-    pub fn fetch(metal: &mut MetalBackend) -> Result<Self, MetalError> {
+    pub fn fetch(metal: &mut MetalContext) -> Result<Self, MetalError> {
         Ok(Self {
             v3_4bit: metal.pipeline("dequant_matvec_4bit_v3")?.clone(),
             fast_4bit: metal.pipeline("dequant_matvec_4bit_fast")?.clone(),
@@ -237,7 +237,7 @@ pub struct BfMatvecPipelines {
 }
 
 impl BfMatvecPipelines {
-    pub fn fetch(metal: &mut MetalBackend) -> Result<Self, MetalError> {
+    pub fn fetch(metal: &mut MetalContext) -> Result<Self, MetalError> {
         Ok(Self {
             bf16: metal.pipeline("bf16_matvec")?.clone(),
             bf16_n: metal.pipeline("bf16_matmul_n_tokens")?.clone(),

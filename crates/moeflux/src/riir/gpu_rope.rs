@@ -28,7 +28,7 @@ use metal::{
     MTLSize, NSUInteger,
 };
 
-use super::metal::{MetalBackend, MetalError};
+use super::metal::{MetalContext, MetalError};
 
 /// Errors from the GPU YaRN RoPE dispatch.
 #[derive(Debug, thiserror::Error)]
@@ -55,7 +55,7 @@ pub enum GpuRopeError {
 ///
 /// Pipeline-as-argument matches the convention in [`super::gpu_norm`]
 /// (e.g. `encode_rms_norm_bf16_into`) and avoids borrowing the
-/// `MetalBackend` mutably across the encoding pass.
+/// `MetalContext` mutably across the encoding pass.
 ///
 /// # Safety
 ///
@@ -99,7 +99,7 @@ pub fn encode_yarn_rope_apply(
 /// YaRN RoPE, copy back. Diff-oracle / unit-test harness, not the
 /// production hot path.
 pub fn yarn_rope_apply_oneshot(
-    metal: &mut MetalBackend,
+    metal: &mut MetalContext,
     x: &mut [f32],
     rotary_dim: usize,
     inv_freq: &[f32],
@@ -169,7 +169,7 @@ mod tests {
     /// kernel-encoded buffer plumbing; doesn't exercise `cos`/`sin`.
     #[test]
     fn yarn_rope_gpu_pos_zero_mscale_one_is_identity() {
-        let mut metal = match MetalBackend::new() {
+        let mut metal = match MetalContext::new() {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("[gpu_rope] skipping: Metal init failed: {e:?}");
@@ -208,7 +208,7 @@ mod tests {
     /// fail spuriously across GPU revisions.
     #[test]
     fn yarn_rope_gpu_matches_cpu_at_pos_4096() {
-        let mut metal = match MetalBackend::new() {
+        let mut metal = match MetalContext::new() {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("[gpu_rope] skipping: Metal init failed: {e:?}");

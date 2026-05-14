@@ -58,7 +58,7 @@ use super::gpu_matvec::{
 };
 use super::gpu_norm::{encode_rms_norm_bf16_into, RmsNormBf16Pipelines};
 use super::layer_weight_cache::LayerWeightCache;
-use super::metal::{MetalBackend, MetalError};
+use super::metal::{MetalContext, MetalError};
 use super::moe_router::moe_router_cpu;
 use super::mtl_weight_buf::MtlWeightBuf;
 use super::state::LinearAttnState;
@@ -442,7 +442,7 @@ pub(super) struct GpuAttnEncodeArgs {
 /// input` is **not** the output target after slice 4f-3.
 #[allow(clippy::too_many_arguments)]
 pub fn linear_attn_layer_forward(
-    metal: &mut MetalBackend,
+    metal: &mut MetalContext,
     wf: &WeightFile,
     wf_buf: &MtlWeightBuf,
     layer_cache: &LayerWeightCache,
@@ -792,7 +792,7 @@ pub(super) struct PostAttnIntermediates {
 /// behaviour.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn post_attention_tail(
-    metal: &mut MetalBackend,
+    metal: &mut MetalContext,
     // Caller-owned cmdbuf into which CMD2+3 work is encoded. The
     // linear-attn caller passes its CMD1 cmdbuf so projections +
     // linear-attn fused kernels share the same submit (slice
@@ -874,7 +874,7 @@ pub(super) fn post_attention_tail(
 /// [`super::expert_forward::encode_moe_batched_permute_fuse`].
 #[allow(clippy::too_many_arguments)]
 pub(super) fn post_attention_pre_moe(
-    metal: &mut MetalBackend,
+    metal: &mut MetalContext,
     cmdbuf: &CommandBufferRef,
     wf: &WeightFile,
     wf_buf: &MtlWeightBuf,
@@ -1212,7 +1212,7 @@ pub(super) fn post_attention_pre_moe(
 /// shared FFN inside one cmdbuf.
 #[allow(dead_code, clippy::too_many_arguments)]
 pub(super) fn post_attention_post_o_proj_to_intermediates(
-    metal: &mut MetalBackend,
+    metal: &mut MetalContext,
     cmdbuf: &CommandBufferRef,
     wf: &WeightFile,
     wf_buf: &MtlWeightBuf,
@@ -1410,7 +1410,7 @@ pub(super) fn post_attention_post_o_proj_to_intermediates(
 /// routing + `shared_gate_score`.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn post_attention_residual_norm_route(
-    metal: &mut MetalBackend,
+    metal: &mut MetalContext,
     cmdbuf: &CommandBufferRef,
     wf: &WeightFile,
     wf_buf: &MtlWeightBuf,
@@ -1528,7 +1528,7 @@ pub(super) fn post_attention_residual_norm_route(
 /// post-dispatch drain).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn moe_dispatch_per_token(
-    metal: &mut MetalBackend,
+    metal: &mut MetalContext,
     wf_buf: &MtlWeightBuf,
     buffers: &mut LayerForwardBuffers,
     moe: &mut MoeBuffers,
@@ -1881,7 +1881,7 @@ fn encode_residual_add(
 /// kept on the signature for symmetry with the per-token oracle.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn batched_linear_attn_layer_forward(
-    metal: &mut MetalBackend,
+    metal: &mut MetalContext,
     wf: &WeightFile,
     wf_buf: &MtlWeightBuf,
     layer_cache: &LayerWeightCache,

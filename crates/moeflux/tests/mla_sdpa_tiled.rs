@@ -34,10 +34,10 @@ use moeflux::riir::gpu_mla::{
     encode_mla_sdpa_folded, encode_mla_sdpa_folded_tiled, MlaPipelines,
     MLA_MAX_CACHE_TG,
 };
-use moeflux::riir::metal::MetalBackend;
+use moeflux::riir::metal::MetalContext;
 use moeflux::riir::variants::VARIANT;
 
-fn make_buf_f32(metal: &MetalBackend, n: usize) -> Buffer {
+fn make_buf_f32(metal: &MetalContext, n: usize) -> Buffer {
     let bytes = (n * std::mem::size_of::<f32>()) as NSUInteger;
     metal
         .device()
@@ -88,7 +88,7 @@ fn run_case(cache_len: u32) -> (Vec<f32>, Vec<f32>) {
     let qk_rope_head_dim = v.qk_rope_head_dim as u32;
     let softmax_scale = 1.0 / ((v.qk_nope_head_dim + v.qk_rope_head_dim) as f32).sqrt();
 
-    let mut metal = MetalBackend::new().expect("MetalBackend::new");
+    let mut metal = MetalContext::new().expect("MetalContext::new");
     let pipes = MlaPipelines::new(&mut metal).expect("MlaPipelines::new");
 
     // Synthetic inputs — sin patterns, deterministic.

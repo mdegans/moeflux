@@ -23,7 +23,7 @@ use metal::{
     Buffer, CommandBufferRef, ComputePipelineState, MTLSize, NSUInteger,
 };
 
-use super::metal::{MetalBackend, MetalError};
+use super::metal::{MetalContext, MetalError};
 use super::variants::{Variant, VARIANT};
 
 /// All linear-attn pipelines pre-fetched. Used by the layer-forward
@@ -37,7 +37,7 @@ pub struct LinearAttnPipelines {
 }
 
 impl LinearAttnPipelines {
-    pub fn fetch(metal: &mut MetalBackend) -> Result<Self, MetalError> {
+    pub fn fetch(metal: &mut MetalContext) -> Result<Self, MetalError> {
         Ok(Self {
             conv1d_step: metal.pipeline("conv1d_step")?.clone(),
             rms_norm_qk: metal.pipeline("rms_norm_qk")?.clone(),

@@ -37,17 +37,16 @@ use metal::{Buffer, Device, MTLResourceOptions, NSUInteger};
 use rayon::prelude::*;
 
 use super::dense_mlp_gpu::{
-    encode_swiglu_ffn_layer_forward_gpu, DenseMlpGpuError, DenseMlpPipelines,
+    DenseMlpGpuError, DenseMlpPipelines, encode_swiglu_ffn_layer_forward_gpu,
 };
 use super::embedding::bf16_to_f32;
 use super::expert_forward::{
-    gpu_batched_experts_encode_pre_staged, ExpertForwardError, MoeBuffers,
-    MAX_K,
+    ExpertForwardError, MAX_K, MoeBuffers, gpu_batched_experts_encode_pre_staged,
 };
 use super::expert_io::{ExpertFiles, ExpertIoError};
-use super::gpu_matvec::{encode_bf16_matvec, BfMatvecPipelines};
-use super::metal::MetalBackend;
-use super::moe_router::{noaux_tc_router_cpu, MoeRouterError};
+use super::gpu_matvec::{BfMatvecPipelines, encode_bf16_matvec};
+use super::metal::MetalContext;
+use super::moe_router::{MoeRouterError, noaux_tc_router_cpu};
 use super::mtl_weight_buf::MtlWeightBuf;
 use super::variants::VARIANT;
 use super::weight_file::WeightFile;
@@ -61,9 +60,7 @@ pub enum CogitoMoeGpuError {
     HiddenOutLen { got: usize, expected: usize },
     #[error("missing tensor '{name}'")]
     MissingTensor { name: String },
-    #[error(
-        "tensor '{name}' size {got} bytes, expected {expected} bytes"
-    )]
+    #[error("tensor '{name}' size {got} bytes, expected {expected} bytes")]
     TensorSize {
         name: String,
         got: usize,
@@ -106,11 +103,7 @@ impl SharedExpertBuffers {
             );
             // SAFETY: shared storage, no GPU work in flight on a fresh buffer.
             unsafe {
-                std::ptr::write_bytes(
-                    b.contents() as *mut u8,
-                    0,
-                    n * std::mem::size_of::<f32>(),
-                );
+                std::ptr::write_bytes(b.contents() as *mut u8, 0, n * std::mem::size_of::<f32>());
             }
             b
         };
@@ -137,7 +130,7 @@ impl SharedExpertBuffers {
 /// reduction order.
 #[allow(clippy::too_many_arguments)]
 pub fn cogito_moe_layer_forward_gpu(
-    metal: &mut MetalBackend,
+    metal: &mut MetalContext,
     bufs: &mut MoeBuffers,
     shared_bufs: &SharedExpertBuffers,
     dense_pipes: &DenseMlpPipelines,
@@ -195,7 +188,7 @@ pub fn cogito_moe_layer_forward_gpu(
 /// CPU bounce. Phase 5 entry point for the GPU residual stream.
 #[allow(clippy::too_many_arguments)]
 pub fn cogito_moe_layer_forward_gpu_buf_io(
-    metal: &mut MetalBackend,
+    metal: &mut MetalContext,
     bufs: &mut MoeBuffers,
     shared_bufs: &SharedExpertBuffers,
     dense_pipes: &DenseMlpPipelines,
@@ -224,7 +217,7 @@ pub fn cogito_moe_layer_forward_gpu_buf_io(
 
 #[allow(clippy::too_many_arguments)]
 fn cogito_moe_layer_forward_gpu_inner(
-    metal: &mut MetalBackend,
+    metal: &mut MetalContext,
     bufs: &mut MoeBuffers,
     shared_bufs: &SharedExpertBuffers,
     dense_pipes: &DenseMlpPipelines,
@@ -247,9 +240,7 @@ fn cogito_moe_layer_forward_gpu_inner(
     // Issued on its own cmdbuf because we need the result host-side
     // for `noaux_tc_router_cpu` before continuing.
     let gate_w_name = format!("model.layers.{layer_idx}.mlp.gate.weight");
-    let bias_name = format!(
-        "model.layers.{layer_idx}.mlp.gate.e_score_correction_bias"
-    );
+    let bias_name = format!("model.layers.{layer_idx}.mlp.gate.e_score_correction_bias");
     let gate_w_off = wf_buf
         .tensor_offset(wf, &gate_w_name)
         .map_err(|e| CogitoMoeGpuError::SharedFfn(e.into()))?
@@ -273,11 +264,11 @@ fn cogito_moe_layer_forward_gpu_inner(
     }
     let mut gate_logits = bufs.gate_logits_to_vec();
 
-    let bias_bytes = wf.tensor_bytes(&bias_name).ok_or_else(|| {
-        CogitoMoeGpuError::MissingTensor {
-            name: bias_name.clone(),
-        }
-    })?;
+    let bias_bytes =
+        wf.tensor_bytes(&bias_name)
+            .ok_or_else(|| CogitoMoeGpuError::MissingTensor {
+                name: bias_name.clone(),
+            })?;
     let expected_bias_bytes = num_experts * 2;
     if bias_bytes.len() != expected_bias_bytes {
         return Err(CogitoMoeGpuError::TensorSize {
@@ -287,8 +278,7 @@ fn cogito_moe_layer_forward_gpu_inner(
         });
     }
     let bias_u16 = bytemuck_u16(bias_bytes);
-    let bias_f32: Vec<f32> =
-        bias_u16.iter().map(|&b| bf16_to_f32(b)).collect();
+    let bias_f32: Vec<f32> = bias_u16.iter().map(|&b| bf16_to_f32(b)).collect();
 
     let mut indices = vec![0i32; k];
     let mut weights = vec![0f32; k];
@@ -322,9 +312,7 @@ fn cogito_moe_layer_forward_gpu_inner(
         dsts[..k]
             .par_iter_mut()
             .zip(indices.par_iter().take(k))
-            .try_for_each(|(slot, &e)| {
-                expert_files.read_expert(layer_idx, e as usize, slot)
-            })
+            .try_for_each(|(slot, &e)| expert_files.read_expert(layer_idx, e as usize, slot))
     })?;
 
     // ---- GPU: shared expert SwiGLU into bufs.shared_out ----
@@ -334,8 +322,7 @@ fn cogito_moe_layer_forward_gpu_inner(
     // wait between cmdbufs.
     {
         let cmdbuf_shared = metal.queue().new_command_buffer();
-        let prefix =
-            format!("model.layers.{layer_idx}.mlp.shared_experts");
+        let prefix = format!("model.layers.{layer_idx}.mlp.shared_experts");
         encode_swiglu_ffn_layer_forward_gpu(
             cmdbuf_shared,
             dense_pipes,
@@ -357,8 +344,7 @@ fn cogito_moe_layer_forward_gpu_inner(
     // `h_mid + moe + shared` produces exactly the residual
     // contribution. shared_gate_score is bound for the kernel
     // signature but the unscaled kernel ignores it.
-    let data_set_per_slot: [super::SlotSource; MAX_K] =
-        [super::SlotSource::Synced; MAX_K];
+    let data_set_per_slot: [super::SlotSource; MAX_K] = [super::SlotSource::Synced; MAX_K];
     // Borrow split: clone the &Buffer references (Metal buffers are
     // Arc-like, clone is cheap retain) so the &mut bufs borrow into
     // the pre-staged encoder doesn't conflict with the input refs.

@@ -44,10 +44,10 @@
 use std::collections::VecDeque;
 
 use super::expert_forward::{
-    gpu_batched_experts_encode, gpu_batched_experts_encode_pre_staged,
-    ChainToNormed, ExpertForwardError, MoeBuffers,
+    ChainToNormed, ExpertForwardError, MoeBuffers, gpu_batched_experts_encode,
+    gpu_batched_experts_encode_pre_staged,
 };
-use super::metal::MetalBackend;
+use super::metal::MetalContext;
 use super::variants::VARIANT;
 use super::{RsCtx, RsError};
 
@@ -65,7 +65,7 @@ use super::{RsCtx, RsError};
 /// can both be in flight. Entering layer N+1, we drain layer N-1
 /// (oldest). By that point N-1 has had ~2 layer-times of GPU runtime
 /// so the wait is short or zero. Metal queue serialization on a single
-/// command queue (`metal::MetalBackend::queue`) handles the inter-
+/// command queue (`metal::MetalContext::queue`) handles the inter-
 /// cmdbuf data dependencies (`linear_buffers.{normed, input, sum_sq}`
 /// written by N's chain, read by N+1's CMD1) without explicit CPU
 /// synchronization.
@@ -101,10 +101,7 @@ impl DeferredRing {
     /// Push a fresh dispatch onto the ring. Errors with [`DeferredError::RingFull`]
     /// if the ring is already at [`Self::DEPTH`] — callers in
     /// `step_internal` must drain before pushing past capacity.
-    pub(crate) fn push(
-        &mut self,
-        state: DeferredState,
-    ) -> Result<(), DeferredError> {
+    pub(crate) fn push(&mut self, state: DeferredState) -> Result<(), DeferredError> {
         if self.is_full() {
             return Err(DeferredError::RingFull);
         }
@@ -186,9 +183,7 @@ pub enum DeferredError {
          before pushing a new one"
     )]
     RingFull,
-    #[error(
-        "hidden_out must be HIDDEN_DIM={expected} floats, got {actual}"
-    )]
+    #[error("hidden_out must be HIDDEN_DIM={expected} floats, got {actual}")]
     BadHiddenOutLen { expected: usize, actual: usize },
     #[error("Metal backend or MoE buffers init failed")]
     Init,
@@ -215,7 +210,7 @@ impl From<RsError> for DeferredError {
 /// path is reached only via the diff-oracle test that forces it on.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gpu_batched_experts_begin(
-    metal: &mut MetalBackend,
+    metal: &mut MetalContext,
     bufs: &mut MoeBuffers,
     ring: &mut DeferredRing,
     actual_k: i32,
@@ -284,7 +279,7 @@ pub(crate) fn gpu_batched_experts_begin(
 /// host-slice variant ([`gpu_batched_experts_begin`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gpu_batched_experts_begin_pre_staged(
-    metal: &mut MetalBackend,
+    metal: &mut MetalContext,
     bufs: &mut MoeBuffers,
     ring: &mut DeferredRing,
     actual_k: i32,
@@ -416,11 +411,7 @@ fn cpu_combine(
     for k in 0..actual_k {
         let expert_k = bufs.out(k).to_vec();
         debug_assert_eq!(expert_k.len(), dim);
-        super::cpu_ops::cpu_vec_madd(
-            &mut moe_out,
-            &expert_k,
-            expert_weights[k],
-        );
+        super::cpu_ops::cpu_vec_madd(&mut moe_out, &expert_k, expert_weights[k]);
     }
 
     // Apply sigmoid gate to shared expert output (in place into a
@@ -491,8 +482,7 @@ impl RsCtx {
             ..
         } = self;
         let metal = metal.as_mut().expect("metal_and_moe_mut just-set");
-        let bufs =
-            moe_buffers.as_mut().expect("metal_and_moe_mut just-set");
+        let bufs = moe_buffers.as_mut().expect("metal_and_moe_mut just-set");
         gpu_batched_experts_begin(
             metal,
             bufs,

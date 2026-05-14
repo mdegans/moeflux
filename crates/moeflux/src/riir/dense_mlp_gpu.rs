@@ -23,7 +23,7 @@ use metal::{
 };
 
 use super::gpu_matvec::{encode_matvec, MatvecPipelines, MatvecSpec};
-use super::metal::{MetalBackend, MetalError};
+use super::metal::{MetalContext, MetalError};
 use super::mtl_weight_buf::{MtlWeightBuf, MtlWeightBufError};
 use super::variants::VARIANT;
 use super::weight_file::WeightFile;
@@ -77,7 +77,7 @@ impl DenseMlpBuffers {
 /// shape of [`super::expert_forward::gpu_batched_experts_forward`] for
 /// host-slice consumers.
 pub fn dense_mlp_layer_forward_gpu(
-    metal: &mut MetalBackend,
+    metal: &mut MetalContext,
     pipes: &DenseMlpPipelines,
     bufs: &mut DenseMlpBuffers,
     wf: &WeightFile,
@@ -166,7 +166,7 @@ pub struct DenseMlpPipelines {
 }
 
 impl DenseMlpPipelines {
-    pub fn fetch(metal: &mut MetalBackend) -> Result<Self, MetalError> {
+    pub fn fetch(metal: &mut MetalContext) -> Result<Self, MetalError> {
         Ok(Self {
             matvec: MatvecPipelines::fetch(metal)?,
             swiglu: metal.pipeline("swiglu_fused")?.clone(),

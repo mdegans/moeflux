@@ -27,7 +27,7 @@ use moeflux::riir::dense_mlp_gpu::DenseMlpPipelines;
 use moeflux::riir::expert_forward::MoeBuffers;
 use moeflux::riir::expert_io::ExpertFiles;
 use moeflux::riir::gpu_matvec::BfMatvecPipelines;
-use moeflux::riir::metal::MetalBackend;
+use moeflux::riir::metal::MetalContext;
 use moeflux::riir::moe_cpu::deepseek_moe_cpu;
 use moeflux::riir::mtl_weight_buf::MtlWeightBuf;
 use moeflux::riir::variants::VARIANT;
@@ -51,7 +51,7 @@ fn cogito_moe_layer3_gpu_matches_cpu() {
     let experts_dir = Path::new(ROOT).join("root");
     let wf = WeightFile::open(&bin, &manifest).expect("open weights");
     let ef = ExpertFiles::open(&experts_dir).expect("open experts");
-    let mut metal = MetalBackend::new().expect("open Metal");
+    let mut metal = MetalContext::new().expect("open Metal");
     let device = metal.device().clone();
     let mut bufs = MoeBuffers::new(&device);
     let shared_bufs = SharedExpertBuffers::new(&device);

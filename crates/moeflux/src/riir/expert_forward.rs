@@ -52,7 +52,7 @@ use metal::{
 
 use super::gpu_matvec::{encode_matvec_n_tokens, MatvecPipelines};
 use super::gpu_norm::{encode_rms_norm_bf16_into, RmsNormBf16Pipelines};
-use super::metal::{MetalBackend, MetalError, MtlBuffer};
+use super::metal::{MetalContext, MetalError, MtlBuffer};
 use super::moe_router::ExpertBuckets;
 use super::variants::{SharedExpertGate, Variant, GROUP_SIZE, VARIANT};
 
@@ -130,7 +130,7 @@ pub enum ExpertForwardError {
 /// up, act, out). At ~5 MB total this is fine for the diff-oracle test
 /// path; persistent reuse arrives with slice 9b.
 pub fn gpu_expert_forward(
-    metal: &mut MetalBackend,
+    metal: &mut MetalContext,
     expert_data: &[u8],
     h_post: &[f32],
     expert_out: &mut [f32],
@@ -602,7 +602,7 @@ impl std::fmt::Debug for MoeBuffers {
 /// per-thread sequential), so it may also land bit-exact like 9a.
 #[allow(clippy::too_many_arguments)]
 pub fn gpu_batched_experts_forward(
-    metal: &mut MetalBackend,
+    metal: &mut MetalContext,
     bufs: &mut MoeBuffers,
     actual_k: i32,
     expert_data: &[u8],
@@ -667,7 +667,7 @@ pub fn gpu_batched_experts_forward(
 /// refactor).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gpu_batched_experts_encode(
-    metal: &mut MetalBackend,
+    metal: &mut MetalContext,
     bufs: &mut MoeBuffers,
     actual_k: i32,
     expert_data: &[u8],
@@ -774,7 +774,7 @@ pub(crate) fn gpu_batched_experts_encode(
 /// layer preads new data into `bufs.data[slot]`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gpu_batched_experts_encode_pre_staged(
-    metal: &mut MetalBackend,
+    metal: &mut MetalContext,
     bufs: &mut MoeBuffers,
     actual_k: i32,
     input: &BufferRef,
@@ -1342,7 +1342,7 @@ mod tests {
     #[test]
     #[ignore = "needs Metal device + access to shaders.metal source"]
     fn gpu_expert_forward_runs_and_produces_finite_output() {
-        let mut metal = MetalBackend::new().expect("MetalBackend::new");
+        let mut metal = MetalContext::new().expect("MetalContext::new");
         let expert_data = synth::expert_data_seeded();
         let h_post = synth::h_post_seeded();
         let mut out = vec![0.0f32; VARIANT.hidden_dim];

@@ -1,6 +1,6 @@
 //! Metal backend for the RIIR port.
 //!
-//! Wraps `metal-rs` into a single-owner [`MetalBackend`] holding the
+//! Wraps `metal-rs` into a single-owner [`MetalContext`] holding the
 //! Metal device, command queue, the compiled shader library, and a
 //! per-kernel pipeline-state cache. RAII; no globals.
 //!
@@ -34,8 +34,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use metal::{
-    CommandBufferRef, CommandQueue, CompileOptions, ComputePipelineState,
-    Device, Library, MTLResourceOptions, NSUInteger,
+    CommandBufferRef, CommandQueue, CompileOptions, ComputePipelineState, Device, Library,
+    MTLResourceOptions, NSUInteger,
 };
 
 /// Errors from the Metal backend.
@@ -53,8 +53,7 @@ pub enum MetalError {
 
 /// Embedded `shaders.metal` source — compiled into the binary so
 /// runtime has no path-discovery requirement. See module doc.
-const SHADER_SOURCE: &str =
-    include_str!("../../shaders/shaders.metal");
+const SHADER_SOURCE: &str = include_str!("../../shaders/shaders.metal");
 
 /// All kernels in `shaders.metal`. The smoke test compiles every
 /// one of these at startup; if any fails, the shader source is
@@ -104,7 +103,7 @@ pub const ALL_KERNELS: &[&str] = &[
 ];
 
 /// Per-label cmdbuf submission stats. Aggregated under
-/// [`MetalBackend::cmdbuf_stats`] via the labeled commit+wait wrapper.
+/// [`MetalContext::cmdbuf_stats`] via the labeled commit+wait wrapper.
 ///
 /// `gpu_ns` is reserved for a future port to a metal-rs version that
 /// surfaces `gpu_start_time` / `gpu_end_time`; for now it stays at
@@ -118,7 +117,7 @@ pub struct CmdbufStat {
 
 /// Single-owner Metal backend. One per `Ctx`. Owns the device,
 /// command queue, compiled library, and pipeline cache.
-pub struct MetalBackend {
+pub struct MetalContext {
     device: Device,
     queue: CommandQueue,
     library: Library,
@@ -133,7 +132,7 @@ pub struct MetalBackend {
     cmdbuf_stats: Mutex<HashMap<&'static str, CmdbufStat>>,
 }
 
-impl MetalBackend {
+impl MetalContext {
     /// Open the system-default Metal device, build a command queue,
     /// and compile `shaders.metal` into a `Library`.
     ///
@@ -175,7 +174,7 @@ impl MetalBackend {
     /// (one Objective-C `retain`).
     ///
     /// Use this when a caller needs to allocate a cmdbuf from the queue
-    /// *and* hold `&mut MetalBackend` simultaneously for pipeline
+    /// *and* hold `&mut MetalContext` simultaneously for pipeline
     /// fetches or labeled commit-waits. Calling
     /// `metal.queue().new_command_buffer()` returns a `&CommandBufferRef`
     /// whose lifetime is tied to `metal`, which conflicts with later
@@ -190,16 +189,13 @@ impl MetalBackend {
     /// `name` must be `'static` so cache keys don't outlive the
     /// strings that produced them — caller passes string literals
     /// from [`ALL_KERNELS`] or from inline `dispatch_*` helpers.
-    pub fn pipeline(
-        &mut self,
-        name: &'static str,
-    ) -> Result<&ComputePipelineState, MetalError> {
+    pub fn pipeline(&mut self, name: &'static str) -> Result<&ComputePipelineState, MetalError> {
         if !self.pipelines.contains_key(name) {
-            let function = self.library.get_function(name, None).map_err(
-                |_| MetalError::FunctionNotFound {
+            let function = self.library.get_function(name, None).map_err(|_| {
+                MetalError::FunctionNotFound {
                     name: name.to_string(),
-                },
-            )?;
+                }
+            })?;
             let state = self
                 .device
                 .new_compute_pipeline_state_with_function(&function)
@@ -232,11 +228,7 @@ impl MetalBackend {
     ///
     /// `label` must be `'static` so the stats map can key on it
     /// without owning a string per call.
-    pub fn commit_and_wait_labeled(
-        &self,
-        cmdbuf: &CommandBufferRef,
-        label: &'static str,
-    ) {
+    pub fn commit_and_wait_labeled(&self, cmdbuf: &CommandBufferRef, label: &'static str) {
         let t0 = std::time::Instant::now();
         cmdbuf.commit();
         cmdbuf.wait_until_completed();
@@ -272,9 +264,9 @@ impl MetalBackend {
     }
 }
 
-impl std::fmt::Debug for MetalBackend {
+impl std::fmt::Debug for MetalContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MetalBackend")
+        f.debug_struct("MetalContext")
             .field("device", &self.device.name())
             .field("pipelines_cached", &self.pipelines.len())
             .finish()
@@ -436,20 +428,16 @@ impl MtlBuffer<u8> {
     /// alignment (trivially true for `u8`). The Metal buffer holds a
     /// non-owning reference to the bytes; the [`AlignedBacking`] in
     /// the returned [`MtlBuffer`] frees on drop after `inner` releases.
-    pub fn with_aligned_len_u8(
-        device: &Device,
-        len: usize,
-        align: usize,
-    ) -> Self {
+    pub fn with_aligned_len_u8(device: &Device, len: usize, align: usize) -> Self {
         assert!(align.is_power_of_two(), "align must be power of two");
         assert!(len > 0, "with_aligned_len_u8 len must be > 0");
-        let layout = std::alloc::Layout::from_size_align(len, align)
-            .expect("invalid alignment for len");
+        let layout =
+            std::alloc::Layout::from_size_align(len, align).expect("invalid alignment for len");
         // SAFETY: `layout` has nonzero size; OOM is handled by aborting
         // via `handle_alloc_error`, matching Box / Vec behavior.
         let raw = unsafe { std::alloc::alloc(layout) };
-        let ptr = std::ptr::NonNull::new(raw)
-            .unwrap_or_else(|| std::alloc::handle_alloc_error(layout));
+        let ptr =
+            std::ptr::NonNull::new(raw).unwrap_or_else(|| std::alloc::handle_alloc_error(layout));
         // Wrap as a Metal buffer with deallocator=None — Metal does
         // not own the allocation; `AlignedBacking::drop` does, and
         // runs strictly after `inner` (declaration order).
@@ -494,8 +482,7 @@ mod tests {
     #[test]
     #[ignore = "needs Metal device + access to shaders.metal source"]
     fn metal_backend_compiles_all_kernels() {
-        let mut backend =
-            MetalBackend::new().expect("MetalBackend::new failed");
+        let mut backend = MetalContext::new().expect("MetalContext::new failed");
         eprintln!("[metal] device: {}", backend.device().name());
         eprintln!("[metal] kernels to compile: {}", ALL_KERNELS.len());
 
@@ -513,7 +500,7 @@ mod tests {
     #[test]
     #[ignore = "needs Metal device"]
     fn buffer_round_trip() {
-        let backend = MetalBackend::new().expect("MetalBackend::new");
+        let backend = MetalContext::new().expect("MetalContext::new");
         let data: Vec<f32> = (0..1024).map(|i| i as f32 * 0.5).collect();
         let buf = MtlBuffer::with_data(backend.device(), &data);
         assert_eq!(buf.len(), 1024);

@@ -24,7 +24,7 @@ use metal::{MTLResourceOptions, NSUInteger};
 use moeflux::riir::dense_mlp_gpu::{
     encode_dense_mlp_layer_forward_gpu, DenseMlpPipelines,
 };
-use moeflux::riir::metal::MetalBackend;
+use moeflux::riir::metal::MetalContext;
 use moeflux::riir::mlp_cpu::dense_mlp_swiglu_cpu;
 use moeflux::riir::mtl_weight_buf::MtlWeightBuf;
 use moeflux::riir::variants::VARIANT;
@@ -49,7 +49,7 @@ fn dense_mlp_layer0_gpu_matches_cpu() {
     let bin = Path::new(ROOT).join("artifacts/model_weights.bin");
     let manifest = Path::new(ROOT).join("artifacts/model_weights.json");
     let wf = WeightFile::open(&bin, &manifest).expect("open weights");
-    let mut metal = MetalBackend::new().expect("open Metal");
+    let mut metal = MetalContext::new().expect("open Metal");
     let device = metal.device().clone();
     let wf_buf = MtlWeightBuf::wrap(&wf, &device);
 

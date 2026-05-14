@@ -30,7 +30,7 @@ use metal::{
     MTLSize, NSUInteger,
 };
 
-use super::metal::{MetalBackend, MetalError, MtlBuffer};
+use super::metal::{MetalContext, MetalError, MtlBuffer};
 use super::variants::{RMS_NORM_EPS, VARIANT};
 
 /// Errors from GPU RMSNorm.
@@ -52,7 +52,7 @@ pub enum GpuNormError {
 /// `weight_bf16` is the raw little-endian BF16 byte sequence (typically
 /// from `WeightFile::tensor_bytes`).
 pub fn gpu_rms_norm_fused(
-    metal: &mut MetalBackend,
+    metal: &mut MetalContext,
     x: &[f32],
     weight_bf16: &[u8],
     out: &mut [f32],
@@ -141,7 +141,7 @@ pub struct RmsNormBf16Pipelines {
 }
 
 impl RmsNormBf16Pipelines {
-    pub fn fetch(metal: &mut MetalBackend) -> Result<Self, MetalError> {
+    pub fn fetch(metal: &mut MetalContext) -> Result<Self, MetalError> {
         Ok(Self {
             sum: metal.pipeline("rms_norm_sum_sq")?.clone(),
             apply: metal.pipeline("rms_norm_apply_bf16")?.clone(),
@@ -222,7 +222,7 @@ pub struct RmsNormBf16FusedNTokensPipeline {
 }
 
 impl RmsNormBf16FusedNTokensPipeline {
-    pub fn fetch(metal: &mut MetalBackend) -> Result<Self, MetalError> {
+    pub fn fetch(metal: &mut MetalContext) -> Result<Self, MetalError> {
         Ok(Self {
             pso: metal.pipeline("rms_norm_bf16_fused_n_tokens")?.clone(),
         })

@@ -80,7 +80,7 @@ pub use linear_attn::{
     LinearAttnError,
 };
 pub use lm_head::{lm_head_cpu, LmHeadError};
-pub use metal::{MetalBackend, MetalError, MtlBuffer};
+pub use metal::{MetalContext, MetalError, MtlBuffer};
 pub use moe_router::{moe_router_cpu, MoeRouterError};
 pub use rms_norm::{rms_norm_cpu, rms_norm_per_head_cpu, RmsNormError};
 pub use rope::{apply_rotary_emb, RopeError};
@@ -206,7 +206,7 @@ pub struct RsCtx {
     /// Lazily-built Metal backend. CPU-only kernels skip the cost; GPU
     /// kernels (`gpu_expert_forward` and friends) construct it on
     /// first use via [`Self::metal_mut`].
-    metal: Option<MetalBackend>,
+    metal: Option<MetalContext>,
     /// Lazily-built persistent multi-expert + combine buffer set.
     /// Allocated on first [`Self::gpu_batched_experts_forward`] call;
     /// reused thereafter. ~28 MB on A3B.
@@ -387,10 +387,10 @@ impl RsCtx {
     /// Build (or return) the Metal backend on demand. CPU-only kernels
     /// don't need it; GPU kernels go through this accessor so the
     /// shader-compile cost is paid lazily on first GPU use.
-    fn metal_mut(&mut self) -> Result<&mut MetalBackend, RsError> {
+    fn metal_mut(&mut self) -> Result<&mut MetalContext, RsError> {
         if self.metal.is_none() {
             self.metal =
-                Some(MetalBackend::new().map_err(|_| RsError::InitFailed)?);
+                Some(MetalContext::new().map_err(|_| RsError::InitFailed)?);
         }
         Ok(self.metal.as_mut().expect("just-set"))
     }
@@ -401,10 +401,10 @@ impl RsCtx {
     /// are valid.
     fn metal_and_moe_mut(
         &mut self,
-    ) -> Result<(&mut MetalBackend, &mut MoeBuffers), RsError> {
+    ) -> Result<(&mut MetalContext, &mut MoeBuffers), RsError> {
         if self.metal.is_none() {
             self.metal =
-                Some(MetalBackend::new().map_err(|_| RsError::InitFailed)?);
+                Some(MetalContext::new().map_err(|_| RsError::InitFailed)?);
         }
         if self.moe_buffers.is_none() {
             let device =
@@ -1100,7 +1100,7 @@ impl RsCtx {
     fn ensure_mla_resources(&mut self) -> Result<(), RsError> {
         if self.metal.is_none() {
             self.metal =
-                Some(MetalBackend::new().map_err(|_| RsError::InitFailed)?);
+                Some(MetalContext::new().map_err(|_| RsError::InitFailed)?);
         }
         if self.wf_buf.is_none() {
             let device =
@@ -1216,7 +1216,7 @@ impl RsCtx {
     fn ensure_linear_resources(&mut self) -> Result<(), RsError> {
         if self.metal.is_none() {
             self.metal =
-                Some(MetalBackend::new().map_err(|_| RsError::InitFailed)?);
+                Some(MetalContext::new().map_err(|_| RsError::InitFailed)?);
         }
         if self.wf_buf.is_none() {
             let device =
@@ -2608,7 +2608,7 @@ impl RsCtx {
         // ran, OR initialize a backend on demand.
         if self.metal.is_none() {
             self.metal = Some(
-                MetalBackend::new()
+                MetalContext::new()
                     .map_err(|_| state_snapshot::StateSnapshotError::BuffersNotReady)?,
             );
         }

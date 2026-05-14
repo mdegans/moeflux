@@ -47,7 +47,7 @@ use super::gpu_norm::{
     encode_rms_norm_bf16_into, RmsNormBf16Pipelines,
 };
 use super::gpu_rope::encode_yarn_rope_apply;
-use super::metal::{MetalBackend, MetalError};
+use super::metal::{MetalContext, MetalError};
 use super::mtl_weight_buf::MtlWeightBuf;
 use super::state::MlaKvCacheGpu;
 use super::variants::{RMS_NORM_EPS, VARIANT};
@@ -167,7 +167,7 @@ pub struct MlaForwardPipelines {
 }
 
 impl MlaForwardPipelines {
-    pub fn new(metal: &mut MetalBackend) -> Result<Self, MetalError> {
+    pub fn new(metal: &mut MetalContext) -> Result<Self, MetalError> {
         Ok(Self {
             mla: MlaPipelines::new(metal)?,
             matvec: MatvecPipelines::fetch(metal)?,
@@ -207,7 +207,7 @@ pub enum MlaForwardGpuError {
 /// `kv_cache.len` is bumped by 1 on success.
 #[allow(clippy::too_many_arguments)]
 pub fn mla_attn_layer_forward_gpu(
-    metal: &mut MetalBackend,
+    metal: &mut MetalContext,
     pipes: &MlaForwardPipelines,
     wf: &WeightFile,
     wf_buf: &MtlWeightBuf,

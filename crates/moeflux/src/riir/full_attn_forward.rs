@@ -57,7 +57,7 @@ use super::linear_attn_forward::{
     read_buffer_to_vec, GpuAttnEncodeArgs, LayerForwardBuffers,
     LayerForwardError, OProj, PostAttnIntermediates,
 };
-use super::metal::MetalBackend;
+use super::metal::MetalContext;
 use super::mtl_weight_buf::MtlWeightBuf;
 use super::rms_norm::rms_norm_per_head_cpu;
 use super::rope::apply_rotary_emb;
@@ -83,7 +83,7 @@ use super::weight_file::WeightFile;
 /// argument to `apply_rotary_emb`).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn full_attn_pre_moe_layer_forward(
-    metal: &mut MetalBackend,
+    metal: &mut MetalContext,
     wf: &WeightFile,
     wf_buf: &MtlWeightBuf,
     layer_cache: &LayerWeightCache,
@@ -427,7 +427,7 @@ pub(super) fn full_attn_pre_moe_layer_forward(
 /// completes (drained at the top of the next layer's forward).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn full_attn_layer_forward(
-    metal: &mut MetalBackend,
+    metal: &mut MetalContext,
     wf: &WeightFile,
     wf_buf: &MtlWeightBuf,
     layer_cache: &LayerWeightCache,
@@ -503,7 +503,7 @@ pub(super) fn full_attn_layer_forward(
 /// state machine is decode-only after Phase H.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn batched_full_attn_layer_forward(
-    metal: &mut MetalBackend,
+    metal: &mut MetalContext,
     wf: &WeightFile,
     wf_buf: &MtlWeightBuf,
     layer_cache: &LayerWeightCache,
