@@ -2565,3 +2565,161 @@ kernel void mla_kv_cache_append(
         rope_k_cache[p * qk_rope + tid] = k_pe[tid];
     }
 }
+
+
+// ============================================================================
+// Kernel: MoE softmax + selection-sort top-K
+// ============================================================================
+// Per-token GPU port of `moe_router_cpu`'s softmax → top-K. One threadgroup
+// per token: lanes cooperate on the softmax reductions; lane 0 then runs the
+// running-min selection-sort to pick K experts.
+//
+// Slot order matches the CPU oracle: each new winner overwrites the running-
+// minimum slot, so the output is NOT sorted by score. This makes the diff
+// test bit-exact per slot (no set-sort needed).
+//
+// Caps:
+//   - n_experts ≤ MAX_EXPERTS (512 — covers Qwen3-A3B's 128 and Cogito-V2 /
+//     DeepSeek-V3's 256 with headroom).
+//   - k ≤ MAX_K (16 — current models use 8).
+//
+// Dispatch:
+//   threadgroups = (n_tokens, 1, 1)
+//   threads      = (tg_size, 1, 1)   // typically 64-128, must be ≥ 32
+//
+// Caller has full control over tg_size: at minimum 32 for one simd group;
+// 64-128 is a sensible sweet spot for the parallel softmax pass.
+
+kernel void moe_softmax_topk(
+    device const float* logits       [[buffer(0)]],   // [n_tokens, n_experts]
+    device int*         out_indices  [[buffer(1)]],   // [n_tokens, k]
+    device float*       out_weights  [[buffer(2)]],   // [n_tokens, k]
+    constant uint&      n_experts    [[buffer(3)]],
+    constant uint&      k            [[buffer(4)]],
+    uint tgid     [[threadgroup_position_in_grid]],
+    uint lid      [[thread_position_in_threadgroup]],
+    uint tg_size  [[threads_per_threadgroup]]
+) {
+    constexpr uint MAX_EXPERTS = 512;
+    constexpr uint MAX_K       = 16;
+    threadgroup float probs[MAX_EXPERTS];
+
+    device const float* l = logits + tgid * n_experts;
+
+    uint simd_lane       = lid % 32;
+    uint simd_group      = lid / 32;
+    uint num_simd_groups = (tg_size + 31) / 32;
+
+    // === Pass 1: max ===
+    threadgroup float shared_max[32];
+    float local_max = -1e30f;
+    for (uint i = lid; i < n_experts; i += tg_size) {
+        local_max = max(local_max, l[i]);
+    }
+    float sm = simd_max(local_max);
+    if (simd_lane == 0) shared_max[simd_group] = sm;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float global_max = -1e30f;
+    if (simd_group == 0 && simd_lane < num_simd_groups) {
+        global_max = simd_max(shared_max[simd_lane]);
+    }
+    threadgroup float bc_max;
+    if (lid == 0) bc_max = global_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    global_max = bc_max;
+
+    // === Pass 2: exp + partial sum (write probs into tg-mem) ===
+    threadgroup float shared_sum[32];
+    float local_sum = 0.0f;
+    for (uint i = lid; i < n_experts; i += tg_size) {
+        float v = exp(l[i] - global_max);
+        probs[i] = v;
+        local_sum += v;
+    }
+    float ss = simd_sum(local_sum);
+    if (simd_lane == 0) shared_sum[simd_group] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float global_sum = 0.0f;
+    if (simd_group == 0 && simd_lane < num_simd_groups) {
+        global_sum = simd_sum(shared_sum[simd_lane]);
+    }
+    threadgroup float bc_sum;
+    if (lid == 0) bc_sum = global_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    global_sum = bc_sum;
+
+    // === Pass 3: in-place softmax normalize in tg-mem ===
+    float inv = 1.0f / global_sum;
+    for (uint i = lid; i < n_experts; i += tg_size) {
+        probs[i] *= inv;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // === Pass 4: serial selection-sort top-K (lane 0 only) ===
+    // Mirrors `cpu_topk`: each candidate either replaces the current
+    // running-minimum slot or is discarded. Output slot order is the
+    // running-min replacement order — not sorted by score, but bit-exact
+    // against the CPU oracle.
+    if (lid == 0) {
+        int   sel_idx[MAX_K];
+        float sel_val[MAX_K];
+        for (uint s = 0; s < k; ++s) {
+            sel_idx[s] = 0;
+            sel_val[s] = -1e30f;
+        }
+        for (uint i = 0; i < n_experts; ++i) {
+            float v = probs[i];
+            uint min_k = 0;
+            for (uint s = 1; s < k; ++s) {
+                if (sel_val[s] < sel_val[min_k]) min_k = s;
+            }
+            if (v > sel_val[min_k]) {
+                sel_val[min_k] = v;
+                sel_idx[min_k] = int(i);
+            }
+        }
+        device int*   ix = out_indices + tgid * k;
+        device float* wt = out_weights + tgid * k;
+        for (uint s = 0; s < k; ++s) {
+            ix[s] = sel_idx[s];
+            wt[s] = sel_val[s];
+        }
+    }
+}
+
+
+// ============================================================================
+// Kernel: MoE per-token weight normalization
+// ============================================================================
+// Per-token: weights[t, 0..k] /= sum(weights[t, 0..k]) if sum > 0; else
+// untouched. Matches `cpu_normalize_weights`'s guarded divide exactly.
+//
+// Dispatch:
+//   threadgroups = (n_tokens, 1, 1)
+//   threads      = (k, 1, 1)         // k is small (≤ 16); one thread/slot
+
+kernel void moe_normalize_weights(
+    device float*  weights  [[buffer(0)]],   // [n_tokens, k] in-place
+    constant uint& k        [[buffer(1)]],
+    uint tgid    [[threadgroup_position_in_grid]],
+    uint lid     [[thread_position_in_threadgroup]]
+) {
+    device float* w = weights + tgid * k;
+
+    threadgroup float bc_inv;
+    if (lid == 0) {
+        float s = 0.0f;
+        for (uint i = 0; i < k; ++i) s += w[i];
+        // Same guard as `cpu_normalize_weights`: skip the divide if sum ≤ 0
+        // (defensive; softmax outputs always satisfy sum > 0 in practice).
+        bc_inv = (s > 0.0f) ? (1.0f / s) : 1.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv = bc_inv;
+
+    if (lid < k) {
+        w[lid] = w[lid] * inv;
+    }
+}

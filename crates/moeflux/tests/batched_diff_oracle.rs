@@ -31,8 +31,11 @@ use moeflux::riir::gpu_matvec::{
     encode_bf16_matmul_n_tokens, encode_matvec_n_tokens, BfMatvecPipelines,
     MatvecPipelines,
 };
+use moeflux::riir::gpu_moe_router::{
+    encode_moe_router, MoeRouterPipelines,
+};
 use moeflux::riir::metal::MetalBackend;
-use moeflux::riir::moe_router::build_expert_buckets;
+use moeflux::riir::moe_router::{build_expert_buckets, moe_router_cpu};
 use moeflux::riir::sdpa::sdpa_cpu;
 use moeflux::riir::variants::VARIANT;
 use moeflux::riir::MtlBuffer;
@@ -1109,4 +1112,175 @@ fn moe_permute_fuse_n_tokens_matches_tokenwise() {
             COSINE_FLOOR
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Phase A (session 6): GPU MoE router vs CPU oracle.
+// ---------------------------------------------------------------------------
+
+/// Per-token GPU `encode_moe_router` against `moe_router_cpu`.
+///
+/// Both sides start from the same f32 logits tensor `[n_tokens, n_experts]`.
+/// The CPU oracle runs softmax → selection-sort top-K → divide-by-sum
+/// normalize per token, the GPU does the same on-device.
+///
+/// Comparison policy (mirrors `moe_router_cpu_close_c_vs_rust` in
+/// `diff_oracle.rs`):
+///   - **Indices**: bit-exact as a *set* per token (sort ascending, compare).
+///     Slot order can drift if two probs collide within ULP, but for
+///     random uniform-ish inputs the magnitude separation dominates.
+///   - **Weights**: cosine ≥ COSINE_FLOOR per token after aligning by
+///     index (gather GPU weights at CPU's index order). ULP drift comes
+///     from the softmax reduction order (tree on GPU vs scan on CPU).
+fn run_moe_router_diff(n_tokens: usize, n_experts: usize, k: usize, seed: u64) {
+    let mut rng = XorShift64::new(seed);
+
+    // Logits: random in (-2, 2) per element. Large enough magnitude that
+    // softmax has real selection pressure (rather than near-uniform output).
+    let logits_f32: Vec<f32> = (0..(n_tokens * n_experts))
+        .map(|_| rng.next_f32() * 2.0)
+        .collect();
+
+    // --- CPU oracle ---
+    let mut cpu_indices: Vec<i32> = vec![0; n_tokens * k];
+    let mut cpu_weights: Vec<f32> = vec![0.0; n_tokens * k];
+    for t in 0..n_tokens {
+        let mut scores = logits_f32[t * n_experts..(t + 1) * n_experts].to_vec();
+        moe_router_cpu(
+            &mut scores,
+            k,
+            &mut cpu_indices[t * k..(t + 1) * k],
+            &mut cpu_weights[t * k..(t + 1) * k],
+        )
+        .expect("moe_router_cpu");
+    }
+
+    // --- GPU ---
+    let mut metal = MetalBackend::new().expect("MetalBackend::new");
+    let pipes = MoeRouterPipelines::fetch(&mut metal).expect("router pipes");
+
+    let logits_buf = make_buf::<f32>(&metal, n_tokens * n_experts);
+    write_buf(&logits_buf, &logits_f32);
+
+    let indices_buf = make_buf::<i32>(&metal, n_tokens * k);
+    let weights_buf = make_buf::<f32>(&metal, n_tokens * k);
+
+    let queue = metal.queue_clone();
+    let cmdbuf = queue.new_command_buffer();
+    encode_moe_router(
+        cmdbuf,
+        &pipes,
+        &logits_buf,
+        &indices_buf,
+        &weights_buf,
+        n_tokens as u32,
+        n_experts as u32,
+        k as u32,
+    );
+    cmdbuf.commit();
+    cmdbuf.wait_until_completed();
+
+    let gpu_indices: Vec<i32> = {
+        let mut v = vec![0i32; n_tokens * k];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                indices_buf.contents() as *const i32,
+                v.as_mut_ptr(),
+                v.len(),
+            );
+        }
+        v
+    };
+    let gpu_weights = read_buf_f32(&weights_buf, n_tokens * k);
+
+    // Compare per token.
+    let mut min_cos = f32::INFINITY;
+    let mut max_abs_w: f32 = 0.0;
+    let mut slot_matches = 0usize;
+    for t in 0..n_tokens {
+        let ci = &cpu_indices[t * k..(t + 1) * k];
+        let gi = &gpu_indices[t * k..(t + 1) * k];
+        let cw = &cpu_weights[t * k..(t + 1) * k];
+        let gw = &gpu_weights[t * k..(t + 1) * k];
+
+        // Set equality after sort.
+        let mut ci_sorted = ci.to_vec();
+        let mut gi_sorted = gi.to_vec();
+        ci_sorted.sort();
+        gi_sorted.sort();
+        assert_eq!(
+            gi_sorted, ci_sorted,
+            "token {} index set mismatch: gpu={:?} cpu={:?}",
+            t, gi_sorted, ci_sorted
+        );
+
+        if gi == ci {
+            slot_matches += 1;
+        }
+
+        // Gather GPU weights at CPU's index order (so we compare same-expert
+        // weights) — pick out each CPU slot's expert from the GPU output.
+        let mut gw_aligned = vec![0.0f32; k];
+        for (cs, &cpu_e) in ci.iter().enumerate() {
+            let gs = gi.iter().position(|&e| e == cpu_e).unwrap();
+            gw_aligned[cs] = gw[gs];
+        }
+
+        let cos = cosine_sim(&gw_aligned, cw);
+        let max_abs = gw_aligned
+            .iter()
+            .zip(cw.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        min_cos = min_cos.min(cos);
+        max_abs_w = max_abs_w.max(max_abs);
+        assert!(
+            cos >= COSINE_FLOOR,
+            "token {} weight cosine {:.9} below floor {} (max_abs={:.3e})",
+            t,
+            cos,
+            COSINE_FLOOR,
+            max_abs
+        );
+    }
+
+    eprintln!(
+        "[diff:moe_router_gpu] N={} E={} K={}: slot-match {}/{}, min_cos={:.9}, max_abs_w={:.3e}",
+        n_tokens, n_experts, k, slot_matches, n_tokens, min_cos, max_abs_w
+    );
+}
+
+/// Qwen3.6-A3B shape: 256 experts, K=8. Single token (decode N=1).
+#[test]
+#[ignore = "long-running GPU test"]
+fn moe_router_gpu_matches_cpu_a3b_n1() {
+    run_moe_router_diff(1, 256, 8, 0xA3B_0001);
+}
+
+/// Qwen3.6-A3B shape, small batch (N=8 — sub-chunk).
+#[test]
+#[ignore = "long-running GPU test"]
+fn moe_router_gpu_matches_cpu_a3b_n8() {
+    run_moe_router_diff(8, 256, 8, 0xA3B_0008);
+}
+
+/// Qwen3.6-A3B shape, mid batch (N=256).
+#[test]
+#[ignore = "long-running GPU test"]
+fn moe_router_gpu_matches_cpu_a3b_n256() {
+    run_moe_router_diff(256, 256, 8, 0xA3B_0256);
+}
+
+/// Smaller variant shape: 128 experts, K=8 (Qwen2-style for breadth).
+#[test]
+#[ignore = "long-running GPU test"]
+fn moe_router_gpu_matches_cpu_e128_k8() {
+    run_moe_router_diff(64, 128, 8, 0xE128_0064);
+}
+
+/// Large-K stress: 512 experts (kernel cap), K=10 (Qwen3.5-A17B shape).
+#[test]
+#[ignore = "long-running GPU test"]
+fn moe_router_gpu_matches_cpu_e512_k10() {
+    run_moe_router_diff(32, 512, 10, 0xE512_000A);
 }
