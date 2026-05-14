@@ -598,10 +598,50 @@ impl Backend for MetalBackend {
                     "GatedDeltaNetStepNTokens encode_op: per-token loop with encode_delta_net_step; defer to S7-6 producer wire-up"
                 )
             }
-            Op::GatedRmsNormNTokens { .. } => {
-                todo!(
-                    "GatedRmsNormNTokens encode_op: per-token loop with encode_gated_rms_norm; defer to S7-6 producer wire-up"
-                )
+            Op::GatedRmsNormNTokens {
+                values,
+                z,
+                weight_off,
+                output,
+                num_v_heads,
+                value_dim,
+                n_tokens,
+                eps,
+                ..
+            } => {
+                // Per-token loop. Each token reads one per-head slot
+                // from `values` and `z` (tightly packed token-major)
+                // and writes to `output` at the matching slot.
+                // Weight is shared across tokens (value_dim bf16).
+                let per_token_bytes =
+                    (*num_v_heads * *value_dim) as u64 * 4;
+                let values_buf = self.pool.handle(*values);
+                let z_buf = self.pool.handle(*z);
+                let output_buf = self.pool.handle(*output);
+                let value_dim_arg = *value_dim;
+                let eps_arg = *eps;
+                for t in 0..*n_tokens {
+                    let off = (t as u64) * per_token_bytes;
+                    let enc = cmd.new_compute_command_encoder();
+                    enc.set_compute_pipeline_state(
+                        &self.linear_attn_pipes.gated_rms_norm,
+                    );
+                    enc.set_buffer(0, Some(values_buf), off as NSUInteger);
+                    enc.set_buffer(1, Some(z_buf), off as NSUInteger);
+                    enc.set_buffer(
+                        2,
+                        Some(self.wf_buf.buffer()),
+                        *weight_off as NSUInteger,
+                    );
+                    enc.set_buffer(3, Some(output_buf), off as NSUInteger);
+                    enc.set_bytes(4, 4, (&value_dim_arg as *const u32).cast());
+                    enc.set_bytes(5, 4, (&eps_arg as *const f32).cast());
+                    enc.dispatch_thread_groups(
+                        MTLSize::new(*num_v_heads as NSUInteger, 1, 1),
+                        MTLSize::new(*value_dim as NSUInteger, 1, 1),
+                    );
+                    enc.end_encoding();
+                }
             }
         }
     }

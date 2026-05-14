@@ -708,3 +708,114 @@ fn graph_metal_matches_cpu_rms_norm_qk() {
         max_abs
     );
 }
+
+// ============================================================================
+// Test: GatedRmsNormNTokens through both backends (S7-6b)
+// ============================================================================
+
+#[test]
+#[ignore = "long-running GPU test"]
+fn graph_metal_matches_cpu_gated_rms_norm() {
+    let n_tokens: u32 = 4;
+    let num_v_heads: u32 = 8;
+    let value_dim: u32 = 32;
+    let eps: f32 = 1e-6;
+    let per_token = (num_v_heads * value_dim) as usize;
+    let total = n_tokens as usize * per_token;
+    let mut rng = Rng::new(0xA3B_BB02);
+    let values_data: Vec<f32> =
+        (0..total).map(|_| rng.next_f32_unit()).collect();
+    let z_data: Vec<f32> = (0..total).map(|_| rng.next_f32_unit()).collect();
+    // Weight = value_dim bf16. Construct random finite bf16 around
+    // ~1.0 (avoid NaN/inf exponents from raw random u16).
+    let mut weight_bytes = vec![0u8; (value_dim as usize) * 2];
+    for chunk in weight_bytes.chunks_exact_mut(2) {
+        let w_f32 = rng.next_f32_unit() * 0.25 + 1.0;
+        let bits = (w_f32.to_bits() >> 16) as u16;
+        chunk[0] = bits.to_le_bytes()[0];
+        chunk[1] = bits.to_le_bytes()[1];
+    }
+    let tensors = &[(
+        "gated_rms_weight",
+        "BF16",
+        0,
+        vec![value_dim as usize],
+        weight_bytes.clone(),
+    )];
+
+    // CPU path
+    let mut cpu_wf = SyntheticWf::build("gated_rms_norm_cpu", tensors);
+    let weight_off = {
+        let wf = cpu_wf.wf.as_ref().unwrap();
+        wf.tensor_info("gated_rms_weight").unwrap().offset as u64
+    };
+    let mut cpu = CpuBackend::new(cpu_wf.take());
+    let cpu_values = cpu.pool_mut().alloc(total * 4, "values", false).unwrap();
+    let cpu_z = cpu.pool_mut().alloc(total * 4, "z", false).unwrap();
+    let cpu_out = cpu.pool_mut().alloc(total * 4, "out", false).unwrap();
+    cpu.pool_mut().upload(cpu_values, bytes_of_f32(&values_data)).unwrap();
+    cpu.pool_mut().upload(cpu_z, bytes_of_f32(&z_data)).unwrap();
+    let mut g_cpu = Graph::new();
+    g_cpu.push(Op::GatedRmsNormNTokens {
+        label: "test_gated_rms_norm",
+        values: cpu_values,
+        z: cpu_z,
+        weight_off,
+        output: cpu_out,
+        num_v_heads,
+        value_dim,
+        n_tokens,
+        eps,
+    });
+    cpu.execute(&g_cpu).unwrap();
+    let mut cpu_out_bytes = vec![0u8; total * 4];
+    cpu.pool().download(cpu_out, &mut cpu_out_bytes).unwrap();
+    let cpu_out_f32 = f32_of_bytes(&cpu_out_bytes);
+
+    // GPU path
+    let mut gpu_wf = SyntheticWf::build("gated_rms_norm_gpu", tensors);
+    let metal_ctx = MetalContext::new().expect("MetalContext::new");
+    let wf_ref = gpu_wf.wf.as_ref().unwrap();
+    let wf_buf = MtlWeightBuf::wrap(wf_ref, metal_ctx.device());
+    let _ = gpu_wf.take();
+    let mut gpu = MetalBackend::new(metal_ctx, wf_buf).expect("MetalBackend::new");
+    let gpu_values = gpu.pool_mut().alloc(total * 4, "values", false).unwrap();
+    let gpu_z = gpu.pool_mut().alloc(total * 4, "z", false).unwrap();
+    let gpu_out = gpu.pool_mut().alloc(total * 4, "out", false).unwrap();
+    gpu.pool_mut().upload(gpu_values, bytes_of_f32(&values_data)).unwrap();
+    gpu.pool_mut().upload(gpu_z, bytes_of_f32(&z_data)).unwrap();
+    let mut g_gpu = Graph::new();
+    g_gpu.push(Op::GatedRmsNormNTokens {
+        label: "test_gated_rms_norm",
+        values: gpu_values,
+        z: gpu_z,
+        weight_off,
+        output: gpu_out,
+        num_v_heads,
+        value_dim,
+        n_tokens,
+        eps,
+    });
+    gpu.execute(&g_gpu).unwrap();
+    let mut gpu_out_bytes = vec![0u8; total * 4];
+    gpu.pool().download(gpu_out, &mut gpu_out_bytes).unwrap();
+    let gpu_out_f32 = f32_of_bytes(&gpu_out_bytes);
+
+    let cos = cosine_sim(&cpu_out_f32, &gpu_out_f32);
+    let max_abs = cpu_out_f32
+        .iter()
+        .zip(gpu_out_f32.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    eprintln!(
+        "[s7-6b gated_rms_norm] N={} h={} vd={}: cos={:.9}, max_abs={:.3e}",
+        n_tokens, num_v_heads, value_dim, cos, max_abs
+    );
+    assert!(
+        cos >= COSINE_FLOOR,
+        "cosine {} below floor {} (max_abs={})",
+        cos,
+        COSINE_FLOOR,
+        max_abs
+    );
+}
