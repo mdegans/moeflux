@@ -413,6 +413,60 @@ pub fn gated_delta_recurrence(
     Ok(())
 }
 
+/// Compute the linear-attn 1c step element-wise per v-head:
+///
+/// ```text
+/// g_decay[h]   = exp(-exp(a_log[h]) * softplus(alpha[h] + dt_bias[h]))
+/// beta_gate[h] = sigmoid(beta[h])
+/// ```
+///
+/// CPU oracle for the Metal `compute_decay_beta` kernel at
+/// `shaders.metal:1831`. Note: `a_log` is read as f32 in the kernel
+/// (despite living in the `wf` weight buffer alongside bf16 weights),
+/// while `dt_bias` is bf16.
+///
+/// Lengths: all six slices must equal `num_v_heads`.
+#[inline]
+pub fn compute_decay_beta_cpu(
+    alpha: &[f32],
+    beta: &[f32],
+    a_log: &[f32],
+    dt_bias_bf16: &[u8],
+    g_decay_out: &mut [f32],
+    beta_gate_out: &mut [f32],
+) -> Result<(), LinearAttnError> {
+    let n = alpha.len();
+    if beta.len() != n
+        || a_log.len() != n
+        || g_decay_out.len() != n
+        || beta_gate_out.len() != n
+    {
+        return Err(LinearAttnError::OutputLen {
+            got: beta.len(),
+            expected: n,
+        });
+    }
+    if dt_bias_bf16.len() < n * 2 {
+        return Err(LinearAttnError::WeightSize {
+            name: "<dt_bias>".to_string(),
+            got: dt_bias_bf16.len() as u64,
+            expected: (n * 2) as u64,
+            elems: n,
+        });
+    }
+    for h in 0..n {
+        let dt_b_bits =
+            u16::from_le_bytes([dt_bias_bf16[h * 2], dt_bias_bf16[h * 2 + 1]]);
+        let dt_b = bf16_to_f32(dt_b_bits);
+        let a_val = alpha[h];
+        let a_decay = a_log[h].exp();
+        let softplus_val = (1.0f32 + (a_val + dt_b).exp()).ln();
+        g_decay_out[h] = (-a_decay * softplus_val).exp();
+        beta_gate_out[h] = 1.0f32 / (1.0f32 + (-beta[h]).exp());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,6 +479,29 @@ mod tests {
         // sqrt(mean(1) + eps) ≈ 1, so out ≈ 1 / 1 ≈ 1.
         for v in &out {
             assert!((*v - 1.0).abs() < 1e-3);
+        }
+    }
+
+    #[test]
+    fn compute_decay_beta_at_zero_inputs() {
+        // alpha = beta = 0, a_log = 0 (so a_decay = exp(0) = 1),
+        // dt_bias = 0 (bf16 0x0000).
+        // softplus(0 + 0) = ln(1 + e^0) = ln(2)
+        // g_decay = exp(-1 * ln(2)) = 0.5
+        // beta_gate = sigmoid(0) = 0.5
+        let alpha = vec![0.0f32; 4];
+        let beta = vec![0.0f32; 4];
+        let a_log = vec![0.0f32; 4];
+        let dt_bias_bf16 = vec![0u8; 4 * 2];
+        let mut g_decay = vec![0.0f32; 4];
+        let mut beta_gate = vec![0.0f32; 4];
+        compute_decay_beta_cpu(
+            &alpha, &beta, &a_log, &dt_bias_bf16, &mut g_decay, &mut beta_gate,
+        )
+        .unwrap();
+        for h in 0..4 {
+            assert!((g_decay[h] - 0.5).abs() < 1e-6, "g_decay[{h}] = {}", g_decay[h]);
+            assert!((beta_gate[h] - 0.5).abs() < 1e-6, "beta_gate[{h}] = {}", beta_gate[h]);
         }
     }
 

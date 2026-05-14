@@ -163,6 +163,104 @@ pub fn dequant_matvec_4bit_cpu(
     Ok(())
 }
 
+/// Compute `out[r] = sum_c dequant_8bit(W[r, c]) * x[c]` for
+/// `r in 0..out_dim`. 8-bit-byte variant of [`dequant_matvec_4bit_cpu`].
+///
+/// Layout (mirrors the Metal `dequant_matvec_8bit_v3_n_tokens` kernel
+/// at `shaders.metal:608`):
+/// - `packed`: `[out_dim, in_dim / 4]` u32, four 8-bit bytes per u32 in
+///   little-endian byte order (byte `n` occupies bits `n*8..n*8+8`).
+/// - `scales` / `biases`: `[out_dim, in_dim / GROUP_SIZE]` bf16, one per group.
+///
+/// Dequant of `(r, c)`: `byte * scale[r, c/GS] + bias[r, c/GS]`.
+///
+/// Used as the CPU oracle for the 8-bit matvec path that Qwen3.6-A3B
+/// hits on the post-attn gate and shared-gate projections. Bit-exact
+/// match against the GPU kernel is *not* guaranteed (reduction order
+/// differs); cosine ≥ 0.9999 is the contract.
+pub fn dequant_matvec_8bit_v3_cpu(
+    packed: &[u32],
+    scales: &[u16],
+    biases: &[u16],
+    in_dim: usize,
+    out_dim: usize,
+    x: &[f32],
+    out: &mut [f32],
+) -> Result<(), CpuMatvecError> {
+    if in_dim % GROUP_SIZE != 0 {
+        return Err(CpuMatvecError::InDimNotMultiple {
+            in_dim,
+            group_size: GROUP_SIZE,
+        });
+    }
+    let in_packed = in_dim / 4;
+    let in_groups = in_dim / GROUP_SIZE;
+    let packed_per_group = GROUP_SIZE / 4;
+
+    let expect_packed = out_dim * in_packed;
+    let expect_scales = out_dim * in_groups;
+    if packed.len() != expect_packed {
+        return Err(CpuMatvecError::SliceLen {
+            field: "packed",
+            got: packed.len(),
+            expected: expect_packed,
+        });
+    }
+    if scales.len() != expect_scales {
+        return Err(CpuMatvecError::SliceLen {
+            field: "scales",
+            got: scales.len(),
+            expected: expect_scales,
+        });
+    }
+    if biases.len() != expect_scales {
+        return Err(CpuMatvecError::SliceLen {
+            field: "biases",
+            got: biases.len(),
+            expected: expect_scales,
+        });
+    }
+    if x.len() != in_dim {
+        return Err(CpuMatvecError::SliceLen {
+            field: "x",
+            got: x.len(),
+            expected: in_dim,
+        });
+    }
+    if out.len() != out_dim {
+        return Err(CpuMatvecError::SliceLen {
+            field: "out",
+            got: out.len(),
+            expected: out_dim,
+        });
+    }
+
+    out.par_iter_mut().enumerate().for_each(|(r, out_r)| {
+        let packed_row = &packed[r * in_packed..(r + 1) * in_packed];
+        let scale_row = &scales[r * in_groups..(r + 1) * in_groups];
+        let bias_row = &biases[r * in_groups..(r + 1) * in_groups];
+        let mut acc = 0.0f32;
+        for g in 0..in_groups {
+            let scale = bf16_to_f32(scale_row[g]);
+            let bias = bf16_to_f32(bias_row[g]);
+            let group_packed = &packed_row
+                [g * packed_per_group..(g + 1) * packed_per_group];
+            let x_group = &x[g * GROUP_SIZE..(g + 1) * GROUP_SIZE];
+            for p in 0..packed_per_group {
+                let word = group_packed[p];
+                let x_chunk = &x_group[p * 4..p * 4 + 4];
+                for n in 0..4 {
+                    let byte = ((word >> (n * 8)) & 0xFF) as f32;
+                    let w = byte.mul_add(scale, bias);
+                    acc = w.mul_add(x_chunk[n], acc);
+                }
+            }
+        }
+        *out_r = acc;
+    });
+    Ok(())
+}
+
 /// Bytes-level variant of [`dequant_matvec_4bit_cpu`] used by the
 /// per-layer expert path: the packed expert blob is read via
 /// `pread` into a single `Vec<u8>` and we want to slice the `gate`
@@ -382,6 +480,26 @@ mod tests {
         )
         .unwrap();
         // 64 ones, dot with 64 ones = 64.
+        assert_eq!(out[0], 64.0);
+    }
+
+    /// 8-bit analog of `dequant_matvec_all_ones`. Every byte is 1
+    /// (0x01010101), scale=1.0, bias=0.0, x = ones. With in_dim=64 we
+    /// pack 16 u32 words (64 bytes), and the matvec returns 64.0.
+    #[test]
+    fn dequant_matvec_8bit_all_ones() {
+        let in_dim = 64;
+        let out_dim = 1;
+        // 16 u32 = 64 bytes, each = 1.
+        let packed = vec![0x0101_0101u32; in_dim / 4];
+        let scales = vec![0x3F80u16; 1];
+        let biases = vec![0x0000u16; 1];
+        let x = vec![1.0f32; in_dim];
+        let mut out = vec![0.0f32; out_dim];
+        dequant_matvec_8bit_v3_cpu(
+            &packed, &scales, &biases, in_dim, out_dim, &x, &mut out,
+        )
+        .unwrap();
         assert_eq!(out[0], 64.0);
     }
 

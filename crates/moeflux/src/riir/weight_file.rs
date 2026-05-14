@@ -146,6 +146,23 @@ impl WeightFile {
         Some(&self.mmap[start..end])
     }
 
+    /// Borrowed byte slice `[offset, offset + len)` of the mmap'd
+    /// weight file. Used by the graph compiler's CPU backend to
+    /// resolve [`crate::riir::graph::WeightRef`] offsets — the
+    /// producer code reads tensor offsets from
+    /// [`crate::riir::layer_weight_cache::LayerWeightCache`] and the
+    /// CPU encoder slices the mmap directly without going through
+    /// the tensor-name map. Returns `None` if the range falls
+    /// outside the mmap.
+    pub fn bytes_at(&self, offset: u64, len: usize) -> Option<&[u8]> {
+        let start = offset as usize;
+        let end = start.checked_add(len)?;
+        if end > self.mmap.len() {
+            return None;
+        }
+        Some(&self.mmap[start..end])
+    }
+
     /// Iterator over `(name, info)` pairs. Order is HashMap-defined
     /// (i.e., unspecified). Useful for debugging / dumping.
     pub fn iter(&self) -> impl Iterator<Item = (&str, &TensorInfo)> {

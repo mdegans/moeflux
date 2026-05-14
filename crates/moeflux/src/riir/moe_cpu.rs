@@ -23,7 +23,7 @@ use super::cpu_matvec::{
 use super::embedding::bf16_to_f32;
 use super::expert_io::{ExpertFiles, ExpertIoError};
 use super::mlp_cpu::{shared_expert_swiglu_cpu, MlpForwardError};
-use super::moe_router::{noaux_tc_router_cpu, MoeRouterError};
+use super::moe_router::{noaux_tc_router_cpu, ExpertBuckets, MoeRouterError};
 use super::variants::{Variant, GROUP_SIZE, VARIANT};
 use super::weight_file::WeightFile;
 
@@ -226,6 +226,102 @@ fn run_packed_expert_swiglu(
     dequant_matvec_4bit_bytes_cpu(
         down_w, down_s, down_b, intermediate, hidden_dim, &gate, out,
     )?;
+    Ok(())
+}
+
+/// CPU oracle for the bucket-driven MoE permute-fuse Op
+/// ([`crate::riir::graph::Op::MoeBatchedPermuteFuse`]).
+///
+/// For each non-empty bucket, iterate the `(token_idx, weight)` pairs
+/// stored in [`ExpertBuckets`], run the per-expert SwiGLU on the
+/// bucket-flat input copy, and scatter-accumulate the result into
+/// `out_sum`. Logical math is identical to
+/// [`deepseek_moe_cpu`]'s per-token loop, just expressed in
+/// bucket-driven iteration order so the diff against the GPU bucket
+/// kernel catches bucket-traversal bugs.
+///
+/// Arguments:
+/// - `v`: the active variant — supplies hidden_dim and the expert
+///   blob layout (`gate_w_off_4bit` etc.).
+/// - `expert_blobs`: one blob slice per non-empty bucket. Indexed by
+///   bucket index (i.e. `0..buckets.expert_ids.len()`). Caller is
+///   responsible for resolving `buckets.expert_ids[b]` to the
+///   corresponding mmap'd weight bytes via [`ExpertFiles`] or any
+///   other backing store.
+/// - `bucket_input`: bucket-flat token copies, `[total_slots,
+///   hidden_dim]`. Slot `s` corresponds to `token_idx[s]`'s hidden
+///   vector. Caller materializes this by gathering from per-token
+///   hidden state.
+/// - `buckets`: routing metadata. `offsets[b]..offsets[b+1]` gives
+///   the slot range for bucket `b`; `token_idx[s]` and `weights[s]`
+///   identify the destination token and routing weight.
+/// - `out_sum`: `[n_tokens, hidden_dim]` accumulator. Caller MUST
+///   zero this before calling (or pre-seed it for fused
+///   residual-plus-MoE patterns). The function adds to it.
+///
+/// Outputs are bit-equivalent to [`run_packed_expert_swiglu`] within
+/// a bucket, but the scatter-sum over multiple buckets writing the
+/// same `(token, hidden_dim)` element is non-associative — different
+/// bucket orders yield different ULP-level sums. The Op-level diff
+/// against the GPU kernel uses cosine ≥ 0.9999, not bit-exact.
+pub fn moe_permute_fuse_cpu(
+    v: &Variant,
+    expert_blobs: &[&[u8]],
+    bucket_input: &[f32],
+    buckets: &ExpertBuckets,
+    out_sum: &mut [f32],
+) -> Result<(), MoeForwardError> {
+    let hidden_dim = v.hidden_dim;
+    if buckets.expert_ids.len() != expert_blobs.len() {
+        return Err(MoeForwardError::MissingTensor {
+            name: format!(
+                "expert_blobs[len={}] does not match buckets.expert_ids[len={}]",
+                expert_blobs.len(),
+                buckets.expert_ids.len()
+            ),
+        });
+    }
+    if buckets.offsets.len() != buckets.expert_ids.len() + 1 {
+        return Err(MoeForwardError::MissingTensor {
+            name: format!(
+                "buckets.offsets[len={}] must be expert_ids[len={}] + 1",
+                buckets.offsets.len(),
+                buckets.expert_ids.len()
+            ),
+        });
+    }
+    let total_slots = *buckets.offsets.last().unwrap_or(&0) as usize;
+    if bucket_input.len() != total_slots * hidden_dim {
+        return Err(MoeForwardError::HiddenLen {
+            got: bucket_input.len(),
+            expected: total_slots * hidden_dim,
+        });
+    }
+    if buckets.token_idx.len() != total_slots
+        || buckets.weights.len() != total_slots
+    {
+        return Err(MoeForwardError::OutLen {
+            got: buckets.token_idx.len(),
+            expected: total_slots,
+        });
+    }
+
+    let mut tmp_out = vec![0.0f32; hidden_dim];
+    for (b, &_expert_id) in buckets.expert_ids.iter().enumerate() {
+        let lo = buckets.offsets[b] as usize;
+        let hi = buckets.offsets[b + 1] as usize;
+        let blob = expert_blobs[b];
+        for s in lo..hi {
+            let x = &bucket_input[s * hidden_dim..(s + 1) * hidden_dim];
+            run_packed_expert_swiglu(v, blob, x, &mut tmp_out)?;
+            let t = buckets.token_idx[s] as usize;
+            let w = buckets.weights[s];
+            let out_token = &mut out_sum[t * hidden_dim..(t + 1) * hidden_dim];
+            for i in 0..hidden_dim {
+                out_token[i] = tmp_out[i].mul_add(w, out_token[i]);
+            }
+        }
+    }
     Ok(())
 }
 

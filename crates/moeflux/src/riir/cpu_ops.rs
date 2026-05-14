@@ -23,3 +23,32 @@ pub fn cpu_vec_madd(dst: &mut [f32], src: &[f32], scale: f32) {
 pub fn cpu_sigmoid_scalar(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
+
+/// Element-wise `out[i] = a[i] + b[i]` over `n_tokens * dim` elements.
+/// CPU oracle for the `residual_add_n_tokens` Metal kernel; consumed
+/// by [`crate::riir::graph::Op::ResidualAddNTokens`]'s CpuBackend
+/// dispatch.
+#[inline]
+pub fn residual_add_n_tokens_cpu(a: &[f32], b: &[f32], out: &mut [f32]) {
+    debug_assert_eq!(a.len(), b.len());
+    debug_assert_eq!(a.len(), out.len());
+    for (o, (&ai, &bi)) in out.iter_mut().zip(a.iter().zip(b.iter())) {
+        *o = ai + bi;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn residual_add_n_tokens_matches_naive() {
+        let a: Vec<f32> = (0..32).map(|i| i as f32 * 0.5).collect();
+        let b: Vec<f32> = (0..32).map(|i| -(i as f32) * 0.25).collect();
+        let mut out = vec![0.0f32; 32];
+        residual_add_n_tokens_cpu(&a, &b, &mut out);
+        for i in 0..32 {
+            assert_eq!(out[i], a[i] + b[i]);
+        }
+    }
+}
