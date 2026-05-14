@@ -35,6 +35,7 @@ pub mod embedding;
 pub mod expert_forward;
 pub mod expert_io;
 pub mod full_attn_forward;
+pub mod graph;
 pub mod gpu_attn;
 pub mod gpu_linear_attn;
 pub mod gpu_lm_head;
