@@ -2348,16 +2348,34 @@ pub(super) fn batched_linear_attn_layer_forward(
     let total_assignments = buckets.token_idx.len();
     debug_assert_eq!(total_assignments, n_tokens * k_active);
 
+    // Expert weight buffers — mmap path vs pread-and-copy path. See
+    // `batched_full_attn_layer_forward` for the rationale.
     let expert_size = v.expert_size_4bit();
-    let mut expert_blobs: Vec<MtlBuffer<u8>> =
-        Vec::with_capacity(buckets.expert_ids.len());
-    let mut blob_scratch = vec![0u8; expert_size];
-    for &expert_id in &buckets.expert_ids {
-        expert_files
-            .read_expert(layer_idx, expert_id as usize, &mut blob_scratch)?;
-        expert_blobs
-            .push(MtlBuffer::<u8>::with_data(&device, &blob_scratch));
+    let mut owned_blobs: Vec<MtlBuffer<u8>> = Vec::new();
+    if expert_files.mode() != super::expert_io::ExpertIoMode::Mmap {
+        owned_blobs.reserve(buckets.expert_ids.len());
+        let mut blob_scratch = vec![0u8; expert_size];
+        for &expert_id in &buckets.expert_ids {
+            expert_files
+                .read_expert(layer_idx, expert_id as usize, &mut blob_scratch)?;
+            owned_blobs
+                .push(MtlBuffer::<u8>::with_data(&device, &blob_scratch));
+        }
     }
+    let expert_refs: Vec<super::expert_forward::ExpertRef<'_>> =
+        if expert_files.mode() == super::expert_io::ExpertIoMode::Mmap {
+            buckets
+                .expert_ids
+                .iter()
+                .map(|&expert_id| {
+                    expert_files
+                        .mmap_buffer_for_expert(layer_idx, expert_id as u32)
+                        .expect("mmap layer present in mmap mode")
+                })
+                .collect()
+        } else {
+            owned_blobs.iter().map(|b| (b.buffer(), 0u64)).collect()
+        };
 
     let mut bucket_input_host = vec![0.0f32; total_assignments * hidden_dim];
     for assignment_idx in 0..total_assignments {
@@ -2400,7 +2418,7 @@ pub(super) fn batched_linear_attn_layer_forward(
             &mv,
             &swiglu_pso,
             &bucket_accumulate,
-            &expert_blobs,
+            &expert_refs,
             bucket_input.buffer(),
             bucket_gate.buffer(),
             bucket_up.buffer(),

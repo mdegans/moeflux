@@ -1186,6 +1186,15 @@ impl RsCtx {
                 self.metal.as_ref().expect("just-set").device().to_owned();
             self.wf_buf = Some(MtlWeightBuf::wrap(&self.wf, &device));
         }
+        // Session-5 Phase 2: when MOEFLUX_EXPERT_IO=mmap, wrap each
+        // mmap'd layer file as a Metal-shared buffer via
+        // newBufferWithBytesNoCopy. Idempotent (skipped after first
+        // call) and a no-op when mode == Pread.
+        {
+            let device =
+                self.metal.as_ref().expect("just-set").device().to_owned();
+            self.experts.attach_to_device(&device);
+        }
         if self.layer_caches.is_none() {
             let wf_buf = self.wf_buf.as_ref().expect("just-set");
             let caches = LayerWeightCache::build_all(&self.wf, wf_buf)

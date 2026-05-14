@@ -1060,12 +1060,14 @@ fn moe_permute_fuse_n_tokens_matches_tokenwise() {
 
     let queue = metal.queue();
     let cmdbuf = queue.new_command_buffer();
+    let blob_refs: Vec<(&metal::Buffer, u64)> =
+        blobs_mtl.iter().map(|b| (b.buffer(), 0u64)).collect();
     encode_moe_batched_permute_fuse(
         cmdbuf,
         &matvec_pipes,
         &swiglu,
         &bucket_accumulate,
-        &blobs_mtl,
+        &blob_refs,
         &in_buf,
         &gate_buf,
         &up_buf,

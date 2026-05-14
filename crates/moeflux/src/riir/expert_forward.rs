@@ -1120,13 +1120,28 @@ fn encode_swiglu_into_buf(
 /// Empty buckets are skipped (they don't appear in
 /// [`ExpertBuckets::expert_ids`] by construction, but the loop also
 /// guards `b_size == 0` defensively).
+/// Per-bucket expert-weight reference: the underlying Metal buffer
+/// plus a byte offset to the start of this expert's blob within it.
+///
+/// - **Pread mode**: `buffer` is a fresh `MtlBuffer<u8>` allocated by
+///   the caller for this expert's blob, `offset` is `0`.
+/// - **Mmap mode**: `buffer` is the layer's mmap-backed Metal buffer,
+///   `offset` is `expert_idx * expert_size`. Multiple `ExpertRef`s
+///   in the same call may share the same `buffer` with different
+///   offsets.
+///
+/// The matvec encoder adds this `offset` to each per-tensor offset
+/// (`gate_w_off_4bit()`, `gate_s_off_4bit()`, etc.) when binding —
+/// the within-blob tensor layout matches in both modes.
+pub type ExpertRef<'a> = (&'a Buffer, u64);
+
 #[allow(clippy::too_many_arguments)]
 pub fn encode_moe_batched_permute_fuse(
     cmdbuf: &CommandBufferRef,
     matvec: &MatvecPipelines,
     swiglu: &ComputePipelineState,
     bucket_accumulate: &ComputePipelineState,
-    expert_blobs: &[MtlBuffer<u8>],
+    expert_refs: &[ExpertRef<'_>],
     bucket_input: &Buffer,
     bucket_gate: &Buffer,
     bucket_up: &Buffer,
@@ -1138,14 +1153,14 @@ pub fn encode_moe_batched_permute_fuse(
     buckets: &ExpertBuckets,
     v: Variant,
 ) {
-    debug_assert_eq!(expert_blobs.len(), buckets.expert_ids.len());
+    debug_assert_eq!(expert_refs.len(), buckets.expert_ids.len());
 
     let hidden_dim = v.hidden_dim as u32;
     let moe_inter = v.moe_intermediate as u32;
     let f32_sz = std::mem::size_of::<f32>() as u64;
     let i32_sz = std::mem::size_of::<i32>() as u64;
 
-    for (bi, blob) in expert_blobs.iter().enumerate() {
+    for (bi, &(blob, expert_off)) in expert_refs.iter().enumerate() {
         let start = buckets.offsets[bi] as u64;
         let end = buckets.offsets[bi + 1] as u64;
         let b_size = (end - start) as u32;
@@ -1163,10 +1178,10 @@ pub fn encode_moe_batched_permute_fuse(
         encode_matvec_n_tokens(
             cmdbuf,
             matvec,
-            blob.buffer(),
-            v.gate_w_off_4bit() as u64,
-            v.gate_s_off_4bit() as u64,
-            v.gate_b_off_4bit() as u64,
+            blob,
+            expert_off + v.gate_w_off_4bit() as u64,
+            expert_off + v.gate_s_off_4bit() as u64,
+            expert_off + v.gate_b_off_4bit() as u64,
             bucket_input,
             in_off,
             bucket_gate,
@@ -1181,10 +1196,10 @@ pub fn encode_moe_batched_permute_fuse(
         encode_matvec_n_tokens(
             cmdbuf,
             matvec,
-            blob.buffer(),
-            v.up_w_off_4bit() as u64,
-            v.up_s_off_4bit() as u64,
-            v.up_b_off_4bit() as u64,
+            blob,
+            expert_off + v.up_w_off_4bit() as u64,
+            expert_off + v.up_s_off_4bit() as u64,
+            expert_off + v.up_b_off_4bit() as u64,
             bucket_input,
             in_off,
             bucket_up,
@@ -1219,10 +1234,10 @@ pub fn encode_moe_batched_permute_fuse(
         encode_matvec_n_tokens(
             cmdbuf,
             matvec,
-            blob.buffer(),
-            v.down_w_off_4bit() as u64,
-            v.down_s_off_4bit() as u64,
-            v.down_b_off_4bit() as u64,
+            blob,
+            expert_off + v.down_w_off_4bit() as u64,
+            expert_off + v.down_s_off_4bit() as u64,
+            expert_off + v.down_b_off_4bit() as u64,
             bucket_act,
             mid_off,
             bucket_out,
