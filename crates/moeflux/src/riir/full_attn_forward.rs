@@ -574,37 +574,39 @@ pub(super) fn batched_full_attn_layer_forward(
     let mv = MatvecPipelines::fetch(metal)?;
     let rms_pipes = RmsNormBf16Pipelines::fetch(metal)?;
 
-    // ── Phase 1a: per-token input rms_norm → normed_stack_host. ──
-    let mut normed_stack_host = vec![0.0f32; n_tokens * hidden_dim];
-    for t in 0..n_tokens {
-        unsafe {
-            let dst = buffers.input.contents() as *mut f32;
-            std::ptr::copy_nonoverlapping(
-                hidden_in[t * hidden_dim..].as_ptr(),
-                dst,
-                hidden_dim,
-            );
-        }
-        let cmdbuf = metal.queue().new_command_buffer();
-        encode_rms_norm_bf16_into(
+    // ── Phase 1a: batched input rms_norm → normed_buf (GPU). ─────
+    // Fused single-dispatch — one threadgroup per token, sum_sq stays
+    // in tg-mem. Replaces the N-token per-iteration commit_and_wait
+    // loop that historically dominated the per-layer commit count.
+    let rms_n_pipe =
+        super::gpu_norm::RmsNormBf16FusedNTokensPipeline::fetch(metal)?;
+    let hidden_in_buf = MtlBuffer::<f32>::with_data(&device, hidden_in);
+    let normed_buf = MtlBuffer::<f32>::with_len(&device, n_tokens * hidden_dim);
+    {
+        let queue = metal.queue_clone();
+        let cmdbuf = queue.new_command_buffer();
+        super::gpu_norm::encode_rms_norm_bf16_fused_n_tokens(
             cmdbuf,
-            &rms_pipes,
-            &buffers.input,
+            &rms_n_pipe,
+            hidden_in_buf.buffer(),
             wf_buf.buffer(),
             layer_cache.input_layernorm_w,
-            &buffers.sum_sq,
-            &buffers.normed,
+            normed_buf.buffer(),
             hidden_dim as u32,
+            n_tokens as u32,
             super::variants::RMS_NORM_EPS,
         );
-        metal.commit_and_wait_labeled(cmdbuf, "batched_input_rms_norm");
-        normed_stack_host[t * hidden_dim..(t + 1) * hidden_dim]
-            .copy_from_slice(&read_buffer_to_vec(&buffers.normed, hidden_dim));
+        metal.commit_and_wait_labeled(
+            cmdbuf,
+            "batched_input_rms_norm_fused",
+        );
     }
+    // Keep `rms_pipes` for any per-token fallback paths that still need
+    // the single-token chain (e.g. post-attn rms_norm in the existing
+    // per-token tail until B-0c lands).
+    let _ = &rms_pipes;
 
     // ── Phase 1b: batched Q / K / V projections. ─────────────────
-    let normed_buf =
-        MtlBuffer::<f32>::with_data(&device, &normed_stack_host);
     let q_proj_buf =
         MtlBuffer::<f32>::with_len(&device, n_tokens * q_proj_dim);
     let k_proj_buf = MtlBuffer::<f32>::with_len(&device, n_tokens * kv_dim);

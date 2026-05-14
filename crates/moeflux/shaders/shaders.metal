@@ -2568,6 +2568,94 @@ kernel void mla_kv_cache_append(
 
 
 // ============================================================================
+// Kernel: Fused RMS norm with bf16 weights, batched over N tokens
+// ============================================================================
+// One threadgroup per token. Each threadgroup computes its own sum-of-squares
+// via simd_sum + cross-simd reduction in tg-mem, then applies
+// `out[t, i] = x[t, i] * rsqrt(sum_sq/dim + eps) * bf16_to_f32(w[i])`.
+//
+// Fused vs the single-token chain (`rms_norm_sum_sq` + `rms_norm_apply_bf16`):
+// `sum_sq` stays in tg-mem instead of going to global, so the second pass
+// reads it via threadgroup broadcast — one cmdbuf, one dispatch, no
+// intermediate global write.
+//
+// Dispatch:
+//   threadgroups = (n_tokens, 1, 1)
+//   threads      = (tg_size, 1, 1)    // 256 is the sweet spot
+//
+// Weights `w` are shared across tokens (per-channel norm weight).
+
+kernel void rms_norm_bf16_fused_n_tokens(
+    device const float*    x         [[buffer(0)]],   // [n_tokens, dim]
+    device const uint16_t* weight    [[buffer(1)]],   // [dim] bf16
+    device float*          out       [[buffer(2)]],   // [n_tokens, dim]
+    constant uint&         dim       [[buffer(3)]],
+    constant float&        eps       [[buffer(4)]],
+    uint tgid     [[threadgroup_position_in_grid]],   // token index
+    uint lid      [[thread_position_in_threadgroup]],
+    uint tg_size  [[threads_per_threadgroup]]
+) {
+    device const float* xt = x   + tgid * dim;
+    device       float* ot = out + tgid * dim;
+
+    uint simd_lane       = lid % 32;
+    uint simd_group      = lid / 32;
+    uint num_simd_groups = (tg_size + 31) / 32;
+
+    // Phase 1: parallel sum-of-squares reduction.
+    threadgroup float shared[32];
+    float acc = 0.0f;
+    for (uint i = lid; i < dim; i += tg_size) {
+        float v = xt[i];
+        acc += v * v;
+    }
+    float sm = simd_sum(acc);
+    if (simd_lane == 0) shared[simd_group] = sm;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float total = 0.0f;
+    if (simd_group == 0 && simd_lane < num_simd_groups) {
+        total = simd_sum(shared[simd_lane]);
+    }
+    threadgroup float bc_inv_rms;
+    if (lid == 0) {
+        bc_inv_rms = rsqrt(total / float(dim) + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_rms = bc_inv_rms;
+
+    // Phase 2: apply.
+    for (uint i = lid; i < dim; i += tg_size) {
+        float w = bf16_to_f32(weight[i]);
+        ot[i] = xt[i] * inv_rms * w;
+    }
+}
+
+
+// ============================================================================
+// Kernel: Residual add batched over N tokens
+// ============================================================================
+// `out[t*dim + i] = a[t*dim + i] + b[t*dim + i]`. Trivially data-parallel —
+// just enough infrastructure to share a single dispatch across the n_tokens
+// stack instead of one cmdbuf per token.
+//
+// Dispatch:
+//   threadgroups = (ceil(n_tokens * dim / 256), 1, 1)
+//   threads      = (256, 1, 1)
+
+kernel void residual_add_n_tokens(
+    device const float* a       [[buffer(0)]],
+    device const float* b       [[buffer(1)]],
+    device float*       out     [[buffer(2)]],
+    constant uint&      total   [[buffer(3)]],   // n_tokens * dim
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= total) return;
+    out[tid] = a[tid] + b[tid];
+}
+
+
+// ============================================================================
 // Kernel: MoE softmax + selection-sort top-K
 // ============================================================================
 // Per-token GPU port of `moe_router_cpu`'s softmax → top-K. One threadgroup

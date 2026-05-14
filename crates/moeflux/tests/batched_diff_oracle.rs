@@ -34,6 +34,10 @@ use moeflux::riir::gpu_matvec::{
 use moeflux::riir::gpu_moe_router::{
     encode_moe_router, MoeRouterPipelines,
 };
+use moeflux::riir::gpu_norm::{
+    encode_residual_add_n_tokens_into, encode_rms_norm_bf16_fused_n_tokens,
+    RmsNormBf16FusedNTokensPipeline,
+};
 use moeflux::riir::metal::MetalBackend;
 use moeflux::riir::moe_router::{build_expert_buckets, moe_router_cpu};
 use moeflux::riir::sdpa::sdpa_cpu;
@@ -1283,4 +1287,168 @@ fn moe_router_gpu_matches_cpu_e128_k8() {
 #[ignore = "long-running GPU test"]
 fn moe_router_gpu_matches_cpu_e512_k10() {
     run_moe_router_diff(32, 512, 10, 0xE512_000A);
+}
+
+// ---------------------------------------------------------------------------
+// Phase B-0a/B-0b (session 6): batched rms_norm + residual_add.
+// ---------------------------------------------------------------------------
+
+/// Reference CPU implementation of bf16-weighted RMSNorm, matching the
+/// fused GPU kernel's behavior for a single token. Self-contained so the
+/// diff test doesn't depend on `WeightFile` plumbing.
+fn rms_norm_bf16_ref(x: &[f32], weight_bf16: &[u16], eps: f32, out: &mut [f32]) {
+    let dim = x.len();
+    let mut sum_sq = 0.0f32;
+    for &v in x {
+        sum_sq += v * v;
+    }
+    let inv_rms = 1.0f32 / (sum_sq / dim as f32 + eps).sqrt();
+    for i in 0..dim {
+        // bf16 → f32: shift left 16 bits into the high half of the f32.
+        let w_u32 = (weight_bf16[i] as u32) << 16;
+        let w = f32::from_bits(w_u32);
+        out[i] = x[i] * inv_rms * w;
+    }
+}
+
+#[test]
+#[ignore = "long-running GPU test"]
+fn rms_norm_bf16_fused_n_tokens_matches_cpu() {
+    let n_tokens: usize = 16;
+    let dim: usize = 2048;
+    let eps: f32 = 1e-6;
+
+    let mut rng = XorShift64::new(0xB0_FE_DD_01);
+    let x: Vec<f32> = (0..(n_tokens * dim))
+        .map(|_| rng.next_f32() * 0.5)
+        .collect();
+    let weight_bf16: Vec<u16> =
+        (0..dim).map(|_| f32_to_bf16(rng.next_f32() * 0.1)).collect();
+
+    // CPU reference: per-token rms_norm.
+    let mut cpu_out = vec![0.0f32; n_tokens * dim];
+    for t in 0..n_tokens {
+        rms_norm_bf16_ref(
+            &x[t * dim..(t + 1) * dim],
+            &weight_bf16,
+            eps,
+            &mut cpu_out[t * dim..(t + 1) * dim],
+        );
+    }
+
+    // GPU: single fused dispatch.
+    let mut metal = MetalBackend::new().expect("MetalBackend::new");
+    let pipe = RmsNormBf16FusedNTokensPipeline::fetch(&mut metal)
+        .expect("rms_norm fused pipe");
+
+    let x_buf = make_buf::<f32>(&metal, n_tokens * dim);
+    write_buf(&x_buf, &x);
+    let w_buf = make_buf::<u16>(&metal, dim);
+    write_buf(&w_buf, &weight_bf16);
+    let out_buf = make_buf::<f32>(&metal, n_tokens * dim);
+
+    let queue = metal.queue_clone();
+    let cmdbuf = queue.new_command_buffer();
+    encode_rms_norm_bf16_fused_n_tokens(
+        cmdbuf,
+        &pipe,
+        &x_buf,
+        &w_buf,
+        0,
+        &out_buf,
+        dim as u32,
+        n_tokens as u32,
+        eps,
+    );
+    cmdbuf.commit();
+    cmdbuf.wait_until_completed();
+
+    let gpu_out = read_buf_f32(&out_buf, n_tokens * dim);
+
+    let mut min_cos = f32::INFINITY;
+    let mut max_abs: f32 = 0.0;
+    for t in 0..n_tokens {
+        let g = &gpu_out[t * dim..(t + 1) * dim];
+        let c = &cpu_out[t * dim..(t + 1) * dim];
+        let cos = cosine_sim(g, c);
+        let m = g
+            .iter()
+            .zip(c.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        min_cos = min_cos.min(cos);
+        max_abs = max_abs.max(m);
+        assert!(
+            cos >= COSINE_FLOOR,
+            "token {} cosine {:.9} below floor {} (max_abs={:.3e})",
+            t, cos, COSINE_FLOOR, m
+        );
+    }
+    eprintln!(
+        "[diff:rms_norm_bf16_fused_n_tokens] N={} dim={}: min_cos={:.9} max_abs={:.3e}",
+        n_tokens, dim, min_cos, max_abs
+    );
+}
+
+#[test]
+#[ignore = "long-running GPU test"]
+fn residual_add_n_tokens_matches_cpu() {
+    let n_tokens: usize = 32;
+    let dim: usize = 2048;
+
+    let mut rng = XorShift64::new(0xB0_FE_DD_02);
+    let a: Vec<f32> = (0..(n_tokens * dim))
+        .map(|_| rng.next_f32())
+        .collect();
+    let b: Vec<f32> = (0..(n_tokens * dim))
+        .map(|_| rng.next_f32())
+        .collect();
+
+    // CPU ref: element-wise add.
+    let cpu_out: Vec<f32> = a.iter().zip(b.iter()).map(|(x, y)| x + y).collect();
+
+    let metal = MetalBackend::new().expect("MetalBackend::new");
+    let mut metal = metal;
+    let pso = metal
+        .pipeline("residual_add_n_tokens")
+        .expect("residual_add_n_tokens pso")
+        .clone();
+
+    let a_buf = make_buf::<f32>(&metal, n_tokens * dim);
+    write_buf(&a_buf, &a);
+    let b_buf = make_buf::<f32>(&metal, n_tokens * dim);
+    write_buf(&b_buf, &b);
+    let out_buf = make_buf::<f32>(&metal, n_tokens * dim);
+
+    let queue = metal.queue_clone();
+    let cmdbuf = queue.new_command_buffer();
+    encode_residual_add_n_tokens_into(
+        cmdbuf,
+        &pso,
+        &a_buf,
+        &b_buf,
+        &out_buf,
+        n_tokens as u32,
+        dim as u32,
+    );
+    cmdbuf.commit();
+    cmdbuf.wait_until_completed();
+
+    let gpu_out = read_buf_f32(&out_buf, n_tokens * dim);
+
+    // Element-wise add is bit-exact between CPU and GPU on the same inputs.
+    let max_abs: f32 = gpu_out
+        .iter()
+        .zip(cpu_out.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_abs == 0.0,
+        "residual_add_n_tokens not bit-exact: max_abs={:.3e}",
+        max_abs
+    );
+    eprintln!(
+        "[diff:residual_add_n_tokens] N={} dim={}: max_abs={:.3e}",
+        n_tokens, dim, max_abs
+    );
 }

@@ -214,6 +214,80 @@ pub fn encode_rms_norm_bf16_into(
     }
 }
 
+/// Pipeline for the fused batched RMSNorm-bf16 kernel. One dispatch
+/// covers the full `[n_tokens, dim]` stack; intermediate `sum_sq`
+/// lives in threadgroup memory only.
+pub struct RmsNormBf16FusedNTokensPipeline {
+    pub pso: ComputePipelineState,
+}
+
+impl RmsNormBf16FusedNTokensPipeline {
+    pub fn fetch(metal: &mut MetalBackend) -> Result<Self, MetalError> {
+        Ok(Self {
+            pso: metal.pipeline("rms_norm_bf16_fused_n_tokens")?.clone(),
+        })
+    }
+}
+
+/// Encode the fused batched RMSNorm into `cmdbuf`. One threadgroup per
+/// token; intra-tg parallel sum_sq reduction + apply. Output is
+/// `[n_tokens, dim]` f32, ready for downstream batched matvec.
+///
+/// Replaces the per-token loop that called `encode_rms_norm_bf16_into`
+/// once per token with `commit_and_wait_labeled` between iterations
+/// (the dominant per-layer commit churn in the existing "batched" path).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_rms_norm_bf16_fused_n_tokens(
+    cmdbuf: &CommandBufferRef,
+    pipe: &RmsNormBf16FusedNTokensPipeline,
+    input: &Buffer,
+    weight_buf: &Buffer,
+    weight_off: u64,
+    out: &Buffer,
+    dim: u32,
+    n_tokens: u32,
+    eps: f32,
+) {
+    let enc = cmdbuf.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipe.pso);
+    enc.set_buffer(0, Some(input), 0);
+    enc.set_buffer(1, Some(weight_buf), weight_off as NSUInteger);
+    enc.set_buffer(2, Some(out), 0);
+    enc.set_bytes(3, 4, (&dim as *const u32).cast());
+    enc.set_bytes(4, 4, (&eps as *const f32).cast());
+    enc.dispatch_thread_groups(
+        MTLSize::new(n_tokens as NSUInteger, 1, 1),
+        MTLSize::new(256, 1, 1),
+    );
+    enc.end_encoding();
+}
+
+/// Encode `out[t*dim + i] = a[t*dim + i] + b[t*dim + i]` over the full
+/// `n_tokens * dim` element range. Single 1D dispatch.
+pub fn encode_residual_add_n_tokens_into(
+    cmdbuf: &CommandBufferRef,
+    pipeline: &ComputePipelineState,
+    a: &Buffer,
+    b: &Buffer,
+    out: &Buffer,
+    n_tokens: u32,
+    dim: u32,
+) {
+    let total = n_tokens * dim;
+    let enc = cmdbuf.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(pipeline);
+    enc.set_buffer(0, Some(a), 0);
+    enc.set_buffer(1, Some(b), 0);
+    enc.set_buffer(2, Some(out), 0);
+    enc.set_bytes(3, 4, (&total as *const u32).cast());
+    let num_tgs = (total + 255) / 256;
+    enc.dispatch_thread_groups(
+        MTLSize::new(num_tgs as NSUInteger, 1, 1),
+        MTLSize::new(256, 1, 1),
+    );
+    enc.end_encoding();
+}
+
 /// Encode a GPU-side buffer-to-buffer memcpy via Metal's blit encoder.
 /// `dim` floats from `src` → `dst`. Used by the orchestrator's GPU
 /// residual stream (Phase 5) to snapshot `hidden → residual` at the
