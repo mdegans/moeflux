@@ -480,6 +480,26 @@ impl MoeBuffers {
         self.data_prefetch[set].each_mut().map(|b| b.as_mut_slice())
     }
 
+    /// One per-slot `data_prefetch[set][slot]` Metal buffer for
+    /// binding into the batched MoE permute-fuse encoder. Session-5
+    /// Phase 3 entry point: the batched layer forward maps each
+    /// prefetched bucket expert to its pre-loaded slot buffer here
+    /// via `ExpertRef = (buf, 0)`.
+    ///
+    /// `set` must be `0` or `1`; `slot` must be `< MAX_K`. Caller
+    /// guarantees the slot was the target of a completed
+    /// `prefetch.dispatch` (via `PrefetchState::wait_for`) before
+    /// the dispatch that reads from it.
+    pub(crate) fn data_prefetch_buffer(
+        &self,
+        set: usize,
+        slot: usize,
+    ) -> &metal::Buffer {
+        debug_assert!(set < 2);
+        debug_assert!(slot < MAX_K);
+        self.data_prefetch[set][slot].buffer()
+    }
+
     /// Owned-form accessor for the post-attn-norm input buffer
     /// (`bufs.input`). Used by callers (Cogito MoE path) that pre-stage
     /// the input host-side via [`Self::stage_host_input`] and then bind

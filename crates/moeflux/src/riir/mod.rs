@@ -1251,21 +1251,20 @@ impl RsCtx {
     /// Decode-style single-token step. Always emits logits. Mirrors C
     /// `mf_eval_token` (infer.m:7746..7757).
     ///
-    /// **Stays on the per-token oracle path** — Phase G's attempt to
-    /// route this through `step_internal(&[tok], pos, ...)` looked
-    /// like a +17.6% win on a directional 32-token decode bench but
-    /// regressed bench.py's essay+512-decode workload from ~10.5 tok/s
-    /// to 7.66 tok/s (-27%) because the batched orchestrator
-    /// (`step_internal_batched_gqa`) doesn't fire
-    /// [`PrefetchState::dispatch`] for the next layer's experts.
-    /// Decode-time MoE I/O is bound by the prefetch hit rate (0.396
-    /// on the oracle path), and a 32-token bench is too short for
-    /// the prediction state to warm up enough to show that.
-    ///
-    /// Phase G's real shape is: add prefetch to
-    /// `step_internal_batched_gqa`, then route eval_token through it.
-    /// Session-5 follow-up. Until then, eval_token stays on the
-    /// oracle — diff-target and decode-perf both.
+    /// **Stays on the per-token oracle path.** Session-5 Phase 3 wired
+    /// the prefetch state machine into `step_internal_batched_gqa`
+    /// (set-based hit matching, record_actual, record_outcome) and
+    /// proved correctness at cosine=1.0 against the C side at N=1.
+    /// In-process A/B (`bench_decode_per_token_vs_batched_n1`) on the
+    /// post-Phase-3 build shows batched-N=1 still 10.5% slower than
+    /// the per-token oracle (7.63 vs 8.53 tok/s, decode_hit=0.395 on
+    /// both). The remaining gap is the oracle's cross-layer deferred-
+    /// K-expert pipelining — layer N's async K-expert dispatch
+    /// overlaps with layer N+1's CMD1+CMD2+3 GPU work — which the
+    /// batched path's sync permute-fuse can't replicate at N=1.
+    /// Re-routing eval_token through `step_internal` is unblocked once
+    /// the batched path also pipelines cross-layer MoE; until then
+    /// the oracle wins decode and stays canonical.
     pub fn eval_token(
         &mut self,
         token: i32,
@@ -1388,13 +1387,14 @@ impl RsCtx {
         self.ensure_linear_resources()?;
         let k_active = self.k_active;
 
-        // Field-disjoint mutable borrows. Session-5 Phase 1 dropped
-        // moe_buffers / deferred / prefetch / io_pool from the loop —
-        // both batched paths (full-attn and linear-attn) manage their
-        // own scratch + MoE permute-fuse without touching those fields.
+        // Field-disjoint mutable borrows. Phase 1 had dropped
+        // moe_buffers / prefetch / io_pool — Phase 3 re-introduces them
+        // for the N=1 prefetch state machine (eval_token re-routed
+        // through this path).
         let Self {
             wf,
             metal,
+            moe_buffers,
             experts,
             layer_states,
             wf_buf,
@@ -1402,6 +1402,8 @@ impl RsCtx {
             linear_buffers,
             deferred,
             lm_head_gpu,
+            io_pool,
+            prefetch,
             ..
         } = self;
         let metal = metal.as_mut().expect("ensure_linear_resources");
@@ -1410,14 +1412,31 @@ impl RsCtx {
             layer_caches.as_ref().expect("ensure_linear_resources");
         let linear_buffers =
             linear_buffers.as_mut().expect("ensure_linear_resources");
+        let moe_buffers =
+            moe_buffers.as_mut().expect("ensure_linear_resources");
         let lm_head_gpu =
             lm_head_gpu.as_ref().expect("ensure_linear_resources");
+        let io_pool: &rayon::ThreadPool = &*io_pool;
 
         // Drain any stale deferred state — neither batched path uses
         // the ring, but a prior per-token oracle call on the same
         // RsCtx may have left in-flight K-expert dispatches that the
         // batched path's MoE permute-fuse would race with. Defensive.
         deferred::discard_deferred_experts_in(deferred);
+
+        // Phase 3: prefetch is enabled only at N == 1 (eval_token
+        // shape after re-route) and only in pread mode (mmap mode
+        // has no I/O cost to prefetch over). At N > 1 the bucket
+        // spans multiple unique experts per layer and the per-token
+        // K-slot prefetch state machine can't satisfy them. Drain
+        // any in-flight prefetch from a prior eval_token to keep
+        // the state machine consistent — the next eval_token will
+        // re-prime from this chunk's record_actuals.
+        let prefetch_enabled =
+            n == 1 && experts.mode() == expert_io::ExpertIoMode::Pread;
+        if !prefetch_enabled {
+            prefetch.drain();
+        }
 
         // Embed all tokens into a stacked host buffer.
         let mut hidden_in_stack = vec![0.0f32; n * hidden_dim];
@@ -1432,6 +1451,33 @@ impl RsCtx {
         let mut hidden_out_stack = vec![0.0f32; n * hidden_dim];
 
         for layer_idx in 0..v.num_layers {
+            let prefetch_set = layer_idx % 2;
+            // Phase 3: fire async prefetch for THIS layer before the
+            // batched compute. Disk I/O overlaps with this layer's
+            // matvecs / SDPA / linear-attn kernels; the wait happens
+            // inside the layer forward right before MoE permute-fuse.
+            // Skipped when prefetch is disabled (N != 1 or mmap mode).
+            if prefetch_enabled {
+                if let Some(predicted) = prefetch.predict_for(layer_idx) {
+                    let data_prefetch =
+                        moe_buffers.data_prefetch_slots_mut_array(prefetch_set);
+                    prefetch.dispatch(
+                        layer_idx,
+                        predicted,
+                        k_active,
+                        data_prefetch,
+                        io_pool,
+                        experts,
+                    );
+                }
+            }
+            let prefetch_env = prefetch_enabled.then(|| {
+                linear_attn_forward::PrefetchEnv {
+                    prefetch: &mut *prefetch,
+                    moe_buffers: &mut *moe_buffers,
+                    prefetch_set,
+                }
+            });
             let is_full = v.layer_kind(layer_idx)
                 == variants::LayerKind::FullAttn;
             if is_full {
@@ -1453,6 +1499,7 @@ impl RsCtx {
                     k_active,
                     experts,
                     kv_state,
+                    prefetch_env,
                     &hidden_in_stack,
                     &mut hidden_out_stack,
                 )
@@ -1485,6 +1532,7 @@ impl RsCtx {
                     k_active,
                     experts,
                     layer_state,
+                    prefetch_env,
                     &hidden_in_stack,
                     &mut hidden_out_stack,
                 )

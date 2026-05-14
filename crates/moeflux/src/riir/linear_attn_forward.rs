@@ -365,6 +365,27 @@ pub(super) fn bits_of(wf: &WeightFile, name: &str) -> u32 {
         .max(4)
 }
 
+/// Prefetch context for the batched layer forwards — session-5
+/// Phase 3.
+///
+/// When `Some`, the caller has fired
+/// [`super::PrefetchState::dispatch`] for THIS layer before invoking
+/// the batched forward and wants the in-flight pread to be drained +
+/// set-matched against the bucket experts. Hits route through the
+/// per-slot `moe.data_prefetch[set]` buffers (zero-I/O); misses fall
+/// through to the existing mmap-or-pread path.
+///
+/// Caller fires the dispatch only at small N (the per-layer
+/// prefetch is wasted work at N ≥ 32 — the bucket spans most or all
+/// experts) and only in pread mode (mmap mode has zero pread cost
+/// to begin with; the prefetch's pread would duplicate work the
+/// kernel's demand-fault handler is about to do anyway).
+pub(super) struct PrefetchEnv<'a> {
+    pub prefetch: &'a mut super::PrefetchState,
+    pub moe_buffers: &'a mut super::expert_forward::MoeBuffers,
+    pub prefetch_set: usize,
+}
+
 /// Adapter naming the o_proj weights + input shape to use for one
 /// call into [`post_attention_tail`]. Linear-attn fills with
 /// `linear_o_proj_*`; full-attn fills with `full_o_proj_*`.
@@ -1870,6 +1891,12 @@ pub(super) fn batched_linear_attn_layer_forward(
     k_active: usize,
     expert_files: &ExpertFiles,
     _layer_state: &mut LinearAttnState,
+    // Session-5 Phase 3: when `Some`, the caller has fired
+    // `prefetch.dispatch` for this layer and wants the bucket-vs-
+    // prediction set match + record_outcome / record_actual. Only
+    // enabled by `step_internal_batched_gqa` at N == 1 (decode
+    // re-routed eval_token shape) and only in pread mode.
+    mut prefetch: Option<PrefetchEnv<'_>>,
     hidden_in: &[f32],
     hidden_out: &mut [f32],
 ) -> Result<(), LayerForwardError> {
@@ -2348,34 +2375,79 @@ pub(super) fn batched_linear_attn_layer_forward(
     let total_assignments = buckets.token_idx.len();
     debug_assert_eq!(total_assignments, n_tokens * k_active);
 
-    // Expert weight buffers — mmap path vs pread-and-copy path. See
-    // `batched_full_attn_layer_forward` for the rationale.
+    // Expert weight buffers — three sources, evaluated per bucket:
+    //
+    // - **Prefetch hit** (Phase 3): caller dispatched async prefetch
+    //   before this call. If this bucket's expert matches any of the
+    //   predicted-and-loaded indices, bind `moe.data_prefetch[set][slot]`.
+    // - **Mmap miss**: `mode == Mmap` → bind the layer-wide mmap'd
+    //   Metal buffer with `expert_idx * expert_size` offset. Zero I/O.
+    // - **Pread miss**: read into a fresh `MtlBuffer<u8>` via
+    //   `read_expert` + `MtlBuffer::with_data`. Same as the pre-Phase-3
+    //   path.
+    //
+    // Mmap mode is hot-pathed: no prefetch (caller passes `None`), no
+    // owned blobs. Pread mode at small N may have prefetch hits.
     let expert_size = v.expert_size_4bit();
-    let mut owned_blobs: Vec<MtlBuffer<u8>> = Vec::new();
-    if expert_files.mode() != super::expert_io::ExpertIoMode::Mmap {
-        owned_blobs.reserve(buckets.expert_ids.len());
+    let mode = expert_files.mode();
+    let num_buckets = buckets.expert_ids.len();
+    let mut bucket_prefetch_slot: Vec<Option<usize>> = vec![None; num_buckets];
+    let mut hit_count: u64 = 0;
+    if let Some(pe) = prefetch.as_mut() {
+        if let Some(status) = pe.prefetch.wait_for(layer_idx) {
+            for (bi, &expert_id) in buckets.expert_ids.iter().enumerate() {
+                for buf_idx in 0..status.k {
+                    if status.loaded_indices[buf_idx] == expert_id {
+                        bucket_prefetch_slot[bi] = Some(buf_idx);
+                        hit_count += 1;
+                        break;
+                    }
+                }
+            }
+        }
+        pe.prefetch.record_outcome(
+            hit_count,
+            num_buckets as u64 - hit_count,
+        );
+    }
+
+    let mut owned_blobs: Vec<Option<MtlBuffer<u8>>> = (0..num_buckets)
+        .map(|_| None)
+        .collect();
+    if mode == super::expert_io::ExpertIoMode::Pread {
         let mut blob_scratch = vec![0u8; expert_size];
-        for &expert_id in &buckets.expert_ids {
+        for (bi, &expert_id) in buckets.expert_ids.iter().enumerate() {
+            if bucket_prefetch_slot[bi].is_some() {
+                continue;
+            }
             expert_files
                 .read_expert(layer_idx, expert_id as usize, &mut blob_scratch)?;
-            owned_blobs
-                .push(MtlBuffer::<u8>::with_data(&device, &blob_scratch));
+            owned_blobs[bi] =
+                Some(MtlBuffer::<u8>::with_data(&device, &blob_scratch));
         }
     }
-    let expert_refs: Vec<super::expert_forward::ExpertRef<'_>> =
-        if expert_files.mode() == super::expert_io::ExpertIoMode::Mmap {
-            buckets
-                .expert_ids
-                .iter()
-                .map(|&expert_id| {
-                    expert_files
-                        .mmap_buffer_for_expert(layer_idx, expert_id as u32)
-                        .expect("mmap layer present in mmap mode")
-                })
-                .collect()
-        } else {
-            owned_blobs.iter().map(|b| (b.buffer(), 0u64)).collect()
-        };
+
+    let expert_refs: Vec<super::expert_forward::ExpertRef<'_>> = buckets
+        .expert_ids
+        .iter()
+        .enumerate()
+        .map(|(bi, &expert_id)| {
+            if let Some(buf_idx) = bucket_prefetch_slot[bi] {
+                let pe = prefetch.as_ref().expect("prefetch slot requires env");
+                let buf =
+                    pe.moe_buffers.data_prefetch_buffer(pe.prefetch_set, buf_idx);
+                (buf, 0u64)
+            } else if mode == super::expert_io::ExpertIoMode::Mmap {
+                expert_files
+                    .mmap_buffer_for_expert(layer_idx, expert_id as u32)
+                    .expect("mmap layer present in mmap mode")
+            } else {
+                let blob =
+                    owned_blobs[bi].as_ref().expect("synced miss has owned blob");
+                (blob.buffer(), 0u64)
+            }
+        })
+        .collect();
 
     let mut bucket_input_host = vec![0.0f32; total_assignments * hidden_dim];
     for assignment_idx in 0..total_assignments {
@@ -2433,6 +2505,19 @@ pub(super) fn batched_linear_attn_layer_forward(
         metal.commit_and_wait_labeled(cmdbuf, "batched_la_moe_permute_fuse");
     }
     let moe_sum_host = out_sum.to_vec();
+
+    // Phase 3: record this layer's actual routing as the prediction
+    // for the next token's same layer. Only meaningful at N=1
+    // (eval_token shape) — at larger N the layer routes many tokens
+    // and the per-token prediction semantic is murky. The caller
+    // gates the env to `None` for N != 1.
+    if let Some(pe) = prefetch.as_mut() {
+        use super::expert_forward::MAX_K;
+        let mut actuals: [i32; MAX_K] = [0; MAX_K];
+        let len = k_active.min(MAX_K).min(all_routing_indices.len());
+        actuals[..len].copy_from_slice(&all_routing_indices[..len]);
+        pe.prefetch.record_actual(layer_idx, actuals);
+    }
 
     // ── Phase 1h: CPU combine. ──────────────────────────────────
     for t in 0..n_tokens {
