@@ -819,3 +819,139 @@ fn graph_metal_matches_cpu_gated_rms_norm() {
         max_abs
     );
 }
+
+// ============================================================================
+// Test: ComputeDecayBetaNTokens through both backends (S7-6b)
+// ============================================================================
+
+#[test]
+#[ignore = "long-running GPU test"]
+fn graph_metal_matches_cpu_compute_decay_beta() {
+    let n_tokens: u32 = 4;
+    let num_v_heads: u32 = 8;
+    let per_token = num_v_heads as usize;
+    let total = n_tokens as usize * per_token;
+    let mut rng = Rng::new(0xA3B_BB03);
+    let alpha_data: Vec<f32> =
+        (0..total).map(|_| rng.next_f32_unit()).collect();
+    let beta_data: Vec<f32> =
+        (0..total).map(|_| rng.next_f32_unit()).collect();
+    // a_log is f32[num_v_heads]. dt_bias is bf16[num_v_heads].
+    let a_log_data: Vec<f32> =
+        (0..num_v_heads as usize).map(|_| rng.next_f32_unit() * 0.1 - 1.0).collect();
+    let a_log_bytes: Vec<u8> = a_log_data
+        .iter()
+        .flat_map(|f| f.to_le_bytes())
+        .collect();
+    let mut dt_bias_bytes = vec![0u8; (num_v_heads as usize) * 2];
+    for chunk in dt_bias_bytes.chunks_exact_mut(2) {
+        let f = rng.next_f32_unit() * 0.25;
+        let bits = (f.to_bits() >> 16) as u16;
+        chunk[0] = bits.to_le_bytes()[0];
+        chunk[1] = bits.to_le_bytes()[1];
+    }
+    let tensors = &[
+        (
+            "a_log",
+            "F32",
+            0,
+            vec![num_v_heads as usize],
+            a_log_bytes.clone(),
+        ),
+        (
+            "dt_bias",
+            "BF16",
+            0,
+            vec![num_v_heads as usize],
+            dt_bias_bytes.clone(),
+        ),
+    ];
+
+    // CPU path
+    let mut cpu_wf = SyntheticWf::build("compute_decay_beta_cpu", tensors);
+    let (a_log_off, dt_bias_off) = {
+        let wf = cpu_wf.wf.as_ref().unwrap();
+        (
+            wf.tensor_info("a_log").unwrap().offset as u64,
+            wf.tensor_info("dt_bias").unwrap().offset as u64,
+        )
+    };
+    let mut cpu = CpuBackend::new(cpu_wf.take());
+    let cpu_alpha = cpu.pool_mut().alloc(total * 4, "alpha", false).unwrap();
+    let cpu_beta = cpu.pool_mut().alloc(total * 4, "beta", false).unwrap();
+    let cpu_g = cpu.pool_mut().alloc(total * 4, "g", false).unwrap();
+    let cpu_bg = cpu.pool_mut().alloc(total * 4, "bg", false).unwrap();
+    cpu.pool_mut().upload(cpu_alpha, bytes_of_f32(&alpha_data)).unwrap();
+    cpu.pool_mut().upload(cpu_beta, bytes_of_f32(&beta_data)).unwrap();
+    let mut g_cpu = Graph::new();
+    g_cpu.push(Op::ComputeDecayBetaNTokens {
+        label: "test_compute_decay_beta",
+        alpha_in: cpu_alpha,
+        beta_in: cpu_beta,
+        a_log_off,
+        dt_bias_off,
+        g_decay_out: cpu_g,
+        beta_gate_out: cpu_bg,
+        num_v_heads,
+        n_tokens,
+    });
+    cpu.execute(&g_cpu).unwrap();
+    let mut cpu_g_bytes = vec![0u8; total * 4];
+    let mut cpu_bg_bytes = vec![0u8; total * 4];
+    cpu.pool().download(cpu_g, &mut cpu_g_bytes).unwrap();
+    cpu.pool().download(cpu_bg, &mut cpu_bg_bytes).unwrap();
+    let cpu_g_f32 = f32_of_bytes(&cpu_g_bytes);
+    let cpu_bg_f32 = f32_of_bytes(&cpu_bg_bytes);
+
+    // GPU path
+    let mut gpu_wf = SyntheticWf::build("compute_decay_beta_gpu", tensors);
+    let metal_ctx = MetalContext::new().expect("MetalContext::new");
+    let wf_ref = gpu_wf.wf.as_ref().unwrap();
+    let wf_buf = MtlWeightBuf::wrap(wf_ref, metal_ctx.device());
+    let _ = gpu_wf.take();
+    let mut gpu = MetalBackend::new(metal_ctx, wf_buf).expect("MetalBackend::new");
+    let gpu_alpha = gpu.pool_mut().alloc(total * 4, "alpha", false).unwrap();
+    let gpu_beta = gpu.pool_mut().alloc(total * 4, "beta", false).unwrap();
+    let gpu_g = gpu.pool_mut().alloc(total * 4, "g", false).unwrap();
+    let gpu_bg = gpu.pool_mut().alloc(total * 4, "bg", false).unwrap();
+    gpu.pool_mut().upload(gpu_alpha, bytes_of_f32(&alpha_data)).unwrap();
+    gpu.pool_mut().upload(gpu_beta, bytes_of_f32(&beta_data)).unwrap();
+    let mut g_gpu = Graph::new();
+    g_gpu.push(Op::ComputeDecayBetaNTokens {
+        label: "test_compute_decay_beta",
+        alpha_in: gpu_alpha,
+        beta_in: gpu_beta,
+        a_log_off,
+        dt_bias_off,
+        g_decay_out: gpu_g,
+        beta_gate_out: gpu_bg,
+        num_v_heads,
+        n_tokens,
+    });
+    gpu.execute(&g_gpu).unwrap();
+    let mut gpu_g_bytes = vec![0u8; total * 4];
+    let mut gpu_bg_bytes = vec![0u8; total * 4];
+    gpu.pool().download(gpu_g, &mut gpu_g_bytes).unwrap();
+    gpu.pool().download(gpu_bg, &mut gpu_bg_bytes).unwrap();
+    let gpu_g_f32 = f32_of_bytes(&gpu_g_bytes);
+    let gpu_bg_f32 = f32_of_bytes(&gpu_bg_bytes);
+
+    let cos_g = cosine_sim(&cpu_g_f32, &gpu_g_f32);
+    let cos_bg = cosine_sim(&cpu_bg_f32, &gpu_bg_f32);
+    let max_abs_g = cpu_g_f32
+        .iter()
+        .zip(gpu_g_f32.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let max_abs_bg = cpu_bg_f32
+        .iter()
+        .zip(gpu_bg_f32.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    eprintln!(
+        "[s7-6b compute_decay_beta] N={} h={}: g_decay cos={:.9} max_abs={:.3e}; beta_gate cos={:.9} max_abs={:.3e}",
+        n_tokens, num_v_heads, cos_g, max_abs_g, cos_bg, max_abs_bg
+    );
+    assert!(cos_g >= COSINE_FLOOR, "g_decay cosine {} max_abs={}", cos_g, max_abs_g);
+    assert!(cos_bg >= COSINE_FLOOR, "beta_gate cosine {} max_abs={}", cos_bg, max_abs_bg);
+}

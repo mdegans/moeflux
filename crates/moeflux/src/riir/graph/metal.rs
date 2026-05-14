@@ -588,10 +588,57 @@ impl Backend for MetalBackend {
                     "Conv1dStepNTokens encode_op: per-token loop with encode_conv1d_step; defer to S7-6 producer wire-up"
                 )
             }
-            Op::ComputeDecayBetaNTokens { .. } => {
-                todo!(
-                    "ComputeDecayBetaNTokens encode_op: per-token loop with encode_compute_decay_beta; defer to S7-6 producer wire-up"
-                )
+            Op::ComputeDecayBetaNTokens {
+                alpha_in,
+                beta_in,
+                a_log_off,
+                dt_bias_off,
+                g_decay_out,
+                beta_gate_out,
+                num_v_heads,
+                n_tokens,
+                ..
+            } => {
+                // Per-token loop: each token's alpha / beta are
+                // `num_v_heads` floats, tightly packed token-major.
+                // Outputs `g_decay` and `beta_gate` follow the same
+                // layout. a_log + dt_bias are shared per-head weights.
+                let per_token_bytes = (*num_v_heads as u64) * 4;
+                let alpha_buf = self.pool.handle(*alpha_in);
+                let beta_buf = self.pool.handle(*beta_in);
+                let g_decay_buf = self.pool.handle(*g_decay_out);
+                let beta_gate_buf = self.pool.handle(*beta_gate_out);
+                let nvh = *num_v_heads;
+                for t in 0..*n_tokens {
+                    let off = (t as u64) * per_token_bytes;
+                    let enc = cmd.new_compute_command_encoder();
+                    enc.set_compute_pipeline_state(
+                        &self.linear_attn_pipes.compute_decay_beta,
+                    );
+                    enc.set_buffer(0, Some(alpha_buf), off as NSUInteger);
+                    enc.set_buffer(1, Some(beta_buf), off as NSUInteger);
+                    enc.set_buffer(
+                        2,
+                        Some(self.wf_buf.buffer()),
+                        *a_log_off as NSUInteger,
+                    );
+                    enc.set_buffer(
+                        3,
+                        Some(self.wf_buf.buffer()),
+                        *dt_bias_off as NSUInteger,
+                    );
+                    enc.set_buffer(4, Some(g_decay_buf), off as NSUInteger);
+                    enc.set_buffer(
+                        5,
+                        Some(beta_gate_buf),
+                        off as NSUInteger,
+                    );
+                    enc.dispatch_thread_groups(
+                        MTLSize::new(1, 1, 1),
+                        MTLSize::new(nvh as NSUInteger, 1, 1),
+                    );
+                    enc.end_encoding();
+                }
             }
             Op::GatedDeltaNetStepNTokens { .. } => {
                 todo!(
