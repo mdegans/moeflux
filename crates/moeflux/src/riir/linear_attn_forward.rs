@@ -1897,17 +1897,21 @@ pub(super) fn batched_linear_attn_layer_forward(
     // enabled by `step_internal_batched_gqa` at N == 1 (decode
     // re-routed eval_token shape) and only in pread mode.
     mut prefetch: Option<PrefetchEnv<'_>>,
-    hidden_in: &[f32],
-    hidden_out: &mut [f32],
+    // S7-2 (session 6): hidden_in / hidden_out live on GPU. The
+    // orchestrator double-buffers two MtlBuffers and swaps between
+    // layers, eliminating the inter-layer host bounce.
+    hidden_in_buf: &metal::Buffer,
+    hidden_out_buf: &metal::Buffer,
 ) -> Result<(), LayerForwardError> {
-    use super::expert_forward::{encode_moe_batched_permute_fuse, MAX_K};
+    use super::expert_forward::{
+        encode_moe_batched_permute_fuse, encode_moe_combine_residual_n_tokens,
+        MAX_K,
+    };
     use super::metal::MtlBuffer;
     use super::moe_router::build_expert_buckets;
 
     let v = VARIANT;
     debug_assert!(k_active <= MAX_K);
-    debug_assert_eq!(hidden_in.len(), n_tokens * v.hidden_dim);
-    debug_assert_eq!(hidden_out.len(), n_tokens * v.hidden_dim);
 
     let linear_layer_idx = linear_layer_idx_for(layer_idx).ok_or(
         LayerForwardError::MissingTensor {
@@ -1984,7 +1988,7 @@ pub(super) fn batched_linear_attn_layer_forward(
     // within a cmdbuf so RAW hazards across kernels are honoured.
     let rms_n_pipe =
         super::gpu_norm::RmsNormBf16FusedNTokensPipeline::fetch(metal)?;
-    let hidden_in_buf = MtlBuffer::<f32>::with_data(&device, hidden_in);
+    // hidden_in_buf comes from the orchestrator's double-buffer (S7-2).
     let normed_buf =
         MtlBuffer::<f32>::with_len(&device, n_tokens * hidden_dim);
     let pre_moe_queue = metal.queue_clone();
@@ -1992,7 +1996,7 @@ pub(super) fn batched_linear_attn_layer_forward(
     super::gpu_norm::encode_rms_norm_bf16_fused_n_tokens(
         pre_moe_cmdbuf,
         &rms_n_pipe,
-        hidden_in_buf.buffer(),
+        hidden_in_buf,
         wf_buf.buffer(),
         layer_cache.input_layernorm_w,
         normed_buf.buffer(),
@@ -2192,11 +2196,12 @@ pub(super) fn batched_linear_attn_layer_forward(
     //    over all N tokens — collapses the per-token loop that issued
     //    N×commit_and_wait + N host bounces. Mirrors the full-attn
     //    Phase 3c refactor (B-0c). ─────────────────────────────────
-    let mut h_mid_stack = vec![0.0f32; n_tokens * hidden_dim];
+    // S7-2: h_mid + shared_gate stay on GPU (consumed by GPU combine).
+    // h_post_stack is still read back so the per-token bucket_input
+    // gather (`bucket_input_host[assignment_idx]`) can index into it.
     let mut h_post_stack = vec![0.0f32; n_tokens * hidden_dim];
     let all_routing_indices: Vec<i32>;
     let all_routing_weights: Vec<f32>;
-    let shared_gate_scores: Vec<f32>;
     let gate_bits =
         bits_of(wf, &format!("model.layers.{layer_idx}.mlp.gate.weight"));
     let seg_bits = bits_of(
@@ -2225,7 +2230,7 @@ pub(super) fn batched_linear_attn_layer_forward(
         pre_moe_cmdbuf,
         &resid_add_n_pso,
         o_proj_stack.buffer(),
-        hidden_in_buf.buffer(),
+        hidden_in_buf,
         h_mid_buf.buffer(),
         n_tokens as u32,
         hidden_dim as u32,
@@ -2287,12 +2292,12 @@ pub(super) fn batched_linear_attn_layer_forward(
         pre_moe_cmdbuf,
         "batched_la_pre_moe_fused",
     );
-    // Bulk readback (one transfer per layer, not N).
-    h_mid_stack.copy_from_slice(&h_mid_buf.to_vec());
+    // Bulk readback (S7-2): only h_post_stack (for bucket_input
+    // gather) and the small routing buffers — h_mid + shared_gate
+    // stay on GPU and feed directly into the GPU combine kernel.
     h_post_stack.copy_from_slice(&h_post_buf.to_vec());
     all_routing_indices = routing_indices_buf.to_vec();
     all_routing_weights = routing_weights_buf.to_vec();
-    shared_gate_scores = shared_gate_buf.to_vec();
 
     // ── Phase 1f: batched shared FFN. ───────────────────────────
     let s_gate_bits = bits_of(
@@ -2324,7 +2329,11 @@ pub(super) fn batched_linear_attn_layer_forward(
     let shared_down_b = layer_cache.shared.down_b;
     let h_post_buf =
         MtlBuffer::<f32>::with_data(&device, &h_post_stack);
-    let shared_gate_buf = MtlBuffer::<f32>::with_len(
+    // Shared FFN's gate-proj output (NOT the per-token sigmoid scalar
+    // from Phase 1e — that one is `shared_gate_buf` and is still in
+    // scope). Renamed from `shared_gate_buf` to `shared_ffn_gate_buf`
+    // so the GPU combine kernel below reads the right buffer.
+    let shared_ffn_gate_buf = MtlBuffer::<f32>::with_len(
         &device,
         n_tokens * v.shared_intermediate,
     );
@@ -2353,7 +2362,7 @@ pub(super) fn batched_linear_attn_layer_forward(
         shared_gate_b,
         h_post_buf.buffer(),
         0,
-        shared_gate_buf.buffer(),
+        shared_ffn_gate_buf.buffer(),
         0,
         hidden_dim as u32,
         v.shared_intermediate as u32,
@@ -2379,7 +2388,7 @@ pub(super) fn batched_linear_attn_layer_forward(
     {
         let enc = moe_cmdbuf.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&swiglu_pso);
-        enc.set_buffer(0, Some(shared_gate_buf.buffer()), 0);
+        enc.set_buffer(0, Some(shared_ffn_gate_buf.buffer()), 0);
         enc.set_buffer(1, Some(shared_up_buf.buffer()), 0);
         enc.set_buffer(2, Some(shared_act_buf.buffer()), 0);
         let dim = (n_tokens * v.shared_intermediate) as u32;
@@ -2546,9 +2555,24 @@ pub(super) fn batched_linear_attn_layer_forward(
         &buckets,
         v,
     );
-    metal.commit_and_wait_labeled(moe_cmdbuf, "batched_la_shared_ffn_moe_permute_fuse");
-    let shared_out_stack = shared_down_buf.to_vec();
-    let moe_sum_host = out_sum.to_vec();
+    // S7-2: GPU combine into hidden_out_buf — replaces the CPU loop
+    // that read h_mid_stack / shared_out_stack / shared_gate_scores /
+    // moe_sum_host. Encoded into the same moe_cmdbuf as 1f/1g.
+    let combine_pso = metal
+        .pipeline("moe_combine_residual_n_tokens")?
+        .clone();
+    encode_moe_combine_residual_n_tokens(
+        moe_cmdbuf,
+        &combine_pso,
+        h_mid_buf.buffer(),
+        out_sum.buffer(),
+        shared_down_buf.buffer(),
+        shared_gate_buf.buffer(),
+        hidden_out_buf,
+        n_tokens as u32,
+        hidden_dim as u32,
+    );
+    metal.commit_and_wait_labeled(moe_cmdbuf, "batched_la_shared_ffn_moe_combine");
 
     // Phase 3: record this layer's actual routing as the prediction
     // for the next token's same layer. Only meaningful at N=1
@@ -2561,19 +2585,6 @@ pub(super) fn batched_linear_attn_layer_forward(
         let len = k_active.min(MAX_K).min(all_routing_indices.len());
         actuals[..len].copy_from_slice(&all_routing_indices[..len]);
         pe.prefetch.record_actual(layer_idx, actuals);
-    }
-
-    // ── Phase 1h: CPU combine. ──────────────────────────────────
-    for t in 0..n_tokens {
-        let sg = shared_gate_scores[t];
-        let sigmoid_sg = 1.0f32 / (1.0f32 + (-sg).exp());
-        let h_mid = &h_mid_stack[t * hidden_dim..(t + 1) * hidden_dim];
-        let moe = &moe_sum_host[t * hidden_dim..(t + 1) * hidden_dim];
-        let shared = &shared_out_stack[t * hidden_dim..(t + 1) * hidden_dim];
-        let out = &mut hidden_out[t * hidden_dim..(t + 1) * hidden_dim];
-        for i in 0..hidden_dim {
-            out[i] = h_mid[i] + moe[i] + sigmoid_sg * shared[i];
-        }
     }
 
     Ok(())

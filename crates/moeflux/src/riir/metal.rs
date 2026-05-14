@@ -86,6 +86,7 @@ pub const ALL_KERNELS: &[&str] = &[
     "mla_sdpa_tile_accumulate",
     "mla_sdpa_tile_finalize",
     "moe_combine_residual",
+    "moe_combine_residual_n_tokens",
     "moe_normalize_weights",
     "moe_softmax_topk",
     "residual_add",

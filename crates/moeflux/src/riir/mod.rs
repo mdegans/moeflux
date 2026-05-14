@@ -1485,17 +1485,26 @@ impl RsCtx {
             prefetch.drain();
         }
 
-        // Embed all tokens into a stacked host buffer.
-        let mut hidden_in_stack = vec![0.0f32; n * hidden_dim];
+        // S7-2: embed all tokens into a stacked host buffer, then
+        // upload to a GPU buffer once. Layer-forwards read/write GPU
+        // buffers directly; the orchestrator double-buffers
+        // hidden_a / hidden_b and swaps between layers. Eliminates the
+        // inter-layer host bounce that historically forced one
+        // commit_and_wait per layer just for hidden state marshaling.
+        let mut hidden_stack_host = vec![0.0f32; n * hidden_dim];
         for (t, &tok) in tokens.iter().enumerate() {
             embedding::embed_lookup(
                 wf,
                 tok,
-                &mut hidden_in_stack[t * hidden_dim..(t + 1) * hidden_dim],
+                &mut hidden_stack_host[t * hidden_dim..(t + 1) * hidden_dim],
             )
             .map_err(|_| RsError::EvalFailed)?;
         }
-        let mut hidden_out_stack = vec![0.0f32; n * hidden_dim];
+        let device = metal.device().clone();
+        let mut hidden_a =
+            MtlBuffer::<f32>::with_data(&device, &hidden_stack_host);
+        let mut hidden_b =
+            MtlBuffer::<f32>::with_len(&device, n * hidden_dim);
 
         for layer_idx in 0..v.num_layers {
             let prefetch_set = layer_idx % 2;
@@ -1547,8 +1556,8 @@ impl RsCtx {
                     experts,
                     kv_state,
                     prefetch_env,
-                    &hidden_in_stack,
-                    &mut hidden_out_stack,
+                    hidden_a.buffer(),
+                    hidden_b.buffer(),
                 )
                 .map_err(|_| RsError::EvalFailed)?;
             } else {
@@ -1580,20 +1589,24 @@ impl RsCtx {
                     experts,
                     layer_state,
                     prefetch_env,
-                    &hidden_in_stack,
-                    &mut hidden_out_stack,
+                    hidden_a.buffer(),
+                    hidden_b.buffer(),
                 )
                 .map_err(|_| RsError::EvalFailed)?;
             }
-            // Swap stacks: this layer's output becomes next layer's
-            // input. The previously-input stack is reused as next
-            // layer's output buffer (saves alloc).
-            std::mem::swap(&mut hidden_in_stack, &mut hidden_out_stack);
+            // Swap GPU buffers: this layer wrote `hidden_b`; next
+            // layer reads it as `hidden_a` and writes the previously-
+            // input buffer.
+            std::mem::swap(&mut hidden_a, &mut hidden_b);
         }
 
         // Final norm + lm_head on the LAST token's hidden state.
+        // `hidden_a` now holds the final layer's output (after the
+        // final swap). Read the last token's row to host for the
+        // CPU rms_norm pass.
         if let Some(logits) = logits_out {
-            let last_row = &hidden_in_stack
+            let hidden_final_host = hidden_a.to_vec();
+            let last_row = &hidden_final_host
                 [(n - 1) * hidden_dim..n * hidden_dim];
             let mut hidden_normed = vec![0.0f32; hidden_dim];
             rms_norm_cpu(

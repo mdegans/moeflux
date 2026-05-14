@@ -2647,6 +2647,43 @@ kernel void mla_kv_cache_append(
 
 
 // ============================================================================
+// Kernel: MoE combine + residual + shared expert gate, batched over N tokens
+// ============================================================================
+// Batched-prefill variant of the existing `moe_combine_residual` for the
+// post-MoE-permute-fuse path. Inputs are already aggregated per token
+// (the bucket-accumulate kernel summed expert outputs into `moe_sum`),
+// so no per-expert weighted reduction needed here. Just:
+//
+//   hidden_out[t, i] = h_mid[t, i] + moe_sum[t, i]
+//                    + sigmoid(shared_gate[t]) * shared_out[t, i]
+//
+// One thread per (token, dim) pair. Eliminates the CPU combine loop
+// (`for t in 0..n_tokens { sigmoid + multiply + add }`) and lets the
+// orchestrator keep hidden_out on GPU as the next layer's hidden_in.
+//
+// Dispatch:
+//   threadgroups = (ceil(n_tokens * dim / 256), 1, 1)
+//   threads      = (256, 1, 1)
+
+kernel void moe_combine_residual_n_tokens(
+    device const float* h_mid        [[buffer(0)]],  // [n_tokens, dim]
+    device const float* moe_sum      [[buffer(1)]],  // [n_tokens, dim]
+    device const float* shared_out   [[buffer(2)]],  // [n_tokens, dim]
+    device const float* shared_gate  [[buffer(3)]],  // [n_tokens] f32 (pre-sigmoid)
+    device float*       hidden_out   [[buffer(4)]],  // [n_tokens, dim]
+    constant uint&      n_tokens     [[buffer(5)]],
+    constant uint&      dim          [[buffer(6)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    uint total = n_tokens * dim;
+    if (tid >= total) return;
+    uint t = tid / dim;
+    float sg = 1.0f / (1.0f + exp(-shared_gate[t]));
+    hidden_out[tid] = h_mid[tid] + moe_sum[tid] + sg * shared_out[tid];
+}
+
+
+// ============================================================================
 // Kernel: Fused RMS norm with bf16 weights, batched over N tokens
 // ============================================================================
 // One threadgroup per token. Each threadgroup computes its own sum-of-squares

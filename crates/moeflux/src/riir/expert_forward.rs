@@ -1296,6 +1296,42 @@ pub fn encode_moe_batched_permute_fuse(
     }
 }
 
+/// Encode the batched MoE combine kernel into `cmdbuf`. Replaces the
+/// CPU loop that computed
+/// `hidden_out[t,i] = h_mid[t,i] + moe_sum[t,i] + sigmoid(shared_gate[t]) * shared_out[t,i]`
+/// after each layer's MoE permute-fuse. With this on GPU the
+/// orchestrator can keep `hidden_out` on the GPU as the next layer's
+/// `hidden_in`, eliminating the inter-layer host bounce.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_moe_combine_residual_n_tokens(
+    cmdbuf: &CommandBufferRef,
+    pipeline: &ComputePipelineState,
+    h_mid: &Buffer,
+    moe_sum: &Buffer,
+    shared_out: &Buffer,
+    shared_gate: &Buffer,
+    hidden_out: &Buffer,
+    n_tokens: u32,
+    dim: u32,
+) {
+    let total = n_tokens * dim;
+    let enc = cmdbuf.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(pipeline);
+    enc.set_buffer(0, Some(h_mid), 0);
+    enc.set_buffer(1, Some(moe_sum), 0);
+    enc.set_buffer(2, Some(shared_out), 0);
+    enc.set_buffer(3, Some(shared_gate), 0);
+    enc.set_buffer(4, Some(hidden_out), 0);
+    enc.set_bytes(5, 4, (&n_tokens as *const u32).cast());
+    enc.set_bytes(6, 4, (&dim as *const u32).cast());
+    let num_tgs = (total + 255) / 256;
+    enc.dispatch_thread_groups(
+        MTLSize::new(num_tgs as NSUInteger, 1, 1),
+        MTLSize::new(256, 1, 1),
+    );
+    enc.end_encoding();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
