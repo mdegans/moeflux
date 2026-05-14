@@ -6,15 +6,10 @@
 //! a `MetalEncodeCtx` that owns a `CommandBuffer`; `submit_and_wait`
 //! commits the cmdbuf and blocks.
 //!
-//! **S7-3 scope:** 8 of 15 `Op` variants are fully wired (the ones
-//! exercised by S7-4's load-bearing diff test): `RmsNormBf16NTokens`,
-//! `ResidualAddNTokens`, `MatvecNTokens`, `SwigluFusedBatched`,
-//! `MoeSoftmaxTopK`, `MoeNormalizeWeights`,
-//! `MoeCombineResidualNTokens`, `LmHead`. The remaining 7
-//! (`RmsNormQkNTokens`, `SdpaCausalTiled`, `MoeBatchedPermuteFuse`,
-//! `Conv1dStepNTokens`, `ComputeDecayBetaNTokens`,
-//! `GatedDeltaNetStepNTokens`, `GatedRmsNormNTokens`) are stubbed
-//! `todo!()` and will wire alongside their producers in S7-6/S7-7.
+//! **S7-3 / S7-6b scope:** 13 of 15 `Op` variants are fully wired.
+//! `LmHead` (workspace BufId) and `SdpaCausalTiled` (kv_dim
+//! disambiguation) remain as `todo!()` and will wire alongside the
+//! full-attn producer rewrite in S7-7.
 
 use super::{Backend, BufId, BufferPool, Graph, GraphError, Op};
 
@@ -293,7 +288,9 @@ pub struct MetalBackend {
     linear_attn_pipes: LinearAttnPipelines,
     residual_add_n_pso: ComputePipelineState,
     swiglu_fused_batched_pso: ComputePipelineState,
+    swiglu_fused_pso: ComputePipelineState,
     moe_combine_residual_n_pso: ComputePipelineState,
+    moe_bucket_accumulate_pso: ComputePipelineState,
 }
 
 impl MetalBackend {
@@ -315,8 +312,11 @@ impl MetalBackend {
             metal.pipeline("residual_add_n_tokens")?.clone();
         let swiglu_fused_batched_pso =
             metal.pipeline("swiglu_fused_batched")?.clone();
+        let swiglu_fused_pso = metal.pipeline("swiglu_fused")?.clone();
         let moe_combine_residual_n_pso =
             metal.pipeline("moe_combine_residual_n_tokens")?.clone();
+        let moe_bucket_accumulate_pso =
+            metal.pipeline("moe_bucket_accumulate")?.clone();
 
         let device = metal.device().clone();
         Ok(Self {
@@ -332,7 +332,9 @@ impl MetalBackend {
             linear_attn_pipes,
             residual_add_n_pso,
             swiglu_fused_batched_pso,
+            swiglu_fused_pso,
             moe_combine_residual_n_pso,
+            moe_bucket_accumulate_pso,
         })
     }
 
@@ -578,10 +580,49 @@ impl Backend for MetalBackend {
                     "SdpaCausalTiled encode_op: needs kv_dim arg disambiguation; defer to S7-7 producer wire-up"
                 )
             }
-            Op::MoeBatchedPermuteFuse { .. } => {
-                todo!(
-                    "MoeBatchedPermuteFuse encode_op: multi-pipeline composition (gather/gate/up/swiglu/down/bucket_accumulate); defer to S7-6 producer wire-up"
-                )
+            Op::MoeBatchedPermuteFuse {
+                expert_refs,
+                bucket_input,
+                bucket_gate,
+                bucket_up,
+                bucket_act,
+                bucket_out,
+                bucket_token_idx,
+                bucket_weights,
+                out_sum,
+                buckets,
+                ..
+            } => {
+                // Resolve per-bucket expert blob BufIds to (Buffer, offset)
+                // pairs in the format the existing encoder consumes. The
+                // `expert_refs` vec is parallel to `buckets.expert_ids`.
+                let blobs: Vec<&Buffer> = expert_refs
+                    .iter()
+                    .map(|(id, _)| self.pool.handle(*id))
+                    .collect();
+                let resolved: Vec<crate::riir::expert_forward::ExpertRef<'_>> =
+                    blobs
+                        .iter()
+                        .zip(expert_refs.iter())
+                        .map(|(buf, (_, off))| (*buf, *off))
+                        .collect();
+                crate::riir::expert_forward::encode_moe_batched_permute_fuse(
+                    cmd,
+                    &self.matvec_pipes,
+                    &self.swiglu_fused_pso,
+                    &self.moe_bucket_accumulate_pso,
+                    &resolved,
+                    self.pool.handle(*bucket_input),
+                    self.pool.handle(*bucket_gate),
+                    self.pool.handle(*bucket_up),
+                    self.pool.handle(*bucket_act),
+                    self.pool.handle(*bucket_out),
+                    self.pool.handle(*bucket_token_idx),
+                    self.pool.handle(*bucket_weights),
+                    self.pool.handle(*out_sum),
+                    buckets,
+                    crate::riir::variants::VARIANT,
+                );
             }
             Op::Conv1dStepNTokens {
                 qkv_in,
