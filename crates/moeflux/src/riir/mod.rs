@@ -1379,11 +1379,13 @@ impl RsCtx {
         self.ensure_linear_resources()?;
         let k_active = self.k_active;
 
-        // Field-disjoint mutable borrows.
+        // Field-disjoint mutable borrows. Session-5 Phase 1 dropped
+        // moe_buffers / deferred / prefetch / io_pool from the loop —
+        // both batched paths (full-attn and linear-attn) manage their
+        // own scratch + MoE permute-fuse without touching those fields.
         let Self {
             wf,
             metal,
-            moe_buffers,
             experts,
             layer_states,
             wf_buf,
@@ -1391,8 +1393,6 @@ impl RsCtx {
             linear_buffers,
             deferred,
             lm_head_gpu,
-            io_pool,
-            prefetch,
             ..
         } = self;
         let metal = metal.as_mut().expect("ensure_linear_resources");
@@ -1401,16 +1401,13 @@ impl RsCtx {
             layer_caches.as_ref().expect("ensure_linear_resources");
         let linear_buffers =
             linear_buffers.as_mut().expect("ensure_linear_resources");
-        let moe_buffers =
-            moe_buffers.as_mut().expect("ensure_linear_resources");
         let lm_head_gpu =
             lm_head_gpu.as_ref().expect("ensure_linear_resources");
-        let io_pool: &rayon::ThreadPool = &*io_pool;
 
-        // Drain any stale deferred state — batched path doesn't use
-        // the ring, but the per-token linear-attn fallback below does,
-        // and the per-token oracle's drain discipline assumes a clean
-        // start.
+        // Drain any stale deferred state — neither batched path uses
+        // the ring, but a prior per-token oracle call on the same
+        // RsCtx may have left in-flight K-expert dispatches that the
+        // batched path's MoE permute-fuse would race with. Defensive.
         deferred::discard_deferred_experts_in(deferred);
 
         // Embed all tokens into a stacked host buffer.
@@ -1458,51 +1455,31 @@ impl RsCtx {
                         return Err(RsError::EvalFailed);
                     }
                 };
-                // Per-token linear-attn fallback. Each token's
-                // dispatch lands in `moe_buffers.moe_hidden`; we drain
-                // synchronously to per-token slots of hidden_out_stack.
-                for t in 0..n {
-                    // Stage token t's input.
-                    // SAFETY: shared-storage; prior token's dispatch
-                    // was drained (next iteration's drain or the
-                    // discard above for t=0).
-                    unsafe {
-                        let dst = linear_buffers.input.contents()
-                            as *mut f32;
-                        std::ptr::copy_nonoverlapping(
-                            hidden_in_stack[t * hidden_dim..].as_ptr(),
-                            dst,
-                            hidden_dim,
-                        );
-                    }
-                    linear_attn_forward::linear_attn_layer_forward(
-                        metal,
-                        wf,
-                        wf_buf,
-                        &layer_caches[layer_idx],
-                        linear_buffers,
-                        moe_buffers,
-                        deferred,
-                        layer_idx,
-                        k_active,
-                        experts,
-                        io_pool,
-                        prefetch,
-                        /* prefetch_set = */ layer_idx % 2,
-                        layer_state,
-                        /* gpu_combine = */ true,
-                        /* prev_layer_chained = */ false,
-                        /* chain_next_norm_off = */ None,
-                    )
-                    .map_err(|_| RsError::EvalFailed)?;
-                    deferred::complete_deferred_experts_into(
-                        deferred,
-                        moe_buffers,
-                        &mut hidden_out_stack
-                            [t * hidden_dim..(t + 1) * hidden_dim],
-                    )
-                    .map_err(|_| RsError::EvalFailed)?;
-                }
+                // Session-5 Phase 1: batched linear-attn forward. The
+                // per-token fallback (previously a loop over
+                // `linear_attn_layer_forward` + per-token deferred
+                // drain) was 55% of prefill inclusive time per the
+                // post-session-4 profile. The batched form keeps the
+                // 5 recurrent kernels per-token but folds N×5
+                // dispatches into one cmdbuf, batches the 4
+                // projections + o_proj + shared FFN, and routes MoE
+                // through the same permute-fuse path as the full-attn
+                // batched forward.
+                linear_attn_forward::batched_linear_attn_layer_forward(
+                    metal,
+                    wf,
+                    wf_buf,
+                    &layer_caches[layer_idx],
+                    linear_buffers,
+                    layer_idx,
+                    n,
+                    k_active,
+                    experts,
+                    layer_state,
+                    &hidden_in_stack,
+                    &mut hidden_out_stack,
+                )
+                .map_err(|_| RsError::EvalFailed)?;
             }
             // Swap stacks: this layer's output becomes next layer's
             // input. The previously-input stack is reused as next

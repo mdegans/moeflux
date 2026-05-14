@@ -50,12 +50,18 @@ impl LinearAttnPipelines {
 
 /// Encode `conv1d_step` with the C-side dispatch shape.
 /// `(conv_dim + 255) / 256` threadgroups × 256 threads.
+///
+/// `qkv_in_off` is the byte offset into `qkv_in` where this token's
+/// `linear_conv_dim` floats start — the batched-prefill caller binds
+/// a stacked projection buffer with a per-token offset. Per-token
+/// callers pass 0.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_conv1d_step(
     cmdbuf: &CommandBufferRef,
     pipeline: &ComputePipelineState,
     conv_state: &Buffer,
     qkv_in: &Buffer,
+    qkv_in_off: u64,
     weight_buf: &Buffer,
     weight_off: u64,
     conv_out: &Buffer,
@@ -64,7 +70,7 @@ pub fn encode_conv1d_step(
     let enc = cmdbuf.new_compute_command_encoder();
     enc.set_compute_pipeline_state(pipeline);
     enc.set_buffer(0, Some(conv_state), 0);
-    enc.set_buffer(1, Some(qkv_in), 0);
+    enc.set_buffer(1, Some(qkv_in), qkv_in_off as NSUInteger);
     enc.set_buffer(2, Some(weight_buf), weight_off as NSUInteger);
     enc.set_buffer(3, Some(conv_out), 0);
     enc.set_bytes(4, 4, (&conv_dim as *const u32).cast());
@@ -104,12 +110,18 @@ pub fn encode_rms_norm_qk(
 
 /// Encode `compute_decay_beta`. 1 threadgroup × `num_v_heads`
 /// threads, one thread per v-head.
+///
+/// `alpha_in_off` / `beta_in_off` are byte offsets into the stacked
+/// projection buffers — the batched-prefill caller binds the alpha /
+/// beta stacks with a per-token offset. Per-token callers pass 0.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_compute_decay_beta(
     cmdbuf: &CommandBufferRef,
     pipeline: &ComputePipelineState,
     alpha_in: &Buffer,
+    alpha_in_off: u64,
     beta_in: &Buffer,
+    beta_in_off: u64,
     weight_buf: &Buffer,
     a_log_off: u64,
     dt_bias_off: u64,
@@ -119,8 +131,8 @@ pub fn encode_compute_decay_beta(
 ) {
     let enc = cmdbuf.new_compute_command_encoder();
     enc.set_compute_pipeline_state(pipeline);
-    enc.set_buffer(0, Some(alpha_in), 0);
-    enc.set_buffer(1, Some(beta_in), 0);
+    enc.set_buffer(0, Some(alpha_in), alpha_in_off as NSUInteger);
+    enc.set_buffer(1, Some(beta_in), beta_in_off as NSUInteger);
     enc.set_buffer(2, Some(weight_buf), a_log_off as NSUInteger);
     enc.set_buffer(3, Some(weight_buf), dt_bias_off as NSUInteger);
     enc.set_buffer(4, Some(g_decay_out), 0);
@@ -173,15 +185,22 @@ pub fn encode_delta_net_step(
 
 /// Encode `gated_rms_norm`. `num_v_heads` threadgroups × `value_dim`
 /// threads.
+///
+/// `z_off` / `output_off` are byte offsets into the stacked z input
+/// and the stacked gated-rms-norm output — the batched-prefill caller
+/// binds the per-token z slice and the per-token output slot.
+/// Per-token callers pass 0.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_gated_rms_norm(
     cmdbuf: &CommandBufferRef,
     pipeline: &ComputePipelineState,
     values: &Buffer,
     z: &Buffer,
+    z_off: u64,
     weight_buf: &Buffer,
     weight_off: u64,
     output: &Buffer,
+    output_off: u64,
     num_v_heads: u32,
     value_dim: u32,
 ) {
@@ -189,9 +208,9 @@ pub fn encode_gated_rms_norm(
     let enc = cmdbuf.new_compute_command_encoder();
     enc.set_compute_pipeline_state(pipeline);
     enc.set_buffer(0, Some(values), 0);
-    enc.set_buffer(1, Some(z), 0);
+    enc.set_buffer(1, Some(z), z_off as NSUInteger);
     enc.set_buffer(2, Some(weight_buf), weight_off as NSUInteger);
-    enc.set_buffer(3, Some(output), 0);
+    enc.set_buffer(3, Some(output), output_off as NSUInteger);
     enc.set_bytes(4, 4, (&value_dim as *const u32).cast());
     enc.set_bytes(5, 4, (&eps as *const f32).cast());
     enc.dispatch_thread_groups(
