@@ -955,3 +955,119 @@ fn graph_metal_matches_cpu_compute_decay_beta() {
     assert!(cos_g >= COSINE_FLOOR, "g_decay cosine {} max_abs={}", cos_g, max_abs_g);
     assert!(cos_bg >= COSINE_FLOOR, "beta_gate cosine {} max_abs={}", cos_bg, max_abs_bg);
 }
+
+// ============================================================================
+// Test: Conv1dStepNTokens through both backends (S7-6b)
+// ============================================================================
+
+#[test]
+#[ignore = "long-running GPU test"]
+fn graph_metal_matches_cpu_conv1d_step() {
+    let n_tokens: u32 = 4;
+    let conv_dim: u32 = 16;
+    let kernel_size: usize = 4; // hardcoded in CPU oracle + Metal kernel
+    let state_floats = (kernel_size - 1) * conv_dim as usize;
+    let in_total = n_tokens as usize * conv_dim as usize;
+    let out_total = in_total;
+    let mut rng = Rng::new(0xA3B_BB04);
+    let initial_state: Vec<f32> =
+        (0..state_floats).map(|_| rng.next_f32_unit()).collect();
+    let qkv_data: Vec<f32> =
+        (0..in_total).map(|_| rng.next_f32_unit()).collect();
+    // Conv weight: conv_dim * kernel_size bf16. Random finite.
+    let mut weight_bytes = vec![0u8; conv_dim as usize * kernel_size * 2];
+    for chunk in weight_bytes.chunks_exact_mut(2) {
+        let f = rng.next_f32_unit() * 0.5;
+        let bits = (f.to_bits() >> 16) as u16;
+        chunk[0] = bits.to_le_bytes()[0];
+        chunk[1] = bits.to_le_bytes()[1];
+    }
+    let tensors = &[(
+        "conv1d_weight",
+        "BF16",
+        0,
+        vec![conv_dim as usize, kernel_size],
+        weight_bytes.clone(),
+    )];
+
+    // CPU path
+    let mut cpu_wf = SyntheticWf::build("conv1d_step_cpu", tensors);
+    let weight_off = {
+        let wf = cpu_wf.wf.as_ref().unwrap();
+        wf.tensor_info("conv1d_weight").unwrap().offset as u64
+    };
+    let mut cpu = CpuBackend::new(cpu_wf.take());
+    let cpu_qkv = cpu.pool_mut().alloc(in_total * 4, "qkv", false).unwrap();
+    let cpu_state =
+        cpu.pool_mut().alloc(state_floats * 4, "state", true).unwrap();
+    let cpu_out = cpu.pool_mut().alloc(out_total * 4, "out", false).unwrap();
+    cpu.pool_mut().upload(cpu_qkv, bytes_of_f32(&qkv_data)).unwrap();
+    cpu.pool_mut().upload(cpu_state, bytes_of_f32(&initial_state)).unwrap();
+    let mut g_cpu = Graph::new();
+    g_cpu.push(Op::Conv1dStepNTokens {
+        label: "test_conv1d_step",
+        qkv_in: cpu_qkv,
+        conv_state: cpu_state,
+        weight_off,
+        conv_out: cpu_out,
+        conv_dim,
+        n_tokens,
+    });
+    cpu.execute(&g_cpu).unwrap();
+    let mut cpu_out_bytes = vec![0u8; out_total * 4];
+    cpu.pool().download(cpu_out, &mut cpu_out_bytes).unwrap();
+    let cpu_out_f32 = f32_of_bytes(&cpu_out_bytes);
+    let mut cpu_state_bytes = vec![0u8; state_floats * 4];
+    cpu.pool().download(cpu_state, &mut cpu_state_bytes).unwrap();
+    let cpu_state_f32 = f32_of_bytes(&cpu_state_bytes);
+
+    // GPU path
+    let mut gpu_wf = SyntheticWf::build("conv1d_step_gpu", tensors);
+    let metal_ctx = MetalContext::new().expect("MetalContext::new");
+    let wf_ref = gpu_wf.wf.as_ref().unwrap();
+    let wf_buf = MtlWeightBuf::wrap(wf_ref, metal_ctx.device());
+    let _ = gpu_wf.take();
+    let mut gpu = MetalBackend::new(metal_ctx, wf_buf).expect("MetalBackend::new");
+    let gpu_qkv = gpu.pool_mut().alloc(in_total * 4, "qkv", false).unwrap();
+    let gpu_state =
+        gpu.pool_mut().alloc(state_floats * 4, "state", true).unwrap();
+    let gpu_out = gpu.pool_mut().alloc(out_total * 4, "out", false).unwrap();
+    gpu.pool_mut().upload(gpu_qkv, bytes_of_f32(&qkv_data)).unwrap();
+    gpu.pool_mut().upload(gpu_state, bytes_of_f32(&initial_state)).unwrap();
+    let mut g_gpu = Graph::new();
+    g_gpu.push(Op::Conv1dStepNTokens {
+        label: "test_conv1d_step",
+        qkv_in: gpu_qkv,
+        conv_state: gpu_state,
+        weight_off,
+        conv_out: gpu_out,
+        conv_dim,
+        n_tokens,
+    });
+    gpu.execute(&g_gpu).unwrap();
+    let mut gpu_out_bytes = vec![0u8; out_total * 4];
+    gpu.pool().download(gpu_out, &mut gpu_out_bytes).unwrap();
+    let gpu_out_f32 = f32_of_bytes(&gpu_out_bytes);
+    let mut gpu_state_bytes = vec![0u8; state_floats * 4];
+    gpu.pool().download(gpu_state, &mut gpu_state_bytes).unwrap();
+    let gpu_state_f32 = f32_of_bytes(&gpu_state_bytes);
+
+    let cos_out = cosine_sim(&cpu_out_f32, &gpu_out_f32);
+    let cos_state = cosine_sim(&cpu_state_f32, &gpu_state_f32);
+    let max_abs_out = cpu_out_f32
+        .iter()
+        .zip(gpu_out_f32.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let max_abs_state = cpu_state_f32
+        .iter()
+        .zip(gpu_state_f32.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    eprintln!(
+        "[s7-6b conv1d_step] N={} cd={}: out cos={:.9} max_abs={:.3e}; state cos={:.9} max_abs={:.3e}",
+        n_tokens, conv_dim, cos_out, max_abs_out, cos_state, max_abs_state
+    );
+    assert!(cos_out >= COSINE_FLOOR, "out cosine {} max_abs={}", cos_out, max_abs_out);
+    assert!(cos_state >= COSINE_FLOOR, "state cosine {} max_abs={}", cos_state, max_abs_state);
+}

@@ -583,10 +583,48 @@ impl Backend for MetalBackend {
                     "MoeBatchedPermuteFuse encode_op: multi-pipeline composition (gather/gate/up/swiglu/down/bucket_accumulate); defer to S7-6 producer wire-up"
                 )
             }
-            Op::Conv1dStepNTokens { .. } => {
-                todo!(
-                    "Conv1dStepNTokens encode_op: per-token loop with encode_conv1d_step; defer to S7-6 producer wire-up"
-                )
+            Op::Conv1dStepNTokens {
+                qkv_in,
+                conv_state,
+                weight_off,
+                conv_out,
+                conv_dim,
+                n_tokens,
+                ..
+            } => {
+                // Per-token loop. Each token reads `conv_dim` floats
+                // from `qkv_in` and writes `conv_dim` floats to
+                // `conv_out`. The Metal kernel updates `conv_state`
+                // in-place (history shift) at the end of each call,
+                // so consecutive token dispatches see the post-shifted
+                // state.
+                let per_token_bytes = (*conv_dim as u64) * 4;
+                let qkv_buf = self.pool.handle(*qkv_in);
+                let state_buf = self.pool.handle(*conv_state);
+                let conv_out_buf = self.pool.handle(*conv_out);
+                let conv_dim_arg = *conv_dim;
+                let num_tgs = (conv_dim_arg + 255) / 256;
+                for t in 0..*n_tokens {
+                    let off = (t as u64) * per_token_bytes;
+                    let enc = cmd.new_compute_command_encoder();
+                    enc.set_compute_pipeline_state(
+                        &self.linear_attn_pipes.conv1d_step,
+                    );
+                    enc.set_buffer(0, Some(state_buf), 0);
+                    enc.set_buffer(1, Some(qkv_buf), off as NSUInteger);
+                    enc.set_buffer(
+                        2,
+                        Some(self.wf_buf.buffer()),
+                        *weight_off as NSUInteger,
+                    );
+                    enc.set_buffer(3, Some(conv_out_buf), off as NSUInteger);
+                    enc.set_bytes(4, 4, (&conv_dim_arg as *const u32).cast());
+                    enc.dispatch_thread_groups(
+                        MTLSize::new(num_tgs as NSUInteger, 1, 1),
+                        MTLSize::new(256, 1, 1),
+                    );
+                    enc.end_encoding();
+                }
             }
             Op::ComputeDecayBetaNTokens {
                 alpha_in,
