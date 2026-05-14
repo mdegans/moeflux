@@ -1975,112 +1975,105 @@ pub(super) fn batched_linear_attn_layer_forward(
     let mv = MatvecPipelines::fetch(metal)?;
     let rms_pipes = RmsNormBf16Pipelines::fetch(metal)?;
 
-    // ── Phase 1a: batched input rms_norm → normed_buf (GPU). ─────
-    // B-0d (session 6): single fused dispatch replacing the N-iter
-    // commit_and_wait loop. One threadgroup per token; sum_sq lives
-    // in tg-mem.
+    // ── Phase 1a+1b+1c+1d+1e: fused pre-MoE chain.  ──────────────
+    // S7-1a (session 6) fusion: the entire pre-MoE chain in linear-
+    // attn has GPU-only data dependencies (no q/k norm / RoPE on
+    // CPU like full-attn), so all 5 phases share ONE command buffer
+    // and ONE commit. The recurrent kernels' state buffers are
+    // read/written every token; Metal serialises encoder order
+    // within a cmdbuf so RAW hazards across kernels are honoured.
     let rms_n_pipe =
         super::gpu_norm::RmsNormBf16FusedNTokensPipeline::fetch(metal)?;
     let hidden_in_buf = MtlBuffer::<f32>::with_data(&device, hidden_in);
     let normed_buf =
         MtlBuffer::<f32>::with_len(&device, n_tokens * hidden_dim);
-    {
-        let queue = metal.queue_clone();
-        let cmdbuf = queue.new_command_buffer();
-        super::gpu_norm::encode_rms_norm_bf16_fused_n_tokens(
-            cmdbuf,
-            &rms_n_pipe,
-            hidden_in_buf.buffer(),
-            wf_buf.buffer(),
-            layer_cache.input_layernorm_w,
-            normed_buf.buffer(),
-            hidden_dim as u32,
-            n_tokens as u32,
-            RMS_NORM_EPS,
-        );
-        metal.commit_and_wait_labeled(
-            cmdbuf,
-            "batched_la_input_rms_norm_fused",
-        );
-    }
+    let pre_moe_queue = metal.queue_clone();
+    let pre_moe_cmdbuf = pre_moe_queue.new_command_buffer();
+    super::gpu_norm::encode_rms_norm_bf16_fused_n_tokens(
+        pre_moe_cmdbuf,
+        &rms_n_pipe,
+        hidden_in_buf.buffer(),
+        wf_buf.buffer(),
+        layer_cache.input_layernorm_w,
+        normed_buf.buffer(),
+        hidden_dim as u32,
+        n_tokens as u32,
+        RMS_NORM_EPS,
+    );
     let _ = &rms_pipes;
 
     // ── Phase 1b: batched 4 projections (qkv / z / beta / alpha). ──
+    //    Encoded into pre_moe_cmdbuf (no commit — fused with 1a/1c/1d/1e).
     let qkv_stack = MtlBuffer::<f32>::with_len(&device, n_tokens * conv_dim);
     let z_stack = MtlBuffer::<f32>::with_len(&device, n_tokens * total_value);
     let beta_stack =
         MtlBuffer::<f32>::with_len(&device, n_tokens * num_v_heads);
     let alpha_stack =
         MtlBuffer::<f32>::with_len(&device, n_tokens * num_v_heads);
-    {
-        let queue = metal.queue_clone();
-        let cmdbuf = queue.new_command_buffer();
-        encode_matvec_n_tokens(
-            cmdbuf,
-            &mv,
-            wf_buf.buffer(),
-            qkv_w,
-            qkv_s,
-            qkv_b,
-            normed_buf.buffer(),
-            0,
-            qkv_stack.buffer(),
-            0,
-            hidden_dim as u32,
-            conv_dim as u32,
-            n_tokens as u32,
-            qkv_bits,
-        );
-        encode_matvec_n_tokens(
-            cmdbuf,
-            &mv,
-            wf_buf.buffer(),
-            z_w,
-            z_s,
-            z_b,
-            normed_buf.buffer(),
-            0,
-            z_stack.buffer(),
-            0,
-            hidden_dim as u32,
-            total_value as u32,
-            n_tokens as u32,
-            z_bits,
-        );
-        encode_matvec_n_tokens(
-            cmdbuf,
-            &mv,
-            wf_buf.buffer(),
-            beta_w,
-            beta_s,
-            beta_b,
-            normed_buf.buffer(),
-            0,
-            beta_stack.buffer(),
-            0,
-            hidden_dim as u32,
-            num_v_heads as u32,
-            n_tokens as u32,
-            beta_bits,
-        );
-        encode_matvec_n_tokens(
-            cmdbuf,
-            &mv,
-            wf_buf.buffer(),
-            alpha_w,
-            alpha_s,
-            alpha_b,
-            normed_buf.buffer(),
-            0,
-            alpha_stack.buffer(),
-            0,
-            hidden_dim as u32,
-            num_v_heads as u32,
-            n_tokens as u32,
-            alpha_bits,
-        );
-        metal.commit_and_wait_labeled(cmdbuf, "batched_la_projections");
-    }
+    encode_matvec_n_tokens(
+        pre_moe_cmdbuf,
+        &mv,
+        wf_buf.buffer(),
+        qkv_w,
+        qkv_s,
+        qkv_b,
+        normed_buf.buffer(),
+        0,
+        qkv_stack.buffer(),
+        0,
+        hidden_dim as u32,
+        conv_dim as u32,
+        n_tokens as u32,
+        qkv_bits,
+    );
+    encode_matvec_n_tokens(
+        pre_moe_cmdbuf,
+        &mv,
+        wf_buf.buffer(),
+        z_w,
+        z_s,
+        z_b,
+        normed_buf.buffer(),
+        0,
+        z_stack.buffer(),
+        0,
+        hidden_dim as u32,
+        total_value as u32,
+        n_tokens as u32,
+        z_bits,
+    );
+    encode_matvec_n_tokens(
+        pre_moe_cmdbuf,
+        &mv,
+        wf_buf.buffer(),
+        beta_w,
+        beta_s,
+        beta_b,
+        normed_buf.buffer(),
+        0,
+        beta_stack.buffer(),
+        0,
+        hidden_dim as u32,
+        num_v_heads as u32,
+        n_tokens as u32,
+        beta_bits,
+    );
+    encode_matvec_n_tokens(
+        pre_moe_cmdbuf,
+        &mv,
+        wf_buf.buffer(),
+        alpha_w,
+        alpha_s,
+        alpha_b,
+        normed_buf.buffer(),
+        0,
+        alpha_stack.buffer(),
+        0,
+        hidden_dim as u32,
+        num_v_heads as u32,
+        n_tokens as u32,
+        alpha_bits,
+    );
 
     // ── Phase 1c: recurrent loop in one cmdbuf. ──────────────────
     //
@@ -2101,8 +2094,6 @@ pub(super) fn batched_linear_attn_layer_forward(
     let value_out_stack =
         MtlBuffer::<f32>::with_len(&device, n_tokens * total_value);
     {
-        let queue = metal.queue_clone();
-        let cmdbuf = queue.new_command_buffer();
         let k_heads_per_v =
             (v.linear_num_v_heads / v.linear_num_k_heads) as u32;
         let value_dim = Variant::LINEAR_VALUE_DIM as u32;
@@ -2114,7 +2105,7 @@ pub(super) fn batched_linear_attn_layer_forward(
             let out_off = (t * total_value) as u64 * f32_sz;
 
             encode_conv1d_step(
-                cmdbuf,
+                pre_moe_cmdbuf,
                 &lp.conv1d_step,
                 &buffers.conv_state[linear_layer_idx],
                 qkv_stack.buffer(),
@@ -2125,14 +2116,14 @@ pub(super) fn batched_linear_attn_layer_forward(
                 conv_dim as u32,
             );
             encode_rms_norm_qk(
-                cmdbuf,
+                pre_moe_cmdbuf,
                 &lp.rms_norm_qk,
                 &buffers.conv_output,
                 v.linear_num_k_heads as u32,
                 Variant::LINEAR_KEY_DIM as u32,
             );
             encode_compute_decay_beta(
-                cmdbuf,
+                pre_moe_cmdbuf,
                 &lp.compute_decay_beta,
                 alpha_stack.buffer(),
                 alpha_off,
@@ -2146,7 +2137,7 @@ pub(super) fn batched_linear_attn_layer_forward(
                 v.linear_num_v_heads as u32,
             );
             encode_delta_net_step(
-                cmdbuf,
+                pre_moe_cmdbuf,
                 &lp.delta_net_step,
                 &buffers.delta_state[linear_layer_idx],
                 &buffers.conv_output,
@@ -2158,7 +2149,7 @@ pub(super) fn batched_linear_attn_layer_forward(
                 k_heads_per_v,
             );
             encode_gated_rms_norm(
-                cmdbuf,
+                pre_moe_cmdbuf,
                 &lp.gated_rms_norm,
                 &buffers.delta_output,
                 z_stack.buffer(),
@@ -2171,15 +2162,13 @@ pub(super) fn batched_linear_attn_layer_forward(
                 value_dim,
             );
         }
-        metal.commit_and_wait_labeled(cmdbuf, "batched_la_recurrent");
     }
 
     // ── Phase 1d: batched o_proj. ───────────────────────────────
     let o_proj_stack =
         MtlBuffer::<f32>::with_len(&device, n_tokens * hidden_dim);
     {
-        let queue = metal.queue_clone();
-        let cmdbuf = queue.new_command_buffer();
+        let cmdbuf = pre_moe_cmdbuf;
         encode_matvec_n_tokens(
             cmdbuf,
             &mv,
@@ -2196,7 +2185,7 @@ pub(super) fn batched_linear_attn_layer_forward(
             n_tokens as u32,
             o_bits,
         );
-        metal.commit_and_wait_labeled(cmdbuf, "batched_la_o_proj");
+        let _ = cmdbuf;
     }
     // ── Phase 1e: batched residual_add + post-attn rms_norm + gate
     //    matvec + shared-gate matvec + GPU MoE router. Single cmdbuf
@@ -2232,76 +2221,72 @@ pub(super) fn batched_linear_attn_layer_forward(
         MtlBuffer::<i32>::with_len(&device, n_tokens * k_active);
     let routing_weights_buf =
         MtlBuffer::<f32>::with_len(&device, n_tokens * k_active);
-    {
-        let queue = metal.queue_clone();
-        let cmdbuf = queue.new_command_buffer();
-        super::gpu_norm::encode_residual_add_n_tokens_into(
-            cmdbuf,
-            &resid_add_n_pso,
-            o_proj_stack.buffer(),
-            hidden_in_buf.buffer(),
-            h_mid_buf.buffer(),
-            n_tokens as u32,
-            hidden_dim as u32,
-        );
-        super::gpu_norm::encode_rms_norm_bf16_fused_n_tokens(
-            cmdbuf,
-            &rms_n_pipe,
-            h_mid_buf.buffer(),
-            wf_buf.buffer(),
-            layer_cache.post_attention_layernorm_w,
-            h_post_buf.buffer(),
-            hidden_dim as u32,
-            n_tokens as u32,
-            RMS_NORM_EPS,
-        );
-        encode_matvec_n_tokens(
-            cmdbuf,
-            &mv,
-            wf_buf.buffer(),
-            layer_cache.gate.w,
-            layer_cache.gate.s,
-            layer_cache.gate.b,
-            h_post_buf.buffer(),
-            0,
-            gate_logits_buf.buffer(),
-            0,
-            hidden_dim as u32,
-            v.num_experts as u32,
-            n_tokens as u32,
-            gate_bits,
-        );
-        encode_matvec_n_tokens(
-            cmdbuf,
-            &mv,
-            wf_buf.buffer(),
-            layer_cache.shared.seg_w,
-            layer_cache.shared.seg_s,
-            layer_cache.shared.seg_b,
-            h_post_buf.buffer(),
-            0,
-            shared_gate_buf.buffer(),
-            0,
-            hidden_dim as u32,
-            1,
-            n_tokens as u32,
-            seg_bits,
-        );
-        super::gpu_moe_router::encode_moe_router(
-            cmdbuf,
-            &router_pipes,
-            gate_logits_buf.buffer(),
-            routing_indices_buf.buffer(),
-            routing_weights_buf.buffer(),
-            n_tokens as u32,
-            v.num_experts as u32,
-            k_active as u32,
-        );
-        metal.commit_and_wait_labeled(
-            cmdbuf,
-            "batched_la_post_attn_residual_norm_route",
-        );
-    }
+    super::gpu_norm::encode_residual_add_n_tokens_into(
+        pre_moe_cmdbuf,
+        &resid_add_n_pso,
+        o_proj_stack.buffer(),
+        hidden_in_buf.buffer(),
+        h_mid_buf.buffer(),
+        n_tokens as u32,
+        hidden_dim as u32,
+    );
+    super::gpu_norm::encode_rms_norm_bf16_fused_n_tokens(
+        pre_moe_cmdbuf,
+        &rms_n_pipe,
+        h_mid_buf.buffer(),
+        wf_buf.buffer(),
+        layer_cache.post_attention_layernorm_w,
+        h_post_buf.buffer(),
+        hidden_dim as u32,
+        n_tokens as u32,
+        RMS_NORM_EPS,
+    );
+    encode_matvec_n_tokens(
+        pre_moe_cmdbuf,
+        &mv,
+        wf_buf.buffer(),
+        layer_cache.gate.w,
+        layer_cache.gate.s,
+        layer_cache.gate.b,
+        h_post_buf.buffer(),
+        0,
+        gate_logits_buf.buffer(),
+        0,
+        hidden_dim as u32,
+        v.num_experts as u32,
+        n_tokens as u32,
+        gate_bits,
+    );
+    encode_matvec_n_tokens(
+        pre_moe_cmdbuf,
+        &mv,
+        wf_buf.buffer(),
+        layer_cache.shared.seg_w,
+        layer_cache.shared.seg_s,
+        layer_cache.shared.seg_b,
+        h_post_buf.buffer(),
+        0,
+        shared_gate_buf.buffer(),
+        0,
+        hidden_dim as u32,
+        1,
+        n_tokens as u32,
+        seg_bits,
+    );
+    super::gpu_moe_router::encode_moe_router(
+        pre_moe_cmdbuf,
+        &router_pipes,
+        gate_logits_buf.buffer(),
+        routing_indices_buf.buffer(),
+        routing_weights_buf.buffer(),
+        n_tokens as u32,
+        v.num_experts as u32,
+        k_active as u32,
+    );
+    metal.commit_and_wait_labeled(
+        pre_moe_cmdbuf,
+        "batched_la_pre_moe_fused",
+    );
     // Bulk readback (one transfer per layer, not N).
     h_mid_stack.copy_from_slice(&h_mid_buf.to_vec());
     h_post_stack.copy_from_slice(&h_post_buf.to_vec());
@@ -2354,75 +2339,75 @@ pub(super) fn batched_linear_attn_layer_forward(
     let shared_down_buf =
         MtlBuffer::<f32>::with_len(&device, n_tokens * hidden_dim);
     let swiglu_pso = metal.pipeline("swiglu_fused")?.clone();
+    // S7-1a fusion: 1f (shared FFN) + 1g (MoE permute-fuse) share
+    // one cmdbuf. GPU encodes 1f while CPU prepares 1g's bucket data;
+    // 1g dispatches on the same cmdbuf after 1f.
+    let moe_queue = metal.queue_clone();
+    let moe_cmdbuf = moe_queue.new_command_buffer();
+    encode_matvec_n_tokens(
+        moe_cmdbuf,
+        &mv,
+        wf_buf.buffer(),
+        shared_gate_w,
+        shared_gate_s,
+        shared_gate_b,
+        h_post_buf.buffer(),
+        0,
+        shared_gate_buf.buffer(),
+        0,
+        hidden_dim as u32,
+        v.shared_intermediate as u32,
+        n_tokens as u32,
+        s_gate_bits,
+    );
+    encode_matvec_n_tokens(
+        moe_cmdbuf,
+        &mv,
+        wf_buf.buffer(),
+        shared_up_w,
+        shared_up_s,
+        shared_up_b,
+        h_post_buf.buffer(),
+        0,
+        shared_up_buf.buffer(),
+        0,
+        hidden_dim as u32,
+        v.shared_intermediate as u32,
+        n_tokens as u32,
+        s_up_bits,
+    );
     {
-        let queue = metal.queue_clone();
-        let cmdbuf = queue.new_command_buffer();
-        encode_matvec_n_tokens(
-            cmdbuf,
-            &mv,
-            wf_buf.buffer(),
-            shared_gate_w,
-            shared_gate_s,
-            shared_gate_b,
-            h_post_buf.buffer(),
-            0,
-            shared_gate_buf.buffer(),
-            0,
-            hidden_dim as u32,
-            v.shared_intermediate as u32,
-            n_tokens as u32,
-            s_gate_bits,
+        let enc = moe_cmdbuf.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&swiglu_pso);
+        enc.set_buffer(0, Some(shared_gate_buf.buffer()), 0);
+        enc.set_buffer(1, Some(shared_up_buf.buffer()), 0);
+        enc.set_buffer(2, Some(shared_act_buf.buffer()), 0);
+        let dim = (n_tokens * v.shared_intermediate) as u32;
+        enc.set_bytes(3, 4, (&dim as *const u32).cast());
+        let num_tgs = (dim + 255) / 256;
+        enc.dispatch_thread_groups(
+            MTLSize::new(num_tgs as NSUInteger, 1, 1),
+            MTLSize::new(256, 1, 1),
         );
-        encode_matvec_n_tokens(
-            cmdbuf,
-            &mv,
-            wf_buf.buffer(),
-            shared_up_w,
-            shared_up_s,
-            shared_up_b,
-            h_post_buf.buffer(),
-            0,
-            shared_up_buf.buffer(),
-            0,
-            hidden_dim as u32,
-            v.shared_intermediate as u32,
-            n_tokens as u32,
-            s_up_bits,
-        );
-        {
-            let enc = cmdbuf.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&swiglu_pso);
-            enc.set_buffer(0, Some(shared_gate_buf.buffer()), 0);
-            enc.set_buffer(1, Some(shared_up_buf.buffer()), 0);
-            enc.set_buffer(2, Some(shared_act_buf.buffer()), 0);
-            let dim = (n_tokens * v.shared_intermediate) as u32;
-            enc.set_bytes(3, 4, (&dim as *const u32).cast());
-            let num_tgs = (dim + 255) / 256;
-            enc.dispatch_thread_groups(
-                MTLSize::new(num_tgs as NSUInteger, 1, 1),
-                MTLSize::new(256, 1, 1),
-            );
-            enc.end_encoding();
-        }
-        encode_matvec_n_tokens(
-            cmdbuf,
-            &mv,
-            wf_buf.buffer(),
-            shared_down_w,
-            shared_down_s,
-            shared_down_b,
-            shared_act_buf.buffer(),
-            0,
-            shared_down_buf.buffer(),
-            0,
-            v.shared_intermediate as u32,
-            hidden_dim as u32,
-            n_tokens as u32,
-            s_down_bits,
-        );
-        metal.commit_and_wait_labeled(cmdbuf, "batched_la_shared_ffn");
+        enc.end_encoding();
     }
-    let shared_out_stack = shared_down_buf.to_vec();
+    encode_matvec_n_tokens(
+        moe_cmdbuf,
+        &mv,
+        wf_buf.buffer(),
+        shared_down_w,
+        shared_down_s,
+        shared_down_b,
+        shared_act_buf.buffer(),
+        0,
+        shared_down_buf.buffer(),
+        0,
+        v.shared_intermediate as u32,
+        hidden_dim as u32,
+        n_tokens as u32,
+        s_down_bits,
+    );
+    // 1f encoded — fall through to 1g CPU bucket prep without committing.
 
     // ── Phase 1g: batched MoE permute-fuse. ─────────────────────
     let buckets = build_expert_buckets(
@@ -2542,28 +2527,27 @@ pub(super) fn batched_linear_attn_layer_forward(
 
     let bucket_accumulate =
         metal.pipeline("moe_bucket_accumulate")?.clone();
-    {
-        let queue = metal.queue_clone();
-        let cmdbuf = queue.new_command_buffer();
-        encode_moe_batched_permute_fuse(
-            cmdbuf,
-            &mv,
-            &swiglu_pso,
-            &bucket_accumulate,
-            &expert_refs,
-            bucket_input.buffer(),
-            bucket_gate.buffer(),
-            bucket_up.buffer(),
-            bucket_act.buffer(),
-            bucket_out.buffer(),
-            bucket_token_idx.buffer(),
-            bucket_weights.buffer(),
-            out_sum.buffer(),
-            &buckets,
-            v,
-        );
-        metal.commit_and_wait_labeled(cmdbuf, "batched_la_moe_permute_fuse");
-    }
+    // 1g encodes into the same cmdbuf the 1f block opened above —
+    // single commit fuses shared FFN + MoE permute-fuse.
+    encode_moe_batched_permute_fuse(
+        moe_cmdbuf,
+        &mv,
+        &swiglu_pso,
+        &bucket_accumulate,
+        &expert_refs,
+        bucket_input.buffer(),
+        bucket_gate.buffer(),
+        bucket_up.buffer(),
+        bucket_act.buffer(),
+        bucket_out.buffer(),
+        bucket_token_idx.buffer(),
+        bucket_weights.buffer(),
+        out_sum.buffer(),
+        &buckets,
+        v,
+    );
+    metal.commit_and_wait_labeled(moe_cmdbuf, "batched_la_shared_ffn_moe_permute_fuse");
+    let shared_out_stack = shared_down_buf.to_vec();
     let moe_sum_host = out_sum.to_vec();
 
     // Phase 3: record this layer's actual routing as the prediction
