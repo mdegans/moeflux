@@ -23,16 +23,26 @@ use crate::riir::moe_cpu::moe_permute_fuse_cpu;
 use crate::riir::variants::{GROUP_SIZE, VARIANT};
 use crate::riir::weight_file::WeightFile;
 
-use super::{Backend, BufId, BufferPool, GraphError, Op};
+use super::{Backend, BufId, BufferPool, Graph, GraphError, Op};
 
-/// Naive CPU buffer pool: one `RefCell<Vec<u8>>` per `BufId`.
-/// `reset_transient` truncates back to the persistent prefix
-/// (assumes persistent allocations come before transient ones, which
-/// matches how producer code uses the pool).
+/// CPU buffer pool: physical storage is `Vec<RefCell<Vec<u8>>>`,
+/// indexed *indirectly* by `BufId` through `bufid_to_physical`. Pre-
+/// [`BufferPool::commit_plan`], the mapping is identity (one buffer
+/// per `BufId`). Post-`commit_plan`, multiple colorable `BufId`s may
+/// share a single physical buffer.
+///
+/// `reset_transient` keeps the longest persistent prefix of BufIds
+/// (producer convention: persistent allocations precede transient
+/// ones) and drops everything beyond.
 pub struct CpuBufferPool {
+    /// Physical storage. `buffers.len() == physical_buffer_count()`.
     buffers: Vec<RefCell<Vec<u8>>>,
+    /// Per-`BufId` label, byte-size, persistent flag, and physical
+    /// index. All four are kept in lock-step with the BufId space.
     labels: Vec<&'static str>,
     persistent: Vec<bool>,
+    byte_sizes: Vec<usize>,
+    bufid_to_physical: Vec<u32>,
 }
 
 impl CpuBufferPool {
@@ -41,11 +51,14 @@ impl CpuBufferPool {
             buffers: Vec::new(),
             labels: Vec::new(),
             persistent: Vec::new(),
+            byte_sizes: Vec::new(),
+            bufid_to_physical: Vec::new(),
         }
     }
 
-    /// Total number of physical buffers (one per non-aliased BufId
-    /// for the naive pool). Useful for memory-pressure assertions.
+    /// Number of physical buffers actually allocated. With identity
+    /// mapping this equals the number of `BufId`s; after
+    /// `commit_plan` it can be strictly less (the aliasing win).
     pub fn physical_buffer_count(&self) -> usize {
         self.buffers.len()
     }
@@ -67,62 +80,85 @@ impl BufferPool for CpuBufferPool {
         label: &'static str,
         persistent: bool,
     ) -> Result<BufId, GraphError> {
-        let id = BufId(self.buffers.len() as u32);
+        let id = BufId(self.bufid_to_physical.len() as u32);
+        let physical = self.buffers.len() as u32;
         self.buffers.push(RefCell::new(vec![0u8; bytes]));
         self.labels.push(label);
         self.persistent.push(persistent);
+        self.byte_sizes.push(bytes);
+        self.bufid_to_physical.push(physical);
         Ok(id)
     }
 
     fn handle(&self, id: BufId) -> &RefCell<Vec<u8>> {
-        &self.buffers[id.0 as usize]
+        let physical = self.bufid_to_physical[id.0 as usize] as usize;
+        &self.buffers[physical]
     }
 
     fn upload(&mut self, id: BufId, host: &[u8]) -> Result<(), GraphError> {
         let idx = id.0 as usize;
         let label = *self.labels.get(idx).ok_or(GraphError::BadBufId(id))?;
-        let buf = &self.buffers[idx];
-        let mut buf_mut = buf.borrow_mut();
-        if buf_mut.len() != host.len() {
+        let expected = self.byte_sizes[idx];
+        if host.len() != expected {
             return Err(GraphError::SizeMismatch {
                 label,
-                expected: buf_mut.len(),
+                expected,
                 actual: host.len(),
             });
         }
-        buf_mut.copy_from_slice(host);
+        let physical = self.bufid_to_physical[idx] as usize;
+        let mut buf_mut = self.buffers[physical].borrow_mut();
+        buf_mut[..expected].copy_from_slice(host);
         Ok(())
     }
 
     fn download(&self, id: BufId, host: &mut [u8]) -> Result<(), GraphError> {
         let idx = id.0 as usize;
         let label = *self.labels.get(idx).ok_or(GraphError::BadBufId(id))?;
-        let buf = self.buffers[idx].borrow();
-        if buf.len() != host.len() {
+        let expected = self.byte_sizes[idx];
+        if host.len() != expected {
             return Err(GraphError::SizeMismatch {
                 label,
-                expected: buf.len(),
+                expected,
                 actual: host.len(),
             });
         }
-        host.copy_from_slice(&buf);
+        let physical = self.bufid_to_physical[idx] as usize;
+        let buf = self.buffers[physical].borrow();
+        host.copy_from_slice(&buf[..expected]);
         Ok(())
     }
 
     fn reset_transient(&mut self) {
-        // Keep the longest persistent prefix and drop everything past it.
-        // Producer convention: persistent allocations (KV cache, hidden
-        // double-buffer, weight file views) are made before transient
-        // intermediates.
-        let mut keep = 0;
+        // Keep the longest persistent prefix in BufId space and drop
+        // everything past it. Producer convention: persistent allocs
+        // (KV cache, hidden double-buffer, weight views) come before
+        // transient intermediates. After `commit_plan`, persistents
+        // retain their original physical indices (only colorable
+        // BufIds are re-laid out), so the physical-buffer truncation
+        // below is the persistent prefix length too.
+        let mut keep_bufids = 0;
         for (i, &p) in self.persistent.iter().enumerate() {
             if p {
-                keep = i + 1;
+                keep_bufids = i + 1;
             }
         }
-        self.buffers.truncate(keep);
-        self.labels.truncate(keep);
-        self.persistent.truncate(keep);
+        self.labels.truncate(keep_bufids);
+        self.persistent.truncate(keep_bufids);
+        self.byte_sizes.truncate(keep_bufids);
+        self.bufid_to_physical.truncate(keep_bufids);
+
+        // Physical-buffer truncation: drop any physical buffer no
+        // longer referenced by a surviving BufId. Find the highest
+        // physical index still in use (+1) and truncate there.
+        let max_physical = self
+            .bufid_to_physical
+            .iter()
+            .copied()
+            .max()
+            .map(|m| m as usize + 1)
+            .unwrap_or(0);
+        self.buffers.truncate(max_physical);
     }
 
     fn label(&self, id: BufId) -> &'static str {
@@ -130,6 +166,73 @@ impl BufferPool for CpuBufferPool {
             .get(id.0 as usize)
             .copied()
             .unwrap_or("<bad-bufid>")
+    }
+
+    fn commit_plan(&mut self, graph: &Graph) {
+        use super::lifetime::{analyze_lifetimes, greedy_color, ColorId};
+        use std::collections::HashMap;
+
+        let lifetimes = analyze_lifetimes(graph);
+        let coloring = greedy_color(&lifetimes);
+
+        // Filter coloring: persistent BufIds keep their dedicated
+        // physical buffer (content must survive `reset_transient`).
+        // Non-persistent colorable BufIds are eligible for aliasing.
+        let n_bufids = self.bufid_to_physical.len();
+        let aliasable: HashMap<BufId, ColorId> = coloring
+            .bufid_to_color
+            .iter()
+            .filter(|(b, _)| !self.persistent[b.0 as usize])
+            .map(|(b, c)| (*b, *c))
+            .collect();
+
+        // Phase 1: place non-aliasable BufIds (persistent + non-
+        // colorable transients) in the new physical layout, moving
+        // their existing buffer to preserve content.
+        let mut new_buffers: Vec<RefCell<Vec<u8>>> = Vec::new();
+        let mut new_bufid_to_physical: Vec<u32> = vec![u32::MAX; n_bufids];
+        for bufid_idx in 0..n_bufids {
+            let buf = BufId(bufid_idx as u32);
+            if aliasable.contains_key(&buf) {
+                continue;
+            }
+            let old_physical = self.bufid_to_physical[bufid_idx] as usize;
+            let old_buf = std::mem::replace(
+                &mut self.buffers[old_physical],
+                RefCell::new(Vec::new()),
+            );
+            new_bufid_to_physical[bufid_idx] = new_buffers.len() as u32;
+            new_buffers.push(old_buf);
+        }
+
+        // Phase 2: allocate one physical buffer per color group,
+        // sized to the max byte_size among the group's BufIds.
+        let mut color_to_physical: HashMap<ColorId, u32> = HashMap::new();
+        for color in 0..coloring.color_count {
+            let max_size = aliasable
+                .iter()
+                .filter(|&(_, c)| *c == color)
+                .map(|(b, _)| self.byte_sizes[b.0 as usize])
+                .max()
+                .unwrap_or(0);
+            if max_size == 0 {
+                // No BufIds with this color after filtering out
+                // persistents — skip.
+                continue;
+            }
+            color_to_physical.insert(color, new_buffers.len() as u32);
+            new_buffers.push(RefCell::new(vec![0u8; max_size]));
+        }
+
+        // Phase 3: point each aliasable BufId at its color's slot.
+        for (buf, color) in &aliasable {
+            let phys = color_to_physical[color];
+            new_bufid_to_physical[buf.0 as usize] = phys;
+        }
+
+        debug_assert!(new_bufid_to_physical.iter().all(|&p| p != u32::MAX));
+        self.buffers = new_buffers;
+        self.bufid_to_physical = new_bufid_to_physical;
     }
 }
 

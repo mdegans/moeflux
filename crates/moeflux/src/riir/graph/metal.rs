@@ -16,7 +16,7 @@
 //! `GatedDeltaNetStepNTokens`, `GatedRmsNormNTokens`) are stubbed
 //! `todo!()` and will wire alongside their producers in S7-6/S7-7.
 
-use super::{Backend, BufId, BufferPool, GraphError, Op};
+use super::{Backend, BufId, BufferPool, Graph, GraphError, Op};
 
 use metal::{
     Buffer, CommandBuffer, CommandBufferRef, ComputePipelineState, Device,
@@ -36,12 +36,17 @@ use crate::riir::gpu_norm::{
 use crate::riir::metal::{MetalContext, MetalError};
 use crate::riir::mtl_weight_buf::MtlWeightBuf;
 
-/// Naive Metal buffer pool: one `metal::Buffer` per `BufId`.
+/// Metal buffer pool. Storage is `Vec<Buffer>` indexed *indirectly*
+/// by `BufId` through `bufid_to_physical`. Pre-`commit_plan` the
+/// mapping is identity; after `commit_plan`, colorable BufIds may
+/// share a single `metal::Buffer`.
 pub struct MetalBufferPool {
     device: Device,
     buffers: Vec<Buffer>,
     labels: Vec<&'static str>,
     persistent: Vec<bool>,
+    byte_sizes: Vec<usize>,
+    bufid_to_physical: Vec<u32>,
 }
 
 impl MetalBufferPool {
@@ -51,6 +56,8 @@ impl MetalBufferPool {
             buffers: Vec::new(),
             labels: Vec::new(),
             persistent: Vec::new(),
+            byte_sizes: Vec::new(),
+            bufid_to_physical: Vec::new(),
         }
     }
 
@@ -69,7 +76,8 @@ impl BufferPool for MetalBufferPool {
         label: &'static str,
         persistent: bool,
     ) -> Result<BufId, GraphError> {
-        let id = BufId(self.buffers.len() as u32);
+        let id = BufId(self.bufid_to_physical.len() as u32);
+        let physical = self.buffers.len() as u32;
         let buf = self.device.new_buffer(
             bytes as NSUInteger,
             MTLResourceOptions::StorageModeShared,
@@ -83,30 +91,34 @@ impl BufferPool for MetalBufferPool {
         self.buffers.push(buf);
         self.labels.push(label);
         self.persistent.push(persistent);
+        self.byte_sizes.push(bytes);
+        self.bufid_to_physical.push(physical);
         Ok(id)
     }
 
     fn handle(&self, id: BufId) -> &Buffer {
-        &self.buffers[id.0 as usize]
+        let physical = self.bufid_to_physical[id.0 as usize] as usize;
+        &self.buffers[physical]
     }
 
     fn upload(&mut self, id: BufId, host: &[u8]) -> Result<(), GraphError> {
         let idx = id.0 as usize;
         let label = *self.labels.get(idx).ok_or(GraphError::BadBufId(id))?;
-        let buf = &self.buffers[idx];
-        let len = buf.length() as usize;
-        if len != host.len() {
+        let expected = self.byte_sizes[idx];
+        if host.len() != expected {
             return Err(GraphError::SizeMismatch {
                 label,
-                expected: len,
+                expected,
                 actual: host.len(),
             });
         }
+        let physical = self.bufid_to_physical[idx] as usize;
+        let buf = &self.buffers[physical];
         unsafe {
             std::ptr::copy_nonoverlapping(
                 host.as_ptr(),
                 buf.contents() as *mut u8,
-                len,
+                expected,
             );
         }
         Ok(())
@@ -119,35 +131,50 @@ impl BufferPool for MetalBufferPool {
     ) -> Result<(), GraphError> {
         let idx = id.0 as usize;
         let label = *self.labels.get(idx).ok_or(GraphError::BadBufId(id))?;
-        let buf = &self.buffers[idx];
-        let len = buf.length() as usize;
-        if len != host.len() {
+        let expected = self.byte_sizes[idx];
+        if host.len() != expected {
             return Err(GraphError::SizeMismatch {
                 label,
-                expected: len,
+                expected,
                 actual: host.len(),
             });
         }
+        let physical = self.bufid_to_physical[idx] as usize;
+        let buf = &self.buffers[physical];
         unsafe {
             std::ptr::copy_nonoverlapping(
                 buf.contents() as *const u8,
                 host.as_mut_ptr(),
-                len,
+                expected,
             );
         }
         Ok(())
     }
 
     fn reset_transient(&mut self) {
-        let mut keep = 0;
+        // Mirrors CpuBufferPool::reset_transient: keep the persistent
+        // prefix in BufId space; drop physical buffers no longer
+        // referenced. After `commit_plan`, persistents retain their
+        // original physical indices.
+        let mut keep_bufids = 0;
         for (i, &p) in self.persistent.iter().enumerate() {
             if p {
-                keep = i + 1;
+                keep_bufids = i + 1;
             }
         }
-        self.buffers.truncate(keep);
-        self.labels.truncate(keep);
-        self.persistent.truncate(keep);
+        self.labels.truncate(keep_bufids);
+        self.persistent.truncate(keep_bufids);
+        self.byte_sizes.truncate(keep_bufids);
+        self.bufid_to_physical.truncate(keep_bufids);
+
+        let max_physical = self
+            .bufid_to_physical
+            .iter()
+            .copied()
+            .max()
+            .map(|m| m as usize + 1)
+            .unwrap_or(0);
+        self.buffers.truncate(max_physical);
     }
 
     fn label(&self, id: BufId) -> &'static str {
@@ -155,6 +182,82 @@ impl BufferPool for MetalBufferPool {
             .get(id.0 as usize)
             .copied()
             .unwrap_or("<bad-bufid>")
+    }
+
+    fn commit_plan(&mut self, graph: &Graph) {
+        use super::lifetime::{analyze_lifetimes, greedy_color, ColorId};
+        use std::collections::HashMap;
+
+        let lifetimes = analyze_lifetimes(graph);
+        let coloring = greedy_color(&lifetimes);
+
+        let n_bufids = self.bufid_to_physical.len();
+        let aliasable: HashMap<BufId, ColorId> = coloring
+            .bufid_to_color
+            .iter()
+            .filter(|(b, _)| !self.persistent[b.0 as usize])
+            .map(|(b, c)| (*b, *c))
+            .collect();
+
+        // Phase 1: place non-aliasable BufIds (persistent + non-
+        // colorable transients) in the new layout, preserving the
+        // underlying metal::Buffer (and its content) via swap.
+        let mut new_buffers: Vec<Buffer> = Vec::new();
+        let mut new_bufid_to_physical: Vec<u32> = vec![u32::MAX; n_bufids];
+
+        // We need a placeholder Buffer to swap with — use a 1-byte
+        // throwaway allocation, deferred to the first swap.
+        let placeholder = self
+            .device
+            .new_buffer(1, MTLResourceOptions::StorageModeShared);
+
+        for bufid_idx in 0..n_bufids {
+            let buf = BufId(bufid_idx as u32);
+            if aliasable.contains_key(&buf) {
+                continue;
+            }
+            let old_physical = self.bufid_to_physical[bufid_idx] as usize;
+            let old_buf =
+                std::mem::replace(&mut self.buffers[old_physical], placeholder.clone());
+            new_bufid_to_physical[bufid_idx] = new_buffers.len() as u32;
+            new_buffers.push(old_buf);
+        }
+
+        // Phase 2: one Metal buffer per color, sized to max(byte_size).
+        let mut color_to_physical: HashMap<ColorId, u32> = HashMap::new();
+        for color in 0..coloring.color_count {
+            let max_size = aliasable
+                .iter()
+                .filter(|&(_, c)| *c == color)
+                .map(|(b, _)| self.byte_sizes[b.0 as usize])
+                .max()
+                .unwrap_or(0);
+            if max_size == 0 {
+                continue;
+            }
+            let buf = self.device.new_buffer(
+                max_size as NSUInteger,
+                MTLResourceOptions::StorageModeShared,
+            );
+            unsafe {
+                std::ptr::write_bytes(
+                    buf.contents() as *mut u8,
+                    0,
+                    max_size,
+                );
+            }
+            color_to_physical.insert(color, new_buffers.len() as u32);
+            new_buffers.push(buf);
+        }
+
+        for (buf, color) in &aliasable {
+            let phys = color_to_physical[color];
+            new_bufid_to_physical[buf.0 as usize] = phys;
+        }
+
+        debug_assert!(new_bufid_to_physical.iter().all(|&p| p != u32::MAX));
+        self.buffers = new_buffers;
+        self.bufid_to_physical = new_bufid_to_physical;
     }
 }
 

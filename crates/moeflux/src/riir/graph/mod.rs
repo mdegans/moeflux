@@ -138,6 +138,30 @@ pub trait BufferPool {
 
     /// Label of the buffer at `id`, for [`Graph::dump`] inspection.
     fn label(&self, id: BufId) -> &'static str;
+
+    /// Apply lifetime-aware buffer aliasing for `graph`. After this
+    /// call, multiple `BufId`s with disjoint live ranges may share a
+    /// single physical buffer, reducing `physical_buffer_count()`.
+    ///
+    /// Default impl is a no-op (preserves backwards compatibility
+    /// for tests that don't need aliasing). Concrete impls override
+    /// it via [`lifetime::analyze_lifetimes`] +
+    /// [`lifetime::greedy_color`].
+    ///
+    /// **Contract:**
+    /// - Persistent BufIds are never aliased (their physical buffer
+    ///   survives [`Self::reset_transient`]).
+    /// - Non-colorable transient BufIds (those that appear only in
+    ///   `Op::reads()`, never in `Op::writes()`) are never aliased;
+    ///   their content is preserved (it was uploaded externally).
+    /// - Colorable BufIds (written by some `Op`) may share physical
+    ///   storage with other colorable BufIds whose live ranges don't
+    ///   overlap. Their pre-`commit_plan` content is NOT preserved
+    ///   — they'll be re-written when `Backend::execute` runs.
+    /// - Called once, after all `alloc()`s for the graph are done
+    ///   and before `Backend::execute`. Multiple calls are allowed
+    ///   but unnecessary.
+    fn commit_plan(&mut self, _graph: &Graph) {}
 }
 
 /// Backend trait. Owns the device / executor + pool + pipeline /
