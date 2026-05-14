@@ -164,6 +164,42 @@ fn batched_chunk_size() -> usize {
         .unwrap_or(BATCHED_CHUNK_SIZE)
 }
 
+/// Session-5 Phase 3: `eval_token` routing backend, read once from
+/// `MOEFLUX_EVAL_TOKEN` at first call.
+///
+/// - `oracle` (default): the historical per-token oracle path with
+///   deferred K-expert async pipelining.
+/// - `batched`: routes through `step_internal(&[tok], pos, ...)`,
+///   exercising the batched orchestrator at N=1 with the Phase 3
+///   prefetch state machine.
+///
+/// The two paths produce identical logits (cosine=1.0); only
+/// per-token decode wall-clock differs. See [`RsCtx::eval_token`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EvalTokenMode {
+    Oracle,
+    Batched,
+}
+
+fn eval_token_mode() -> EvalTokenMode {
+    use std::sync::OnceLock;
+    static MODE: OnceLock<EvalTokenMode> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        match std::env::var("MOEFLUX_EVAL_TOKEN").as_deref() {
+            Ok("batched") => EvalTokenMode::Batched,
+            Ok("oracle") | Err(_) => EvalTokenMode::Oracle,
+            Ok(other) => {
+                eprintln!(
+                    "[eval_token] MOEFLUX_EVAL_TOKEN={other:?} \
+                     unrecognised; using `oracle`. Valid values: \
+                     oracle | batched."
+                );
+                EvalTokenMode::Oracle
+            }
+        }
+    })
+}
+
 pub struct RsCtx {
     wf: WeightFile,
     /// Lazily-built Metal backend. CPU-only kernels skip the cost; GPU
@@ -1251,20 +1287,20 @@ impl RsCtx {
     /// Decode-style single-token step. Always emits logits. Mirrors C
     /// `mf_eval_token` (infer.m:7746..7757).
     ///
-    /// **Stays on the per-token oracle path.** Session-5 Phase 3 wired
-    /// the prefetch state machine into `step_internal_batched_gqa`
-    /// (set-based hit matching, record_actual, record_outcome) and
-    /// proved correctness at cosine=1.0 against the C side at N=1.
-    /// In-process A/B (`bench_decode_per_token_vs_batched_n1`) on the
-    /// post-Phase-3 build shows batched-N=1 still 10.5% slower than
-    /// the per-token oracle (7.63 vs 8.53 tok/s, decode_hit=0.395 on
-    /// both). The remaining gap is the oracle's cross-layer deferred-
-    /// K-expert pipelining — layer N's async K-expert dispatch
-    /// overlaps with layer N+1's CMD1+CMD2+3 GPU work — which the
-    /// batched path's sync permute-fuse can't replicate at N=1.
-    /// Re-routing eval_token through `step_internal` is unblocked once
-    /// the batched path also pipelines cross-layer MoE; until then
-    /// the oracle wins decode and stays canonical.
+    /// **Routing is env-gated** via `MOEFLUX_EVAL_TOKEN`:
+    /// - `oracle` (default): per-token oracle, with the deferred
+    ///   K-expert ring giving cross-layer pipelining.
+    /// - `batched`: routes through `step_internal(&[tok], pos, ...)`,
+    ///   which fires the prefetch state machine wired in Phase 3.
+    ///   Cosine=1.0 against oracle at N=1. In-process A/B
+    ///   (`bench_decode_per_token_vs_batched_n1`) measures
+    ///   batched-N=1 ~10.5% slower than oracle on decode (the gap is
+    ///   the oracle's cross-layer deferred-K-expert pipelining —
+    ///   layer N's async K-expert dispatch overlapping layer N+1's
+    ///   CMD1+CMD2+3 — which the batched permute-fuse can't yet
+    ///   replicate at N=1). The opt-in lets the user measure the
+    ///   batched-N=1 path's improvements as cross-layer pipelining
+    ///   inside batched lands, without a recompile.
     pub fn eval_token(
         &mut self,
         token: i32,
@@ -1275,7 +1311,17 @@ impl RsCtx {
         if logits.len() != VARIANT.vocab_size {
             return Err(RsError::EvalFailed);
         }
-        self.step_internal_per_token_oracle(token, pos as i32, Some(logits))
+        match eval_token_mode() {
+            EvalTokenMode::Oracle => self
+                .step_internal_per_token_oracle(
+                    token,
+                    pos as i32,
+                    Some(logits),
+                ),
+            EvalTokenMode::Batched => {
+                self.step_internal(&[token], pos as i32, Some(logits))
+            }
+        }
     }
 
     /// Canonical multi-token forward orchestrator. Processes
