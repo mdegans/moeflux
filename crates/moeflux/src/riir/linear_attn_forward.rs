@@ -38,6 +38,7 @@ use metal::{
     MTLResourceOptions, MTLSize, NSUInteger,
 };
 
+use super::graph::{BufId, BufferPool, MetalBufferPool};
 use super::deferred::{
     gpu_batched_experts_begin, gpu_batched_experts_begin_pre_staged,
     DeferredError,
@@ -114,11 +115,11 @@ pub type LinearAttnForwardError = LayerForwardError;
 ///   outputs read back to host for CPU per-head norm + RoPE + KV
 ///   append + SDPA).
 pub struct LayerForwardBuffers {
-    pub input: Buffer,
-    pub normed: Buffer,
-    pub residual: Buffer,
-    pub h_mid: Buffer,
-    pub output: Buffer,
+    pub input: BufId,
+    pub normed: BufId,
+    pub residual: BufId,
+    pub h_mid: BufId,
+    pub output: BufId,
     /// 7 batch-output slots. Sized per slot:
     /// - [0]: LINEAR_CONV_DIM (qkv) — only used by linear-attn
     /// - [1]: LINEAR_TOTAL_VALUE (z) — only used by linear-attn
@@ -130,29 +131,29 @@ pub struct LayerForwardBuffers {
     ///   o_proj input staging slot for both paths. On qwen3_5_moe
     ///   variants these two values match exactly (linear: 32*128 =
     ///   4096 for A3B; full: 16*256 = 4096), so the slot is reused.
-    pub batch_out: [Buffer; 7],
+    pub batch_out: [BufId; 7],
     /// Per-linear-layer recurrence state.
-    pub conv_state: Vec<Buffer>,
-    pub delta_state: Vec<Buffer>,
+    pub conv_state: Vec<BufId>,
+    pub delta_state: Vec<BufId>,
     /// Scratch for one layer's linear-attn pipeline (reused across
     /// layers).
-    pub conv_output: Buffer,
-    pub delta_g_decay: Buffer,
-    pub delta_beta: Buffer,
-    pub delta_output: Buffer,
-    pub sum_sq: Buffer,
+    pub conv_output: BufId,
+    pub delta_g_decay: BufId,
+    pub delta_beta: BufId,
+    pub delta_output: BufId,
+    pub sum_sq: BufId,
     /// Shared-expert intermediate (SHARED_INTERMEDIATE floats).
-    pub shared_gate_out: Buffer,
-    pub shared_up_out: Buffer,
-    pub shared_act: Buffer,
-    pub shared_out: Buffer,
+    pub shared_gate_out: BufId,
+    pub shared_up_out: BufId,
+    pub shared_act: BufId,
+    pub shared_out: BufId,
     /// Full-attn projection outputs. `q_proj_out` carries the raw
     /// per-head `(q, gate)` interleave (`num_attn_heads * head_dim *
     /// 2` floats); `k_out` / `v_out` carry the `kv_dim` raw outputs
     /// before per-head norm + RoPE + KV append.
-    pub q_proj_out: Buffer,
-    pub k_out: Buffer,
-    pub v_out: Buffer,
+    pub q_proj_out: BufId,
+    pub k_out: BufId,
+    pub v_out: BufId,
 
     /// Slice 5d-7b — GPU full-attention buffers.
     ///
@@ -162,46 +163,35 @@ pub struct LayerForwardBuffers {
     /// floats each. `fa_idx` = `full_attn_layer_idx_for(layer_idx)`.
     /// Mirrors C `g_metal->buf_kv_k[NUM_FULL_ATTN_LAYERS]` allocation
     /// at `infer.m:1255..1260`.
-    pub gpu_kv_k: Vec<Buffer>,
-    pub gpu_kv_v: Vec<Buffer>,
+    pub gpu_kv_k: Vec<BufId>,
+    pub gpu_kv_v: Vec<BufId>,
     /// Shared scratch for the GPU SDPA fast path. Reused across layers
     /// because SDPA is layer-sequential per token (matches C). Sizes:
     /// - `gpu_attn_q` / `gpu_attn_out` / `gpu_attn_gate`:
     ///   `num_attn_heads * head_dim` floats each
     /// - `gpu_attn_scores`: `num_attn_heads * GPU_KV_SEQ` floats
-    pub gpu_attn_q: Buffer,
-    pub gpu_attn_scores: Buffer,
-    pub gpu_attn_out: Buffer,
-    pub gpu_attn_gate: Buffer,
+    pub gpu_attn_q: BufId,
+    pub gpu_attn_scores: BufId,
+    pub gpu_attn_out: BufId,
+    pub gpu_attn_gate: BufId,
 }
 
 /// Backwards-compat alias for the original 4c name.
 pub type LinearAttnBuffers = LayerForwardBuffers;
 
 impl LayerForwardBuffers {
-    pub fn new(device: &Device) -> Self {
+    /// Allocate every per-layer / per-step buffer as a persistent BufId
+    /// in the graph-mode pool. `pool.alloc` zero-fills under the hood,
+    /// so the recurrence buffers (`conv_state` / `delta_state`) start
+    /// at zero — matching the C `metal_setup` calloc semantics.
+    pub fn new(pool: &mut MetalBufferPool) -> Self {
         let v = VARIANT;
-        // Allocate + zero. `device.new_buffer` doesn't guarantee
-        // zeroed storage; the recurrence buffers (`conv_state`,
-        // `delta_state`) read from this region on first call so
-        // garbage initial values would diverge from the C path's
-        // metal_setup (which calloc-zeros the same buffers).
-        let f32_buf = |n: usize| {
-            let b = device.new_buffer(
-                (n * std::mem::size_of::<f32>()) as NSUInteger,
-                MTLResourceOptions::StorageModeShared,
-            );
-            // SAFETY: shared storage; no GPU work in flight on a
-            // freshly allocated buffer.
-            unsafe {
-                std::ptr::write_bytes(
-                    b.contents() as *mut u8,
-                    0,
-                    n * std::mem::size_of::<f32>(),
-                );
-            }
-            b
-        };
+        let f32_bytes = |n: usize| n * std::mem::size_of::<f32>();
+        let alloc =
+            |pool: &mut MetalBufferPool, n: usize, label: &'static str| {
+                pool.alloc(f32_bytes(n), label, true)
+                    .expect("LayerForwardBuffers::new pool alloc")
+            };
         let q_dim_full = v.num_attn_heads * v.head_dim;
         let q_proj_dim_full = q_dim_full * 2;
         let kv_dim_full = v.num_kv_heads * v.head_dim;
@@ -218,62 +208,96 @@ impl LayerForwardBuffers {
             1,
             oproj_in_max,
         ];
-        let batch_out: [Buffer; 7] =
-            std::array::from_fn(|i| f32_buf(batch_sizes[i]));
+        let batch_labels: [&'static str; 7] = [
+            "lfb.batch_out[0:qkv]",
+            "lfb.batch_out[1:z]",
+            "lfb.batch_out[2:beta]",
+            "lfb.batch_out[3:alpha]",
+            "lfb.batch_out[4:router_gate]",
+            "lfb.batch_out[5:shared_gate]",
+            "lfb.batch_out[6:oproj_in]",
+        ];
+        let batch_out: [BufId; 7] =
+            std::array::from_fn(|i| alloc(pool, batch_sizes[i], batch_labels[i]));
 
         let num_linear = v.num_layers - num_full_attn_layers(&v);
         let conv_state = (0..num_linear)
             .map(|_| {
-                f32_buf((Variant::CONV_KERNEL_SIZE - 1) * v.linear_conv_dim())
+                alloc(
+                    pool,
+                    (Variant::CONV_KERNEL_SIZE - 1) * v.linear_conv_dim(),
+                    "lfb.conv_state",
+                )
             })
             .collect();
         let delta_state = (0..num_linear)
             .map(|_| {
-                f32_buf(
+                alloc(
+                    pool,
                     v.linear_num_v_heads
                         * Variant::LINEAR_VALUE_DIM
                         * Variant::LINEAR_KEY_DIM,
+                    "lfb.delta_state",
                 )
             })
             .collect();
 
         let num_full_attn = num_full_attn_layers(&v);
-        let gpu_kv_floats =
-            super::variants::GPU_KV_SEQ * kv_dim_full;
-        let gpu_kv_k =
-            (0..num_full_attn).map(|_| f32_buf(gpu_kv_floats)).collect();
-        let gpu_kv_v =
-            (0..num_full_attn).map(|_| f32_buf(gpu_kv_floats)).collect();
+        let gpu_kv_floats = super::variants::GPU_KV_SEQ * kv_dim_full;
+        let gpu_kv_k = (0..num_full_attn)
+            .map(|_| alloc(pool, gpu_kv_floats, "lfb.gpu_kv_k"))
+            .collect();
+        let gpu_kv_v = (0..num_full_attn)
+            .map(|_| alloc(pool, gpu_kv_floats, "lfb.gpu_kv_v"))
+            .collect();
 
         Self {
-            input: f32_buf(v.hidden_dim),
-            normed: f32_buf(v.hidden_dim),
-            residual: f32_buf(v.hidden_dim),
-            h_mid: f32_buf(v.hidden_dim),
-            output: f32_buf(v.hidden_dim),
+            input: alloc(pool, v.hidden_dim, "lfb.input"),
+            normed: alloc(pool, v.hidden_dim, "lfb.normed"),
+            residual: alloc(pool, v.hidden_dim, "lfb.residual"),
+            h_mid: alloc(pool, v.hidden_dim, "lfb.h_mid"),
+            output: alloc(pool, v.hidden_dim, "lfb.output"),
             batch_out,
             conv_state,
             delta_state,
-            conv_output: f32_buf(v.linear_conv_dim()),
-            delta_g_decay: f32_buf(v.linear_num_v_heads),
-            delta_beta: f32_buf(v.linear_num_v_heads),
-            delta_output: f32_buf(v.linear_total_value()),
-            sum_sq: f32_buf(1),
-            shared_gate_out: f32_buf(v.shared_intermediate),
-            shared_up_out: f32_buf(v.shared_intermediate),
-            shared_act: f32_buf(v.shared_intermediate),
-            shared_out: f32_buf(v.hidden_dim),
-            q_proj_out: f32_buf(q_proj_dim_full),
-            k_out: f32_buf(kv_dim_full),
-            v_out: f32_buf(kv_dim_full),
+            conv_output: alloc(pool, v.linear_conv_dim(), "lfb.conv_output"),
+            delta_g_decay: alloc(
+                pool,
+                v.linear_num_v_heads,
+                "lfb.delta_g_decay",
+            ),
+            delta_beta: alloc(pool, v.linear_num_v_heads, "lfb.delta_beta"),
+            delta_output: alloc(
+                pool,
+                v.linear_total_value(),
+                "lfb.delta_output",
+            ),
+            sum_sq: alloc(pool, 1, "lfb.sum_sq"),
+            shared_gate_out: alloc(
+                pool,
+                v.shared_intermediate,
+                "lfb.shared_gate_out",
+            ),
+            shared_up_out: alloc(
+                pool,
+                v.shared_intermediate,
+                "lfb.shared_up_out",
+            ),
+            shared_act: alloc(pool, v.shared_intermediate, "lfb.shared_act"),
+            shared_out: alloc(pool, v.hidden_dim, "lfb.shared_out"),
+            q_proj_out: alloc(pool, q_proj_dim_full, "lfb.q_proj_out"),
+            k_out: alloc(pool, kv_dim_full, "lfb.k_out"),
+            v_out: alloc(pool, kv_dim_full, "lfb.v_out"),
             gpu_kv_k,
             gpu_kv_v,
-            gpu_attn_q: f32_buf(q_dim_full),
-            gpu_attn_scores: f32_buf(
+            gpu_attn_q: alloc(pool, q_dim_full, "lfb.gpu_attn_q"),
+            gpu_attn_scores: alloc(
+                pool,
                 v.num_attn_heads * super::variants::GPU_KV_SEQ,
+                "lfb.gpu_attn_scores",
             ),
-            gpu_attn_out: f32_buf(q_dim_full),
-            gpu_attn_gate: f32_buf(q_dim_full),
+            gpu_attn_out: alloc(pool, q_dim_full, "lfb.gpu_attn_out"),
+            gpu_attn_gate: alloc(pool, q_dim_full, "lfb.gpu_attn_gate"),
         }
     }
 
@@ -281,12 +305,12 @@ impl LayerForwardBuffers {
     /// `RsCtx::memory_clear` to clear the recurrence in addition to
     /// the host-side state vector (which today the GPU doesn't read,
     /// so this is the source of truth on the GPU side).
-    pub fn reset_recurrence(&mut self) {
-        for b in &self.conv_state {
-            zero_f32_buffer(b);
+    pub fn reset_recurrence(&self, pool: &MetalBufferPool) {
+        for &id in &self.conv_state {
+            zero_f32_buffer(pool.handle(id));
         }
-        for b in &self.delta_state {
-            zero_f32_buffer(b);
+        for &id in &self.delta_state {
+            zero_f32_buffer(pool.handle(id));
         }
     }
 
@@ -295,12 +319,12 @@ impl LayerForwardBuffers {
     /// KV cache is cleared via `clear_all(layer_states)`; this is the
     /// matching reset on the GPU side. Mirrors the C path's reset of
     /// `buf_kv_k` / `buf_kv_v` at `mf_memory_clear`.
-    pub fn reset_gpu_attn_kv_mirrors(&mut self) {
-        for b in &self.gpu_kv_k {
-            zero_f32_buffer(b);
+    pub fn reset_gpu_attn_kv_mirrors(&self, pool: &MetalBufferPool) {
+        for &id in &self.gpu_kv_k {
+            zero_f32_buffer(pool.handle(id));
         }
-        for b in &self.gpu_kv_v {
-            zero_f32_buffer(b);
+        for &id in &self.gpu_kv_v {
+            zero_f32_buffer(pool.handle(id));
         }
     }
 }
@@ -446,7 +470,8 @@ pub fn linear_attn_layer_forward(
     wf: &WeightFile,
     wf_buf: &MtlWeightBuf,
     layer_cache: &LayerWeightCache,
-    buffers: &mut LayerForwardBuffers,
+    buffers: &LayerForwardBuffers,
+    buffer_pool: &MetalBufferPool,
     moe: &mut MoeBuffers,
     deferred: &mut super::DeferredRing,
     layer_idx: usize,
@@ -579,11 +604,11 @@ pub fn linear_attn_layer_forward(
             encode_rms_norm_bf16_into(
                 cmdbuf,
                 &rms_pipes,
-                &buffers.input,
+                buffer_pool.handle(buffers.input),
                 wf_buf.buffer(),
                 layer_cache.input_layernorm_w,
-                &buffers.sum_sq,
-                &buffers.normed,
+                buffer_pool.handle(buffers.sum_sq),
+                buffer_pool.handle(buffers.normed),
                 v.hidden_dim as u32,
                 RMS_NORM_EPS,
             );
@@ -595,8 +620,8 @@ pub fn linear_attn_layer_forward(
                 w_off: qkv_w,
                 s_off: qkv_s,
                 b_off: qkv_b,
-                input: &buffers.normed,
-                output: &buffers.batch_out[0],
+                input: buffer_pool.handle(buffers.normed),
+                output: buffer_pool.handle(buffers.batch_out[0]),
                 out_dim: v.linear_conv_dim() as u32,
                 in_dim: v.hidden_dim as u32,
                 bits: qkv_bits,
@@ -605,8 +630,8 @@ pub fn linear_attn_layer_forward(
                 w_off: z_w,
                 s_off: z_s,
                 b_off: z_b,
-                input: &buffers.normed,
-                output: &buffers.batch_out[1],
+                input: buffer_pool.handle(buffers.normed),
+                output: buffer_pool.handle(buffers.batch_out[1]),
                 out_dim: v.linear_total_value() as u32,
                 in_dim: v.hidden_dim as u32,
                 bits: z_bits,
@@ -615,8 +640,8 @@ pub fn linear_attn_layer_forward(
                 w_off: beta_w,
                 s_off: beta_s,
                 b_off: beta_b,
-                input: &buffers.normed,
-                output: &buffers.batch_out[2],
+                input: buffer_pool.handle(buffers.normed),
+                output: buffer_pool.handle(buffers.batch_out[2]),
                 out_dim: v.linear_num_v_heads as u32,
                 in_dim: v.hidden_dim as u32,
                 bits: beta_bits,
@@ -625,8 +650,8 @@ pub fn linear_attn_layer_forward(
                 w_off: alpha_w,
                 s_off: alpha_s,
                 b_off: alpha_b,
-                input: &buffers.normed,
-                output: &buffers.batch_out[3],
+                input: buffer_pool.handle(buffers.normed),
+                output: buffer_pool.handle(buffers.batch_out[3]),
                 out_dim: v.linear_num_v_heads as u32,
                 in_dim: v.hidden_dim as u32,
                 bits: alpha_bits,
@@ -639,19 +664,19 @@ pub fn linear_attn_layer_forward(
         encode_conv1d_step(
             cmdbuf,
             &lp.conv1d_step,
-            &buffers.conv_state[linear_layer_idx],
-            &buffers.batch_out[0],
+            buffer_pool.handle(buffers.conv_state[linear_layer_idx]),
+            buffer_pool.handle(buffers.batch_out[0]),
             0,
             wf_buf.buffer(),
             conv1d_w,
-            &buffers.conv_output,
+            buffer_pool.handle(buffers.conv_output),
             v.linear_conv_dim() as u32,
         );
 
         encode_rms_norm_qk(
             cmdbuf,
             &lp.rms_norm_qk,
-            &buffers.conv_output,
+            buffer_pool.handle(buffers.conv_output),
             v.linear_num_k_heads as u32,
             Variant::LINEAR_KEY_DIM as u32,
         );
@@ -659,15 +684,15 @@ pub fn linear_attn_layer_forward(
         encode_compute_decay_beta(
             cmdbuf,
             &lp.compute_decay_beta,
-            &buffers.batch_out[3], // alpha
+            buffer_pool.handle(buffers.batch_out[3]), // alpha
             0,
-            &buffers.batch_out[2], // beta
+            buffer_pool.handle(buffers.batch_out[2]), // beta
             0,
             wf_buf.buffer(),
             a_log,
             dt_bias,
-            &buffers.delta_g_decay,
-            &buffers.delta_beta,
+            buffer_pool.handle(buffers.delta_g_decay),
+            buffer_pool.handle(buffers.delta_beta),
             v.linear_num_v_heads as u32,
         );
 
@@ -676,11 +701,11 @@ pub fn linear_attn_layer_forward(
         encode_delta_net_step(
             cmdbuf,
             &lp.delta_net_step,
-            &buffers.delta_state[linear_layer_idx],
-            &buffers.conv_output,
-            &buffers.delta_g_decay,
-            &buffers.delta_beta,
-            &buffers.delta_output,
+            buffer_pool.handle(buffers.delta_state[linear_layer_idx]),
+            buffer_pool.handle(buffers.conv_output),
+            buffer_pool.handle(buffers.delta_g_decay),
+            buffer_pool.handle(buffers.delta_beta),
+            buffer_pool.handle(buffers.delta_output),
             v.linear_num_v_heads as u32,
             Variant::LINEAR_VALUE_DIM as u32,
             k_heads_per_v,
@@ -689,12 +714,12 @@ pub fn linear_attn_layer_forward(
         encode_gated_rms_norm(
             cmdbuf,
             &lp.gated_rms_norm,
-            &buffers.delta_output,
-            &buffers.batch_out[1], // z
+            buffer_pool.handle(buffers.delta_output),
+            buffer_pool.handle(buffers.batch_out[1]), // z
             0,
             wf_buf.buffer(),
             gnorm_w,
-            &buffers.batch_out[6],
+            buffer_pool.handle(buffers.batch_out[6]),
             0,
             v.linear_num_v_heads as u32,
             Variant::LINEAR_VALUE_DIM as u32,
@@ -717,6 +742,7 @@ pub fn linear_attn_layer_forward(
         wf_buf,
         layer_cache,
         buffers,
+        buffer_pool,
         moe,
         deferred,
         layer_idx,
@@ -805,7 +831,8 @@ pub(super) fn post_attention_tail(
     wf: &WeightFile,
     wf_buf: &MtlWeightBuf,
     layer_cache: &LayerWeightCache,
-    buffers: &mut LayerForwardBuffers,
+    buffers: &LayerForwardBuffers,
+    buffer_pool: &MetalBufferPool,
     moe: &mut MoeBuffers,
     deferred: &mut super::DeferredRing,
     layer_idx: usize,
@@ -834,6 +861,7 @@ pub(super) fn post_attention_tail(
         wf_buf,
         layer_cache,
         buffers,
+        buffer_pool,
         layer_idx,
         k_active,
         o_proj,
@@ -843,6 +871,7 @@ pub(super) fn post_attention_tail(
         metal,
         wf_buf,
         buffers,
+        buffer_pool,
         moe,
         deferred,
         layer_idx,
@@ -879,7 +908,8 @@ pub(super) fn post_attention_pre_moe(
     wf: &WeightFile,
     wf_buf: &MtlWeightBuf,
     layer_cache: &LayerWeightCache,
-    buffers: &mut LayerForwardBuffers,
+    buffers: &LayerForwardBuffers,
+    buffer_pool: &MetalBufferPool,
     layer_idx: usize,
     k_active: usize,
     o_proj: OProj,
@@ -995,9 +1025,9 @@ pub(super) fn post_attention_pre_moe(
             encode_attn_scores_batched_into(
                 cmdbuf,
                 &attn_pipes.scores,
-                &buffers.gpu_attn_q,
-                &buffers.gpu_kv_k[args.fa_idx],
-                &buffers.gpu_attn_scores,
+                buffer_pool.handle(buffers.gpu_attn_q),
+                buffer_pool.handle(buffers.gpu_kv_k[args.fa_idx]),
+                buffer_pool.handle(buffers.gpu_attn_scores),
                 num_heads,
                 head_dim,
                 kv_dim,
@@ -1009,7 +1039,7 @@ pub(super) fn post_attention_pre_moe(
             encode_attn_softmax_batched_into(
                 cmdbuf,
                 &attn_pipes.softmax,
-                &buffers.gpu_attn_scores,
+                buffer_pool.handle(buffers.gpu_attn_scores),
                 num_heads,
                 args.kv_len,
                 seq_stride,
@@ -1017,9 +1047,9 @@ pub(super) fn post_attention_pre_moe(
             encode_attn_values_batched_into(
                 cmdbuf,
                 &attn_pipes.values,
-                &buffers.gpu_attn_scores,
-                &buffers.gpu_kv_v[args.fa_idx],
-                &buffers.gpu_attn_out,
+                buffer_pool.handle(buffers.gpu_attn_scores),
+                buffer_pool.handle(buffers.gpu_kv_v[args.fa_idx]),
+                buffer_pool.handle(buffers.gpu_attn_out),
                 num_heads,
                 head_dim,
                 kv_dim,
@@ -1030,8 +1060,8 @@ pub(super) fn post_attention_pre_moe(
             encode_sigmoid_gate_into(
                 cmdbuf,
                 &attn_pipes.gate,
-                &buffers.gpu_attn_out,
-                &buffers.gpu_attn_gate,
+                buffer_pool.handle(buffers.gpu_attn_out),
+                buffer_pool.handle(buffers.gpu_attn_gate),
                 num_heads * head_dim,
             );
         }
@@ -1040,9 +1070,9 @@ pub(super) fn post_attention_pre_moe(
         // GPU SDPA path: read from `gpu_attn_out` (zero-host-stage).
         // CPU SDPA / linear-attn paths: read from `batch_out[6]`.
         let oproj_input = if gpu_attn_args.is_some() {
-            &buffers.gpu_attn_out
+            buffer_pool.handle(buffers.gpu_attn_out)
         } else {
-            &buffers.batch_out[6]
+            buffer_pool.handle(buffers.batch_out[6])
         };
         encode_matvec(
             cmdbuf,
@@ -1053,7 +1083,7 @@ pub(super) fn post_attention_pre_moe(
                 s_off: o_proj.s_off,
                 b_off: o_proj.b_off,
                 input: oproj_input,
-                output: &buffers.output,
+                output: buffer_pool.handle(buffers.output),
                 out_dim: v.hidden_dim as u32,
                 in_dim: o_proj.in_dim,
                 bits: o_proj.bits,
@@ -1062,20 +1092,20 @@ pub(super) fn post_attention_pre_moe(
         encode_residual_add(
             cmdbuf,
             &resid_add,
-            &buffers.output,
-            &buffers.input, // residual source — see slice 5d-2 note
-            &buffers.h_mid,
+            buffer_pool.handle(buffers.output),
+            buffer_pool.handle(buffers.input), // residual source — see slice 5d-2 note
+            buffer_pool.handle(buffers.h_mid),
             v.hidden_dim as u32,
         );
         encode_rms_norm_pair(
             cmdbuf,
             &sum_sq,
             &apply,
-            &buffers.h_mid,
+            buffer_pool.handle(buffers.h_mid),
             wf_buf.buffer(),
             post_attn_norm_w,
-            &buffers.normed,
-            &buffers.sum_sq,
+            buffer_pool.handle(buffers.normed),
+            buffer_pool.handle(buffers.sum_sq),
             v.hidden_dim as u32,
         );
 
@@ -1089,8 +1119,8 @@ pub(super) fn post_attention_pre_moe(
                 w_off: gate_w,
                 s_off: gate_s,
                 b_off: gate_b,
-                input: &buffers.normed,
-                output: &buffers.batch_out[4],
+                input: buffer_pool.handle(buffers.normed),
+                output: buffer_pool.handle(buffers.batch_out[4]),
                 out_dim: v.num_experts as u32,
                 in_dim: v.hidden_dim as u32,
                 bits: gate_bits,
@@ -1104,8 +1134,8 @@ pub(super) fn post_attention_pre_moe(
                 w_off: seg_w,
                 s_off: seg_s,
                 b_off: seg_b,
-                input: &buffers.normed,
-                output: &buffers.batch_out[5],
+                input: buffer_pool.handle(buffers.normed),
+                output: buffer_pool.handle(buffers.batch_out[5]),
                 out_dim: 1,
                 in_dim: v.hidden_dim as u32,
                 bits: seg_bits,
@@ -1119,8 +1149,8 @@ pub(super) fn post_attention_pre_moe(
                 w_off: shared_gate_w,
                 s_off: shared_gate_s,
                 b_off: shared_gate_b,
-                input: &buffers.normed,
-                output: &buffers.shared_gate_out,
+                input: buffer_pool.handle(buffers.normed),
+                output: buffer_pool.handle(buffers.shared_gate_out),
                 out_dim: v.shared_intermediate as u32,
                 in_dim: v.hidden_dim as u32,
                 bits: s_gate_bits,
@@ -1134,8 +1164,8 @@ pub(super) fn post_attention_pre_moe(
                 w_off: shared_up_w,
                 s_off: shared_up_s,
                 b_off: shared_up_b,
-                input: &buffers.normed,
-                output: &buffers.shared_up_out,
+                input: buffer_pool.handle(buffers.normed),
+                output: buffer_pool.handle(buffers.shared_up_out),
                 out_dim: v.shared_intermediate as u32,
                 in_dim: v.hidden_dim as u32,
                 bits: s_up_bits,
@@ -1146,9 +1176,9 @@ pub(super) fn post_attention_pre_moe(
         encode_swiglu_buf(
             cmdbuf,
             &swiglu,
-            &buffers.shared_gate_out,
-            &buffers.shared_up_out,
-            &buffers.shared_act,
+            buffer_pool.handle(buffers.shared_gate_out),
+            buffer_pool.handle(buffers.shared_up_out),
+            buffer_pool.handle(buffers.shared_act),
             v.shared_intermediate as u32,
         );
 
@@ -1161,8 +1191,8 @@ pub(super) fn post_attention_pre_moe(
                 w_off: shared_down_w,
                 s_off: shared_down_s,
                 b_off: shared_down_b,
-                input: &buffers.shared_act,
-                output: &buffers.shared_out,
+                input: buffer_pool.handle(buffers.shared_act),
+                output: buffer_pool.handle(buffers.shared_out),
                 out_dim: v.hidden_dim as u32,
                 in_dim: v.shared_intermediate as u32,
                 bits: s_down_bits,
@@ -1174,7 +1204,7 @@ pub(super) fn post_attention_pre_moe(
 
     // ── CPU: MoE router on the gate logits ───────────────────────
     let mut scores =
-        read_buffer_to_vec(&buffers.batch_out[4], v.num_experts);
+        read_buffer_to_vec(buffer_pool.handle(buffers.batch_out[4]), v.num_experts);
     let mut routing_indices = vec![0i32; k_active];
     let mut routing_weights = vec![0f32; k_active];
     moe_router_cpu(
@@ -1186,7 +1216,7 @@ pub(super) fn post_attention_pre_moe(
 
     // Read shared-gate score scalar (pre-sigmoid).
     let shared_gate_score = {
-        let s = read_buffer_to_vec(&buffers.batch_out[5], 1);
+        let s = read_buffer_to_vec(buffer_pool.handle(buffers.batch_out[5]), 1);
         s[0]
     };
 
@@ -1217,7 +1247,8 @@ pub(super) fn post_attention_post_o_proj_to_intermediates(
     wf: &WeightFile,
     wf_buf: &MtlWeightBuf,
     layer_cache: &LayerWeightCache,
-    buffers: &mut LayerForwardBuffers,
+    buffers: &LayerForwardBuffers,
+    buffer_pool: &MetalBufferPool,
     layer_idx: usize,
     k_active: usize,
 ) -> Result<PostAttnIntermediates, LayerForwardError> {
@@ -1276,20 +1307,20 @@ pub(super) fn post_attention_post_o_proj_to_intermediates(
     encode_residual_add(
         cmdbuf,
         &resid_add,
-        &buffers.output,
-        &buffers.input,
-        &buffers.h_mid,
+        buffer_pool.handle(buffers.output),
+        buffer_pool.handle(buffers.input),
+        buffer_pool.handle(buffers.h_mid),
         v.hidden_dim as u32,
     );
     encode_rms_norm_pair(
         cmdbuf,
         &sum_sq,
         &apply,
-        &buffers.h_mid,
+        buffer_pool.handle(buffers.h_mid),
         wf_buf.buffer(),
         post_attn_norm_w,
-        &buffers.normed,
-        &buffers.sum_sq,
+        buffer_pool.handle(buffers.normed),
+        buffer_pool.handle(buffers.sum_sq),
         v.hidden_dim as u32,
     );
     encode_matvec(
@@ -1300,8 +1331,8 @@ pub(super) fn post_attention_post_o_proj_to_intermediates(
             w_off: gate_w,
             s_off: gate_s,
             b_off: gate_b,
-            input: &buffers.normed,
-            output: &buffers.batch_out[4],
+            input: buffer_pool.handle(buffers.normed),
+            output: buffer_pool.handle(buffers.batch_out[4]),
             out_dim: v.num_experts as u32,
             in_dim: v.hidden_dim as u32,
             bits: gate_bits,
@@ -1315,8 +1346,8 @@ pub(super) fn post_attention_post_o_proj_to_intermediates(
             w_off: seg_w,
             s_off: seg_s,
             b_off: seg_b,
-            input: &buffers.normed,
-            output: &buffers.batch_out[5],
+            input: buffer_pool.handle(buffers.normed),
+            output: buffer_pool.handle(buffers.batch_out[5]),
             out_dim: 1,
             in_dim: v.hidden_dim as u32,
             bits: seg_bits,
@@ -1330,8 +1361,8 @@ pub(super) fn post_attention_post_o_proj_to_intermediates(
             w_off: shared_gate_w,
             s_off: shared_gate_s,
             b_off: shared_gate_b,
-            input: &buffers.normed,
-            output: &buffers.shared_gate_out,
+            input: buffer_pool.handle(buffers.normed),
+            output: buffer_pool.handle(buffers.shared_gate_out),
             out_dim: v.shared_intermediate as u32,
             in_dim: v.hidden_dim as u32,
             bits: s_gate_bits,
@@ -1345,8 +1376,8 @@ pub(super) fn post_attention_post_o_proj_to_intermediates(
             w_off: shared_up_w,
             s_off: shared_up_s,
             b_off: shared_up_b,
-            input: &buffers.normed,
-            output: &buffers.shared_up_out,
+            input: buffer_pool.handle(buffers.normed),
+            output: buffer_pool.handle(buffers.shared_up_out),
             out_dim: v.shared_intermediate as u32,
             in_dim: v.hidden_dim as u32,
             bits: s_up_bits,
@@ -1355,9 +1386,9 @@ pub(super) fn post_attention_post_o_proj_to_intermediates(
     encode_swiglu_buf(
         cmdbuf,
         &swiglu,
-        &buffers.shared_gate_out,
-        &buffers.shared_up_out,
-        &buffers.shared_act,
+        buffer_pool.handle(buffers.shared_gate_out),
+        buffer_pool.handle(buffers.shared_up_out),
+        buffer_pool.handle(buffers.shared_act),
         v.shared_intermediate as u32,
     );
     encode_matvec(
@@ -1368,8 +1399,8 @@ pub(super) fn post_attention_post_o_proj_to_intermediates(
             w_off: shared_down_w,
             s_off: shared_down_s,
             b_off: shared_down_b,
-            input: &buffers.shared_act,
-            output: &buffers.shared_out,
+            input: buffer_pool.handle(buffers.shared_act),
+            output: buffer_pool.handle(buffers.shared_out),
             out_dim: v.hidden_dim as u32,
             in_dim: v.shared_intermediate as u32,
             bits: s_down_bits,
@@ -1378,7 +1409,7 @@ pub(super) fn post_attention_post_o_proj_to_intermediates(
     metal.commit_and_wait_labeled(cmdbuf, "post_attn_post_oproj.cmd");
 
     let mut scores =
-        read_buffer_to_vec(&buffers.batch_out[4], v.num_experts);
+        read_buffer_to_vec(buffer_pool.handle(buffers.batch_out[4]), v.num_experts);
     let mut routing_indices = vec![0i32; k_active];
     let mut routing_weights = vec![0f32; k_active];
     moe_router_cpu(
@@ -1388,7 +1419,7 @@ pub(super) fn post_attention_post_o_proj_to_intermediates(
         &mut routing_weights,
     )?;
     let shared_gate_score = {
-        let s = read_buffer_to_vec(&buffers.batch_out[5], 1);
+        let s = read_buffer_to_vec(buffer_pool.handle(buffers.batch_out[5]), 1);
         s[0]
     };
     Ok(PostAttnIntermediates {
@@ -1415,7 +1446,8 @@ pub(super) fn post_attention_residual_norm_route(
     wf: &WeightFile,
     wf_buf: &MtlWeightBuf,
     layer_cache: &LayerWeightCache,
-    buffers: &mut LayerForwardBuffers,
+    buffers: &LayerForwardBuffers,
+    buffer_pool: &MetalBufferPool,
     layer_idx: usize,
     k_active: usize,
 ) -> Result<PostAttnIntermediates, LayerForwardError> {
@@ -1446,20 +1478,20 @@ pub(super) fn post_attention_residual_norm_route(
     encode_residual_add(
         cmdbuf,
         &resid_add,
-        &buffers.output,
-        &buffers.input,
-        &buffers.h_mid,
+        buffer_pool.handle(buffers.output),
+        buffer_pool.handle(buffers.input),
+        buffer_pool.handle(buffers.h_mid),
         v.hidden_dim as u32,
     );
     encode_rms_norm_pair(
         cmdbuf,
         &sum_sq,
         &apply,
-        &buffers.h_mid,
+        buffer_pool.handle(buffers.h_mid),
         wf_buf.buffer(),
         post_attn_norm_w,
-        &buffers.normed,
-        &buffers.sum_sq,
+        buffer_pool.handle(buffers.normed),
+        buffer_pool.handle(buffers.sum_sq),
         v.hidden_dim as u32,
     );
     encode_matvec(
@@ -1470,8 +1502,8 @@ pub(super) fn post_attention_residual_norm_route(
             w_off: gate_w,
             s_off: gate_s,
             b_off: gate_b,
-            input: &buffers.normed,
-            output: &buffers.batch_out[4],
+            input: buffer_pool.handle(buffers.normed),
+            output: buffer_pool.handle(buffers.batch_out[4]),
             out_dim: v.num_experts as u32,
             in_dim: v.hidden_dim as u32,
             bits: gate_bits,
@@ -1485,8 +1517,8 @@ pub(super) fn post_attention_residual_norm_route(
             w_off: seg_w,
             s_off: seg_s,
             b_off: seg_b,
-            input: &buffers.normed,
-            output: &buffers.batch_out[5],
+            input: buffer_pool.handle(buffers.normed),
+            output: buffer_pool.handle(buffers.batch_out[5]),
             out_dim: 1,
             in_dim: v.hidden_dim as u32,
             bits: seg_bits,
@@ -1495,7 +1527,7 @@ pub(super) fn post_attention_residual_norm_route(
     metal.commit_and_wait_labeled(cmdbuf, "post_attn_residual_norm_route");
 
     let mut scores =
-        read_buffer_to_vec(&buffers.batch_out[4], v.num_experts);
+        read_buffer_to_vec(buffer_pool.handle(buffers.batch_out[4]), v.num_experts);
     let mut routing_indices = vec![0i32; k_active];
     let mut routing_weights = vec![0f32; k_active];
     moe_router_cpu(
@@ -1505,7 +1537,7 @@ pub(super) fn post_attention_residual_norm_route(
         &mut routing_weights,
     )?;
     let shared_gate_score = {
-        let s = read_buffer_to_vec(&buffers.batch_out[5], 1);
+        let s = read_buffer_to_vec(buffer_pool.handle(buffers.batch_out[5]), 1);
         s[0]
     };
     Ok(PostAttnIntermediates {
@@ -1530,7 +1562,8 @@ pub(super) fn post_attention_residual_norm_route(
 pub(super) fn moe_dispatch_per_token(
     metal: &mut MetalContext,
     wf_buf: &MtlWeightBuf,
-    buffers: &mut LayerForwardBuffers,
+    buffers: &LayerForwardBuffers,
+    buffer_pool: &MetalBufferPool,
     moe: &mut MoeBuffers,
     deferred: &mut super::DeferredRing,
     layer_idx: usize,
@@ -1668,9 +1701,9 @@ pub(super) fn moe_dispatch_per_token(
                 pipes,
                 wf_buf: wf_buf.buffer(),
                 next_norm_off: off,
-                combine_out: &buffers.input,
-                chain_sum_sq: &buffers.sum_sq,
-                chain_normed: &buffers.normed,
+                combine_out: buffer_pool.handle(buffers.input),
+                chain_sum_sq: buffer_pool.handle(buffers.sum_sq),
+                chain_normed: buffer_pool.handle(buffers.normed),
                 eps: RMS_NORM_EPS,
             })
         });
@@ -1679,9 +1712,9 @@ pub(super) fn moe_dispatch_per_token(
             moe,
             deferred,
             k as i32,
-            &buffers.normed,     // h_post (post-attn-norm input)
-            &buffers.h_mid,      // residual hidden (combine input)
-            &buffers.shared_out, // shared FFN output (combine input)
+            buffer_pool.handle(buffers.normed),     // h_post (post-attn-norm input)
+            buffer_pool.handle(buffers.h_mid),      // residual hidden (combine input)
+            buffer_pool.handle(buffers.shared_out), // shared FFN output (combine input)
             weights,
             shared_gate_score,
             layer_idx as i32,
@@ -1698,10 +1731,10 @@ pub(super) fn moe_dispatch_per_token(
                 [slot * expert_size..(slot + 1) * expert_size];
             expert_files.read_expert(layer_idx, expert_idx, dst)?;
         }
-        let h_mid_host = read_buffer_to_vec(&buffers.h_mid, v.hidden_dim);
+        let h_mid_host = read_buffer_to_vec(buffer_pool.handle(buffers.h_mid), v.hidden_dim);
         let shared_out_host =
-            read_buffer_to_vec(&buffers.shared_out, v.hidden_dim);
-        let normed_host = read_buffer_to_vec(&buffers.normed, v.hidden_dim);
+            read_buffer_to_vec(buffer_pool.handle(buffers.shared_out), v.hidden_dim);
+        let normed_host = read_buffer_to_vec(buffer_pool.handle(buffers.normed), v.hidden_dim);
         gpu_batched_experts_begin(
             metal,
             moe,
@@ -1885,7 +1918,8 @@ pub(super) fn batched_linear_attn_layer_forward(
     wf: &WeightFile,
     wf_buf: &MtlWeightBuf,
     layer_cache: &LayerWeightCache,
-    buffers: &mut LayerForwardBuffers,
+    buffers: &LayerForwardBuffers,
+    buffer_pool: &MetalBufferPool,
     layer_idx: usize,
     n_tokens: usize,
     k_active: usize,
@@ -2111,18 +2145,18 @@ pub(super) fn batched_linear_attn_layer_forward(
             encode_conv1d_step(
                 pre_moe_cmdbuf,
                 &lp.conv1d_step,
-                &buffers.conv_state[linear_layer_idx],
+                buffer_pool.handle(buffers.conv_state[linear_layer_idx]),
                 qkv_stack.buffer(),
                 qkv_off,
                 wf_buf.buffer(),
                 conv1d_w,
-                &buffers.conv_output,
+                buffer_pool.handle(buffers.conv_output),
                 conv_dim as u32,
             );
             encode_rms_norm_qk(
                 pre_moe_cmdbuf,
                 &lp.rms_norm_qk,
-                &buffers.conv_output,
+                buffer_pool.handle(buffers.conv_output),
                 v.linear_num_k_heads as u32,
                 Variant::LINEAR_KEY_DIM as u32,
             );
@@ -2136,18 +2170,18 @@ pub(super) fn batched_linear_attn_layer_forward(
                 wf_buf.buffer(),
                 a_log,
                 dt_bias,
-                &buffers.delta_g_decay,
-                &buffers.delta_beta,
+                buffer_pool.handle(buffers.delta_g_decay),
+                buffer_pool.handle(buffers.delta_beta),
                 v.linear_num_v_heads as u32,
             );
             encode_delta_net_step(
                 pre_moe_cmdbuf,
                 &lp.delta_net_step,
-                &buffers.delta_state[linear_layer_idx],
-                &buffers.conv_output,
-                &buffers.delta_g_decay,
-                &buffers.delta_beta,
-                &buffers.delta_output,
+                buffer_pool.handle(buffers.delta_state[linear_layer_idx]),
+                buffer_pool.handle(buffers.conv_output),
+                buffer_pool.handle(buffers.delta_g_decay),
+                buffer_pool.handle(buffers.delta_beta),
+                buffer_pool.handle(buffers.delta_output),
                 v.linear_num_v_heads as u32,
                 value_dim,
                 k_heads_per_v,
@@ -2155,7 +2189,7 @@ pub(super) fn batched_linear_attn_layer_forward(
             encode_gated_rms_norm(
                 pre_moe_cmdbuf,
                 &lp.gated_rms_norm,
-                &buffers.delta_output,
+                buffer_pool.handle(buffers.delta_output),
                 z_stack.buffer(),
                 z_off,
                 wf_buf.buffer(),

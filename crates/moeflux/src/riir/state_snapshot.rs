@@ -237,7 +237,9 @@ pub fn state_save(
     buf: &mut [u8],
     layer_states: &[LayerState],
     linear_buffers: Option<&LayerForwardBuffers>,
+    pool: Option<&crate::riir::graph::MetalBufferPool>,
 ) -> Result<usize, StateSnapshotError> {
+    use crate::riir::graph::BufferPool as _;
     let v = VARIANT;
     let need = state_size(layer_states);
     if buf.len() < need {
@@ -340,15 +342,17 @@ pub fn state_save(
             LayerKind::LinearAttn => {
                 let lb = linear_buffers
                     .ok_or(StateSnapshotError::BuffersNotReady)?;
+                let p = pool
+                    .ok_or(StateSnapshotError::BuffersNotReady)?;
                 let linear_idx = linear_layer_idx_for(i)
                     .expect("layer_kind says LinearAttn");
                 read_buffer_bytes(
-                    &lb.conv_state[linear_idx],
+                    p.handle(lb.conv_state[linear_idx]),
                     &mut buf[off..off + la_conv],
                 );
                 off += la_conv;
                 read_buffer_bytes(
-                    &lb.delta_state[linear_idx],
+                    p.handle(lb.delta_state[linear_idx]),
                     &mut buf[off..off + la_ssm],
                 );
                 off += la_ssm;
@@ -368,8 +372,10 @@ pub fn state_load(
     buf: &[u8],
     layer_states: &mut [LayerState],
     mut linear_buffers: Option<&mut LayerForwardBuffers>,
+    pool: Option<&crate::riir::graph::MetalBufferPool>,
     device: &Device,
 ) -> Result<(), StateSnapshotError> {
+    use crate::riir::graph::BufferPool as _;
     let v = VARIANT;
 
     // Read magic + version up front so we can choose v1 vs v2 header
@@ -619,11 +625,15 @@ pub fn state_load(
                         // the `discard_deferred_experts` guard at the
                         // top of state_load callers), so no GPU work is
                         // in flight on the mirror.
+                        let p = pool
+                            .ok_or(StateSnapshotError::BuffersNotReady)?;
                         unsafe {
-                            let k_dst = lb.gpu_kv_k[fa_idx]
+                            let k_dst = p
+                                .handle(lb.gpu_kv_k[fa_idx])
                                 .contents()
                                 as *mut f32;
-                            let v_dst = lb.gpu_kv_v[fa_idx]
+                            let v_dst = p
+                                .handle(lb.gpu_kv_v[fa_idx])
                                 .contents()
                                 as *mut f32;
                             std::ptr::copy_nonoverlapping(
@@ -644,15 +654,17 @@ pub fn state_load(
                 let lb = linear_buffers
                     .as_deref_mut()
                     .ok_or(StateSnapshotError::BuffersNotReady)?;
+                let p = pool
+                    .ok_or(StateSnapshotError::BuffersNotReady)?;
                 let linear_idx = linear_layer_idx_for(i)
                     .expect("layer_kind says LinearAttn");
                 write_buffer_bytes(
-                    &lb.conv_state[linear_idx],
+                    p.handle(lb.conv_state[linear_idx]),
                     &buf[off..off + la_conv],
                 );
                 off += la_conv;
                 write_buffer_bytes(
-                    &lb.delta_state[linear_idx],
+                    p.handle(lb.delta_state[linear_idx]),
                     &buf[off..off + la_ssm],
                 );
                 off += la_ssm;

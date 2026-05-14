@@ -45,6 +45,7 @@
 use metal::NSUInteger;
 
 use super::expert_forward::MoeBuffers;
+use super::graph::{BufferPool, MetalBufferPool};
 use super::expert_io::ExpertFiles;
 use super::gpu_attn::{encode_sdpa_causal_tiled, BatchedSdpaPipelines};
 use super::gpu_matvec::{encode_matvec, MatvecPipelines, MatvecSpec};
@@ -87,7 +88,8 @@ pub(super) fn full_attn_pre_moe_layer_forward(
     wf: &WeightFile,
     wf_buf: &MtlWeightBuf,
     layer_cache: &LayerWeightCache,
-    buffers: &mut LayerForwardBuffers,
+    buffers: &LayerForwardBuffers,
+    buffer_pool: &MetalBufferPool,
     layer_idx: usize,
     pos: i32,
     k_active: usize,
@@ -175,11 +177,11 @@ pub(super) fn full_attn_pre_moe_layer_forward(
             encode_rms_norm_bf16_into(
                 cmdbuf,
                 &rms_pipes,
-                &buffers.input,
+                buffer_pool.handle(buffers.input),
                 wf_buf.buffer(),
                 layer_cache.input_layernorm_w,
-                &buffers.sum_sq,
-                &buffers.normed,
+                buffer_pool.handle(buffers.sum_sq),
+                buffer_pool.handle(buffers.normed),
                 v.hidden_dim as u32,
                 super::variants::RMS_NORM_EPS,
             );
@@ -190,8 +192,8 @@ pub(super) fn full_attn_pre_moe_layer_forward(
                 w_off: q_w,
                 s_off: q_s,
                 b_off: q_b,
-                input: &buffers.normed,
-                output: &buffers.q_proj_out,
+                input: buffer_pool.handle(buffers.normed),
+                output: buffer_pool.handle(buffers.q_proj_out),
                 out_dim: q_proj_dim as u32,
                 in_dim: v.hidden_dim as u32,
                 bits: q_bits,
@@ -200,8 +202,8 @@ pub(super) fn full_attn_pre_moe_layer_forward(
                 w_off: k_w,
                 s_off: k_s,
                 b_off: k_b,
-                input: &buffers.normed,
-                output: &buffers.k_out,
+                input: buffer_pool.handle(buffers.normed),
+                output: buffer_pool.handle(buffers.k_out),
                 out_dim: kv_dim as u32,
                 in_dim: v.hidden_dim as u32,
                 bits: k_bits,
@@ -210,8 +212,8 @@ pub(super) fn full_attn_pre_moe_layer_forward(
                 w_off: v_w,
                 s_off: v_s,
                 b_off: v_b,
-                input: &buffers.normed,
-                output: &buffers.v_out,
+                input: buffer_pool.handle(buffers.normed),
+                output: buffer_pool.handle(buffers.v_out),
                 out_dim: kv_dim as u32,
                 in_dim: v.hidden_dim as u32,
                 bits: v_bits,
@@ -225,9 +227,9 @@ pub(super) fn full_attn_pre_moe_layer_forward(
     }
 
     // ── Read q_proj_out, k, v back to host ───────────────────────
-    let q_proj_host = read_buffer_to_vec(&buffers.q_proj_out, q_proj_dim);
-    let mut k_host = read_buffer_to_vec(&buffers.k_out, kv_dim);
-    let v_host = read_buffer_to_vec(&buffers.v_out, kv_dim);
+    let q_proj_host = read_buffer_to_vec(buffer_pool.handle(buffers.q_proj_out), q_proj_dim);
+    let mut k_host = read_buffer_to_vec(buffer_pool.handle(buffers.k_out), kv_dim);
+    let v_host = read_buffer_to_vec(buffer_pool.handle(buffers.v_out), kv_dim);
 
     // ── Per-head split: q_proj_out → q + q_gate ──────────────────
     // q_proj_out layout per head: `[q_h (HEAD_DIM) | gate_h
@@ -300,8 +302,8 @@ pub(super) fn full_attn_pre_moe_layer_forward(
             // happened in last layer's `complete_deferred_experts_into`
             // drain at the top of this layer's eval call).
             unsafe {
-                let k_dst = buffers.gpu_kv_k[fa_idx].contents() as *mut f32;
-                let v_dst = buffers.gpu_kv_v[fa_idx].contents() as *mut f32;
+                let k_dst = buffer_pool.handle(buffers.gpu_kv_k[fa_idx]).contents() as *mut f32;
+                let v_dst = buffer_pool.handle(buffers.gpu_kv_v[fa_idx]).contents() as *mut f32;
                 std::ptr::copy_nonoverlapping(
                     k_host.as_ptr(),
                     k_dst.add(row_start),
@@ -335,8 +337,8 @@ pub(super) fn full_attn_pre_moe_layer_forward(
         // in flight on these buffers (CMD1 above committed and waited;
         // CMD2 hasn't been built yet).
         unsafe {
-            let q_dst = buffers.gpu_attn_q.contents() as *mut f32;
-            let g_dst = buffers.gpu_attn_gate.contents() as *mut f32;
+            let q_dst = buffer_pool.handle(buffers.gpu_attn_q).contents() as *mut f32;
+            let g_dst = buffer_pool.handle(buffers.gpu_attn_gate).contents() as *mut f32;
             std::ptr::copy_nonoverlapping(q_host.as_ptr(), q_dst, q_dim);
             std::ptr::copy_nonoverlapping(
                 q_gate_host.as_ptr(),
@@ -362,7 +364,7 @@ pub(super) fn full_attn_pre_moe_layer_forward(
             &mut attn_out,
         )?;
 
-        let dst = buffers.batch_out[6].contents() as *mut f32;
+        let dst = buffer_pool.handle(buffers.batch_out[6]).contents() as *mut f32;
         // SAFETY: shared-storage; no GPU work in flight (CMD1
         // committed and waited above).
         unsafe {
@@ -373,10 +375,10 @@ pub(super) fn full_attn_pre_moe_layer_forward(
             );
         }
         debug_assert!(
-            buffers.batch_out[6].length() as usize
+            buffer_pool.handle(buffers.batch_out[6]).length() as usize
                 >= q_dim * std::mem::size_of::<f32>(),
             "batch_out[6] sized {} bytes, need {} for full-attn o_proj input",
-            buffers.batch_out[6].length() as NSUInteger,
+            buffer_pool.handle(buffers.batch_out[6]).length() as NSUInteger,
             q_dim * std::mem::size_of::<f32>(),
         );
         None
@@ -405,6 +407,7 @@ pub(super) fn full_attn_pre_moe_layer_forward(
         wf_buf,
         layer_cache,
         buffers,
+        buffer_pool,
         layer_idx,
         k_active,
         OProj {
@@ -431,7 +434,8 @@ pub(super) fn full_attn_layer_forward(
     wf: &WeightFile,
     wf_buf: &MtlWeightBuf,
     layer_cache: &LayerWeightCache,
-    buffers: &mut LayerForwardBuffers,
+    buffers: &LayerForwardBuffers,
+    buffer_pool: &MetalBufferPool,
     moe: &mut MoeBuffers,
     deferred: &mut super::deferred::DeferredRing,
     layer_idx: usize,
@@ -455,6 +459,7 @@ pub(super) fn full_attn_layer_forward(
         wf_buf,
         layer_cache,
         buffers,
+        buffer_pool,
         layer_idx,
         pos,
         k_active,
@@ -465,6 +470,7 @@ pub(super) fn full_attn_layer_forward(
         metal,
         wf_buf,
         buffers,
+        buffer_pool,
         moe,
         deferred,
         layer_idx,
@@ -507,7 +513,8 @@ pub(super) fn batched_full_attn_layer_forward(
     wf: &WeightFile,
     wf_buf: &MtlWeightBuf,
     layer_cache: &LayerWeightCache,
-    buffers: &mut LayerForwardBuffers,
+    buffers: &LayerForwardBuffers,
+    buffer_pool: &MetalBufferPool,
     layer_idx: usize,
     start_pos: i32,
     n_tokens: usize,

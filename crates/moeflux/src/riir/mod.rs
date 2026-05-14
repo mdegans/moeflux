@@ -914,6 +914,7 @@ impl RsCtx {
             deferred,
             io_pool,
             prefetch,
+            pool,
             ..
         } = self;
 
@@ -926,6 +927,7 @@ impl RsCtx {
         let moe_buffers =
             moe_buffers.as_mut().expect("ensure_linear_resources");
         let io_pool: &rayon::ThreadPool = &*io_pool;
+        let buffer_pool = pool.as_ref().expect("ensure_linear_resources");
 
         // Defensive: drain any leaked deferred state from a prior
         // failed call so this entry point stays safe to call
@@ -946,7 +948,8 @@ impl RsCtx {
         unsafe {
             std::ptr::copy_nonoverlapping(
                 hidden_in.as_ptr(),
-                linear_buffers.input.contents() as *mut f32,
+                buffer_pool.handle(linear_buffers.input).contents()
+                    as *mut f32,
                 v.hidden_dim,
             );
         }
@@ -974,6 +977,7 @@ impl RsCtx {
                 wf_buf,
                 &layer_caches[layer_idx_us],
                 linear_buffers,
+                buffer_pool,
                 moe_buffers,
                 deferred,
                 layer_idx_us,
@@ -1002,6 +1006,7 @@ impl RsCtx {
                 wf_buf,
                 &layer_caches[layer_idx_us],
                 linear_buffers,
+                buffer_pool,
                 moe_buffers,
                 deferred,
                 layer_idx_us,
@@ -1029,7 +1034,7 @@ impl RsCtx {
         // flight against `linear_buffers.input`.
         let buf_input_slice = unsafe {
             std::slice::from_raw_parts_mut(
-                linear_buffers.input.contents() as *mut f32,
+                buffer_pool.handle(linear_buffers.input).contents() as *mut f32,
                 v.hidden_dim,
             )
         };
@@ -1043,7 +1048,7 @@ impl RsCtx {
         // Read post-forward hidden state out of buffers.input.
         unsafe {
             std::ptr::copy_nonoverlapping(
-                linear_buffers.input.contents() as *const f32,
+                buffer_pool.handle(linear_buffers.input).contents() as *const f32,
                 hidden_out.as_mut_ptr(),
                 v.hidden_dim,
             );
@@ -1075,6 +1080,7 @@ impl RsCtx {
             .linear_buffers
             .as_ref()
             .ok_or(RsError::EvalFailed)?;
+        let pool = self.pool.as_ref().ok_or(RsError::EvalFailed)?;
         let v = VARIANT;
         let read_into = |buf: &::metal::Buffer, dst: Option<&mut [f32]>| {
             if let Some(dst) = dst {
@@ -1087,11 +1093,11 @@ impl RsCtx {
                 }
             }
         };
-        read_into(&bufs.normed, h_post_out);
-        read_into(&bufs.h_mid, h_mid_out);
-        read_into(&bufs.shared_out, shared_out_out);
+        read_into(pool.handle(bufs.normed), h_post_out);
+        read_into(pool.handle(bufs.h_mid), h_mid_out);
+        read_into(pool.handle(bufs.shared_out), shared_out_out);
         if let Some(gate_dst) = gate_score_out {
-            let s = bufs.batch_out[5].contents() as *const f32;
+            let s = pool.handle(bufs.batch_out[5]).contents() as *const f32;
             // SAFETY: shared storage.
             *gate_dst = unsafe { *s };
         }
@@ -1251,10 +1257,14 @@ impl RsCtx {
                 .map_err(|_| RsError::InitFailed)?;
             self.layer_caches = Some(caches);
         }
-        if self.linear_buffers.is_none() {
+        if self.pool.is_none() {
             let device =
                 self.metal.as_ref().expect("just-set").device().to_owned();
-            self.linear_buffers = Some(LinearAttnBuffers::new(&device));
+            self.pool = Some(graph::MetalBufferPool::new(device));
+        }
+        if self.linear_buffers.is_none() {
+            let pool = self.pool.as_mut().expect("just-set");
+            self.linear_buffers = Some(LinearAttnBuffers::new(pool));
         }
         if self.moe_buffers.is_none() {
             let device =
@@ -1268,11 +1278,6 @@ impl RsCtx {
                 GpuLmHead::new(metal, &self.wf, wf_buf)
                     .map_err(|_| RsError::InitFailed)?,
             );
-        }
-        if self.pool.is_none() {
-            let device =
-                self.metal.as_ref().expect("just-set").device().to_owned();
-            self.pool = Some(graph::MetalBufferPool::new(device));
         }
         Ok(())
     }
@@ -1584,6 +1589,7 @@ impl RsCtx {
                     wf_buf,
                     &layer_caches[layer_idx],
                     linear_buffers,
+                    pool,
                     layer_idx,
                     start_pos,
                     n,
@@ -1618,6 +1624,7 @@ impl RsCtx {
                     wf_buf,
                     &layer_caches[layer_idx],
                     linear_buffers,
+                    pool,
                     layer_idx,
                     n,
                     k_active,
@@ -2169,6 +2176,7 @@ impl RsCtx {
             lm_head_gpu,
             io_pool,
             prefetch,
+            pool,
             ..
         } = self;
         let metal = metal.as_mut().expect("ensure_linear_resources");
@@ -2182,6 +2190,7 @@ impl RsCtx {
         let lm_head_gpu =
             lm_head_gpu.as_ref().expect("ensure_linear_resources");
         let io_pool: &rayon::ThreadPool = &*io_pool;
+        let buffer_pool = pool.as_ref().expect("ensure_linear_resources");
 
         // Defensive bracket — drain stale state from a buggy prior
         // call so re-entrancy holds.
@@ -2193,7 +2202,7 @@ impl RsCtx {
         {
             let buf_input_slice = unsafe {
                 std::slice::from_raw_parts_mut(
-                    linear_buffers.input.contents() as *mut f32,
+                    buffer_pool.handle(linear_buffers.input).contents() as *mut f32,
                     v.hidden_dim,
                 )
             };
@@ -2288,6 +2297,7 @@ impl RsCtx {
                     wf_buf,
                     &layer_caches[layer_idx],
                     linear_buffers,
+                    buffer_pool,
                     moe_buffers,
                     deferred,
                     layer_idx,
@@ -2316,6 +2326,7 @@ impl RsCtx {
                     wf_buf,
                     &layer_caches[layer_idx],
                     linear_buffers,
+                    buffer_pool,
                     moe_buffers,
                     deferred,
                     layer_idx,
@@ -2408,13 +2419,15 @@ impl RsCtx {
     /// freshly-allocated Ctx.
     pub fn memory_clear(&mut self) {
         clear_all(&mut self.layer_states);
-        if let Some(bufs) = self.linear_buffers.as_mut() {
-            bufs.reset_recurrence();
+        if let (Some(bufs), Some(pool)) =
+            (self.linear_buffers.as_ref(), self.pool.as_ref())
+        {
+            bufs.reset_recurrence(pool);
             // Slice 5d-7b — zero the GPU full-attn KV mirrors
             // alongside the host-side clear. Without this, the GPU
             // SDPA fast path would read stale k/v from the previous
             // sequence at positions [0, prev_len).
-            bufs.reset_gpu_attn_kv_mirrors();
+            bufs.reset_gpu_attn_kv_mirrors(pool);
         }
         // Slice 5d-6b: drain any in-flight prefetch and clear all
         // last-token predictions. After memory_clear the next token
@@ -2620,6 +2633,7 @@ impl RsCtx {
             buf,
             &self.layer_states,
             self.linear_buffers.as_ref(),
+            self.pool.as_ref(),
         )
     }
 
@@ -2670,12 +2684,14 @@ impl RsCtx {
         let Self {
             layer_states,
             linear_buffers,
+            pool,
             ..
         } = self;
         state_snapshot::state_load(
             buf,
             layer_states,
             linear_buffers.as_mut(),
+            pool.as_ref(),
             &device,
         )
     }
