@@ -2066,12 +2066,18 @@ impl Backend for MetalBackend {
                 total,
                 ..
             } => {
+                // Kernel takes (dim, K) where total = K * dim; the inner
+                // loop only sees `total`. Pass K=1 and dim=total so the
+                // arithmetic resolves to our flat dispatch shape.
+                let dim = *total;
+                let k_one: u32 = 1;
                 let enc = cmd.new_compute_command_encoder();
                 enc.set_compute_pipeline_state(&self.swiglu_fused_batched_pso);
                 enc.set_buffer(0, Some(self.pool.handle(*gate)), 0);
                 enc.set_buffer(1, Some(self.pool.handle(*up)), 0);
                 enc.set_buffer(2, Some(self.pool.handle(*out)), 0);
-                enc.set_bytes(3, 4, (total as *const u32).cast());
+                enc.set_bytes(3, 4, (&dim as *const u32).cast());
+                enc.set_bytes(4, 4, (&k_one as *const u32).cast());
                 let num_tgs = (*total + 255) / 256;
                 enc.dispatch_thread_groups(
                     MTLSize::new(num_tgs as NSUInteger, 1, 1),
