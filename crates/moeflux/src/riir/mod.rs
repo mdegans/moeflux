@@ -80,6 +80,9 @@ pub use linear_attn::{
     conv1d_step, gated_delta_recurrence, rms_norm_bare, rms_norm_gated,
     LinearAttnError,
 };
+// S7-6c: trait scope for `pool.alloc/handle/upload/download/reset_transient`
+// in `step_internal_batched_gqa`.
+use graph::BufferPool as _;
 pub use lm_head::{lm_head_cpu, LmHeadError};
 pub use metal::{MetalContext, MetalError, MtlBuffer};
 pub use moe_router::{moe_router_cpu, MoeRouterError};
@@ -326,6 +329,14 @@ pub struct RsCtx {
     /// pipeline for the GPU residual stream. Same kernel the
     /// linear-attn path uses internally.
     residual_add_pipe: Option<::metal::ComputePipelineState>,
+    /// Session 9 / S7-6c: graph-mode buffer pool. Owns persistent
+    /// and transient BufIds backing the active forward path's
+    /// hidden state (S7-6c-1), linear-attn / MoE scratch (S7-6c-2),
+    /// and per-layer Op outputs (S7-6d). Allocated alongside
+    /// `metal` in [`Self::ensure_linear_resources`]. Lives for the
+    /// `RsCtx`'s lifetime; `reset_transient` is called at each
+    /// chunk end to release non-persistent slots.
+    pool: Option<graph::MetalBufferPool>,
     // Future phases populate: vocab.
 }
 
@@ -382,6 +393,7 @@ impl RsCtx {
             mla_residual_scratch: None,
             mla_norm_pipes: None,
             residual_add_pipe: None,
+            pool: None,
         })
     }
 
@@ -1257,6 +1269,11 @@ impl RsCtx {
                     .map_err(|_| RsError::InitFailed)?,
             );
         }
+        if self.pool.is_none() {
+            let device =
+                self.metal.as_ref().expect("just-set").device().to_owned();
+            self.pool = Some(graph::MetalBufferPool::new(device));
+        }
         Ok(())
     }
 
@@ -1452,6 +1469,7 @@ impl RsCtx {
             lm_head_gpu,
             io_pool,
             prefetch,
+            pool,
             ..
         } = self;
         let metal = metal.as_mut().expect("ensure_linear_resources");
@@ -1465,6 +1483,7 @@ impl RsCtx {
         let lm_head_gpu =
             lm_head_gpu.as_ref().expect("ensure_linear_resources");
         let io_pool: &rayon::ThreadPool = &*io_pool;
+        let pool = pool.as_mut().expect("ensure_linear_resources");
 
         // Drain any stale deferred state — neither batched path uses
         // the ring, but a prior per-token oracle call on the same
@@ -1501,11 +1520,26 @@ impl RsCtx {
             )
             .map_err(|_| RsError::EvalFailed)?;
         }
-        let device = metal.device().clone();
-        let mut hidden_a =
-            MtlBuffer::<f32>::with_data(&device, &hidden_stack_host);
-        let mut hidden_b =
-            MtlBuffer::<f32>::with_len(&device, n * hidden_dim);
+        // S7-6c-1: allocate hidden_a / hidden_b in the graph-mode
+        // pool. Transient (released by `pool.reset_transient()` at
+        // step end) — sized exactly to this step's n × hidden_dim.
+        let hidden_bytes = n * hidden_dim * std::mem::size_of::<f32>();
+        let mut hidden_a_id = pool
+            .alloc(hidden_bytes, "step.hidden_a", false)
+            .expect("pool alloc hidden_a");
+        let mut hidden_b_id = pool
+            .alloc(hidden_bytes, "step.hidden_b", false)
+            .expect("pool alloc hidden_b");
+        {
+            let stack_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    hidden_stack_host.as_ptr() as *const u8,
+                    std::mem::size_of_val(&hidden_stack_host[..]),
+                )
+            };
+            pool.upload(hidden_a_id, stack_bytes)
+                .expect("pool upload hidden_a embeddings");
+        }
 
         for layer_idx in 0..v.num_layers {
             let prefetch_set = layer_idx % 2;
@@ -1557,8 +1591,8 @@ impl RsCtx {
                     experts,
                     kv_state,
                     prefetch_env,
-                    hidden_a.buffer(),
-                    hidden_b.buffer(),
+                    pool.handle(hidden_a_id),
+                    pool.handle(hidden_b_id),
                 )
                 .map_err(|_| RsError::EvalFailed)?;
             } else {
@@ -1590,23 +1624,33 @@ impl RsCtx {
                     experts,
                     layer_state,
                     prefetch_env,
-                    hidden_a.buffer(),
-                    hidden_b.buffer(),
+                    pool.handle(hidden_a_id),
+                    pool.handle(hidden_b_id),
                 )
                 .map_err(|_| RsError::EvalFailed)?;
             }
             // Swap GPU buffers: this layer wrote `hidden_b`; next
             // layer reads it as `hidden_a` and writes the previously-
-            // input buffer.
-            std::mem::swap(&mut hidden_a, &mut hidden_b);
+            // input buffer. Swapping BufIds (not buffer handles) is
+            // safe because we re-fetch via `pool.handle(...)` each
+            // iteration.
+            std::mem::swap(&mut hidden_a_id, &mut hidden_b_id);
         }
 
         // Final norm + lm_head on the LAST token's hidden state.
-        // `hidden_a` now holds the final layer's output (after the
-        // final swap). Read the last token's row to host for the
-        // CPU rms_norm pass.
+        // `hidden_a_id` now references the buffer that the final
+        // layer wrote (post-swap). Read the last token's row to host
+        // for the CPU rms_norm pass.
         if let Some(logits) = logits_out {
-            let hidden_final_host = hidden_a.to_vec();
+            let mut hidden_final_host = vec![0.0f32; n * hidden_dim];
+            let bytes_out: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(
+                    hidden_final_host.as_mut_ptr() as *mut u8,
+                    hidden_bytes,
+                )
+            };
+            pool.download(hidden_a_id, bytes_out)
+                .expect("pool download hidden_final");
             let last_row = &hidden_final_host
                 [(n - 1) * hidden_dim..n * hidden_dim];
             let mut hidden_normed = vec![0.0f32; hidden_dim];
@@ -1621,6 +1665,10 @@ impl RsCtx {
                 .forward(metal, wf_buf, &hidden_normed, logits)
                 .map_err(|_| RsError::EvalFailed)?;
         }
+        // Release the transient hidden BufIds so the pool doesn't
+        // grow unbounded across steps. Persistent BufIds (none yet
+        // at S7-6c-1) would survive this call.
+        pool.reset_transient();
         Ok(())
     }
 
