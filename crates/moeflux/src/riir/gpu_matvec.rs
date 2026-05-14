@@ -73,6 +73,7 @@ pub struct MatvecPipelines {
     pub v3_8bit: ComputePipelineState,
     pub v3_4bit_n: ComputePipelineState,
     pub fast_4bit_n: ComputePipelineState,
+    pub v3_8bit_n: ComputePipelineState,
 }
 
 impl MatvecPipelines {
@@ -86,6 +87,9 @@ impl MatvecPipelines {
                 .clone(),
             fast_4bit_n: metal
                 .pipeline("dequant_matvec_4bit_fast_n_tokens")?
+                .clone(),
+            v3_8bit_n: metal
+                .pipeline("dequant_matvec_8bit_v3_n_tokens")?
                 .clone(),
         })
     }
@@ -168,16 +172,18 @@ pub fn encode_matvec_n_tokens(
     bits: u32,
 ) {
     assert!(
-        bits == 4,
-        "encode_matvec_n_tokens: only 4-bit supported (got bits={})",
+        bits == 4 || bits == 8,
+        "encode_matvec_n_tokens: only 4-bit / 8-bit supported (got bits={})",
         bits
     );
     if n_tokens == 0 {
         return;
     }
     let group_size = GROUP_SIZE as u32;
-    let use_v3 = in_dim <= 4096;
-    let pipeline = if use_v3 {
+    let use_v3 = bits == 8 || in_dim <= 4096;
+    let pipeline = if bits == 8 {
+        &pipes.v3_8bit_n
+    } else if use_v3 {
         &pipes.v3_4bit_n
     } else {
         &pipes.fast_4bit_n

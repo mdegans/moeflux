@@ -595,6 +595,85 @@ kernel void dequant_matvec_8bit_v3(
 
 
 // ============================================================================
+// Kernel: 8-bit dequant matvec, N tokens
+// ============================================================================
+// Batched-prefill variant of `dequant_matvec_8bit_v3`. Same per-(row, token)
+// arithmetic, with an outer token-axis sweep encoded as
+// `tgid_flat = token * num_row_tiles + row_tile`. Per-(row, token) result
+// is bit-exact against `dequant_matvec_8bit_v3` for N=1.
+//
+// `x_shared` size: 4096 floats = 16 KB tg-mem (limit on Apple Silicon
+// is 32 KB). in_dim must be ≤ 4096.
+
+kernel void dequant_matvec_8bit_v3_n_tokens(
+    device const uint32_t* W_packed   [[buffer(0)]],  // [out_dim, in_dim/4]
+    device const uint16_t* scales     [[buffer(1)]],  // [out_dim, num_groups] bf16
+    device const uint16_t* biases     [[buffer(2)]],  // [out_dim, num_groups] bf16
+    device const float*    x_inputs   [[buffer(3)]],  // [n_tokens, in_dim]
+    device float*          out        [[buffer(4)]],  // [n_tokens, out_dim]
+    constant uint&         out_dim    [[buffer(5)]],
+    constant uint&         in_dim     [[buffer(6)]],
+    constant uint&         group_size [[buffer(7)]],
+    constant uint&         n_tokens   [[buffer(8)]],
+    constant uint&         num_row_tiles [[buffer(9)]],  // (out_dim + ROWS_PER_TG-1) / ROWS_PER_TG
+    uint tgid_flat  [[threadgroup_position_in_grid]],
+    uint lid        [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint token    = tgid_flat / num_row_tiles;
+    uint row_tile = tgid_flat % num_row_tiles;
+    uint row      = row_tile * ROWS_PER_TG + simd_group;
+
+    uint packed_cols = in_dim / 4;
+    uint num_groups  = in_dim / group_size;
+
+    threadgroup float x_shared[4096];
+
+    device const float* x_token =
+        x_inputs + (size_t)token * (size_t)in_dim;
+
+    for (uint i = lid; i < in_dim; i += 256) {
+        x_shared[i] = x_token[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (token >= n_tokens) return;
+    if (row >= out_dim) return;
+
+    device const uint32_t* w_row = W_packed + row * packed_cols;
+    device const uint16_t* s_row = scales   + row * num_groups;
+    device const uint16_t* b_row = biases   + row * num_groups;
+
+    float acc = 0.0f;
+
+    for (uint col = simd_lane; col < packed_cols; col += 32) {
+        uint g = col / (group_size / 4);
+        float scale = bf16_to_f32(s_row[g]);
+        float bias  = bf16_to_f32(b_row[g]);
+
+        uint32_t packed = w_row[col];
+        uint x_base = col * 4;
+
+        float sx0 = scale * x_shared[x_base + 0];  float bx0 = bias * x_shared[x_base + 0];
+        float sx1 = scale * x_shared[x_base + 1];  float bx1 = bias * x_shared[x_base + 1];
+        float sx2 = scale * x_shared[x_base + 2];  float bx2 = bias * x_shared[x_base + 2];
+        float sx3 = scale * x_shared[x_base + 3];  float bx3 = bias * x_shared[x_base + 3];
+
+        acc += fma(float((packed >>  0) & 0xFFu), sx0, bx0);
+        acc += fma(float((packed >>  8) & 0xFFu), sx1, bx1);
+        acc += fma(float((packed >> 16) & 0xFFu), sx2, bx2);
+        acc += fma(float((packed >> 24) & 0xFFu), sx3, bx3);
+    }
+
+    float sum = simd_sum(acc);
+    if (simd_lane == 0) {
+        out[(size_t)token * (size_t)out_dim + row] = sum;
+    }
+}
+
+
+// ============================================================================
 // Kernel 1f: 4-bit dequant matvec with LUT (eliminates uint→float conversions)
 // ============================================================================
 // Instead of converting each nibble to float (expensive conversion instruction),

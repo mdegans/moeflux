@@ -536,9 +536,9 @@ pub(super) fn batched_full_attn_layer_forward(
 
     let mut h_mid_stack = vec![0.0f32; n_tokens * hidden_dim];
     let mut h_post_stack = vec![0.0f32; n_tokens * hidden_dim];
-    let mut all_routing_indices = Vec::with_capacity(n_tokens * k_active);
-    let mut all_routing_weights = Vec::with_capacity(n_tokens * k_active);
-    let mut shared_gate_scores = Vec::with_capacity(n_tokens);
+    let all_routing_indices: Vec<i32>;
+    let all_routing_weights: Vec<f32>;
+    let shared_gate_scores: Vec<f32>;
 
     let kv_start = kv_state.len;
     if (kv_start as usize) + n_tokens > super::variants::MAX_SEQ_LEN {
@@ -806,51 +806,116 @@ pub(super) fn batched_full_attn_layer_forward(
         o_bits,
     );
     metal.commit_and_wait_labeled(cmdbuf, "batched_o_proj");
-    let o_proj_stack = o_proj_buf.to_vec();
 
-    // ── Phase 3c: per-token residual_add + post-attn rms_norm + gate
-    //    logits + shared-gate scalar + CPU routing. No shared FFN —
-    //    that's batched externally in Phase 3d. ──────────────────
-    for t in 0..n_tokens {
-        // SAFETY: shared-storage; previous iteration's cmdbuf
-        // committed and waited so no GPU work is in flight on these
-        // buffers.
-        unsafe {
-            let dst_out = buffers.output.contents() as *mut f32;
-            std::ptr::copy_nonoverlapping(
-                o_proj_stack[t * hidden_dim..].as_ptr(),
-                dst_out,
-                hidden_dim,
-            );
-            let dst_in = buffers.input.contents() as *mut f32;
-            std::ptr::copy_nonoverlapping(
-                hidden_in[t * hidden_dim..].as_ptr(),
-                dst_in,
-                hidden_dim,
-            );
-        }
-
-        let tail_queue = metal.queue_clone();
-        let tail_cmdbuf = tail_queue.new_command_buffer();
-        let intermediates = post_attention_residual_norm_route(
-            metal,
-            tail_cmdbuf,
-            wf,
-            wf_buf,
-            layer_cache,
-            buffers,
-            layer_idx,
-            k_active,
-        )?;
-
-        h_mid_stack[t * hidden_dim..(t + 1) * hidden_dim]
-            .copy_from_slice(&read_buffer_to_vec(&buffers.h_mid, hidden_dim));
-        h_post_stack[t * hidden_dim..(t + 1) * hidden_dim]
-            .copy_from_slice(&read_buffer_to_vec(&buffers.normed, hidden_dim));
-        all_routing_indices.extend_from_slice(&intermediates.routing_indices);
-        all_routing_weights.extend_from_slice(&intermediates.routing_weights);
-        shared_gate_scores.push(intermediates.shared_gate_score);
+    // ── Phase 3c: batched residual_add + post-attn rms_norm + gate
+    //    matvec + shared-gate matvec + GPU MoE router. One cmdbuf
+    //    covers all N tokens — replaces the per-token loop that issued
+    //    N×commit_and_wait + N host bounces. The GPU MoE router
+    //    (B-0c) keeps routing on-device until one chunk-end readback.
+    //
+    //    Buffers allocated here are scoped to this phase; subsequent
+    //    phases read `h_mid_stack` / `h_post_stack` via host vectors
+    //    until B-3 wires graph-mode through the whole layer. The host
+    //    readback is one bulk transfer per layer, not N per layer.
+    let gate_bits =
+        bits_of(wf, &format!("model.layers.{layer_idx}.mlp.gate.weight"));
+    let seg_bits = bits_of(
+        wf,
+        &format!(
+            "model.layers.{layer_idx}.mlp.shared_expert_gate.weight"
+        ),
+    );
+    let resid_add_n_pso = metal
+        .pipeline("residual_add_n_tokens")?
+        .clone();
+    let router_pipes =
+        super::gpu_moe_router::MoeRouterPipelines::fetch(metal)?;
+    let h_mid_buf =
+        MtlBuffer::<f32>::with_len(&device, n_tokens * hidden_dim);
+    let h_post_buf =
+        MtlBuffer::<f32>::with_len(&device, n_tokens * hidden_dim);
+    let gate_logits_buf =
+        MtlBuffer::<f32>::with_len(&device, n_tokens * v.num_experts);
+    let shared_gate_buf = MtlBuffer::<f32>::with_len(&device, n_tokens);
+    let routing_indices_buf = MtlBuffer::<i32>::with_len(&device, n_tokens * k_active);
+    let routing_weights_buf =
+        MtlBuffer::<f32>::with_len(&device, n_tokens * k_active);
+    {
+        let queue = metal.queue_clone();
+        let cmdbuf = queue.new_command_buffer();
+        super::gpu_norm::encode_residual_add_n_tokens_into(
+            cmdbuf,
+            &resid_add_n_pso,
+            o_proj_buf.buffer(),
+            hidden_in_buf.buffer(),
+            h_mid_buf.buffer(),
+            n_tokens as u32,
+            hidden_dim as u32,
+        );
+        super::gpu_norm::encode_rms_norm_bf16_fused_n_tokens(
+            cmdbuf,
+            &rms_n_pipe,
+            h_mid_buf.buffer(),
+            wf_buf.buffer(),
+            layer_cache.post_attention_layernorm_w,
+            h_post_buf.buffer(),
+            hidden_dim as u32,
+            n_tokens as u32,
+            super::variants::RMS_NORM_EPS,
+        );
+        encode_matvec_n_tokens(
+            cmdbuf,
+            &mv,
+            wf_buf.buffer(),
+            layer_cache.gate.w,
+            layer_cache.gate.s,
+            layer_cache.gate.b,
+            h_post_buf.buffer(),
+            0,
+            gate_logits_buf.buffer(),
+            0,
+            hidden_dim as u32,
+            v.num_experts as u32,
+            n_tokens as u32,
+            gate_bits,
+        );
+        encode_matvec_n_tokens(
+            cmdbuf,
+            &mv,
+            wf_buf.buffer(),
+            layer_cache.shared.seg_w,
+            layer_cache.shared.seg_s,
+            layer_cache.shared.seg_b,
+            h_post_buf.buffer(),
+            0,
+            shared_gate_buf.buffer(),
+            0,
+            hidden_dim as u32,
+            1,
+            n_tokens as u32,
+            seg_bits,
+        );
+        super::gpu_moe_router::encode_moe_router(
+            cmdbuf,
+            &router_pipes,
+            gate_logits_buf.buffer(),
+            routing_indices_buf.buffer(),
+            routing_weights_buf.buffer(),
+            n_tokens as u32,
+            v.num_experts as u32,
+            k_active as u32,
+        );
+        metal.commit_and_wait_labeled(
+            cmdbuf,
+            "batched_post_attn_residual_norm_route",
+        );
     }
+    // Bulk readback (one transfer per layer, not N).
+    h_mid_stack.copy_from_slice(&h_mid_buf.to_vec());
+    h_post_stack.copy_from_slice(&h_post_buf.to_vec());
+    all_routing_indices = routing_indices_buf.to_vec();
+    all_routing_weights = routing_weights_buf.to_vec();
+    shared_gate_scores = shared_gate_buf.to_vec();
 
     // ── Phase 3d: batched shared FFN (gate matvec, up matvec,
     //    flat-element-wise swiglu, down matvec) over h_post_stack. ─
