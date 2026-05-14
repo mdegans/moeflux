@@ -471,3 +471,160 @@ fn graph_metal_matches_cpu_moe_router_normalize() {
         max_abs
     );
 }
+
+// ============================================================================
+// Test: graph_metal_matches_cpu_colored — load-bearing S7-5 gate
+// ============================================================================
+//
+// 10-op residual chain forces aliasing opportunities. Per-op:
+//
+//     tmp_0 = a + b
+//     tmp_i = tmp_{i-1} + b   for i in 1..10
+//
+// `a` and `b` are non-colorable inputs (read but never written by an
+// Op); `tmp_0..tmp_9` are all colorable. Adjacent tmps overlap at one
+// op so greedy coloring produces 2 colors. Total BufIds = 12;
+// physical_buffer_count after `commit_plan` = 2 (inputs) + 2 (colors)
+// = 4.
+//
+// The test asserts:
+// 1. cpu_out matches gpu_out at cosine ≥ COSINE_FLOOR (correctness).
+// 2. Both pools have `physical_buffer_count() < 12` (aliasing happened).
+// 3. CPU and Metal pools agree on `physical_buffer_count()`
+//    (deterministic coloring).
+
+#[test]
+#[ignore = "long-running GPU test"]
+fn graph_metal_matches_cpu_colored() {
+    let n_tokens: u32 = 4;
+    let dim: u32 = 32;
+    let total = (n_tokens * dim) as usize;
+    let n_intermediates: u32 = 10;
+    let bufid_count: u32 = 2 + n_intermediates; // a, b, tmp_0..tmp_9
+    let mut rng = Rng::new(0xA3B_C010_4ED);
+    let a_data: Vec<f32> = (0..total).map(|_| rng.next_f32_unit()).collect();
+    let b_data: Vec<f32> = (0..total).map(|_| rng.next_f32_unit()).collect();
+
+    // Build a Graph against the given (pool, a, b, tmps) IDs.
+    let build_graph =
+        |a: moeflux::riir::graph::BufId,
+         b: moeflux::riir::graph::BufId,
+         tmps: &[moeflux::riir::graph::BufId]| {
+            let mut g = Graph::new();
+            // op 0: tmp_0 = a + b
+            g.push(Op::ResidualAddNTokens {
+                label: "tmp_0",
+                a,
+                b,
+                out: tmps[0],
+                n_tokens,
+                dim,
+            });
+            // op i: tmp_i = tmp_{i-1} + b
+            for i in 1..(n_intermediates as usize) {
+                g.push(Op::ResidualAddNTokens {
+                    label: "tmp_i",
+                    a: tmps[i - 1],
+                    b,
+                    out: tmps[i],
+                    n_tokens,
+                    dim,
+                });
+            }
+            g
+        };
+
+    // CPU path
+    let mut cpu_wf = dummy_weight_file("colored_cpu");
+    let mut cpu = CpuBackend::new(cpu_wf.take());
+    let cpu_a = cpu.pool_mut().alloc(total * 4, "a", false).unwrap();
+    let cpu_b = cpu.pool_mut().alloc(total * 4, "b", false).unwrap();
+    let mut cpu_tmps = Vec::new();
+    for _ in 0..n_intermediates {
+        cpu_tmps.push(cpu.pool_mut().alloc(total * 4, "tmp", false).unwrap());
+    }
+    cpu.pool_mut().upload(cpu_a, bytes_of_f32(&a_data)).unwrap();
+    cpu.pool_mut().upload(cpu_b, bytes_of_f32(&b_data)).unwrap();
+    let g_cpu = build_graph(cpu_a, cpu_b, &cpu_tmps);
+    // Apply coloring.
+    cpu.pool_mut().commit_plan(&g_cpu);
+    let cpu_phys = cpu.pool().physical_buffer_count();
+    cpu.execute(&g_cpu).unwrap();
+    let mut cpu_out_bytes = vec![0u8; total * 4];
+    cpu.pool()
+        .download(*cpu_tmps.last().unwrap(), &mut cpu_out_bytes)
+        .unwrap();
+    let cpu_out_f32 = f32_of_bytes(&cpu_out_bytes);
+
+    // GPU path
+    let mut gpu_wf = dummy_weight_file("colored_gpu");
+    let metal_ctx = MetalContext::new().expect("MetalContext::new");
+    let wf_ref = gpu_wf.wf.as_ref().unwrap();
+    let wf_buf = MtlWeightBuf::wrap(wf_ref, metal_ctx.device());
+    let _ = gpu_wf.take();
+    let mut gpu = MetalBackend::new(metal_ctx, wf_buf).expect("MetalBackend::new");
+    let gpu_a = gpu.pool_mut().alloc(total * 4, "a", false).unwrap();
+    let gpu_b = gpu.pool_mut().alloc(total * 4, "b", false).unwrap();
+    let mut gpu_tmps = Vec::new();
+    for _ in 0..n_intermediates {
+        gpu_tmps.push(gpu.pool_mut().alloc(total * 4, "tmp", false).unwrap());
+    }
+    gpu.pool_mut().upload(gpu_a, bytes_of_f32(&a_data)).unwrap();
+    gpu.pool_mut().upload(gpu_b, bytes_of_f32(&b_data)).unwrap();
+    let g_gpu = build_graph(gpu_a, gpu_b, &gpu_tmps);
+    gpu.pool_mut().commit_plan(&g_gpu);
+    let gpu_phys = gpu.pool().physical_buffer_count();
+    gpu.execute(&g_gpu).unwrap();
+    let mut gpu_out_bytes = vec![0u8; total * 4];
+    gpu.pool()
+        .download(*gpu_tmps.last().unwrap(), &mut gpu_out_bytes)
+        .unwrap();
+    let gpu_out_f32 = f32_of_bytes(&gpu_out_bytes);
+
+    let cos = cosine_sim(&cpu_out_f32, &gpu_out_f32);
+    let max_abs = cpu_out_f32
+        .iter()
+        .zip(gpu_out_f32.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    eprintln!(
+        "[s7-5 colored] N={} dim={} chain={} bufid_count={} cpu_phys={} gpu_phys={} cos={:.9} max_abs={:.3e}",
+        n_tokens,
+        dim,
+        n_intermediates,
+        bufid_count,
+        cpu_phys,
+        gpu_phys,
+        cos,
+        max_abs
+    );
+
+    // Correctness: CPU and Metal agree on the final tmp.
+    assert!(
+        cos >= COSINE_FLOOR,
+        "cosine {} below floor {} (max_abs={})",
+        cos,
+        COSINE_FLOOR,
+        max_abs
+    );
+    // Aliasing happened: both pools should be well under bufid_count.
+    assert!(
+        cpu_phys < bufid_count as usize,
+        "CPU pool physical={} not less than bufid_count={}",
+        cpu_phys,
+        bufid_count
+    );
+    assert!(
+        gpu_phys < bufid_count as usize,
+        "GPU pool physical={} not less than bufid_count={}",
+        gpu_phys,
+        bufid_count
+    );
+    // Determinism: CPU and Metal pools should pick the same physical
+    // layout because the coloring algorithm is deterministic and they
+    // both see identical Graphs.
+    assert_eq!(
+        cpu_phys, gpu_phys,
+        "CPU and Metal pools disagree on physical_buffer_count"
+    );
+}
