@@ -656,6 +656,7 @@ impl Graph {
 }
 
 pub mod cpu;
+pub mod lifetime;
 pub mod metal;
 
 pub use cpu::{CpuBackend, CpuBufferPool};
