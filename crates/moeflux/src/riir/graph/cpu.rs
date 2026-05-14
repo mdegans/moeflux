@@ -17,7 +17,7 @@ use crate::riir::cpu_matvec::{
 use crate::riir::cpu_ops::{cpu_sigmoid_scalar, residual_add_n_tokens_cpu};
 use crate::riir::embedding::bf16_to_f32;
 use crate::riir::linear_attn::{
-    compute_decay_beta_cpu, conv1d_step, gated_delta_recurrence,
+    compute_decay_beta_cpu, conv1d_step, gated_delta_recurrence_supplied,
 };
 use crate::riir::moe_cpu::moe_permute_fuse_cpu;
 use crate::riir::variants::{GROUP_SIZE, VARIANT};
@@ -1051,34 +1051,14 @@ impl Backend for CpuBackend {
                     let q = &conv_t[0..key_total];
                     let k = &conv_t[key_total..2 * key_total];
                     let v = &conv_t[2 * key_total..3 * key_total];
-                    // a_log + dt_bias not used in this Op (consumed by
-                    // ComputeDecayBeta upstream); gated_delta_recurrence
-                    // takes their results.
                     let g = &g_decay_buf
                         [t * v_heads..(t + 1) * v_heads];
                     let bg = &beta_gate_buf
                         [t * v_heads..(t + 1) * v_heads];
                     let mut out_t = vec![0.0f32; value_total];
-                    // Build the recurrence inputs: alpha/beta were
-                    // already consumed; we need a_log / dt_bias_bf16.
-                    // For the CPU oracle, we pass dummy a_log/dt_bias
-                    // because gated_delta_recurrence is structured to
-                    // include the decay-beta math. Refinement: split
-                    // gated_delta_recurrence into pre-decay + post-decay
-                    // pieces. For now, this Op assumes ComputeDecayBeta
-                    // has already produced g_decay/beta_gate, and the
-                    // recurrence consumes those directly.
-                    //
-                    // TODO(s7-graph-cleanup): produce a recurrence-only
-                    // CPU helper that takes (g, bg, q, k, v) and writes
-                    // out_values without re-computing the decay step.
-                    let a_log_dummy = vec![0.0f32; v_heads];
-                    let dt_dummy = vec![0u8; v_heads * 2];
-                    gated_delta_recurrence(
-                        &a_log_dummy,
-                        &dt_dummy,
-                        g, // alpha treated as g_decay input
-                        bg, // beta treated as beta_gate input
+                    gated_delta_recurrence_supplied(
+                        g,
+                        bg,
                         q,
                         k,
                         v,

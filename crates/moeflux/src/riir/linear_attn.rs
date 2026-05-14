@@ -300,6 +300,50 @@ pub fn gated_delta_recurrence(
     ssm_state: &mut [f32],
     out_values: &mut [f32],
 ) -> Result<(), LinearAttnError> {
+    if v_heads == 0 {
+        return Err(LinearAttnError::ZeroDim);
+    }
+    if alpha.len() != v_heads || beta.len() != v_heads {
+        return Err(LinearAttnError::InputLen {
+            got: alpha.len(),
+            expected: v_heads,
+        });
+    }
+    let mut g_decay = vec![0.0f32; v_heads];
+    let mut beta_gate = vec![0.0f32; v_heads];
+    compute_decay_beta_cpu(
+        alpha,
+        beta,
+        a_log,
+        dt_bias_bf16,
+        &mut g_decay,
+        &mut beta_gate,
+    )?;
+    gated_delta_recurrence_supplied(
+        &g_decay, &beta_gate, q, k, v, v_heads, k_heads, key_dim, value_dim,
+        ssm_state, out_values,
+    )
+}
+
+/// Recurrence-only variant of [`gated_delta_recurrence`] that takes
+/// pre-computed `g_decay` and `beta_gate` instead of deriving them
+/// from `alpha`/`beta`/`a_log`/`dt_bias`. Used by the Graph
+/// compiler's `GatedDeltaNetStepNTokens` op, where the decay/beta
+/// math is a separate `ComputeDecayBetaNTokens` op upstream.
+#[allow(clippy::too_many_arguments)]
+pub fn gated_delta_recurrence_supplied(
+    g_decay: &[f32],
+    beta_gate: &[f32],
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    v_heads: usize,
+    k_heads: usize,
+    key_dim: usize,
+    value_dim: usize,
+    ssm_state: &mut [f32],
+    out_values: &mut [f32],
+) -> Result<(), LinearAttnError> {
     if v_heads == 0 || k_heads == 0 || key_dim == 0 || value_dim == 0 {
         return Err(LinearAttnError::ZeroDim);
     }
@@ -309,21 +353,9 @@ pub fn gated_delta_recurrence(
             expected: k_heads,
         });
     }
-    if a_log.len() != v_heads {
+    if g_decay.len() != v_heads || beta_gate.len() != v_heads {
         return Err(LinearAttnError::InputLen {
-            got: a_log.len(),
-            expected: v_heads,
-        });
-    }
-    if dt_bias_bf16.len() != v_heads * 2 {
-        return Err(LinearAttnError::InputLen {
-            got: dt_bias_bf16.len(),
-            expected: v_heads * 2,
-        });
-    }
-    if alpha.len() != v_heads || beta.len() != v_heads {
-        return Err(LinearAttnError::InputLen {
-            got: alpha.len(),
+            got: g_decay.len(),
             expected: v_heads,
         });
     }
@@ -353,22 +385,6 @@ pub fn gated_delta_recurrence(
     }
 
     let k_heads_per_v = v_heads / k_heads;
-
-    // Per-head decay + beta_gate precomputation.
-    let mut g_decay = vec![0.0f32; v_heads];
-    let mut beta_gate = vec![0.0f32; v_heads];
-    for vh in 0..v_heads {
-        let a_val = alpha[vh];
-        let dt_b = bf16_to_f32(u16::from_le_bytes([
-            dt_bias_bf16[vh * 2],
-            dt_bias_bf16[vh * 2 + 1],
-        ]));
-        let a_capital = a_log[vh].exp();
-        let softplus_val = (1.0f32 + (a_val + dt_b).exp()).ln();
-        g_decay[vh] = (-a_capital * softplus_val).exp();
-        beta_gate[vh] = 1.0f32 / (1.0f32 + (-beta[vh]).exp());
-    }
-
     let head_state_stride = value_dim * key_dim;
     for vh in 0..v_heads {
         let kh = vh / k_heads_per_v;
