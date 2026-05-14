@@ -1071,3 +1071,129 @@ fn graph_metal_matches_cpu_conv1d_step() {
     assert!(cos_out >= COSINE_FLOOR, "out cosine {} max_abs={}", cos_out, max_abs_out);
     assert!(cos_state >= COSINE_FLOOR, "state cosine {} max_abs={}", cos_state, max_abs_state);
 }
+
+// ============================================================================
+// Test: GatedDeltaNetStepNTokens through both backends (S7-6b)
+// ============================================================================
+
+#[test]
+#[ignore = "long-running GPU test"]
+fn graph_metal_matches_cpu_gated_delta_net_step() {
+    // Op assumes VARIANT.linear_total_key() for the conv_out layout
+    // and VARIANT::LINEAR_KEY_DIM for the state's key_dim, so test
+    // shapes are pinned to Qwen3.6-A3B (linear_num_k_heads=16,
+    // linear_num_v_heads=64, LINEAR_KEY_DIM=128, LINEAR_VALUE_DIM=128).
+    let n_tokens: u32 = 4;
+    let num_v_heads: u32 = 64;
+    let value_dim: u32 = 128;
+    let k_heads_per_v: u32 = 4;
+    let key_dim: usize = 128;
+    let num_k_heads: usize = 16;
+    let key_total = num_k_heads * key_dim; // 2048
+    let value_total =
+        num_v_heads as usize * value_dim as usize; // 8192
+    let conv_per_token = 2 * key_total + value_total;
+    let conv_total = n_tokens as usize * conv_per_token;
+    let gdb_per_token = num_v_heads as usize;
+    let gdb_total = n_tokens as usize * gdb_per_token;
+    let out_per_token = (num_v_heads * value_dim) as usize;
+    let out_total = n_tokens as usize * out_per_token;
+    let state_floats =
+        num_v_heads as usize * value_dim as usize * key_dim;
+    let mut rng = Rng::new(0xA3B_BB05);
+    let conv_data: Vec<f32> =
+        (0..conv_total).map(|_| rng.next_f32_unit() * 0.5).collect();
+    let g_data: Vec<f32> = (0..gdb_total)
+        .map(|_| 0.9 + rng.next_f32_unit() * 0.05) // ~[0.85, 0.95], realistic decay
+        .collect();
+    let bg_data: Vec<f32> = (0..gdb_total)
+        .map(|_| 0.5 + rng.next_f32_unit() * 0.2) // ~[0.3, 0.7]
+        .collect();
+    let initial_state: Vec<f32> = (0..state_floats)
+        .map(|_| rng.next_f32_unit() * 0.01) // small to keep recurrence stable
+        .collect();
+
+    let tensors: &[(&str, &str, i32, Vec<usize>, Vec<u8>)] = &[];
+    let mut cpu_wf = SyntheticWf::build("gated_delta_net_step_cpu", &[(
+        "dummy", "BF16", 0, vec![32], vec![0u8; 64],
+    )]);
+    let mut cpu = CpuBackend::new(cpu_wf.take());
+    let _ = tensors;
+    let cpu_state =
+        cpu.pool_mut().alloc(state_floats * 4, "state", true).unwrap();
+    let cpu_conv =
+        cpu.pool_mut().alloc(conv_total * 4, "conv", false).unwrap();
+    let cpu_g = cpu.pool_mut().alloc(gdb_total * 4, "g", false).unwrap();
+    let cpu_bg = cpu.pool_mut().alloc(gdb_total * 4, "bg", false).unwrap();
+    let cpu_out = cpu.pool_mut().alloc(out_total * 4, "out", false).unwrap();
+    cpu.pool_mut().upload(cpu_state, bytes_of_f32(&initial_state)).unwrap();
+    cpu.pool_mut().upload(cpu_conv, bytes_of_f32(&conv_data)).unwrap();
+    cpu.pool_mut().upload(cpu_g, bytes_of_f32(&g_data)).unwrap();
+    cpu.pool_mut().upload(cpu_bg, bytes_of_f32(&bg_data)).unwrap();
+    let mut g_cpu = Graph::new();
+    g_cpu.push(Op::GatedDeltaNetStepNTokens {
+        label: "test_gated_delta_net_step",
+        state: cpu_state,
+        conv_out: cpu_conv,
+        g_decay: cpu_g,
+        beta_gate: cpu_bg,
+        output: cpu_out,
+        num_v_heads,
+        value_dim,
+        k_heads_per_v,
+        n_tokens,
+    });
+    cpu.execute(&g_cpu).unwrap();
+    let mut cpu_out_bytes = vec![0u8; out_total * 4];
+    cpu.pool().download(cpu_out, &mut cpu_out_bytes).unwrap();
+    let cpu_out_f32 = f32_of_bytes(&cpu_out_bytes);
+
+    let mut gpu_wf = SyntheticWf::build("gated_delta_net_step_gpu", &[(
+        "dummy", "BF16", 0, vec![32], vec![0u8; 64],
+    )]);
+    let metal_ctx = MetalContext::new().expect("MetalContext::new");
+    let wf_ref = gpu_wf.wf.as_ref().unwrap();
+    let wf_buf = MtlWeightBuf::wrap(wf_ref, metal_ctx.device());
+    let _ = gpu_wf.take();
+    let mut gpu = MetalBackend::new(metal_ctx, wf_buf).expect("MetalBackend::new");
+    let gpu_state =
+        gpu.pool_mut().alloc(state_floats * 4, "state", true).unwrap();
+    let gpu_conv =
+        gpu.pool_mut().alloc(conv_total * 4, "conv", false).unwrap();
+    let gpu_g = gpu.pool_mut().alloc(gdb_total * 4, "g", false).unwrap();
+    let gpu_bg = gpu.pool_mut().alloc(gdb_total * 4, "bg", false).unwrap();
+    let gpu_out = gpu.pool_mut().alloc(out_total * 4, "out", false).unwrap();
+    gpu.pool_mut().upload(gpu_state, bytes_of_f32(&initial_state)).unwrap();
+    gpu.pool_mut().upload(gpu_conv, bytes_of_f32(&conv_data)).unwrap();
+    gpu.pool_mut().upload(gpu_g, bytes_of_f32(&g_data)).unwrap();
+    gpu.pool_mut().upload(gpu_bg, bytes_of_f32(&bg_data)).unwrap();
+    let mut g_gpu = Graph::new();
+    g_gpu.push(Op::GatedDeltaNetStepNTokens {
+        label: "test_gated_delta_net_step",
+        state: gpu_state,
+        conv_out: gpu_conv,
+        g_decay: gpu_g,
+        beta_gate: gpu_bg,
+        output: gpu_out,
+        num_v_heads,
+        value_dim,
+        k_heads_per_v,
+        n_tokens,
+    });
+    gpu.execute(&g_gpu).unwrap();
+    let mut gpu_out_bytes = vec![0u8; out_total * 4];
+    gpu.pool().download(gpu_out, &mut gpu_out_bytes).unwrap();
+    let gpu_out_f32 = f32_of_bytes(&gpu_out_bytes);
+
+    let cos = cosine_sim(&cpu_out_f32, &gpu_out_f32);
+    let max_abs = cpu_out_f32
+        .iter()
+        .zip(gpu_out_f32.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    eprintln!(
+        "[s7-6b gated_delta_net_step] N={} vh={} vd={} kpv={}: cos={:.9} max_abs={:.3e}",
+        n_tokens, num_v_heads, value_dim, k_heads_per_v, cos, max_abs
+    );
+    assert!(cos >= COSINE_FLOOR, "cosine {} max_abs={}", cos, max_abs);
+}

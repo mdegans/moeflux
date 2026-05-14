@@ -1044,13 +1044,20 @@ impl Backend for CpuBackend {
                 let mut output_buf = self.write_f32(*output);
                 let key_total = VARIANT.linear_total_key();
                 let value_total = v_heads * value_dim;
-                let per_token_conv = key_total * 3; // q, k, v stacked
+                // q | k | v stacked per token: q and k each
+                // `key_total` floats, v `value_total` floats. The
+                // v-region size is `num_v_heads * value_dim`, NOT
+                // another `key_total` — kept as a single buffer so
+                // the Metal kernel can read q/k/v via byte-offset
+                // bindings without separate BufIds.
+                let per_token_conv = 2 * key_total + value_total;
                 for t in 0..n_tokens {
                     let conv_t = &conv_out_buf
                         [t * per_token_conv..(t + 1) * per_token_conv];
                     let q = &conv_t[0..key_total];
                     let k = &conv_t[key_total..2 * key_total];
-                    let v = &conv_t[2 * key_total..3 * key_total];
+                    let v =
+                        &conv_t[2 * key_total..2 * key_total + value_total];
                     let g = &g_decay_buf
                         [t * v_heads..(t + 1) * v_heads];
                     let bg = &beta_gate_buf
