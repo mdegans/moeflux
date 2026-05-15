@@ -41,8 +41,9 @@ use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use memmap2::Mmap;
-use metal::{Buffer, Device, MTLResourceOptions, NSUInteger};
+use metal::{Buffer, MTLResourceOptions, NSUInteger};
 
+use super::graph::{BufId, MetalBufferPool};
 use super::variants::{Variant, VARIANT};
 
 /// Disable kernel readahead on a successfully-opened layer fd.
@@ -196,6 +197,14 @@ pub struct ExpertFiles {
     /// exists. `None` for the Pread mode and for missing layers.
     /// Declared before `mmap_layers` so it drops first.
     mmap_buffers: Vec<Option<Buffer>>,
+    /// S10b-pre-2 — per-layer `BufId` parallel to `mmap_buffers`.
+    /// Populated by [`Self::attach_to_device`] via
+    /// `MetalBufferPool::register_borrowed`. Lets graph-mode `Op`s
+    /// (`Op::MoeBatchedPermuteFuse`) address mmap'd expert data by
+    /// `BufId` rather than `&Buffer`. The pool holds a refcounted
+    /// clone of the same `Buffer` that lives in `mmap_buffers`;
+    /// drop order is irrelevant (BufId is `Copy`).
+    mmap_buf_ids: Vec<Option<BufId>>,
     /// Per-layer mmap. Populated at `open` time when `mode == Mmap`.
     /// `None` for the Pread mode and for missing layers.
     mmap_layers: Vec<Option<Mmap>>,
@@ -250,6 +259,7 @@ impl ExpertFiles {
             }
         }
         let mmap_buffers = (0..v.num_layers).map(|_| None).collect();
+        let mmap_buf_ids = (0..v.num_layers).map(|_| None).collect();
         if mode == ExpertIoMode::Mmap {
             eprintln!(
                 "[experts] MOEFLUX_EXPERT_IO=mmap — {} layer(s) mmap'd \
@@ -263,15 +273,23 @@ impl ExpertFiles {
             experts_dir: experts_dir.to_path_buf(),
             mode,
             mmap_buffers,
+            mmap_buf_ids,
             mmap_layers,
         })
     }
 
     /// Wrap each mmap'd layer as a Metal-shared buffer via
-    /// `newBufferWithBytesNoCopy`. Idempotent: the second call is a
-    /// no-op. Called once from `ensure_linear_resources` after the
-    /// Metal backend is created. No-op when `mode == Pread`.
-    pub fn attach_to_device(&mut self, device: &Device) {
+    /// `newBufferWithBytesNoCopy`, and register the buffer with the
+    /// graph-mode buffer pool. Idempotent: the second call is a no-op.
+    /// Called once from `ensure_linear_resources` after the Metal
+    /// backend is created. No-op when `mode == Pread`.
+    ///
+    /// S10b-pre-2: parameter changed from `&Device` to
+    /// `&mut MetalBufferPool`. The buffer is stored in both
+    /// `mmap_buffers` (existing `&Buffer` accessor still works) AND
+    /// `mmap_buf_ids` (new `BufId` accessor for graph-mode `Op`s);
+    /// they share an NSObject-refcounted clone of the same backing.
+    pub fn attach_to_device(&mut self, pool: &mut MetalBufferPool) {
         if self.mode != ExpertIoMode::Mmap {
             return;
         }
@@ -298,14 +316,47 @@ impl ExpertFiles {
             // (see struct docs). Deallocator `None` — Metal does NOT
             // own the mapping; `Mmap`'s drop unmaps after the Buffer
             // is released.
-            let buf = device.new_buffer_with_bytes_no_copy(
+            let buf = pool.device().new_buffer_with_bytes_no_copy(
                 mmap.as_ptr() as *const c_void,
                 aligned_len as NSUInteger,
                 MTLResourceOptions::StorageModeShared,
                 None,
             );
+            // Register a refcounted clone with the pool. The pool's
+            // BufId entry holds an NSObject retain; this `mmap_buffers`
+            // slot holds another. Both die when `ExpertFiles` drops
+            // (Buffer refcount → 0 → newBufferWithBytesNoCopy releases
+            // the non-owning Metal reference), after which `Mmap`
+            // drops and unmaps the file. Order is enforced by struct
+            // field declaration order.
+            let id = pool.register_borrowed(
+                buf.clone(),
+                aligned_len,
+                "expert_io.mmap_layer",
+                /* persistent = */ true,
+            );
             self.mmap_buffers[i] = Some(buf);
+            self.mmap_buf_ids[i] = Some(id);
         }
+    }
+
+    /// Pool BufId for the mmap'd layer Buffer + expert byte offset.
+    /// Mmap-mode sibling of [`Self::mmap_buffer_for_expert`]. Returns
+    /// `None` in Pread mode and for missing layers.
+    ///
+    /// Graph-mode `Op::MoeBatchedPermuteFuse` constructs its
+    /// `expert_refs: Vec<(BufId, u64)>` from this.
+    pub fn mmap_id_for_expert(
+        &self,
+        layer_idx: usize,
+        expert_idx: u32,
+    ) -> Option<(BufId, u64)> {
+        if self.mode != ExpertIoMode::Mmap {
+            return None;
+        }
+        let id = self.mmap_buf_ids.get(layer_idx)?.as_ref()?;
+        let off = (expert_idx as u64) * (self.expert_size as u64);
+        Some((*id, off))
     }
 
     /// Returns `Some((layer_buf, byte_offset))` for `(layer_idx,

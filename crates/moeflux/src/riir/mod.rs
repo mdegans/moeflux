@@ -1259,14 +1259,9 @@ impl RsCtx<MetalBackend> {
         // newBufferWithBytesNoCopy. Idempotent (skipped after first
         // call) and a no-op when mode == Pread.
         {
-            let device = self
-                .backend
-                .as_ref()
-                .expect("just-set")
-                .metal()
-                .device()
-                .to_owned();
-            self.experts.attach_to_device(&device);
+            let pool =
+                self.backend.as_mut().expect("just-set").pool_mut();
+            self.experts.attach_to_device(pool);
         }
         if self.layer_caches.is_none() {
             let wf_buf =

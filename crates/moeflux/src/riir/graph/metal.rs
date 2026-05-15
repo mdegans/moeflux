@@ -69,6 +69,10 @@ impl MetalBufferPool {
         self.buffers.len()
     }
 
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
     /// Allocate a buffer of `bytes` bytes aligned to `alignment`.
     /// `alignment` must be a power of two.
     ///
