@@ -1915,12 +1915,10 @@ fn encode_residual_add(
 /// kept on the signature for symmetry with the per-token oracle.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn batched_linear_attn_layer_forward(
-    metal: &mut MetalContext,
+    backend: &mut super::graph::MetalBackend,
     wf: &WeightFile,
-    wf_buf: &MtlWeightBuf,
     layer_cache: &LayerWeightCache,
     buffers: &LayerForwardBuffers,
-    buffer_pool: &MetalBufferPool,
     layer_idx: usize,
     n_tokens: usize,
     k_active: usize,
@@ -1933,11 +1931,12 @@ pub(super) fn batched_linear_attn_layer_forward(
     // enabled by `step_internal_batched_gqa` at N == 1 (decode
     // re-routed eval_token shape) and only in pread mode.
     mut prefetch: Option<PrefetchEnv<'_>>,
-    // S7-2 (session 6): hidden_in / hidden_out live on GPU. The
-    // orchestrator double-buffers two MtlBuffers and swaps between
-    // layers, eliminating the inter-layer host bounce.
-    hidden_in_buf: &metal::Buffer,
-    hidden_out_buf: &metal::Buffer,
+    // S10b-1a-ii (session 11): hidden in/out are pool BufIds. The
+    // orchestrator owns the alternating double-buffer pair and passes
+    // ids per layer; this producer resolves to `&metal::Buffer` via
+    // `buffer_pool.handle(...)` at the top of the body.
+    hidden_in_id: super::graph::BufId,
+    hidden_out_id: super::graph::BufId,
 ) -> Result<(), LayerForwardError> {
     use super::expert_forward::{
         encode_moe_batched_permute_fuse, encode_moe_combine_residual_n_tokens,
@@ -1945,6 +1944,14 @@ pub(super) fn batched_linear_attn_layer_forward(
     };
     use super::metal::MtlBuffer;
     use super::moe_router::build_expert_buckets;
+
+    // S10b-1a-ii: fold the previous (metal, wf_buf, buffer_pool) tuple
+    // into a single &mut MetalBackend; resolve back inside via
+    // `parts_mut`. Phase 2 (S10b-1b) will replace the imperative
+    // pre-MoE chain with a `Graph` build that calls `backend.execute`.
+    let (metal, wf_buf, buffer_pool) = backend.parts_mut();
+    let hidden_in_buf = buffer_pool.handle(hidden_in_id);
+    let hidden_out_buf = buffer_pool.handle(hidden_out_id);
 
     let v = VARIANT;
     debug_assert!(k_active <= MAX_K);

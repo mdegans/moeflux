@@ -1503,7 +1503,10 @@ impl RsCtx<MetalBackend> {
         } = self;
         let backend =
             backend.as_mut().expect("ensure_linear_resources");
-        let (metal, wf_buf, pool) = backend.parts_mut();
+        // S10b-1a-ii: parts_mut destructure is now scoped per-branch
+        // (full-attn branch inside the layer loop, post-loop block).
+        // The linear-attn branch takes &mut backend directly so the
+        // producer can `backend.execute(&graph)` itself in S10b-1b.
         let layer_caches =
             layer_caches.as_ref().expect("ensure_linear_resources");
         let linear_buffers =
@@ -1552,23 +1555,27 @@ impl RsCtx<MetalBackend> {
         // S7-6c-1: allocate hidden_a / hidden_b in the graph-mode
         // pool. Transient (released by `pool.reset_transient()` at
         // step end) — sized exactly to this step's n × hidden_dim.
+        // S10b-1a-ii: scope the pool borrow so `backend` is freely
+        // re-borrowable inside the layer loop.
         let hidden_bytes = n * hidden_dim * std::mem::size_of::<f32>();
-        let mut hidden_a_id = pool
-            .alloc(hidden_bytes, "step.hidden_a", false)
-            .expect("pool alloc hidden_a");
-        let mut hidden_b_id = pool
-            .alloc(hidden_bytes, "step.hidden_b", false)
-            .expect("pool alloc hidden_b");
-        {
+        let (mut hidden_a_id, mut hidden_b_id) = {
+            let pool = backend.pool_mut();
+            let a = pool
+                .alloc(hidden_bytes, "step.hidden_a", false)
+                .expect("pool alloc hidden_a");
+            let b = pool
+                .alloc(hidden_bytes, "step.hidden_b", false)
+                .expect("pool alloc hidden_b");
             let stack_bytes: &[u8] = unsafe {
                 std::slice::from_raw_parts(
                     hidden_stack_host.as_ptr() as *const u8,
                     std::mem::size_of_val(&hidden_stack_host[..]),
                 )
             };
-            pool.upload(hidden_a_id, stack_bytes)
+            pool.upload(a, stack_bytes)
                 .expect("pool upload hidden_a embeddings");
-        }
+            (a, b)
+        };
 
         for layer_idx in 0..v.num_layers {
             let prefetch_set = layer_idx % 2;
@@ -1579,6 +1586,10 @@ impl RsCtx<MetalBackend> {
             // Skipped when prefetch is disabled (N != 1 or mmap mode).
             if prefetch_enabled {
                 if let Some(predicted) = prefetch.predict_for(layer_idx) {
+                    // S10b-1a-ii: re-borrow the pool just for the
+                    // data_prefetch_slots_mut_array lookup; borrow
+                    // ends after `dispatch` consumes the slot array.
+                    let pool = backend.pool_mut();
                     let data_prefetch = moe_buffers
                         .data_prefetch_slots_mut_array(pool, prefetch_set);
                     prefetch.dispatch(
@@ -1606,6 +1617,9 @@ impl RsCtx<MetalBackend> {
                         return Err(RsError::EvalFailed);
                     }
                 };
+                // S10b-1a-ii: parts_mut local to the full-attn
+                // branch; the borrow ends with the call.
+                let (metal, wf_buf, pool) = backend.parts_mut();
                 batched_full_attn_layer_forward(
                     metal,
                     wf,
@@ -1642,13 +1656,16 @@ impl RsCtx<MetalBackend> {
                 // projections + o_proj + shared FFN, and routes MoE
                 // through the same permute-fuse path as the full-attn
                 // batched forward.
+                // S10b-1a-ii: passes &mut backend + BufIds; the
+                // producer resolves parts via parts_mut internally
+                // so S10b-1b can replace its imperative pre-MoE chain
+                // with backend.execute(&graph) without orchestrator
+                // changes.
                 linear_attn_forward::batched_linear_attn_layer_forward(
-                    metal,
+                    backend,
                     wf,
-                    wf_buf,
                     &layer_caches[layer_idx],
                     linear_buffers,
-                    pool,
                     layer_idx,
                     n,
                     k_active,
@@ -1656,8 +1673,8 @@ impl RsCtx<MetalBackend> {
                     &mut *moe_buffers,
                     layer_state,
                     prefetch_env,
-                    pool.handle(hidden_a_id),
-                    pool.handle(hidden_b_id),
+                    hidden_a_id,
+                    hidden_b_id,
                 )
                 .map_err(|_| RsError::EvalFailed)?;
             }
@@ -1673,6 +1690,8 @@ impl RsCtx<MetalBackend> {
         // `hidden_a_id` now references the buffer that the final
         // layer wrote (post-swap). Read the last token's row to host
         // for the CPU rms_norm pass.
+        // S10b-1a-ii: re-borrow parts for the post-loop block.
+        let (metal, wf_buf, pool) = backend.parts_mut();
         if let Some(logits) = logits_out {
             let mut hidden_final_host = vec![0.0f32; n * hidden_dim];
             let bytes_out: &mut [u8] = unsafe {
