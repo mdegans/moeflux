@@ -699,10 +699,24 @@ fn lm_head_cpu(
 // CpuBackend::Backend impl
 // ----------------------------------------------------------------------------
 
+/// Construction inputs for [`CpuBackend::open`]. Carries the
+/// [`WeightFile`] (mmap'd weight file); the backend takes ownership.
+pub struct CpuConfig {
+    pub wf: WeightFile,
+}
+
 impl Backend for CpuBackend {
     type Pool = CpuBufferPool;
     type EncodeCtx = ();
+    type Config = CpuConfig;
     type Error = GraphError;
+
+    fn open(config: CpuConfig) -> Result<Self, GraphError>
+    where
+        Self: Sized,
+    {
+        Ok(Self::new(config.wf))
+    }
 
     fn pool(&self) -> &CpuBufferPool {
         &self.pool

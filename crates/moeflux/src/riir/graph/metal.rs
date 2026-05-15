@@ -342,15 +342,48 @@ impl MetalBackend {
         &self.metal
     }
 
+    pub fn metal_mut(&mut self) -> &mut MetalContext {
+        &mut self.metal
+    }
+
     pub fn weight_buf(&self) -> &MtlWeightBuf {
         &self.wf_buf
     }
+
+    /// Disjoint mutable borrow of the three graph-mode fields.
+    /// Lets `RsCtx::ensure_*_resources` and the imperative MLA
+    /// step body pass `(&mut MetalContext, &MtlWeightBuf, &mut
+    /// MetalBufferPool)` to existing helpers without manually
+    /// splitting the borrow at each call site.
+    pub fn parts_mut(
+        &mut self,
+    ) -> (&mut MetalContext, &MtlWeightBuf, &mut MetalBufferPool) {
+        (&mut self.metal, &self.wf_buf, &mut self.pool)
+    }
+}
+
+/// Construction inputs for [`MetalBackend::open`]. Carries the
+/// already-built [`MetalContext`] (device + library + queue +
+/// pipeline cache) and the mmap'd weight file wrapped as a Metal
+/// buffer. The backend takes ownership of both.
+pub struct MetalConfig {
+    pub metal: MetalContext,
+    pub wf_buf: MtlWeightBuf,
 }
 
 impl Backend for MetalBackend {
     type Pool = MetalBufferPool;
     type EncodeCtx = MetalEncodeCtx;
+    type Config = MetalConfig;
     type Error = GraphError;
+
+    fn open(config: MetalConfig) -> Result<Self, GraphError>
+    where
+        Self: Sized,
+    {
+        Self::new(config.metal, config.wf_buf)
+            .map_err(|e| GraphError::Backend(Box::new(e)))
+    }
 
     fn pool(&self) -> &MetalBufferPool {
         &self.pool

@@ -85,6 +85,11 @@ pub enum GraphError {
     BadBufId(BufId),
     #[error("buffer size mismatch for {label:?}: expected {expected} bytes, got {actual}")]
     SizeMismatch { label: &'static str, expected: usize, actual: usize },
+    /// Backend-specific error escape hatch. Used by [`Backend::open`]
+    /// impls to box their typed init error (e.g. `MetalError`) without
+    /// forcing this module to depend on backend-specific symbols.
+    #[error("backend error: {0}")]
+    Backend(Box<dyn std::error::Error + Send + Sync + 'static>),
 }
 
 /// Backend-specific buffer pool.
@@ -175,7 +180,24 @@ pub trait BufferPool {
 pub trait Backend {
     type Pool: BufferPool;
     type EncodeCtx;
+    /// Backend-specific construction inputs. Concrete backends define
+    /// their own `Config` struct (e.g. `MetalConfig { metal, wf_buf }`,
+    /// `CpuConfig { wf }`); [`Self::open`] consumes one to produce a
+    /// ready-to-use backend instance.
+    type Config;
     type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Construct a backend from its `Config`. Each impl pre-warms
+    /// whatever pipelines / compiled-graphs / etc. it needs so the
+    /// encode surface (`encode_op`, `submit_and_wait`) can stay
+    /// `&self`-typed afterwards.
+    ///
+    /// `Self: Sized` is a method-level bound (not trait-level) so
+    /// trait-object use of the rest of `Backend` is not foreclosed by
+    /// this constructor.
+    fn open(config: Self::Config) -> Result<Self, Self::Error>
+    where
+        Self: Sized;
 
     fn pool(&self) -> &Self::Pool;
     fn pool_mut(&mut self) -> &mut Self::Pool;
