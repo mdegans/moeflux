@@ -520,6 +520,7 @@ pub(super) fn batched_full_attn_layer_forward(
     n_tokens: usize,
     k_active: usize,
     expert_files: &ExpertFiles,
+    moe_buffers: &mut MoeBuffers,
     kv_state: &mut KvCache,
     // Session-5 Phase 3: prefetch env when caller has fired async
     // prefetch for this layer. See `batched_linear_attn_layer_forward`
@@ -1091,7 +1092,7 @@ pub(super) fn batched_full_attn_layer_forward(
         .map(|(bi, &expert_id)| {
             if let Some(buf_idx) = bucket_prefetch_slot[bi] {
                 let pe = prefetch.as_ref().expect("prefetch slot requires env");
-                let buf = pe.moe_buffers.data_prefetch_buffer(
+                let buf = moe_buffers.data_prefetch_buffer(
                     buffer_pool,
                     pe.prefetch_set,
                     buf_idx,

@@ -1594,7 +1594,6 @@ impl RsCtx<MetalBackend> {
             let prefetch_env = prefetch_enabled.then(|| {
                 linear_attn_forward::PrefetchEnv {
                     prefetch: &mut *prefetch,
-                    moe_buffers: &mut *moe_buffers,
                     prefetch_set,
                 }
             });
@@ -1619,6 +1618,7 @@ impl RsCtx<MetalBackend> {
                     n,
                     k_active,
                     experts,
+                    &mut *moe_buffers,
                     kv_state,
                     prefetch_env,
                     pool.handle(hidden_a_id),
@@ -1653,6 +1653,7 @@ impl RsCtx<MetalBackend> {
                     n,
                     k_active,
                     experts,
+                    &mut *moe_buffers,
                     layer_state,
                     prefetch_env,
                     pool.handle(hidden_a_id),

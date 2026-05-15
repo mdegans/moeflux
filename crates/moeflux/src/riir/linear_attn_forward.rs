@@ -406,7 +406,6 @@ pub(super) fn bits_of(wf: &WeightFile, name: &str) -> u32 {
 /// kernel's demand-fault handler is about to do anyway).
 pub(super) struct PrefetchEnv<'a> {
     pub prefetch: &'a mut super::PrefetchState,
-    pub moe_buffers: &'a mut super::expert_forward::MoeBuffers,
     pub prefetch_set: usize,
 }
 
@@ -1926,6 +1925,7 @@ pub(super) fn batched_linear_attn_layer_forward(
     n_tokens: usize,
     k_active: usize,
     expert_files: &ExpertFiles,
+    moe_buffers: &mut super::expert_forward::MoeBuffers,
     _layer_state: &mut LinearAttnState,
     // Session-5 Phase 3: when `Some`, the caller has fired
     // `prefetch.dispatch` for this layer and wants the bucket-vs-
@@ -2524,7 +2524,7 @@ pub(super) fn batched_linear_attn_layer_forward(
         .map(|(bi, &expert_id)| {
             if let Some(buf_idx) = bucket_prefetch_slot[bi] {
                 let pe = prefetch.as_ref().expect("prefetch slot requires env");
-                let buf = pe.moe_buffers.data_prefetch_buffer(
+                let buf = moe_buffers.data_prefetch_buffer(
                     buffer_pool,
                     pe.prefetch_set,
                     buf_idx,
