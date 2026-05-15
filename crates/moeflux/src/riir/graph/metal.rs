@@ -28,7 +28,7 @@ use crate::riir::gpu_norm::{
     encode_residual_add_n_tokens_into, encode_rms_norm_bf16_fused_n_tokens,
     RmsNormBf16FusedNTokensPipeline, RmsNormBf16Pipelines,
 };
-use crate::riir::metal::{MetalContext, MetalError};
+use crate::riir::metal::{MetalContext, MetalError, MtlBuffer};
 use crate::riir::mtl_weight_buf::MtlWeightBuf;
 
 /// Metal buffer pool. Storage is `Vec<Buffer>` indexed *indirectly*
@@ -42,6 +42,14 @@ pub struct MetalBufferPool {
     persistent: Vec<bool>,
     byte_sizes: Vec<usize>,
     bufid_to_physical: Vec<u32>,
+    /// S10b-pre-1 — anchors for `alloc_aligned`-created buffers.
+    /// `MtlBuffer::with_aligned_len_u8` uses `newBufferWithBytesNoCopy:`
+    /// with `deallocator=None`; the wrapper's `AlignedBacking` owns
+    /// the heap memory the Metal buffer points at. Keeping the
+    /// `MtlBuffer` alive in this vec keeps the backing alive for the
+    /// lifetime of the pool. Append-only; order is independent of
+    /// `buffers` because we never index into it.
+    aligned_anchors: Vec<MtlBuffer<u8>>,
 }
 
 impl MetalBufferPool {
@@ -53,11 +61,110 @@ impl MetalBufferPool {
             persistent: Vec::new(),
             byte_sizes: Vec::new(),
             bufid_to_physical: Vec::new(),
+            aligned_anchors: Vec::new(),
         }
     }
 
     pub fn physical_buffer_count(&self) -> usize {
         self.buffers.len()
+    }
+
+    /// Allocate a buffer of `bytes` bytes aligned to `alignment`.
+    /// `alignment` must be a power of two.
+    ///
+    /// Backed by posix_memalign-equivalent heap memory wrapped via
+    /// `newBufferWithBytesNoCopy:` (deallocator=None). The pool owns
+    /// the heap memory; the Metal buffer references it. Required for
+    /// pread DMA destinations — the C path documents a 3.6× DMA win
+    /// from 2 MiB alignment over 16 KB (`metal_infer/infer.m:1196`).
+    pub fn alloc_aligned(
+        &mut self,
+        bytes: usize,
+        alignment: usize,
+        label: &'static str,
+        persistent: bool,
+    ) -> BufId {
+        let anchor = MtlBuffer::<u8>::with_aligned_len_u8(
+            &self.device,
+            bytes,
+            alignment,
+        );
+        let buf = anchor.buffer().clone();
+        let id = BufId(self.bufid_to_physical.len() as u32);
+        let physical = self.buffers.len() as u32;
+        self.buffers.push(buf);
+        self.aligned_anchors.push(anchor);
+        self.labels.push(label);
+        self.persistent.push(persistent);
+        self.byte_sizes.push(bytes);
+        self.bufid_to_physical.push(physical);
+        id
+    }
+
+    /// Register an externally-owned `metal::Buffer` as a pool slot.
+    /// The pool stores a refcounted clone — for Metal that's an
+    /// NSObject retain, essentially free. The caller continues to own
+    /// the underlying memory's lifetime guarantee (e.g. an mmap that
+    /// outlives the pool, or another retainer of the same `Buffer`).
+    ///
+    /// `bytes` is informational — used for `upload` / `download` size
+    /// checks and for `as_mut_slice_u8` length. Pass the buffer's
+    /// actual length.
+    ///
+    /// Used for mmap'd expert files: `ExpertFiles` owns the `Mmap`
+    /// + the wrapping `Buffer`; the pool registers the `Buffer` so
+    /// graph-mode `Op`s can address it via `BufId`.
+    pub fn register_borrowed(
+        &mut self,
+        buf: Buffer,
+        bytes: usize,
+        label: &'static str,
+        persistent: bool,
+    ) -> BufId {
+        let id = BufId(self.bufid_to_physical.len() as u32);
+        let physical = self.buffers.len() as u32;
+        self.buffers.push(buf);
+        self.labels.push(label);
+        self.persistent.push(persistent);
+        self.byte_sizes.push(bytes);
+        self.bufid_to_physical.push(physical);
+        id
+    }
+
+    /// Returns the buffer's underlying memory as a mut byte slice.
+    ///
+    /// SAFETY/CORRECTNESS: same discipline as today's
+    /// `MtlBuffer::as_mut_slice` — caller ensures no GPU dispatch
+    /// is reading from this buffer concurrently. `&self` because
+    /// `metal::Buffer` is NSObject-interior-mut; Rust borrow rules
+    /// don't apply to its contents.
+    pub fn as_mut_slice_u8(&self, id: BufId) -> &mut [u8] {
+        let idx = id.0 as usize;
+        let physical = self.bufid_to_physical[idx] as usize;
+        let buf = &self.buffers[physical];
+        let bytes = self.byte_sizes[idx];
+        // SAFETY: `buf.contents()` is non-null for any shared-storage
+        // Metal buffer (Apple guarantee). The byte count matches the
+        // allocation; aliasing concerns are caller-managed per the
+        // contract above.
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                buf.contents() as *mut u8,
+                bytes,
+            )
+        }
+    }
+
+    /// Disjoint mut byte slices for the common pread-worker pattern.
+    /// Same soundness contract as [`Self::as_mut_slice_u8`] per slot,
+    /// PLUS the caller guarantees the `ids` array is duplicate-free —
+    /// otherwise the returned references alias and the &mut semantics
+    /// is violated.
+    pub fn as_mut_slices_u8<const N: usize>(
+        &self,
+        ids: [BufId; N],
+    ) -> [&mut [u8]; N] {
+        ids.map(|id| self.as_mut_slice_u8(id))
     }
 }
 
@@ -862,6 +969,103 @@ impl Backend for MetalBackend {
                     enc.end_encoding();
                 }
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests — S10b-pre-1 pool primitives
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dev() -> Device {
+        Device::system_default().expect("no Metal device available")
+    }
+
+    #[test]
+    #[ignore = "needs Metal device"]
+    fn alloc_aligned_returns_aligned_pointer() {
+        let mut pool = MetalBufferPool::new(dev());
+        const TWO_MIB: usize = 2 * 1024 * 1024;
+        // Use a size that wouldn't naturally land on a 2 MiB boundary
+        // (Apple's allocator only does that incidentally for large
+        // allocations).
+        let id = pool.alloc_aligned(64 * 1024, TWO_MIB, "test.aligned", true);
+        let buf = pool.handle(id);
+        let addr = buf.contents() as usize;
+        assert_eq!(
+            addr % TWO_MIB,
+            0,
+            "alloc_aligned returned 0x{addr:x}, not 2 MiB-aligned",
+        );
+    }
+
+    #[test]
+    #[ignore = "needs Metal device"]
+    fn register_borrowed_round_trip_via_handle() {
+        let device = dev();
+        let raw = device.new_buffer(
+            128,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let raw_ptr_before = raw.contents() as usize;
+        let mut pool = MetalBufferPool::new(device);
+        let id = pool.register_borrowed(raw, 128, "test.borrowed", true);
+        let pooled = pool.handle(id);
+        // The buffer the pool returns should point to the same memory
+        // as the buffer we registered (refcounted clone, same backing).
+        assert_eq!(pooled.contents() as usize, raw_ptr_before);
+    }
+
+    #[test]
+    #[ignore = "needs Metal device"]
+    fn as_mut_slice_u8_writes_visible_through_handle() {
+        let mut pool = MetalBufferPool::new(dev());
+        let id = pool
+            .alloc(64, "test.scratch", true)
+            .expect("alloc");
+        {
+            let slice = pool.as_mut_slice_u8(id);
+            assert_eq!(slice.len(), 64);
+            for (i, b) in slice.iter_mut().enumerate() {
+                *b = (i as u8).wrapping_mul(7);
+            }
+        }
+        // Read back through the regular handle path.
+        let buf = pool.handle(id);
+        let read = unsafe {
+            std::slice::from_raw_parts(buf.contents() as *const u8, 64)
+        };
+        for (i, &b) in read.iter().enumerate() {
+            assert_eq!(b, (i as u8).wrapping_mul(7));
+        }
+    }
+
+    #[test]
+    #[ignore = "needs Metal device"]
+    fn as_mut_slices_u8_disjoint_writes_dont_clobber() {
+        let mut pool = MetalBufferPool::new(dev());
+        let a = pool.alloc(32, "a", true).expect("alloc");
+        let b = pool.alloc(32, "b", true).expect("alloc");
+        let c = pool.alloc(32, "c", true).expect("alloc");
+        {
+            let [sa, sb, sc] = pool.as_mut_slices_u8([a, b, c]);
+            sa.fill(0xAA);
+            sb.fill(0xBB);
+            sc.fill(0xCC);
+        }
+        for (id, want) in [(a, 0xAAu8), (b, 0xBBu8), (c, 0xCCu8)] {
+            let buf = pool.handle(id);
+            let read = unsafe {
+                std::slice::from_raw_parts(buf.contents() as *const u8, 32)
+            };
+            assert!(
+                read.iter().all(|&v| v == want),
+                "slot for {id:?} should be filled with 0x{want:x}"
+            );
         }
     }
 }
