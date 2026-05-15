@@ -477,12 +477,15 @@ impl RsCtx<MetalBackend> {
         // pass `&mut self.deferred` alongside the metal+moe pair.
         let _ = self.metal_and_moe_mut()?;
         let Self {
-            metal,
+            backend,
             moe_buffers,
             deferred,
             ..
         } = self;
-        let metal = metal.as_mut().expect("metal_and_moe_mut just-set");
+        let metal = backend
+            .as_mut()
+            .expect("metal_and_moe_mut just-set")
+            .metal_mut();
         let bufs = moe_buffers.as_mut().expect("metal_and_moe_mut just-set");
         gpu_batched_experts_begin(
             metal,

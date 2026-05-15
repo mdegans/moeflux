@@ -706,7 +706,7 @@ pub mod lifetime;
 pub mod metal;
 
 pub use cpu::{CpuBackend, CpuBufferPool};
-pub use metal::{MetalBackend, MetalBufferPool, MetalEncodeCtx};
+pub use metal::{MetalBackend, MetalBufferPool, MetalConfig, MetalEncodeCtx};
 
 #[cfg(test)]
 mod tests {

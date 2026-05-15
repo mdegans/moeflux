@@ -219,10 +219,6 @@ pub struct RsCtx<B: Backend = MetalBackend> {
     /// A `CpuBackend` instantiation is the cross-backend diff-oracle
     /// path for synthetic and (future) end-to-end tests.
     backend: Option<B>,
-    /// Lazily-built Metal backend. CPU-only kernels skip the cost; GPU
-    /// kernels (`gpu_expert_forward` and friends) construct it on
-    /// first use via [`Self::metal_mut`].
-    metal: Option<MetalContext>,
     /// Lazily-built persistent multi-expert + combine buffer set.
     /// Allocated on first [`Self::gpu_batched_experts_forward`] call;
     /// reused thereafter. ~28 MB on A3B.
@@ -245,9 +241,6 @@ pub struct RsCtx<B: Backend = MetalBackend> {
     /// [`Self::open`]; mutated in place by the forward pass and the
     /// `memory_*` ops.
     layer_states: Vec<LayerState>,
-    /// Lazily-built `MTLBuffer` wrapping the [`WeightFile`] mmap.
-    /// First GPU call constructs it via [`Self::weight_resources_mut`].
-    wf_buf: Option<MtlWeightBuf>,
     /// Lazily-built per-layer tensor-offset cache. Per-Ctx (not file-
     /// scope) — the Phase 4b cross-Ctx bug fix.
     layer_caches: Option<Vec<LayerWeightCache>>,
@@ -341,14 +334,6 @@ pub struct RsCtx<B: Backend = MetalBackend> {
     /// pipeline for the GPU residual stream. Same kernel the
     /// linear-attn path uses internally.
     residual_add_pipe: Option<::metal::ComputePipelineState>,
-    /// Session 9 / S7-6c: graph-mode buffer pool. Owns persistent
-    /// and transient BufIds backing the active forward path's
-    /// hidden state (S7-6c-1), linear-attn / MoE scratch (S7-6c-2),
-    /// and per-layer Op outputs (S7-6d). Allocated alongside
-    /// `metal` in [`Self::ensure_linear_resources`]. Lives for the
-    /// `RsCtx`'s lifetime; `reset_transient` is called at each
-    /// chunk end to release non-persistent slots.
-    pool: Option<graph::MetalBufferPool>,
     // Future phases populate: vocab.
 }
 
@@ -381,12 +366,10 @@ impl RsCtx<MetalBackend> {
         Ok(Self {
             wf,
             backend: None,
-            metal: None,
             moe_buffers: None,
             experts,
             layer_states,
             k_active,
-            wf_buf: None,
             layer_caches: None,
             linear_buffers: None,
             deferred: DeferredRing::new(),
@@ -406,7 +389,6 @@ impl RsCtx<MetalBackend> {
             mla_residual_scratch: None,
             mla_norm_pipes: None,
             residual_add_pipe: None,
-            pool: None,
         })
     }
 
@@ -414,11 +396,26 @@ impl RsCtx<MetalBackend> {
     /// don't need it; GPU kernels go through this accessor so the
     /// shader-compile cost is paid lazily on first GPU use.
     fn metal_mut(&mut self) -> Result<&mut MetalContext, RsError> {
-        if self.metal.is_none() {
-            self.metal =
-                Some(MetalContext::new().map_err(|_| RsError::InitFailed)?);
+        self.ensure_backend()?;
+        Ok(self.backend.as_mut().expect("just-set").metal_mut())
+    }
+
+    /// Lazy-build the [`MetalBackend`] (device + library + queue +
+    /// `MtlWeightBuf` + `MetalBufferPool` + pre-warmed pipelines).
+    /// Idempotent. Internal helper for the various ensure_* methods
+    /// and the [`Self::metal_mut`] accessor.
+    fn ensure_backend(&mut self) -> Result<(), RsError> {
+        if self.backend.is_none() {
+            let metal =
+                MetalContext::new().map_err(|_| RsError::InitFailed)?;
+            let device = metal.device().to_owned();
+            let wf_buf = MtlWeightBuf::wrap(&self.wf, &device);
+            self.backend = Some(
+                MetalBackend::open(graph::MetalConfig { metal, wf_buf })
+                    .map_err(|_| RsError::InitFailed)?,
+            );
         }
-        Ok(self.metal.as_mut().expect("just-set"))
+        Ok(())
     }
 
     /// Ensure both the Metal backend and the persistent multi-expert
@@ -428,20 +425,22 @@ impl RsCtx<MetalBackend> {
     fn metal_and_moe_mut(
         &mut self,
     ) -> Result<(&mut MetalContext, &mut MoeBuffers), RsError> {
-        if self.metal.is_none() {
-            self.metal =
-                Some(MetalContext::new().map_err(|_| RsError::InitFailed)?);
-        }
+        self.ensure_backend()?;
         if self.moe_buffers.is_none() {
-            let device =
-                self.metal.as_ref().expect("just-set").device().to_owned();
+            let device = self
+                .backend
+                .as_ref()
+                .expect("just-set")
+                .metal()
+                .device()
+                .to_owned();
             self.moe_buffers = Some(MoeBuffers::new(&device));
         }
         let Self {
-            metal, moe_buffers, ..
+            backend, moe_buffers, ..
         } = self;
         Ok((
-            metal.as_mut().expect("just-set"),
+            backend.as_mut().expect("just-set").metal_mut(),
             moe_buffers.as_mut().expect("just-set"),
         ))
     }
@@ -917,22 +916,21 @@ impl RsCtx<MetalBackend> {
         let k_active = self.k_active;
         let Self {
             wf,
-            metal,
+            backend,
             moe_buffers,
             experts,
             layer_states,
-            wf_buf,
             layer_caches,
             linear_buffers,
             deferred,
             io_pool,
             prefetch,
-            pool,
             ..
         } = self;
 
-        let metal = metal.as_mut().expect("ensure_linear_resources");
-        let wf_buf = wf_buf.as_ref().expect("ensure_linear_resources");
+        let backend =
+            backend.as_mut().expect("ensure_linear_resources");
+        let (metal, wf_buf, buffer_pool) = backend.parts_mut();
         let layer_caches =
             layer_caches.as_ref().expect("ensure_linear_resources");
         let linear_buffers =
@@ -940,7 +938,6 @@ impl RsCtx<MetalBackend> {
         let moe_buffers =
             moe_buffers.as_mut().expect("ensure_linear_resources");
         let io_pool: &rayon::ThreadPool = &*io_pool;
-        let buffer_pool = pool.as_ref().expect("ensure_linear_resources");
 
         // Defensive: drain any leaked deferred state from a prior
         // failed call so this entry point stays safe to call
@@ -1093,7 +1090,8 @@ impl RsCtx<MetalBackend> {
             .linear_buffers
             .as_ref()
             .ok_or(RsError::EvalFailed)?;
-        let pool = self.pool.as_ref().ok_or(RsError::EvalFailed)?;
+        let pool =
+            self.backend.as_ref().ok_or(RsError::EvalFailed)?.pool();
         let v = VARIANT;
         let read_into = |buf: &::metal::Buffer, dst: Option<&mut [f32]>| {
             if let Some(dst) = dst {
@@ -1130,20 +1128,18 @@ impl RsCtx<MetalBackend> {
     /// on MLA variants (Cogito-V2 has `q_a_proj` / `q_b_proj` /
     /// `kv_a_proj_with_mqa` / `kv_b_proj` instead).
     fn ensure_mla_resources(&mut self) -> Result<(), RsError> {
-        if self.metal.is_none() {
-            self.metal =
-                Some(MetalContext::new().map_err(|_| RsError::InitFailed)?);
-        }
-        if self.wf_buf.is_none() {
-            let device =
-                self.metal.as_ref().expect("just-set").device().to_owned();
-            self.wf_buf = Some(MtlWeightBuf::wrap(&self.wf, &device));
-        }
+        self.ensure_backend()?;
         if self.lm_head_gpu.is_none() {
-            let metal = self.metal.as_mut().expect("just-set");
-            let wf_buf = self.wf_buf.as_ref().expect("just-set");
-            self.lm_head_gpu = Some(
-                GpuLmHead::new(metal, &self.wf, wf_buf)
+            let Self {
+                wf,
+                backend,
+                lm_head_gpu,
+                ..
+            } = self;
+            let backend = backend.as_mut().expect("just-set");
+            let (metal, wf_buf, _) = backend.parts_mut();
+            *lm_head_gpu = Some(
+                GpuLmHead::new(metal, wf, wf_buf)
                     .map_err(|_| RsError::InitFailed)?,
             );
         }
@@ -1151,8 +1147,13 @@ impl RsCtx<MetalBackend> {
         // buffers. Idempotent — `ensure_buffers` no-ops on already-
         // populated layers, so re-entering after `memory_clear` (which
         // truncates `len` to 0 but keeps the buffers) is cheap.
-        let device =
-            self.metal.as_ref().expect("just-set").device().to_owned();
+        let device = self
+            .backend
+            .as_ref()
+            .expect("just-set")
+            .metal()
+            .device()
+            .to_owned();
         for state in self.layer_states.iter_mut() {
             if let LayerState::Mla(mla) = state {
                 mla.ensure_buffers(&device);
@@ -1170,7 +1171,8 @@ impl RsCtx<MetalBackend> {
                 Some(mla_attn_forward::MlaYarnTables::new(&device));
         }
         if self.mla_pipes.is_none() {
-            let metal = self.metal.as_mut().expect("just-set");
+            let metal =
+                self.backend.as_mut().expect("just-set").metal_mut();
             self.mla_pipes = Some(
                 mla_attn_forward::MlaForwardPipelines::new(metal)
                     .map_err(|_| RsError::InitFailed)?,
@@ -1185,7 +1187,8 @@ impl RsCtx<MetalBackend> {
         if VARIANT.first_k_dense_replace > 0
             && self.dense_mlp_pipes.is_none()
         {
-            let metal = self.metal.as_mut().expect("just-set");
+            let metal =
+                self.backend.as_mut().expect("just-set").metal_mut();
             self.dense_mlp_pipes = Some(
                 dense_mlp_gpu::DenseMlpPipelines::fetch(metal)
                     .map_err(|_| RsError::InitFailed)?,
@@ -1204,7 +1207,8 @@ impl RsCtx<MetalBackend> {
         // dim-parametric), so even variants with `first_k_dense_replace
         // == 0` need the dense pipes if they have a shared expert.
         if self.dense_mlp_pipes.is_none() && VARIANT.shared_intermediate > 0 {
-            let metal = self.metal.as_mut().expect("just-set");
+            let metal =
+                self.backend.as_mut().expect("just-set").metal_mut();
             self.dense_mlp_pipes = Some(
                 dense_mlp_gpu::DenseMlpPipelines::fetch(metal)
                     .map_err(|_| RsError::InitFailed)?,
@@ -1214,7 +1218,8 @@ impl RsCtx<MetalBackend> {
         // router gate. Only allocated for MLA variants (the linear-attn
         // path's gate is 8-bit dequant via the existing MatvecPipelines).
         if self.bf_matvec_pipes.is_none() {
-            let metal = self.metal.as_mut().expect("just-set");
+            let metal =
+                self.backend.as_mut().expect("just-set").metal_mut();
             self.bf_matvec_pipes = Some(
                 gpu_matvec::BfMatvecPipelines::fetch(metal)
                     .map_err(|_| RsError::InitFailed)?,
@@ -1227,14 +1232,16 @@ impl RsCtx<MetalBackend> {
                 Some(gpu_norm::MlaForwardScratch::new(&device));
         }
         if self.mla_norm_pipes.is_none() {
-            let metal = self.metal.as_mut().expect("just-set");
+            let metal =
+                self.backend.as_mut().expect("just-set").metal_mut();
             self.mla_norm_pipes = Some(
                 gpu_norm::RmsNormBf16Pipelines::fetch(metal)
                     .map_err(|_| RsError::InitFailed)?,
             );
         }
         if self.residual_add_pipe.is_none() {
-            let metal = self.metal.as_mut().expect("just-set");
+            let metal =
+                self.backend.as_mut().expect("just-set").metal_mut();
             self.residual_add_pipe = Some(
                 metal
                     .pipeline("residual_add")
@@ -1246,49 +1253,54 @@ impl RsCtx<MetalBackend> {
     }
 
     fn ensure_linear_resources(&mut self) -> Result<(), RsError> {
-        if self.metal.is_none() {
-            self.metal =
-                Some(MetalContext::new().map_err(|_| RsError::InitFailed)?);
-        }
-        if self.wf_buf.is_none() {
-            let device =
-                self.metal.as_ref().expect("just-set").device().to_owned();
-            self.wf_buf = Some(MtlWeightBuf::wrap(&self.wf, &device));
-        }
+        self.ensure_backend()?;
         // Session-5 Phase 2: when MOEFLUX_EXPERT_IO=mmap, wrap each
         // mmap'd layer file as a Metal-shared buffer via
         // newBufferWithBytesNoCopy. Idempotent (skipped after first
         // call) and a no-op when mode == Pread.
         {
-            let device =
-                self.metal.as_ref().expect("just-set").device().to_owned();
+            let device = self
+                .backend
+                .as_ref()
+                .expect("just-set")
+                .metal()
+                .device()
+                .to_owned();
             self.experts.attach_to_device(&device);
         }
         if self.layer_caches.is_none() {
-            let wf_buf = self.wf_buf.as_ref().expect("just-set");
+            let wf_buf =
+                self.backend.as_ref().expect("just-set").weight_buf();
             let caches = LayerWeightCache::build_all(&self.wf, wf_buf)
                 .map_err(|_| RsError::InitFailed)?;
             self.layer_caches = Some(caches);
         }
-        if self.pool.is_none() {
-            let device =
-                self.metal.as_ref().expect("just-set").device().to_owned();
-            self.pool = Some(graph::MetalBufferPool::new(device));
-        }
         if self.linear_buffers.is_none() {
-            let pool = self.pool.as_mut().expect("just-set");
+            let pool =
+                self.backend.as_mut().expect("just-set").pool_mut();
             self.linear_buffers = Some(LinearAttnBuffers::new(pool));
         }
         if self.moe_buffers.is_none() {
-            let device =
-                self.metal.as_ref().expect("just-set").device().to_owned();
+            let device = self
+                .backend
+                .as_ref()
+                .expect("just-set")
+                .metal()
+                .device()
+                .to_owned();
             self.moe_buffers = Some(MoeBuffers::new(&device));
         }
         if self.lm_head_gpu.is_none() {
-            let metal = self.metal.as_mut().expect("just-set");
-            let wf_buf = self.wf_buf.as_ref().expect("just-set");
-            self.lm_head_gpu = Some(
-                GpuLmHead::new(metal, &self.wf, wf_buf)
+            let Self {
+                wf,
+                backend,
+                lm_head_gpu,
+                ..
+            } = self;
+            let backend = backend.as_mut().expect("just-set");
+            let (metal, wf_buf, _) = backend.parts_mut();
+            *lm_head_gpu = Some(
+                GpuLmHead::new(metal, wf, wf_buf)
                     .map_err(|_| RsError::InitFailed)?,
             );
         }
@@ -1476,22 +1488,21 @@ impl RsCtx<MetalBackend> {
         // through this path).
         let Self {
             wf,
-            metal,
+            backend,
             moe_buffers,
             experts,
             layer_states,
-            wf_buf,
             layer_caches,
             linear_buffers,
             deferred,
             lm_head_gpu,
             io_pool,
             prefetch,
-            pool,
             ..
         } = self;
-        let metal = metal.as_mut().expect("ensure_linear_resources");
-        let wf_buf = wf_buf.as_ref().expect("ensure_linear_resources");
+        let backend =
+            backend.as_mut().expect("ensure_linear_resources");
+        let (metal, wf_buf, pool) = backend.parts_mut();
         let layer_caches =
             layer_caches.as_ref().expect("ensure_linear_resources");
         let linear_buffers =
@@ -1501,7 +1512,6 @@ impl RsCtx<MetalBackend> {
         let lm_head_gpu =
             lm_head_gpu.as_ref().expect("ensure_linear_resources");
         let io_pool: &rayon::ThreadPool = &*io_pool;
-        let pool = pool.as_mut().expect("ensure_linear_resources");
 
         // Drain any stale deferred state — neither batched path uses
         // the ring, but a prior per-token oracle call on the same
@@ -1722,15 +1732,14 @@ impl RsCtx<MetalBackend> {
 
         let Self {
             wf,
-            metal,
+            backend,
             experts,
             layer_states,
-            wf_buf,
             lm_head_gpu,
             ..
         } = self;
-        let metal = metal.as_mut().expect("ensure_mla_resources");
-        let wf_buf = wf_buf.as_ref().expect("ensure_mla_resources");
+        let backend = backend.as_mut().expect("ensure_mla_resources");
+        let (metal, wf_buf, _) = backend.parts_mut();
         let lm_head_gpu =
             lm_head_gpu.as_ref().expect("ensure_mla_resources");
 
@@ -1853,8 +1862,7 @@ impl RsCtx<MetalBackend> {
 
         let Self {
             wf,
-            metal,
-            wf_buf,
+            backend,
             experts,
             layer_states,
             lm_head_gpu,
@@ -1872,8 +1880,8 @@ impl RsCtx<MetalBackend> {
             io_pool,
             ..
         } = self;
-        let metal = metal.as_mut().expect("ensure_mla_resources");
-        let wf_buf = wf_buf.as_ref().expect("ensure_mla_resources");
+        let backend = backend.as_mut().expect("ensure_mla_resources");
+        let (metal, wf_buf, _) = backend.parts_mut();
         let lm_head_gpu =
             lm_head_gpu.as_ref().expect("ensure_mla_resources");
         let mla_buffers =
@@ -2178,22 +2186,21 @@ impl RsCtx<MetalBackend> {
         // pattern as `layer_forward_dump_inner`.
         let Self {
             wf,
-            metal,
+            backend,
             moe_buffers,
             experts,
             layer_states,
-            wf_buf,
             layer_caches,
             linear_buffers,
             deferred,
             lm_head_gpu,
             io_pool,
             prefetch,
-            pool,
             ..
         } = self;
-        let metal = metal.as_mut().expect("ensure_linear_resources");
-        let wf_buf = wf_buf.as_ref().expect("ensure_linear_resources");
+        let backend =
+            backend.as_mut().expect("ensure_linear_resources");
+        let (metal, wf_buf, buffer_pool) = backend.parts_mut();
         let layer_caches =
             layer_caches.as_ref().expect("ensure_linear_resources");
         let linear_buffers =
@@ -2203,7 +2210,6 @@ impl RsCtx<MetalBackend> {
         let lm_head_gpu =
             lm_head_gpu.as_ref().expect("ensure_linear_resources");
         let io_pool: &rayon::ThreadPool = &*io_pool;
-        let buffer_pool = pool.as_ref().expect("ensure_linear_resources");
 
         // Defensive bracket — drain stale state from a buggy prior
         // call so re-entrancy holds.
@@ -2432,9 +2438,10 @@ impl RsCtx<MetalBackend> {
     /// freshly-allocated Ctx.
     pub fn memory_clear(&mut self) {
         clear_all(&mut self.layer_states);
-        if let (Some(bufs), Some(pool)) =
-            (self.linear_buffers.as_ref(), self.pool.as_ref())
+        if let (Some(bufs), Some(backend)) =
+            (self.linear_buffers.as_ref(), self.backend.as_ref())
         {
+            let pool = backend.pool();
             bufs.reset_recurrence(pool);
             // Slice 5d-7b — zero the GPU full-attn KV mirrors
             // alongside the host-side clear. Without this, the GPU
@@ -2646,7 +2653,7 @@ impl RsCtx<MetalBackend> {
             buf,
             &self.layer_states,
             self.linear_buffers.as_ref(),
-            self.pool.as_ref(),
+            self.backend.as_ref().map(|b| b.pool()),
         )
     }
 
@@ -2682,29 +2689,26 @@ impl RsCtx<MetalBackend> {
         // Always need a Metal device for MLA buffer alloc on load. It
         // exists if either ensure_linear_resources or any prior eval
         // ran, OR initialize a backend on demand.
-        if self.metal.is_none() {
-            self.metal = Some(
-                MetalContext::new()
-                    .map_err(|_| state_snapshot::StateSnapshotError::BuffersNotReady)?,
-            );
-        }
+        self.ensure_backend()
+            .map_err(|_| state_snapshot::StateSnapshotError::BuffersNotReady)?;
         let device = self
-            .metal
+            .backend
             .as_ref()
             .expect("just-set")
+            .metal()
             .device()
             .to_owned();
         let Self {
             layer_states,
             linear_buffers,
-            pool,
+            backend,
             ..
         } = self;
         state_snapshot::state_load(
             buf,
             layer_states,
             linear_buffers.as_mut(),
-            pool.as_ref(),
+            backend.as_ref().map(|b| b.pool()),
             &device,
         )
     }
