@@ -49,6 +49,7 @@ use super::expert_forward::{
 };
 use super::metal::MetalContext;
 use super::variants::VARIANT;
+use super::graph::MetalBackend;
 use super::{RsCtx, RsError};
 
 /// Slice 5d-9 — bounded ring of in-flight deferred K-expert dispatches.
@@ -443,7 +444,7 @@ pub(crate) fn discard_deferred_experts_in(ring: &mut DeferredRing) {
     }
 }
 
-impl RsCtx {
+impl RsCtx<MetalBackend> {
     /// Begin an asynchronous K-expert dispatch. Thin wrapper over
     /// [`gpu_batched_experts_begin`] that pulls the disjoint borrows
     /// out of `&mut self`. Kept for the diff-oracle entry path which

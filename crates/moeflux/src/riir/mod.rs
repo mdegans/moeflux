@@ -83,6 +83,7 @@ pub use linear_attn::{
 // S7-6c: trait scope for `pool.alloc/handle/upload/download/reset_transient`
 // in `step_internal_batched_gqa`.
 use graph::BufferPool as _;
+use graph::{Backend, MetalBackend};
 pub use lm_head::{lm_head_cpu, LmHeadError};
 pub use metal::{MetalContext, MetalError, MtlBuffer};
 pub use moe_router::{moe_router_cpu, MoeRouterError};
@@ -205,8 +206,19 @@ fn eval_token_mode() -> EvalTokenMode {
     })
 }
 
-pub struct RsCtx {
+pub struct RsCtx<B: Backend = MetalBackend> {
     wf: WeightFile,
+    /// Session 10a — graph-mode backend. Owns
+    /// `MetalContext + MtlWeightBuf + MetalBufferPool` (and pre-warmed
+    /// pipelines). Replaces the formerly-separate `metal`, `wf_buf`,
+    /// `pool` fields. Lazily built by
+    /// [`Self::ensure_linear_resources`] / [`Self::ensure_mla_resources`].
+    ///
+    /// Default type parameter `B = MetalBackend` preserves source
+    /// compatibility for external callers that write plain `RsCtx`.
+    /// A `CpuBackend` instantiation is the cross-backend diff-oracle
+    /// path for synthetic and (future) end-to-end tests.
+    backend: Option<B>,
     /// Lazily-built Metal backend. CPU-only kernels skip the cost; GPU
     /// kernels (`gpu_expert_forward` and friends) construct it on
     /// first use via [`Self::metal_mut`].
@@ -340,7 +352,7 @@ pub struct RsCtx {
     // Future phases populate: vocab.
 }
 
-impl RsCtx {
+impl RsCtx<MetalBackend> {
     /// Open a model. Argument order matches [`crate::imp::Ctx::open`].
     ///
     /// Phase 3: only the `weights` + `manifest` paths are consumed
@@ -368,6 +380,7 @@ impl RsCtx {
         let prefetch = PrefetchState::new(VARIANT.num_layers);
         Ok(Self {
             wf,
+            backend: None,
             metal: None,
             moe_buffers: None,
             experts,
@@ -2697,7 +2710,7 @@ impl RsCtx {
     }
 }
 
-impl std::fmt::Debug for RsCtx {
+impl std::fmt::Debug for RsCtx<MetalBackend> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RsCtx")
             .field("model", &VARIANT.name)
