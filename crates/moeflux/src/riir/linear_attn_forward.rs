@@ -38,7 +38,7 @@ use metal::{
     MTLResourceOptions, MTLSize, NSUInteger,
 };
 
-use super::graph::{BufId, BufferPool, MetalBufferPool};
+use super::graph::{Backend, BufId, BufferPool, MetalBufferPool};
 use super::deferred::{
     gpu_batched_experts_begin, gpu_batched_experts_begin_pre_staged,
     DeferredError,
@@ -94,6 +94,8 @@ pub enum LayerForwardError {
     RmsNorm(#[from] super::rms_norm::RmsNormError),
     #[error("deferred experts: {0}")]
     Deferred(#[from] DeferredError),
+    #[error("graph: {0}")]
+    Graph(#[from] super::graph::GraphError),
 }
 
 /// Backwards-compat alias. `LinearAttnForwardError` was the original
@@ -1945,13 +1947,10 @@ pub(super) fn batched_linear_attn_layer_forward(
     use super::metal::MtlBuffer;
     use super::moe_router::build_expert_buckets;
 
-    // S10b-1a-ii: fold the previous (metal, wf_buf, buffer_pool) tuple
-    // into a single &mut MetalBackend; resolve back inside via
-    // `parts_mut`. Phase 2 (S10b-1b) will replace the imperative
-    // pre-MoE chain with a `Graph` build that calls `backend.execute`.
-    let (metal, wf_buf, buffer_pool) = backend.parts_mut();
-    let hidden_in_buf = buffer_pool.handle(hidden_in_id);
-    let hidden_out_buf = buffer_pool.handle(hidden_out_id);
+    // S10b-1b (session 11): no parts_mut destructure here — Phase 2's
+    // graph build owns its own pool borrow inside an inner scope, then
+    // re-borrows after `backend.execute(&graph)` for the imperative
+    // MoE block (1f-1h).
 
     let v = VARIANT;
     debug_assert!(k_active <= MAX_K);
@@ -2017,234 +2016,20 @@ pub(super) fn batched_linear_attn_layer_forward(
     let o_s = attn.o_proj_s;
     let o_b = attn.o_proj_b;
 
-    let device = metal.device().clone();
-    let lp = LinearAttnPipelines::fetch(metal)?;
-    let mv = MatvecPipelines::fetch(metal)?;
-    let rms_pipes = RmsNormBf16Pipelines::fetch(metal)?;
+    // ── Phase 1a–1e: pre-MoE chain via the Graph compiler. ───────
+    // S10b-1b (session 11): the imperative encode_X_into chain that
+    // S7-1a (session 6) fused into one cmdbuf is now expressed as a
+    // [`super::graph::Graph`]. Each former encoder call becomes one
+    // [`super::graph::Op`] push; `MetalBackend::execute` walks the op
+    // list and records them into a single cmdbuf, preserving the
+    // commit-fusion win. The recurrent `*NTokens` Ops loop internally
+    // over n_tokens — they expect *stacked* transient buffers
+    // (n_tokens × per_token_size), not the single-token scratch the
+    // imperative loop reused.
+    use super::graph::{Graph, Op, WeightRef};
 
-    // ── Phase 1a+1b+1c+1d+1e: fused pre-MoE chain.  ──────────────
-    // S7-1a (session 6) fusion: the entire pre-MoE chain in linear-
-    // attn has GPU-only data dependencies (no q/k norm / RoPE on
-    // CPU like full-attn), so all 5 phases share ONE command buffer
-    // and ONE commit. The recurrent kernels' state buffers are
-    // read/written every token; Metal serialises encoder order
-    // within a cmdbuf so RAW hazards across kernels are honoured.
-    let rms_n_pipe =
-        super::gpu_norm::RmsNormBf16FusedNTokensPipeline::fetch(metal)?;
-    // hidden_in_buf comes from the orchestrator's double-buffer (S7-2).
-    let normed_buf =
-        MtlBuffer::<f32>::with_len(&device, n_tokens * hidden_dim);
-    let pre_moe_queue = metal.queue_clone();
-    let pre_moe_cmdbuf = pre_moe_queue.new_command_buffer();
-    super::gpu_norm::encode_rms_norm_bf16_fused_n_tokens(
-        pre_moe_cmdbuf,
-        &rms_n_pipe,
-        hidden_in_buf,
-        wf_buf.buffer(),
-        layer_cache.input_layernorm_w,
-        normed_buf.buffer(),
-        hidden_dim as u32,
-        n_tokens as u32,
-        RMS_NORM_EPS,
-    );
-    let _ = &rms_pipes;
-
-    // ── Phase 1b: batched 4 projections (qkv / z / beta / alpha). ──
-    //    Encoded into pre_moe_cmdbuf (no commit — fused with 1a/1c/1d/1e).
-    let qkv_stack = MtlBuffer::<f32>::with_len(&device, n_tokens * conv_dim);
-    let z_stack = MtlBuffer::<f32>::with_len(&device, n_tokens * total_value);
-    let beta_stack =
-        MtlBuffer::<f32>::with_len(&device, n_tokens * num_v_heads);
-    let alpha_stack =
-        MtlBuffer::<f32>::with_len(&device, n_tokens * num_v_heads);
-    encode_matvec_n_tokens(
-        pre_moe_cmdbuf,
-        &mv,
-        wf_buf.buffer(),
-        qkv_w,
-        qkv_s,
-        qkv_b,
-        normed_buf.buffer(),
-        0,
-        qkv_stack.buffer(),
-        0,
-        hidden_dim as u32,
-        conv_dim as u32,
-        n_tokens as u32,
-        qkv_bits,
-    );
-    encode_matvec_n_tokens(
-        pre_moe_cmdbuf,
-        &mv,
-        wf_buf.buffer(),
-        z_w,
-        z_s,
-        z_b,
-        normed_buf.buffer(),
-        0,
-        z_stack.buffer(),
-        0,
-        hidden_dim as u32,
-        total_value as u32,
-        n_tokens as u32,
-        z_bits,
-    );
-    encode_matvec_n_tokens(
-        pre_moe_cmdbuf,
-        &mv,
-        wf_buf.buffer(),
-        beta_w,
-        beta_s,
-        beta_b,
-        normed_buf.buffer(),
-        0,
-        beta_stack.buffer(),
-        0,
-        hidden_dim as u32,
-        num_v_heads as u32,
-        n_tokens as u32,
-        beta_bits,
-    );
-    encode_matvec_n_tokens(
-        pre_moe_cmdbuf,
-        &mv,
-        wf_buf.buffer(),
-        alpha_w,
-        alpha_s,
-        alpha_b,
-        normed_buf.buffer(),
-        0,
-        alpha_stack.buffer(),
-        0,
-        hidden_dim as u32,
-        num_v_heads as u32,
-        n_tokens as u32,
-        alpha_bits,
-    );
-
-    // ── Phase 1c: recurrent loop in one cmdbuf. ──────────────────
-    //
-    // N tokens × 5 kernels, all encoded into ONE command buffer. The
-    // recurrent state buffers (`conv_state[linear_layer_idx]`,
-    // `delta_state[linear_layer_idx]`) are read+written by every
-    // token; Metal serialises encoder order within a cmdbuf so the
-    // read-after-write hazard between adjacent tokens is honoured
-    // without an explicit commit. Per-token scratch buffers
-    // (`conv_output`, `delta_g_decay`, `delta_beta`, `delta_output`)
-    // are 1-token sized and reused — write-then-read inside one
-    // token's compute also serialises by encoder order.
-    //
-    // This is the single biggest profile-shifting change in Phase 1:
-    // the per-token oracle commits between every kernel pair, paying
-    // CPU↔GPU toggle latency 31×N×5 times per chunk. Here it's once
-    // per chunk per layer.
-    let value_out_stack =
-        MtlBuffer::<f32>::with_len(&device, n_tokens * total_value);
-    {
-        let k_heads_per_v =
-            (v.linear_num_v_heads / v.linear_num_k_heads) as u32;
-        let value_dim = Variant::LINEAR_VALUE_DIM as u32;
-        for t in 0..n_tokens {
-            let qkv_off = (t * conv_dim) as u64 * f32_sz;
-            let alpha_off = (t * num_v_heads) as u64 * f32_sz;
-            let beta_off = (t * num_v_heads) as u64 * f32_sz;
-            let z_off = (t * total_value) as u64 * f32_sz;
-            let out_off = (t * total_value) as u64 * f32_sz;
-
-            encode_conv1d_step(
-                pre_moe_cmdbuf,
-                &lp.conv1d_step,
-                buffer_pool.handle(buffers.conv_state[linear_layer_idx]),
-                qkv_stack.buffer(),
-                qkv_off,
-                wf_buf.buffer(),
-                conv1d_w,
-                buffer_pool.handle(buffers.conv_output),
-                conv_dim as u32,
-            );
-            encode_rms_norm_qk(
-                pre_moe_cmdbuf,
-                &lp.rms_norm_qk,
-                buffer_pool.handle(buffers.conv_output),
-                v.linear_num_k_heads as u32,
-                Variant::LINEAR_KEY_DIM as u32,
-            );
-            encode_compute_decay_beta(
-                pre_moe_cmdbuf,
-                &lp.compute_decay_beta,
-                alpha_stack.buffer(),
-                alpha_off,
-                beta_stack.buffer(),
-                beta_off,
-                wf_buf.buffer(),
-                a_log,
-                dt_bias,
-                buffer_pool.handle(buffers.delta_g_decay),
-                buffer_pool.handle(buffers.delta_beta),
-                v.linear_num_v_heads as u32,
-            );
-            encode_delta_net_step(
-                pre_moe_cmdbuf,
-                &lp.delta_net_step,
-                buffer_pool.handle(buffers.delta_state[linear_layer_idx]),
-                buffer_pool.handle(buffers.conv_output),
-                buffer_pool.handle(buffers.delta_g_decay),
-                buffer_pool.handle(buffers.delta_beta),
-                buffer_pool.handle(buffers.delta_output),
-                v.linear_num_v_heads as u32,
-                value_dim,
-                k_heads_per_v,
-            );
-            encode_gated_rms_norm(
-                pre_moe_cmdbuf,
-                &lp.gated_rms_norm,
-                buffer_pool.handle(buffers.delta_output),
-                z_stack.buffer(),
-                z_off,
-                wf_buf.buffer(),
-                gnorm_w,
-                value_out_stack.buffer(),
-                out_off,
-                v.linear_num_v_heads as u32,
-                value_dim,
-            );
-        }
-    }
-
-    // ── Phase 1d: batched o_proj. ───────────────────────────────
-    let o_proj_stack =
-        MtlBuffer::<f32>::with_len(&device, n_tokens * hidden_dim);
-    {
-        let cmdbuf = pre_moe_cmdbuf;
-        encode_matvec_n_tokens(
-            cmdbuf,
-            &mv,
-            wf_buf.buffer(),
-            o_w,
-            o_s,
-            o_b,
-            value_out_stack.buffer(),
-            0,
-            o_proj_stack.buffer(),
-            0,
-            total_value as u32,
-            hidden_dim as u32,
-            n_tokens as u32,
-            o_bits,
-        );
-        let _ = cmdbuf;
-    }
-    // ── Phase 1e: batched residual_add + post-attn rms_norm + gate
-    //    matvec + shared-gate matvec + GPU MoE router. Single cmdbuf
-    //    over all N tokens — collapses the per-token loop that issued
-    //    N×commit_and_wait + N host bounces. Mirrors the full-attn
-    //    Phase 3c refactor (B-0c). ─────────────────────────────────
-    // S7-2: h_mid + shared_gate stay on GPU (consumed by GPU combine).
-    // h_post_stack is still read back so the per-token bucket_input
-    // gather (`bucket_input_host[assignment_idx]`) can index into it.
-    let mut h_post_stack = vec![0.0f32; n_tokens * hidden_dim];
-    let all_routing_indices: Vec<i32>;
-    let all_routing_weights: Vec<f32>;
+    // Hoist bits lookups for gate + shared_expert_gate so we can build
+    // the WeightRefs at graph-build time.
     let gate_bits =
         bits_of(wf, &format!("model.layers.{layer_idx}.mlp.gate.weight"));
     let seg_bits = bits_of(
@@ -2253,94 +2038,338 @@ pub(super) fn batched_linear_attn_layer_forward(
             "model.layers.{layer_idx}.mlp.shared_expert_gate.weight"
         ),
     );
-    let resid_add_n_pso = metal
-        .pipeline("residual_add_n_tokens")?
-        .clone();
-    let router_pipes =
-        super::gpu_moe_router::MoeRouterPipelines::fetch(metal)?;
-    let h_mid_buf =
-        MtlBuffer::<f32>::with_len(&device, n_tokens * hidden_dim);
-    let h_post_buf =
-        MtlBuffer::<f32>::with_len(&device, n_tokens * hidden_dim);
-    let gate_logits_buf =
-        MtlBuffer::<f32>::with_len(&device, n_tokens * v.num_experts);
-    let shared_gate_buf = MtlBuffer::<f32>::with_len(&device, n_tokens);
-    let routing_indices_buf =
-        MtlBuffer::<i32>::with_len(&device, n_tokens * k_active);
-    let routing_weights_buf =
-        MtlBuffer::<f32>::with_len(&device, n_tokens * k_active);
-    super::gpu_norm::encode_residual_add_n_tokens_into(
-        pre_moe_cmdbuf,
-        &resid_add_n_pso,
-        o_proj_stack.buffer(),
-        hidden_in_buf,
-        h_mid_buf.buffer(),
-        n_tokens as u32,
-        hidden_dim as u32,
-    );
-    super::gpu_norm::encode_rms_norm_bf16_fused_n_tokens(
-        pre_moe_cmdbuf,
-        &rms_n_pipe,
-        h_mid_buf.buffer(),
-        wf_buf.buffer(),
-        layer_cache.post_attention_layernorm_w,
-        h_post_buf.buffer(),
-        hidden_dim as u32,
-        n_tokens as u32,
-        RMS_NORM_EPS,
-    );
-    encode_matvec_n_tokens(
-        pre_moe_cmdbuf,
-        &mv,
-        wf_buf.buffer(),
-        layer_cache.gate.w,
-        layer_cache.gate.s,
-        layer_cache.gate.b,
-        h_post_buf.buffer(),
-        0,
-        gate_logits_buf.buffer(),
-        0,
-        hidden_dim as u32,
-        v.num_experts as u32,
-        n_tokens as u32,
-        gate_bits,
-    );
-    encode_matvec_n_tokens(
-        pre_moe_cmdbuf,
-        &mv,
-        wf_buf.buffer(),
-        layer_cache.shared.seg_w,
-        layer_cache.shared.seg_s,
-        layer_cache.shared.seg_b,
-        h_post_buf.buffer(),
-        0,
-        shared_gate_buf.buffer(),
-        0,
-        hidden_dim as u32,
-        1,
-        n_tokens as u32,
-        seg_bits,
-    );
-    super::gpu_moe_router::encode_moe_router(
-        pre_moe_cmdbuf,
-        &router_pipes,
-        gate_logits_buf.buffer(),
-        routing_indices_buf.buffer(),
-        routing_weights_buf.buffer(),
-        n_tokens as u32,
-        v.num_experts as u32,
-        k_active as u32,
-    );
-    metal.commit_and_wait_labeled(
-        pre_moe_cmdbuf,
-        "batched_la_pre_moe_fused",
-    );
-    // Bulk readback (S7-2): only h_post_stack (for bucket_input
-    // gather) and the small routing buffers — h_mid + shared_gate
-    // stay on GPU and feed directly into the GPU combine kernel.
-    h_post_stack.copy_from_slice(&h_post_buf.to_vec());
-    all_routing_indices = routing_indices_buf.to_vec();
-    all_routing_weights = routing_weights_buf.to_vec();
+
+    let f32_sz_u = std::mem::size_of::<f32>();
+    let value_dim = Variant::LINEAR_VALUE_DIM as u32;
+    let k_heads_per_v =
+        (v.linear_num_v_heads / v.linear_num_k_heads) as u32;
+    let key_offset_per_token =
+        (v.linear_num_k_heads * Variant::LINEAR_KEY_DIM) as u32;
+
+    // Build the graph + allocate transient pool BufIds in an inner
+    // scope so the `pool` borrow ends before `backend.execute(&graph)`.
+    // BufIds for buffers consumed by the imperative MoE block (1f-1h)
+    // and the host-side routing readback are returned out.
+    let (
+        graph,
+        h_mid_id,
+        h_post_id,
+        shared_gate_id,
+        routing_indices_id,
+        routing_weights_id,
+    ) = {
+        let mut g = Graph::new();
+        let pool = backend.pool_mut();
+
+        // Phase 1a–1d transients.
+        let normed_id = pool
+            .alloc(n_tokens * hidden_dim * f32_sz_u, "linear_attn.normed", false)
+            ?;
+        let qkv_stack_id = pool
+            .alloc(n_tokens * conv_dim * f32_sz_u, "linear_attn.qkv_stack", false)
+            ?;
+        let z_stack_id = pool
+            .alloc(n_tokens * total_value * f32_sz_u, "linear_attn.z_stack", false)
+            ?;
+        let beta_stack_id = pool
+            .alloc(n_tokens * num_v_heads * f32_sz_u, "linear_attn.beta_stack", false)
+            ?;
+        let alpha_stack_id = pool
+            .alloc(n_tokens * num_v_heads * f32_sz_u, "linear_attn.alpha_stack", false)
+            ?;
+        let conv_out_stack_id = pool
+            .alloc(n_tokens * conv_dim * f32_sz_u, "linear_attn.conv_out_stack", false)
+            ?;
+        let g_decay_stack_id = pool
+            .alloc(n_tokens * num_v_heads * f32_sz_u, "linear_attn.g_decay_stack", false)
+            ?;
+        let beta_gate_stack_id = pool
+            .alloc(n_tokens * num_v_heads * f32_sz_u, "linear_attn.beta_gate_stack", false)
+            ?;
+        let delta_out_stack_id = pool
+            .alloc(
+                n_tokens * (num_v_heads as usize) * (value_dim as usize) * f32_sz_u,
+                "linear_attn.delta_out_stack",
+                false,
+            )
+            ?;
+        let value_out_stack_id = pool
+            .alloc(n_tokens * total_value * f32_sz_u, "linear_attn.value_out_stack", false)
+            ?;
+        let o_proj_stack_id = pool
+            .alloc(n_tokens * hidden_dim * f32_sz_u, "linear_attn.o_proj_stack", false)
+            ?;
+
+        // Phase 1e outputs that feed Phase 1f-1h (or the host readback).
+        let h_mid_id = pool
+            .alloc(n_tokens * hidden_dim * f32_sz_u, "linear_attn.h_mid", false)
+            ?;
+        let h_post_id = pool
+            .alloc(n_tokens * hidden_dim * f32_sz_u, "linear_attn.h_post", false)
+            ?;
+        let gate_logits_id = pool
+            .alloc(n_tokens * v.num_experts * f32_sz_u, "linear_attn.gate_logits", false)
+            ?;
+        let shared_gate_id = pool
+            .alloc(n_tokens * f32_sz_u, "linear_attn.shared_gate", false)
+            ?;
+        let routing_indices_id = pool
+            .alloc(
+                n_tokens * k_active * std::mem::size_of::<i32>(),
+                "linear_attn.routing_indices",
+                false,
+            )
+            ?;
+        let routing_weights_id = pool
+            .alloc(n_tokens * k_active * f32_sz_u, "linear_attn.routing_weights", false)
+            ?;
+
+        // Phase 1a — input rms_norm.
+        g.push(Op::RmsNormBf16NTokens {
+            label: "linear_attn.input_norm",
+            x: hidden_in_id,
+            weight_off: layer_cache.input_layernorm_w,
+            out: normed_id,
+            dim: hidden_dim as u32,
+            n_tokens: n_tokens as u32,
+            eps: RMS_NORM_EPS,
+        });
+
+        // Phase 1b — 4 batched projections (qkv / z / beta / alpha).
+        g.push(Op::MatvecNTokens {
+            label: "linear_attn.qkv_proj",
+            weight: WeightRef { w_off: qkv_w, s_off: qkv_s, b_off: qkv_b, bits: qkv_bits },
+            input: normed_id,
+            input_off: 0,
+            output: qkv_stack_id,
+            output_off: 0,
+            in_dim: hidden_dim as u32,
+            out_dim: conv_dim as u32,
+            n_tokens: n_tokens as u32,
+        });
+        g.push(Op::MatvecNTokens {
+            label: "linear_attn.z_proj",
+            weight: WeightRef { w_off: z_w, s_off: z_s, b_off: z_b, bits: z_bits },
+            input: normed_id,
+            input_off: 0,
+            output: z_stack_id,
+            output_off: 0,
+            in_dim: hidden_dim as u32,
+            out_dim: total_value as u32,
+            n_tokens: n_tokens as u32,
+        });
+        g.push(Op::MatvecNTokens {
+            label: "linear_attn.beta_proj",
+            weight: WeightRef { w_off: beta_w, s_off: beta_s, b_off: beta_b, bits: beta_bits },
+            input: normed_id,
+            input_off: 0,
+            output: beta_stack_id,
+            output_off: 0,
+            in_dim: hidden_dim as u32,
+            out_dim: num_v_heads as u32,
+            n_tokens: n_tokens as u32,
+        });
+        g.push(Op::MatvecNTokens {
+            label: "linear_attn.alpha_proj",
+            weight: WeightRef { w_off: alpha_w, s_off: alpha_s, b_off: alpha_b, bits: alpha_bits },
+            input: normed_id,
+            input_off: 0,
+            output: alpha_stack_id,
+            output_off: 0,
+            in_dim: hidden_dim as u32,
+            out_dim: num_v_heads as u32,
+            n_tokens: n_tokens as u32,
+        });
+
+        // Phase 1c — recurrent loop. Each *NTokens Op below loops
+        // internally over n_tokens. The Rust per-token loop is gone.
+        g.push(Op::Conv1dStepNTokens {
+            label: "linear_attn.conv1d_step",
+            qkv_in: qkv_stack_id,
+            conv_state: buffers.conv_state[linear_layer_idx],
+            weight_off: conv1d_w,
+            conv_out: conv_out_stack_id,
+            conv_dim: conv_dim as u32,
+            n_tokens: n_tokens as u32,
+        });
+        g.push(Op::RmsNormQkNTokens {
+            label: "linear_attn.rms_norm_qk",
+            x: conv_out_stack_id,
+            num_k_heads: v.linear_num_k_heads as u32,
+            key_dim: Variant::LINEAR_KEY_DIM as u32,
+            key_offset_per_token,
+            // conv_out is `q | k | v` per token: stride = conv_dim.
+            per_token_total: conv_dim as u32,
+            n_tokens: n_tokens as u32,
+        });
+        g.push(Op::ComputeDecayBetaNTokens {
+            label: "linear_attn.compute_decay_beta",
+            alpha_in: alpha_stack_id,
+            beta_in: beta_stack_id,
+            a_log_off: a_log,
+            dt_bias_off: dt_bias,
+            g_decay_out: g_decay_stack_id,
+            beta_gate_out: beta_gate_stack_id,
+            num_v_heads: num_v_heads as u32,
+            n_tokens: n_tokens as u32,
+        });
+        g.push(Op::GatedDeltaNetStepNTokens {
+            label: "linear_attn.gated_delta_net_step",
+            state: buffers.delta_state[linear_layer_idx],
+            conv_out: conv_out_stack_id,
+            g_decay: g_decay_stack_id,
+            beta_gate: beta_gate_stack_id,
+            output: delta_out_stack_id,
+            num_v_heads: num_v_heads as u32,
+            value_dim,
+            k_heads_per_v,
+            n_tokens: n_tokens as u32,
+        });
+        g.push(Op::GatedRmsNormNTokens {
+            label: "linear_attn.gated_rms_norm",
+            values: delta_out_stack_id,
+            z: z_stack_id,
+            weight_off: gnorm_w,
+            output: value_out_stack_id,
+            num_v_heads: num_v_heads as u32,
+            value_dim,
+            n_tokens: n_tokens as u32,
+            eps: RMS_NORM_EPS,
+        });
+
+        // Phase 1d — o_proj.
+        g.push(Op::MatvecNTokens {
+            label: "linear_attn.o_proj",
+            weight: WeightRef { w_off: o_w, s_off: o_s, b_off: o_b, bits: o_bits },
+            input: value_out_stack_id,
+            input_off: 0,
+            output: o_proj_stack_id,
+            output_off: 0,
+            in_dim: total_value as u32,
+            out_dim: hidden_dim as u32,
+            n_tokens: n_tokens as u32,
+        });
+
+        // Phase 1e — residual + post-norm + gate matvec + shared-gate
+        // matvec + GPU MoE router (softmax-topK + normalize).
+        g.push(Op::ResidualAddNTokens {
+            label: "linear_attn.residual_add",
+            a: o_proj_stack_id,
+            b: hidden_in_id,
+            out: h_mid_id,
+            n_tokens: n_tokens as u32,
+            dim: hidden_dim as u32,
+        });
+        g.push(Op::RmsNormBf16NTokens {
+            label: "linear_attn.post_attn_norm",
+            x: h_mid_id,
+            weight_off: layer_cache.post_attention_layernorm_w,
+            out: h_post_id,
+            dim: hidden_dim as u32,
+            n_tokens: n_tokens as u32,
+            eps: RMS_NORM_EPS,
+        });
+        g.push(Op::MatvecNTokens {
+            label: "linear_attn.gate_router",
+            weight: WeightRef {
+                w_off: layer_cache.gate.w,
+                s_off: layer_cache.gate.s,
+                b_off: layer_cache.gate.b,
+                bits: gate_bits,
+            },
+            input: h_post_id,
+            input_off: 0,
+            output: gate_logits_id,
+            output_off: 0,
+            in_dim: hidden_dim as u32,
+            out_dim: v.num_experts as u32,
+            n_tokens: n_tokens as u32,
+        });
+        g.push(Op::MatvecNTokens {
+            label: "linear_attn.shared_gate",
+            weight: WeightRef {
+                w_off: layer_cache.shared.seg_w,
+                s_off: layer_cache.shared.seg_s,
+                b_off: layer_cache.shared.seg_b,
+                bits: seg_bits,
+            },
+            input: h_post_id,
+            input_off: 0,
+            output: shared_gate_id,
+            output_off: 0,
+            in_dim: hidden_dim as u32,
+            out_dim: 1,
+            n_tokens: n_tokens as u32,
+        });
+        g.push(Op::MoeSoftmaxTopK {
+            label: "linear_attn.router_softmax_topk",
+            logits: gate_logits_id,
+            indices_out: routing_indices_id,
+            weights_out: routing_weights_id,
+            n_tokens: n_tokens as u32,
+            n_experts: v.num_experts as u32,
+            k: k_active as u32,
+        });
+        g.push(Op::MoeNormalizeWeights {
+            label: "linear_attn.router_normalize",
+            weights: routing_weights_id,
+            n_tokens: n_tokens as u32,
+            k: k_active as u32,
+        });
+
+        (g, h_mid_id, h_post_id, shared_gate_id, routing_indices_id, routing_weights_id)
+    };
+
+    // Submit + wait. Single cmdbuf, single commit (the S7-1a fusion
+    // is preserved by `MetalBackend::execute`'s default loop body).
+    backend.execute(&graph)?;
+
+    // Re-borrow parts now that the graph executed and the pool isn't
+    // mutably borrowed. Imperative MoE block (1f-1h) consumes h_mid /
+    // shared_gate / hidden_out via `buffer_pool.handle(id)`.
+    let (metal, wf_buf, buffer_pool) = backend.parts_mut();
+    let device = metal.device().clone();
+    let mv = MatvecPipelines::fetch(metal)?;
+    let hidden_out_buf = buffer_pool.handle(hidden_out_id);
+    // Bulk readback: h_post_stack (for bucket_input gather), routing
+    // indices + weights (for build_expert_buckets). h_mid + shared_gate
+    // stay on GPU.
+    let mut h_post_stack = vec![0.0f32; n_tokens * hidden_dim];
+    {
+        let bytes_out: &mut [u8] = unsafe {
+            std::slice::from_raw_parts_mut(
+                h_post_stack.as_mut_ptr() as *mut u8,
+                n_tokens * hidden_dim * f32_sz_u,
+            )
+        };
+        buffer_pool
+            .download(h_post_id, bytes_out)
+            ?;
+    }
+    let mut all_routing_indices = vec![0i32; n_tokens * k_active];
+    {
+        let bytes_out: &mut [u8] = unsafe {
+            std::slice::from_raw_parts_mut(
+                all_routing_indices.as_mut_ptr() as *mut u8,
+                n_tokens * k_active * std::mem::size_of::<i32>(),
+            )
+        };
+        buffer_pool
+            .download(routing_indices_id, bytes_out)
+            ?;
+    }
+    let mut all_routing_weights = vec![0.0f32; n_tokens * k_active];
+    {
+        let bytes_out: &mut [u8] = unsafe {
+            std::slice::from_raw_parts_mut(
+                all_routing_weights.as_mut_ptr() as *mut u8,
+                n_tokens * k_active * f32_sz_u,
+            )
+        };
+        buffer_pool
+            .download(routing_weights_id, bytes_out)
+            ?;
+    }
 
     // ── Phase 1f: batched shared FFN. ───────────────────────────
     let s_gate_bits = bits_of(
@@ -2610,10 +2639,11 @@ pub(super) fn batched_linear_attn_layer_forward(
     encode_moe_combine_residual_n_tokens(
         moe_cmdbuf,
         &combine_pso,
-        h_mid_buf.buffer(),
+        // S10b-1b: h_mid + shared_gate live in the graph-mode pool now.
+        buffer_pool.handle(h_mid_id),
         out_sum.buffer(),
         shared_down_buf.buffer(),
-        shared_gate_buf.buffer(),
+        buffer_pool.handle(shared_gate_id),
         hidden_out_buf,
         n_tokens as u32,
         hidden_dim as u32,
