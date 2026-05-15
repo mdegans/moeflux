@@ -683,18 +683,18 @@ impl Backend for MetalBackend {
                 num_k_heads,
                 key_dim,
                 key_offset_per_token,
+                per_token_total,
                 n_tokens,
                 ..
             } => {
                 // In-place per-head RMS-norm on q and k regions of `x`.
-                // Layout: each token spans `key_offset_per_token +
-                // num_k_heads*key_dim` floats — q region at offset 0,
-                // k region at offset `key_offset_per_token`. Matches
-                // `rms_norm_qk_n_tokens_cpu`.
+                // Each token's slot is `per_token_total` floats; q
+                // region at offset 0, k region at offset
+                // `key_offset_per_token`. For q|k|v layouts (linear-
+                // attn `conv_out`) `per_token_total` includes the V
+                // region trailing K. Matches `rms_norm_qk_n_tokens_cpu`.
                 let inv_scale = 1.0f32 / (*key_dim as f32).sqrt();
-                let per_token_elems =
-                    *key_offset_per_token + *num_k_heads * *key_dim;
-                let per_token_bytes = (per_token_elems as u64) * 4;
+                let per_token_bytes = (*per_token_total as u64) * 4;
                 let k_byte_off = (*key_offset_per_token as u64) * 4;
                 let x_buf = self.pool.handle(*x);
                 let key_dim_arg = *key_dim;

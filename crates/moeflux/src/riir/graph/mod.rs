@@ -289,7 +289,11 @@ pub enum Op {
 
     /// Per-head Q/K RMS norm, in-place on `conv_out` / projection
     /// buffer. Operates on the q region at offset 0 and the k
-    /// region at offset `key_offset_per_token`.
+    /// region at offset `key_offset_per_token` (in floats) within
+    /// each token's slot. The slot itself is `per_token_total`
+    /// floats — for `q|k` layouts this equals `key_offset_per_token
+    /// + num_k_heads * key_dim`, but for `q|k|v` layouts (linear-
+    /// attn `conv_out`) it must include the trailing V region.
     ///
     /// `n_tokens` triggers an internal per-token loop in
     /// [`Backend::encode_op`] for now — future work may add a
@@ -300,6 +304,10 @@ pub enum Op {
         num_k_heads: u32,
         key_dim: u32,
         key_offset_per_token: u32,
+        /// Per-token slot stride in floats. Must match the actual
+        /// per-token element count of `x`. The kernel computes the
+        /// per-token base offset as `t * per_token_total * 4`.
+        per_token_total: u32,
         n_tokens: u32,
     },
 

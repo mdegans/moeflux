@@ -404,6 +404,7 @@ fn rms_norm_qk_n_tokens_cpu(
     num_k_heads: usize,
     key_dim: usize,
     key_offset_per_token: usize,
+    per_token_total: usize,
     n_tokens: usize,
     eps: f32,
 ) {
@@ -415,10 +416,10 @@ fn rms_norm_qk_n_tokens_cpu(
     let inv_scale = 1.0f32 / (key_dim as f32).sqrt();
     let q_scale = inv_scale * inv_scale;
     let k_scale = inv_scale;
-    let per_token_stride = key_offset_per_token + num_k_heads * key_dim;
-    debug_assert_eq!(x_inout.len(), n_tokens * per_token_stride);
+    debug_assert!(per_token_total >= key_offset_per_token + num_k_heads * key_dim);
+    debug_assert_eq!(x_inout.len(), n_tokens * per_token_total);
     for t in 0..n_tokens {
-        let base = t * per_token_stride;
+        let base = t * per_token_total;
         // Q region
         for h in 0..num_k_heads {
             let off = base + h * key_dim;
@@ -757,6 +758,7 @@ impl Backend for CpuBackend {
                 num_k_heads,
                 key_dim,
                 key_offset_per_token,
+                per_token_total,
                 n_tokens,
                 ..
             } => {
@@ -766,6 +768,7 @@ impl Backend for CpuBackend {
                     *num_k_heads as usize,
                     *key_dim as usize,
                     *key_offset_per_token as usize,
+                    *per_token_total as usize,
                     *n_tokens as usize,
                     1e-6,
                 );

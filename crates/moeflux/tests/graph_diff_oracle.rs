@@ -659,6 +659,7 @@ fn graph_metal_matches_cpu_rms_norm_qk() {
         num_k_heads,
         key_dim,
         key_offset_per_token,
+        per_token_total: key_offset_per_token + num_k_heads * key_dim,
         n_tokens,
     });
     cpu.execute(&g_cpu).unwrap();
@@ -682,6 +683,7 @@ fn graph_metal_matches_cpu_rms_norm_qk() {
         num_k_heads,
         key_dim,
         key_offset_per_token,
+        per_token_total: key_offset_per_token + num_k_heads * key_dim,
         n_tokens,
     });
     gpu.execute(&g_gpu).unwrap();
