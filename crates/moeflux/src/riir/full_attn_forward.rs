@@ -1091,8 +1091,11 @@ pub(super) fn batched_full_attn_layer_forward(
         .map(|(bi, &expert_id)| {
             if let Some(buf_idx) = bucket_prefetch_slot[bi] {
                 let pe = prefetch.as_ref().expect("prefetch slot requires env");
-                let buf =
-                    pe.moe_buffers.data_prefetch_buffer(pe.prefetch_set, buf_idx);
+                let buf = pe.moe_buffers.data_prefetch_buffer(
+                    buffer_pool,
+                    pe.prefetch_set,
+                    buf_idx,
+                );
                 (buf, 0u64)
             } else if mode == super::expert_io::ExpertIoMode::Mmap {
                 expert_files

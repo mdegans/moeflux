@@ -49,7 +49,7 @@ use super::expert_forward::{
 };
 use super::metal::MetalContext;
 use super::variants::VARIANT;
-use super::graph::MetalBackend;
+use super::graph::{Backend as _, BufferPool as _, MetalBackend, MetalBufferPool};
 use super::{RsCtx, RsError};
 
 /// Slice 5d-9 — bounded ring of in-flight deferred K-expert dispatches.
@@ -213,6 +213,7 @@ impl From<RsError> for DeferredError {
 pub(crate) fn gpu_batched_experts_begin(
     metal: &mut MetalContext,
     bufs: &mut MoeBuffers,
+    buffer_pool: &MetalBufferPool,
     ring: &mut DeferredRing,
     actual_k: i32,
     expert_data: &[u8],
@@ -230,6 +231,7 @@ pub(crate) fn gpu_batched_experts_begin(
     let cmd_buffer = gpu_batched_experts_encode(
         metal,
         bufs,
+        buffer_pool,
         actual_k,
         expert_data,
         h_post,
@@ -282,6 +284,7 @@ pub(crate) fn gpu_batched_experts_begin(
 pub(crate) fn gpu_batched_experts_begin_pre_staged(
     metal: &mut MetalContext,
     bufs: &mut MoeBuffers,
+    buffer_pool: &MetalBufferPool,
     ring: &mut DeferredRing,
     actual_k: i32,
     input: &metal::BufferRef,
@@ -300,6 +303,7 @@ pub(crate) fn gpu_batched_experts_begin_pre_staged(
     let cmd_buffer = gpu_batched_experts_encode_pre_staged(
         metal,
         bufs,
+        buffer_pool,
         actual_k,
         input,
         h_mid,
@@ -332,6 +336,7 @@ pub(crate) fn gpu_batched_experts_begin_pre_staged(
 pub(crate) fn complete_deferred_experts_into(
     ring: &mut DeferredRing,
     bufs: &MoeBuffers,
+    buffer_pool: &MetalBufferPool,
     hidden_out: &mut [f32],
 ) -> Result<(), DeferredError> {
     if hidden_out.len() != VARIANT.hidden_dim {
@@ -346,7 +351,8 @@ pub(crate) fn complete_deferred_experts_into(
     state.cmd_buffer.wait_until_completed();
     match state.mode {
         DeferredMode::Gpu => {
-            hidden_out.copy_from_slice(&bufs.moe_hidden().to_vec());
+            hidden_out
+                .copy_from_slice(&bufs.moe_hidden_to_vec(buffer_pool));
         }
         DeferredMode::Cpu {
             h_mid,
@@ -356,6 +362,7 @@ pub(crate) fn complete_deferred_experts_into(
         } => {
             cpu_combine(
                 bufs,
+                buffer_pool,
                 state.actual_k,
                 &h_mid,
                 &shared_out,
@@ -391,6 +398,7 @@ pub(crate) fn complete_deferred_experts_chained(
 /// sides use; see slice 6 / cpu_ops.rs for the FMA rationale).
 fn cpu_combine(
     bufs: &MoeBuffers,
+    buffer_pool: &MetalBufferPool,
     actual_k: usize,
     h_mid: &[f32],
     shared_out: &[f32],
@@ -410,9 +418,17 @@ fn cpu_combine(
     // moe_out[i] starts at 0, accumulates K experts.
     let mut moe_out = vec![0.0f32; dim];
     for k in 0..actual_k {
-        let expert_k = bufs.out(k).to_vec();
-        debug_assert_eq!(expert_k.len(), dim);
-        super::cpu_ops::cpu_vec_madd(&mut moe_out, &expert_k, expert_weights[k]);
+        let out_buf = buffer_pool.handle(bufs.out_id(k));
+        // SAFETY: caller has awaited the cmdbuf via
+        // `wait_until_completed`; no concurrent GPU dispatch reads
+        // from `bufs.out[k]`.
+        let expert_k: &[f32] = unsafe {
+            std::slice::from_raw_parts(
+                out_buf.contents() as *const f32,
+                dim,
+            )
+        };
+        super::cpu_ops::cpu_vec_madd(&mut moe_out, expert_k, expert_weights[k]);
     }
 
     // Apply sigmoid gate to shared expert output (in place into a
@@ -482,14 +498,14 @@ impl RsCtx<MetalBackend> {
             deferred,
             ..
         } = self;
-        let metal = backend
-            .as_mut()
-            .expect("metal_and_moe_mut just-set")
-            .metal_mut();
+        let backend =
+            backend.as_mut().expect("metal_and_moe_mut just-set");
+        let (metal, _wf_buf, pool) = backend.parts_mut();
         let bufs = moe_buffers.as_mut().expect("metal_and_moe_mut just-set");
         gpu_batched_experts_begin(
             metal,
             bufs,
+            pool,
             deferred,
             actual_k,
             expert_data,
@@ -515,6 +531,7 @@ impl RsCtx<MetalBackend> {
         hidden_out: &mut [f32],
     ) -> Result<(), DeferredError> {
         let Self {
+            backend,
             moe_buffers,
             deferred,
             ..
@@ -523,7 +540,11 @@ impl RsCtx<MetalBackend> {
             // No moe_buffers means no dispatch could have happened.
             return Ok(());
         };
-        complete_deferred_experts_into(deferred, bufs, hidden_out)
+        let Some(backend) = backend.as_ref() else {
+            return Ok(());
+        };
+        let pool = backend.pool();
+        complete_deferred_experts_into(deferred, bufs, pool, hidden_out)
     }
 
     /// Wait for the deferred GPU dispatch (so the persistent

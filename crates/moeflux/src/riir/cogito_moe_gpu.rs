@@ -44,6 +44,7 @@ use super::expert_forward::{
     ExpertForwardError, MAX_K, MoeBuffers, gpu_batched_experts_encode_pre_staged,
 };
 use super::expert_io::{ExpertFiles, ExpertIoError};
+use super::graph::MetalBufferPool;
 use super::gpu_matvec::{BfMatvecPipelines, encode_bf16_matvec};
 use super::metal::MetalContext;
 use super::moe_router::{MoeRouterError, noaux_tc_router_cpu};
@@ -132,6 +133,7 @@ impl SharedExpertBuffers {
 pub fn cogito_moe_layer_forward_gpu(
     metal: &mut MetalContext,
     bufs: &mut MoeBuffers,
+    buffer_pool: &MetalBufferPool,
     shared_bufs: &SharedExpertBuffers,
     dense_pipes: &DenseMlpPipelines,
     bf_pipes: &BfMatvecPipelines,
@@ -161,11 +163,12 @@ pub fn cogito_moe_layer_forward_gpu(
 
     // Stage hidden into bufs.input now so both the GPU gate matvec and
     // the GPU shared expert read it directly from bufs.input.
-    bufs.stage_host_input(hidden);
-    let input_clone: Buffer = bufs.input_buffer().clone();
+    bufs.stage_host_input(buffer_pool, hidden);
+    let input_clone: Buffer = bufs.input_buffer(buffer_pool).clone();
     cogito_moe_layer_forward_gpu_inner(
         metal,
         bufs,
+        buffer_pool,
         shared_bufs,
         dense_pipes,
         bf_pipes,
@@ -176,7 +179,7 @@ pub fn cogito_moe_layer_forward_gpu(
         layer_idx,
         input_clone,
     )?;
-    out.copy_from_slice(&bufs.moe_hidden_to_vec());
+    out.copy_from_slice(&bufs.moe_hidden_to_vec(buffer_pool));
     Ok(())
 }
 
@@ -190,6 +193,7 @@ pub fn cogito_moe_layer_forward_gpu(
 pub fn cogito_moe_layer_forward_gpu_buf_io(
     metal: &mut MetalContext,
     bufs: &mut MoeBuffers,
+    buffer_pool: &MetalBufferPool,
     shared_bufs: &SharedExpertBuffers,
     dense_pipes: &DenseMlpPipelines,
     bf_pipes: &BfMatvecPipelines,
@@ -203,6 +207,7 @@ pub fn cogito_moe_layer_forward_gpu_buf_io(
     cogito_moe_layer_forward_gpu_inner(
         metal,
         bufs,
+        buffer_pool,
         shared_bufs,
         dense_pipes,
         bf_pipes,
@@ -219,6 +224,7 @@ pub fn cogito_moe_layer_forward_gpu_buf_io(
 fn cogito_moe_layer_forward_gpu_inner(
     metal: &mut MetalContext,
     bufs: &mut MoeBuffers,
+    buffer_pool: &MetalBufferPool,
     shared_bufs: &SharedExpertBuffers,
     dense_pipes: &DenseMlpPipelines,
     bf_pipes: &BfMatvecPipelines,
@@ -255,14 +261,14 @@ fn cogito_moe_layer_forward_gpu_inner(
             wf_buf.buffer(),
             gate_w_off,
             &input_buf,
-            bufs.gate_logits_buffer(),
+            bufs.gate_logits_buffer(buffer_pool),
             hidden_dim as u32,
             num_experts as u32,
         );
         cmdbuf_gate.commit();
         cmdbuf_gate.wait_until_completed();
     }
-    let mut gate_logits = bufs.gate_logits_to_vec();
+    let mut gate_logits = bufs.gate_logits_to_vec(buffer_pool);
 
     let bias_bytes =
         wf.tensor_bytes(&bias_name)
@@ -296,7 +302,7 @@ fn cogito_moe_layer_forward_gpu_inner(
     // ---- Stage h_mid as zeros for the unscaled combine ----
     // bufs.input was already staged above for the GPU gate matvec; the
     // shared-expert and routed-expert dispatches read the same buffer.
-    bufs.stage_host_h_mid_zero();
+    bufs.stage_host_h_mid_zero(buffer_pool);
 
     // ---- CPU: read K expert blobs into bufs.data_synced (parallel) ----
     // Slice 5d-6 / 5d-9 path via rayon. `data_set_per_slot` is set to
@@ -307,7 +313,7 @@ fn cogito_moe_layer_forward_gpu_inner(
     // closure only captures `[&mut [u8]; MAX_K]` (Send), not
     // `&mut MoeBuffers`. Same trick the linear-attn path uses at
     // `linear_attn_forward.rs:1106-1129`.
-    let mut dsts = bufs.data_synced_slots_mut_array();
+    let mut dsts = bufs.data_synced_slots_mut_array(buffer_pool);
     pool.install(|| -> Result<(), ExpertIoError> {
         dsts[..k]
             .par_iter_mut()
@@ -334,7 +340,7 @@ fn cogito_moe_layer_forward_gpu_inner(
             &shared_bufs.gate_out,
             &shared_bufs.up_out,
             &shared_bufs.act,
-            bufs.shared_out_buffer(),
+            bufs.shared_out_buffer(buffer_pool),
         )?;
         cmdbuf_shared.commit();
     }
@@ -349,11 +355,12 @@ fn cogito_moe_layer_forward_gpu_inner(
     // Arc-like, clone is cheap retain) so the &mut bufs borrow into
     // the pre-staged encoder doesn't conflict with the input refs.
     // Pass the caller's input_buf directly (replaces bufs.input clone).
-    let h_mid_clone: Buffer = bufs.h_mid_buffer().clone();
-    let shared_clone: Buffer = bufs.shared_out_buffer().clone();
+    let h_mid_clone: Buffer = bufs.h_mid_buffer(buffer_pool).clone();
+    let shared_clone: Buffer = bufs.shared_out_buffer(buffer_pool).clone();
     let cmdbuf = gpu_batched_experts_encode_pre_staged(
         metal,
         bufs,
+        buffer_pool,
         k as i32,
         &input_buf,
         &h_mid_clone,

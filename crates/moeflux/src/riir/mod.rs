@@ -427,14 +427,9 @@ impl RsCtx<MetalBackend> {
     ) -> Result<(&mut MetalContext, &mut MoeBuffers), RsError> {
         self.ensure_backend()?;
         if self.moe_buffers.is_none() {
-            let device = self
-                .backend
-                .as_ref()
-                .expect("just-set")
-                .metal()
-                .device()
-                .to_owned();
-            self.moe_buffers = Some(MoeBuffers::new(&device));
+            let pool =
+                self.backend.as_mut().expect("just-set").pool_mut();
+            self.moe_buffers = Some(MoeBuffers::new(pool));
         }
         let Self {
             backend, moe_buffers, ..
@@ -826,10 +821,23 @@ impl RsCtx<MetalBackend> {
         shared_gate_score: f32,
         hidden_out: &mut [f32],
     ) -> Result<(), RsError> {
-        let (metal, bufs) = self.metal_and_moe_mut()?;
+        self.ensure_backend()?;
+        if self.moe_buffers.is_none() {
+            let pool =
+                self.backend.as_mut().expect("just-set").pool_mut();
+            self.moe_buffers = Some(MoeBuffers::new(pool));
+        }
+        let Self {
+            backend, moe_buffers, ..
+        } = self;
+        let backend =
+            backend.as_mut().expect("ensure_backend just-set");
+        let (metal, _wf_buf, pool) = backend.parts_mut();
+        let bufs = moe_buffers.as_mut().expect("just-set");
         gpu_batched_experts_forward(
             metal,
             bufs,
+            pool,
             actual_k,
             expert_data,
             h_post,
@@ -1051,6 +1059,7 @@ impl RsCtx<MetalBackend> {
         deferred::complete_deferred_experts_into(
             deferred,
             moe_buffers,
+            buffer_pool,
             buf_input_slice,
         )
         .map_err(|_| RsError::EvalFailed)?;
@@ -1195,7 +1204,9 @@ impl RsCtx<MetalBackend> {
             );
         }
         if self.moe_buffers.is_none() {
-            self.moe_buffers = Some(MoeBuffers::new(&device));
+            let pool =
+                self.backend.as_mut().expect("just-set").pool_mut();
+            self.moe_buffers = Some(MoeBuffers::new(pool));
         }
         if self.shared_expert_bufs.is_none() && VARIANT.shared_intermediate > 0
         {
@@ -1276,14 +1287,9 @@ impl RsCtx<MetalBackend> {
             self.linear_buffers = Some(LinearAttnBuffers::new(pool));
         }
         if self.moe_buffers.is_none() {
-            let device = self
-                .backend
-                .as_ref()
-                .expect("just-set")
-                .metal()
-                .device()
-                .to_owned();
-            self.moe_buffers = Some(MoeBuffers::new(&device));
+            let pool =
+                self.backend.as_mut().expect("just-set").pool_mut();
+            self.moe_buffers = Some(MoeBuffers::new(pool));
         }
         if self.lm_head_gpu.is_none() {
             let Self {
@@ -1573,8 +1579,8 @@ impl RsCtx<MetalBackend> {
             // Skipped when prefetch is disabled (N != 1 or mmap mode).
             if prefetch_enabled {
                 if let Some(predicted) = prefetch.predict_for(layer_idx) {
-                    let data_prefetch =
-                        moe_buffers.data_prefetch_slots_mut_array(prefetch_set);
+                    let data_prefetch = moe_buffers
+                        .data_prefetch_slots_mut_array(pool, prefetch_set);
                     prefetch.dispatch(
                         layer_idx,
                         predicted,
@@ -1876,7 +1882,7 @@ impl RsCtx<MetalBackend> {
             ..
         } = self;
         let backend = backend.as_mut().expect("ensure_mla_resources");
-        let (metal, wf_buf, _) = backend.parts_mut();
+        let (metal, wf_buf, pool) = backend.parts_mut();
         let lm_head_gpu =
             lm_head_gpu.as_ref().expect("ensure_mla_resources");
         let mla_buffers =
@@ -2061,6 +2067,7 @@ impl RsCtx<MetalBackend> {
                 cogito_moe_layer_forward_gpu_buf_io(
                     metal,
                     moe_buffers,
+                    pool,
                     shared_expert_bufs,
                     dense_mlp_pipes,
                     bf_matvec_pipes,
@@ -2072,7 +2079,7 @@ impl RsCtx<MetalBackend> {
                     &scratch.normed,
                 )
                 .map_err(|_| RsError::EvalFailed)?;
-                moe_buffers.moe_hidden_ref()
+                moe_buffers.moe_hidden_ref(pool)
             };
 
             // Post-MLP residual_add: hidden := residual + mlp_out.
@@ -2271,8 +2278,8 @@ impl RsCtx<MetalBackend> {
             // reads from the same set this prefetch wrote to.
             let prefetch_set = layer_idx % 2;
             if let Some(predicted) = prefetch.predict_for(layer_idx) {
-                let data_prefetch =
-                    moe_buffers.data_prefetch_slots_mut_array(prefetch_set);
+                let data_prefetch = moe_buffers
+                    .data_prefetch_slots_mut_array(buffer_pool, prefetch_set);
                 prefetch.dispatch(
                     layer_idx,
                     predicted,
@@ -2386,6 +2393,7 @@ impl RsCtx<MetalBackend> {
                 deferred::complete_deferred_experts_into(
                     deferred,
                     moe_buffers,
+                    buffer_pool,
                     &mut hidden_final,
                 )
                 .map_err(|_| RsError::EvalFailed)?;

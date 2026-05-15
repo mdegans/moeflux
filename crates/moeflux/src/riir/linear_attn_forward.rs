@@ -1647,7 +1647,7 @@ pub(super) fn moe_dispatch_per_token(
         prefetch.record_outcome(hit_count, k as u64 - hit_count);
 
         // Step 3: parallel sync-pread the misses into data_synced.
-        let mut dsts = moe.data_synced_slots_mut_array();
+        let mut dsts = moe.data_synced_slots_mut_array(buffer_pool);
         let active = &mut dsts[..k];
         pool.install(|| -> Result<(), super::expert_io::ExpertIoError> {
             active
@@ -1710,6 +1710,7 @@ pub(super) fn moe_dispatch_per_token(
         gpu_batched_experts_begin_pre_staged(
             metal,
             moe,
+            buffer_pool,
             deferred,
             k as i32,
             buffer_pool.handle(buffers.normed),     // h_post (post-attn-norm input)
@@ -1738,6 +1739,7 @@ pub(super) fn moe_dispatch_per_token(
         gpu_batched_experts_begin(
             metal,
             moe,
+            buffer_pool,
             deferred,
             k as i32,
             &expert_data,
@@ -2522,8 +2524,11 @@ pub(super) fn batched_linear_attn_layer_forward(
         .map(|(bi, &expert_id)| {
             if let Some(buf_idx) = bucket_prefetch_slot[bi] {
                 let pe = prefetch.as_ref().expect("prefetch slot requires env");
-                let buf =
-                    pe.moe_buffers.data_prefetch_buffer(pe.prefetch_set, buf_idx);
+                let buf = pe.moe_buffers.data_prefetch_buffer(
+                    buffer_pool,
+                    pe.prefetch_set,
+                    buf_idx,
+                );
                 (buf, 0u64)
             } else if mode == super::expert_io::ExpertIoMode::Mmap {
                 expert_files

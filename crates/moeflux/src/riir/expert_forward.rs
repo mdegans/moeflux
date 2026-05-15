@@ -50,6 +50,7 @@ use metal::{
     NSUInteger,
 };
 
+use super::graph::{BufId, BufferPool, MetalBufferPool};
 use super::gpu_matvec::{encode_matvec_n_tokens, MatvecPipelines};
 use super::gpu_norm::{encode_rms_norm_bf16_into, RmsNormBf16Pipelines};
 use super::metal::{MetalContext, MetalError, MtlBuffer};
@@ -324,71 +325,75 @@ fn encode_swiglu(
 ///   writes set `N % 2` again, the depth-2 ring has drained layer
 ///   N's deferred so set `N % 2` is safe to overwrite.
 pub struct MoeBuffers {
-    /// Sync-pread (miss) target. See type-level docs.
-    data_synced: [MtlBuffer<u8>; MAX_K],
+    /// Sync-pread (miss) target. See type-level docs. `u8`-typed
+    /// (expert blob bytes); 2 MiB aligned via `pool.alloc_aligned`.
+    data_synced: [BufId; MAX_K],
     /// Async-prefetch (hit) target — two parity-keyed sets. Layer N's
     /// prefetch writes set `N % 2`; the encoder for layer N reads from
     /// the same set. See type-level docs for the soundness argument.
-    data_prefetch: [[MtlBuffer<u8>; MAX_K]; 2],
-    gate: [MtlBuffer<f32>; MAX_K],
-    up: [MtlBuffer<f32>; MAX_K],
-    act: [MtlBuffer<f32>; MAX_K],
-    out: [MtlBuffer<f32>; MAX_K],
-    input: MtlBuffer<f32>,
-    h_mid: MtlBuffer<f32>,
-    shared_out: MtlBuffer<f32>,
-    moe_hidden: MtlBuffer<f32>,
-    combine_params: MtlBuffer<f32>,
+    /// 2 MiB aligned via `pool.alloc_aligned`.
+    data_prefetch: [[BufId; MAX_K]; 2],
+    gate: [BufId; MAX_K],
+    up: [BufId; MAX_K],
+    act: [BufId; MAX_K],
+    out: [BufId; MAX_K],
+    input: BufId,
+    h_mid: BufId,
+    shared_out: BufId,
+    moe_hidden: BufId,
+    combine_params: BufId,
     /// Phase 2 (cogito-v2 full-GPU): MoE router-gate logits buffer,
     /// `[num_experts]` f32. The GPU `bf16_matvec` dispatch writes
     /// here; CPU `noaux_tc` routing reads it back via
     /// [`Self::gate_logits_to_vec`]. ~1 KB at num_experts=256.
-    gate_logits: MtlBuffer<f32>,
+    gate_logits: BufId,
 }
 
 impl MoeBuffers {
-    /// Allocate the full multi-expert + combine buffer set on
-    /// `device`. Sizes come from the active [`Variant`] and architectural
-    /// `MAX_K`. Buffers are uninitialized — every call to
+    /// Allocate the full multi-expert + combine buffer set in the pool.
+    /// Sizes come from the active [`Variant`] and architectural
+    /// `MAX_K`. All buffers are persistent — they survive
+    /// `pool.reset_transient()` and live for the lifetime of the
+    /// `RsCtx`. Buffers are zeroed by the pool on alloc; every call to
     /// [`gpu_batched_experts_forward`] writes the slots it uses before
     /// dispatch.
-    pub fn new(device: &metal::Device) -> Self {
+    ///
+    /// S10b-pre-3: migrated from `&Device` + `MtlBuffer<T>` ownership
+    /// to `&mut MetalBufferPool` + `BufId`. Pread DMA destinations
+    /// (`data_synced`, `data_prefetch`) use `pool.alloc_aligned` with
+    /// 2 MiB alignment per the C path's 3.6× DMA win
+    /// (`metal_infer/infer.m:1196`).
+    pub fn new(pool: &mut MetalBufferPool) -> Self {
         let v: Variant = VARIANT;
-        // Slice 5d-6 / Phase 0 (cogito-v2 full-GPU plan): explicit 2 MB
-        // alignment on the pread DMA destinations. The C path documents
-        // a 3.6× DMA improvement over 16 KB alignment
-        // (`metal_infer/infer.m:1196`); Apple's allocator only lands
-        // large allocations on 2 MB boundaries incidentally, and a
-        // probe at this site previously fired on cogito-v2's expert
-        // size (~24 MB), so we control it explicitly via
-        // `MtlBuffer::with_aligned_len_u8` (posix-memalign-equivalent +
-        // `newBufferWithBytesNoCopy:`).
         const TWO_MIB: usize = 2 * 1024 * 1024;
-        let data_synced = std::array::from_fn(|_| {
-            MtlBuffer::<u8>::with_aligned_len_u8(
-                device,
+        let f32_size = std::mem::size_of::<f32>();
+        let data_synced: [BufId; MAX_K] = std::array::from_fn(|_| {
+            pool.alloc_aligned(
                 v.expert_size_4bit(),
                 TWO_MIB,
+                "moe.data_synced",
+                true,
             )
         });
-        let data_prefetch: [[MtlBuffer<u8>; MAX_K]; 2] =
+        let data_prefetch: [[BufId; MAX_K]; 2] =
             std::array::from_fn(|_| {
                 std::array::from_fn(|_| {
-                    MtlBuffer::<u8>::with_aligned_len_u8(
-                        device,
+                    pool.alloc_aligned(
                         v.expert_size_4bit(),
                         TWO_MIB,
+                        "moe.data_prefetch",
+                        true,
                     )
                 })
             });
-        // Defense-in-depth: assert alignment held. Using debug_assert
-        // because the constructor returns aligned bytes by construction
-        // (posix_memalign-equivalent); a release-mode failure would
-        // indicate a bug in the global allocator's alignment handling,
-        // which we don't try to recover from.
-        let probe = |label: &str, set: &[MtlBuffer<u8>]| {
-            for (slot, buf) in set.iter().enumerate() {
-                let addr = buf.raw().contents() as usize;
+        // Defense-in-depth: assert 2 MiB alignment held. The pool's
+        // `alloc_aligned` is posix_memalign-equivalent by construction;
+        // a release-mode failure would indicate a global-allocator bug
+        // we don't try to recover from. The probe accepts a slice of
+        // BufIds and resolves each through the pool.
+        let probe = |label: &str, ids: &[BufId]| {
+            for (slot, &id) in ids.iter().enumerate() {
+                let addr = pool.handle(id).contents() as usize;
                 debug_assert_eq!(
                     addr % TWO_MIB,
                     0,
@@ -399,16 +404,44 @@ impl MoeBuffers {
         probe("synced", &data_synced[..]);
         probe("prefetch[0]", &data_prefetch[0][..]);
         probe("prefetch[1]", &data_prefetch[1][..]);
-        let gate =
-            std::array::from_fn(|_| MtlBuffer::<f32>::with_len(device, v.moe_intermediate));
-        let up = std::array::from_fn(|_| {
-            MtlBuffer::<f32>::with_len(device, v.moe_intermediate)
+        let gate: [BufId; MAX_K] = std::array::from_fn(|_| {
+            pool.alloc(v.moe_intermediate * f32_size, "moe.gate", true)
+                .expect("pool.alloc moe.gate")
         });
-        let act = std::array::from_fn(|_| {
-            MtlBuffer::<f32>::with_len(device, v.moe_intermediate)
+        let up: [BufId; MAX_K] = std::array::from_fn(|_| {
+            pool.alloc(v.moe_intermediate * f32_size, "moe.up", true)
+                .expect("pool.alloc moe.up")
         });
-        let out =
-            std::array::from_fn(|_| MtlBuffer::<f32>::with_len(device, v.hidden_dim));
+        let act: [BufId; MAX_K] = std::array::from_fn(|_| {
+            pool.alloc(v.moe_intermediate * f32_size, "moe.act", true)
+                .expect("pool.alloc moe.act")
+        });
+        let out: [BufId; MAX_K] = std::array::from_fn(|_| {
+            pool.alloc(v.hidden_dim * f32_size, "moe.out", true)
+                .expect("pool.alloc moe.out")
+        });
+        let input = pool
+            .alloc(v.hidden_dim * f32_size, "moe.input", true)
+            .expect("pool.alloc moe.input");
+        let h_mid = pool
+            .alloc(v.hidden_dim * f32_size, "moe.h_mid", true)
+            .expect("pool.alloc moe.h_mid");
+        let shared_out = pool
+            .alloc(v.hidden_dim * f32_size, "moe.shared_out", true)
+            .expect("pool.alloc moe.shared_out");
+        let moe_hidden = pool
+            .alloc(v.hidden_dim * f32_size, "moe.moe_hidden", true)
+            .expect("pool.alloc moe.moe_hidden");
+        let combine_params = pool
+            .alloc(18 * f32_size, "moe.combine_params", true)
+            .expect("pool.alloc moe.combine_params");
+        let gate_logits = pool
+            .alloc(
+                v.num_experts.max(1) * f32_size,
+                "moe.gate_logits",
+                true,
+            )
+            .expect("pool.alloc moe.gate_logits");
         Self {
             data_synced,
             data_prefetch,
@@ -416,154 +449,236 @@ impl MoeBuffers {
             up,
             act,
             out,
-            input: MtlBuffer::with_len(device, v.hidden_dim),
-            h_mid: MtlBuffer::with_len(device, v.hidden_dim),
-            shared_out: MtlBuffer::with_len(device, v.hidden_dim),
-            moe_hidden: MtlBuffer::with_len(device, v.hidden_dim),
-            combine_params: MtlBuffer::with_len(device, 18),
-            gate_logits: MtlBuffer::with_len(device, v.num_experts.max(1)),
+            input,
+            h_mid,
+            shared_out,
+            moe_hidden,
+            combine_params,
+            gate_logits,
         }
     }
 
-    /// The post-combine hidden buffer (`buf_moe_hidden` in C). The
-    /// destination for `moe_combine_residual` and the readback target
-    /// for the deferred-experts state machine
-    /// ([`super::deferred::RsCtx::complete_deferred_experts`]).
-    pub(crate) fn moe_hidden(&self) -> &MtlBuffer<f32> {
-        &self.moe_hidden
-    }
+    // -------- BufId accessors (graph-mode addressing) --------
 
-    /// One per-expert output slot — the readback source for the CPU-
-    /// combine path. `slot` must be `< actual_k` (caller-checked
-    /// against the dispatch's `actual_k`); slots `[actual_k, MAX_K)`
-    /// hold stale data and must not be read.
-    pub(crate) fn out(&self, slot: usize) -> &MtlBuffer<f32> {
-        &self.out[slot]
+    pub(crate) fn moe_hidden_id(&self) -> BufId {
+        self.moe_hidden
     }
-
-    /// All per-slot data_synced (sync-pread / miss target) buffers as
-    /// disjoint `&mut [u8]` views, suitable for parallel pread. Slice
-    /// 5d-6a entry point: K concurrent `read_expert` calls can each
-    /// take one slot's `&mut [u8]` from this array without aliasing
-    /// the others.
-    ///
-    /// SAFETY/CORRECTNESS: caller ensures no GPU dispatch reading
-    /// from any slot is in flight. The deferred-state `complete_*` /
-    /// `discard_*` calls at the top of each layer's forward establish
-    /// this invariant.
-    pub(crate) fn data_synced_slots_mut_array(
-        &mut self,
-    ) -> [&mut [u8]; MAX_K] {
-        self.data_synced.each_mut().map(|b| b.as_mut_slice())
+    pub(crate) fn out_id(&self, slot: usize) -> BufId {
+        self.out[slot]
     }
-
-    /// All per-slot data_prefetch (async-prefetch / hit target)
-    /// buffers in `set` as disjoint `&mut [u8]` views, suitable for
-    /// parallel async pread by the prefetch state machine. Slice 5d-6b
-    /// entry point; slice 5d-9 added the `set: usize` index for the
-    /// parity ping-pong.
-    ///
-    /// `set` must be `0` or `1`. The convention is layer N writes set
-    /// `N % 2`; the encoder for layer N reads from the same set.
-    ///
-    /// SAFETY/CORRECTNESS: caller ensures no GPU dispatch reading
-    /// from this set's slots is in flight, AND that the previous
-    /// async prefetch into THIS set has been drained.
-    /// [`super::prefetch::PrefetchState::wait_for`] /
-    /// [`super::prefetch::PrefetchState::drain`] are the established
-    /// synchronization points.
-    pub(crate) fn data_prefetch_slots_mut_array(
-        &mut self,
-        set: usize,
-    ) -> [&mut [u8]; MAX_K] {
-        debug_assert!(set < 2, "prefetch set index must be 0 or 1");
-        self.data_prefetch[set].each_mut().map(|b| b.as_mut_slice())
+    pub(crate) fn out_ids(&self) -> [BufId; MAX_K] {
+        self.out
     }
-
-    /// One per-slot `data_prefetch[set][slot]` Metal buffer for
-    /// binding into the batched MoE permute-fuse encoder. Session-5
-    /// Phase 3 entry point: the batched layer forward maps each
-    /// prefetched bucket expert to its pre-loaded slot buffer here
-    /// via `ExpertRef = (buf, 0)`.
-    ///
-    /// `set` must be `0` or `1`; `slot` must be `< MAX_K`. Caller
-    /// guarantees the slot was the target of a completed
-    /// `prefetch.dispatch` (via `PrefetchState::wait_for`) before
-    /// the dispatch that reads from it.
-    pub(crate) fn data_prefetch_buffer(
+    pub(crate) fn gate_id(&self, slot: usize) -> BufId {
+        self.gate[slot]
+    }
+    pub(crate) fn up_id(&self, slot: usize) -> BufId {
+        self.up[slot]
+    }
+    pub(crate) fn act_id(&self, slot: usize) -> BufId {
+        self.act[slot]
+    }
+    pub(crate) fn input_id(&self) -> BufId {
+        self.input
+    }
+    pub(crate) fn h_mid_id(&self) -> BufId {
+        self.h_mid
+    }
+    pub(crate) fn shared_out_id(&self) -> BufId {
+        self.shared_out
+    }
+    pub(crate) fn combine_params_id(&self) -> BufId {
+        self.combine_params
+    }
+    pub(crate) fn gate_logits_id(&self) -> BufId {
+        self.gate_logits
+    }
+    pub(crate) fn data_synced_id(&self, slot: usize) -> BufId {
+        self.data_synced[slot]
+    }
+    pub(crate) fn data_synced_ids(&self) -> [BufId; MAX_K] {
+        self.data_synced
+    }
+    pub(crate) fn data_prefetch_id(
         &self,
         set: usize,
         slot: usize,
-    ) -> &metal::Buffer {
+    ) -> BufId {
         debug_assert!(set < 2);
         debug_assert!(slot < MAX_K);
-        self.data_prefetch[set][slot].buffer()
+        self.data_prefetch[set][slot]
+    }
+    pub(crate) fn data_prefetch_ids(&self, set: usize) -> [BufId; MAX_K] {
+        debug_assert!(set < 2);
+        self.data_prefetch[set]
     }
 
-    /// Owned-form accessor for the post-attn-norm input buffer
-    /// (`bufs.input`). Used by callers (Cogito MoE path) that pre-stage
-    /// the input host-side via [`Self::stage_host_input`] and then bind
-    /// the same buffer into a GPU dispatch — avoids the second copy
-    /// the host-slice variant of `gpu_batched_experts_encode` does.
-    /// Returns `&metal::Buffer` (not `&BufferRef`) so callers can
-    /// satisfy APIs that need `&Buffer` (e.g. `MatvecSpec`).
-    pub(crate) fn input_buffer(&self) -> &metal::Buffer {
-        self.input.buffer()
+    // -------- &Buffer accessors via pool (imperative encoders) --------
+
+    /// The post-combine hidden buffer (`buf_moe_hidden` in C).
+    pub(crate) fn moe_hidden_buffer<'p>(
+        &self,
+        pool: &'p MetalBufferPool,
+    ) -> &'p metal::Buffer {
+        pool.handle(self.moe_hidden)
     }
 
-    /// Owned-form accessor for the residual-input buffer (`bufs.h_mid`).
-    /// See [`Self::input_buffer`].
-    pub(crate) fn h_mid_buffer(&self) -> &metal::Buffer {
-        self.h_mid.buffer()
+    /// One per-expert output slot — the readback source for the CPU-
+    /// combine path. `slot` must be `< actual_k`.
+    pub(crate) fn out_buffer<'p>(
+        &self,
+        pool: &'p MetalBufferPool,
+        slot: usize,
+    ) -> &'p metal::Buffer {
+        pool.handle(self.out[slot])
     }
 
-    /// Owned-form accessor for the shared-expert output buffer
-    /// (`bufs.shared_out`). The Cogito MoE path encodes the GPU shared
-    /// expert into this buffer and binds the same buffer into the
-    /// pre-staged combine — no host roundtrip.
-    pub(crate) fn shared_out_buffer(&self) -> &metal::Buffer {
-        self.shared_out.buffer()
+    /// One per-slot `data_prefetch[set][slot]` Metal buffer. Caller
+    /// guarantees the slot was the target of a completed
+    /// `prefetch.dispatch` (via `PrefetchState::wait_for`) before the
+    /// dispatch that reads from it.
+    pub(crate) fn data_prefetch_buffer<'p>(
+        &self,
+        pool: &'p MetalBufferPool,
+        set: usize,
+        slot: usize,
+    ) -> &'p metal::Buffer {
+        debug_assert!(set < 2);
+        debug_assert!(slot < MAX_K);
+        pool.handle(self.data_prefetch[set][slot])
+    }
+
+    /// All per-slot data_synced buffers as disjoint `&mut [u8]` views
+    /// for parallel pread. SAFETY: caller ensures no GPU dispatch is
+    /// reading from any slot.
+    pub(crate) fn data_synced_slots_mut_array<'p>(
+        &self,
+        pool: &'p MetalBufferPool,
+    ) -> [&'p mut [u8]; MAX_K] {
+        pool.as_mut_slices_u8(self.data_synced)
+    }
+
+    /// All per-slot data_prefetch buffers in `set` as disjoint
+    /// `&mut [u8]` views. Same SAFETY contract as
+    /// [`Self::data_synced_slots_mut_array`].
+    pub(crate) fn data_prefetch_slots_mut_array<'p>(
+        &self,
+        pool: &'p MetalBufferPool,
+        set: usize,
+    ) -> [&'p mut [u8]; MAX_K] {
+        debug_assert!(set < 2, "prefetch set index must be 0 or 1");
+        pool.as_mut_slices_u8(self.data_prefetch[set])
+    }
+
+    /// Owned-form accessor for the post-attn-norm input buffer.
+    pub(crate) fn input_buffer<'p>(
+        &self,
+        pool: &'p MetalBufferPool,
+    ) -> &'p metal::Buffer {
+        pool.handle(self.input)
+    }
+
+    /// Owned-form accessor for the residual-input buffer.
+    pub(crate) fn h_mid_buffer<'p>(
+        &self,
+        pool: &'p MetalBufferPool,
+    ) -> &'p metal::Buffer {
+        pool.handle(self.h_mid)
+    }
+
+    /// Owned-form accessor for the shared-expert output buffer.
+    pub(crate) fn shared_out_buffer<'p>(
+        &self,
+        pool: &'p MetalBufferPool,
+    ) -> &'p metal::Buffer {
+        pool.handle(self.shared_out)
     }
 
     /// Stage `hidden` into `bufs.input` (host copy into shared-storage
-    /// Metal buffer). Caller must ensure no GPU work in flight on
-    /// `bufs.input`.
-    pub(crate) fn stage_host_input(&mut self, hidden: &[f32]) {
+    /// Metal buffer). Caller must ensure no GPU work in flight.
+    pub(crate) fn stage_host_input(
+        &self,
+        pool: &MetalBufferPool,
+        hidden: &[f32],
+    ) {
         debug_assert_eq!(hidden.len(), VARIANT.hidden_dim);
-        self.input.as_mut_slice().copy_from_slice(hidden);
+        let buf = pool.handle(self.input);
+        // SAFETY: same discipline as `MtlBuffer::as_mut_slice` — caller
+        // ensures no concurrent GPU read. Shared-storage buffer is
+        // alive while `buf` is held; alignment of f32 on the
+        // posix_memalign / Metal allocation is guaranteed.
+        let dst: &mut [f32] = unsafe {
+            std::slice::from_raw_parts_mut(
+                buf.contents() as *mut f32,
+                VARIANT.hidden_dim,
+            )
+        };
+        dst.copy_from_slice(hidden);
     }
 
     /// Zero `bufs.h_mid`. Used when the layer's residual contribution
-    /// should equal `Σ moe + shared_out` exactly (no h_mid term added
-    /// by the combine kernel).
-    pub(crate) fn stage_host_h_mid_zero(&mut self) {
-        self.h_mid.as_mut_slice().fill(0.0);
+    /// should equal `Σ moe + shared_out` exactly.
+    pub(crate) fn stage_host_h_mid_zero(&self, pool: &MetalBufferPool) {
+        let buf = pool.handle(self.h_mid);
+        let dst: &mut [f32] = unsafe {
+            std::slice::from_raw_parts_mut(
+                buf.contents() as *mut f32,
+                VARIANT.hidden_dim,
+            )
+        };
+        dst.fill(0.0);
     }
 
     /// Read back `bufs.moe_hidden` to a host `Vec<f32>`. Caller must
     /// ensure the cmdbuf that wrote it has completed.
-    pub(crate) fn moe_hidden_to_vec(&self) -> Vec<f32> {
-        self.moe_hidden.to_vec()
+    pub(crate) fn moe_hidden_to_vec(
+        &self,
+        pool: &MetalBufferPool,
+    ) -> Vec<f32> {
+        let buf = pool.handle(self.moe_hidden);
+        let src: &[f32] = unsafe {
+            std::slice::from_raw_parts(
+                buf.contents() as *const f32,
+                VARIANT.hidden_dim,
+            )
+        };
+        src.to_vec()
     }
 
-    /// Owned-form accessor for the post-combine hidden buffer
-    /// (`bufs.moe_hidden`). Phase 5 GPU residual stream uses this to
-    /// read the MoE output directly into a downstream `residual_add`
-    /// dispatch without a host bounce.
-    pub fn moe_hidden_ref(&self) -> &metal::Buffer {
-        self.moe_hidden.buffer()
+    /// Owned-form accessor for the post-combine hidden buffer. Phase 5
+    /// GPU residual stream uses this to read the MoE output directly
+    /// into a downstream `residual_add` dispatch without a host bounce.
+    pub fn moe_hidden_ref<'p>(
+        &self,
+        pool: &'p MetalBufferPool,
+    ) -> &'p metal::Buffer {
+        pool.handle(self.moe_hidden)
     }
 
     /// Owned-form accessor for the router-gate-logits buffer. Used as
     /// the output target by the GPU `bf16_matvec` dispatch.
-    pub(crate) fn gate_logits_buffer(&self) -> &metal::Buffer {
-        self.gate_logits.buffer()
+    pub(crate) fn gate_logits_buffer<'p>(
+        &self,
+        pool: &'p MetalBufferPool,
+    ) -> &'p metal::Buffer {
+        pool.handle(self.gate_logits)
     }
 
     /// Read back `bufs.gate_logits` to a host `Vec<f32>`. Caller must
     /// ensure the cmdbuf that wrote it has completed.
-    pub(crate) fn gate_logits_to_vec(&self) -> Vec<f32> {
-        self.gate_logits.to_vec()
+    pub(crate) fn gate_logits_to_vec(
+        &self,
+        pool: &MetalBufferPool,
+    ) -> Vec<f32> {
+        let buf = pool.handle(self.gate_logits);
+        let n = VARIANT.num_experts.max(1);
+        let src: &[f32] = unsafe {
+            std::slice::from_raw_parts(
+                buf.contents() as *const f32,
+                n,
+            )
+        };
+        src.to_vec()
     }
 }
 
@@ -604,6 +719,7 @@ impl std::fmt::Debug for MoeBuffers {
 pub fn gpu_batched_experts_forward(
     metal: &mut MetalContext,
     bufs: &mut MoeBuffers,
+    buffer_pool: &MetalBufferPool,
     actual_k: i32,
     expert_data: &[u8],
     h_post: &[f32],
@@ -623,6 +739,7 @@ pub fn gpu_batched_experts_forward(
     let cmdbuf = gpu_batched_experts_encode(
         metal,
         bufs,
+        buffer_pool,
         actual_k,
         expert_data,
         h_post,
@@ -634,7 +751,7 @@ pub fn gpu_batched_experts_forward(
     )?;
     cmdbuf.commit();
     cmdbuf.wait_until_completed();
-    hidden_out.copy_from_slice(&bufs.moe_hidden.to_vec());
+    hidden_out.copy_from_slice(&bufs.moe_hidden_to_vec(buffer_pool));
     Ok(())
 }
 
@@ -669,6 +786,7 @@ pub fn gpu_batched_experts_forward(
 pub(crate) fn gpu_batched_experts_encode(
     metal: &mut MetalContext,
     bufs: &mut MoeBuffers,
+    buffer_pool: &MetalBufferPool,
     actual_k: i32,
     expert_data: &[u8],
     h_post: &[f32],
@@ -719,13 +837,40 @@ pub(crate) fn gpu_batched_experts_encode(
     let expert_size = v.expert_size_4bit();
     for slot in 0..k {
         let src = &expert_data[slot * expert_size..(slot + 1) * expert_size];
-        bufs.data_synced[slot].as_mut_slice().copy_from_slice(src);
+        let dst =
+            buffer_pool.as_mut_slice_u8(bufs.data_synced_id(slot));
+        dst.copy_from_slice(src);
     }
-    bufs.input.as_mut_slice().copy_from_slice(h_post);
-    bufs.h_mid.as_mut_slice().copy_from_slice(h_mid);
-    bufs.shared_out.as_mut_slice().copy_from_slice(shared_out);
+    bufs.stage_host_input(buffer_pool, h_post);
+    // h_mid + shared_out: f32 copies through raw slice cast.
     {
-        let params = bufs.combine_params.as_mut_slice();
+        let buf = buffer_pool.handle(bufs.h_mid_id());
+        let dst: &mut [f32] = unsafe {
+            std::slice::from_raw_parts_mut(
+                buf.contents() as *mut f32,
+                v.hidden_dim,
+            )
+        };
+        dst.copy_from_slice(h_mid);
+    }
+    {
+        let buf = buffer_pool.handle(bufs.shared_out_id());
+        let dst: &mut [f32] = unsafe {
+            std::slice::from_raw_parts_mut(
+                buf.contents() as *mut f32,
+                v.hidden_dim,
+            )
+        };
+        dst.copy_from_slice(shared_out);
+    }
+    {
+        let buf = buffer_pool.handle(bufs.combine_params_id());
+        let params: &mut [f32] = unsafe {
+            std::slice::from_raw_parts_mut(
+                buf.contents() as *mut f32,
+                18,
+            )
+        };
         params.fill(0.0);
         params[..k].copy_from_slice(expert_weights);
         params[16] = shared_gate_score;
@@ -734,23 +879,27 @@ pub(crate) fn gpu_batched_experts_encode(
     let cmdbuf = metal.queue().new_command_buffer();
     // Bind bufs' own input/h_mid/shared_out — kernels read whatever we
     // just staged. Field-disjoint borrows: bufs is borrowed shared via
-    // the bufs.input.raw() etc. derivations; emit_batched_experts only
-    // reads bufs (also shared). All consistent.
+    // pool.handle() derivations; emit_batched_experts also borrows
+    // shared. All consistent.
     //
     // Host-slice variant always stages into `data_synced`; emit reads
     // accordingly. `prefetch_set` is unused (no Prefetched slots) — pass
     // 0 as a placeholder.
     let data_set_per_slot: [super::SlotSource; MAX_K] =
         [super::SlotSource::Synced; MAX_K];
+    let input_buf = bufs.input_buffer(buffer_pool).clone();
+    let h_mid_buf = bufs.h_mid_buffer(buffer_pool).clone();
+    let shared_out_buf = bufs.shared_out_buffer(buffer_pool).clone();
     emit_batched_experts(
         cmdbuf,
         &matvec,
         &swiglu,
         combine.as_ref(),
         bufs,
-        bufs.input.raw(),
-        bufs.h_mid.raw(),
-        bufs.shared_out.raw(),
+        buffer_pool,
+        &input_buf,
+        &h_mid_buf,
+        &shared_out_buf,
         k,
         v,
         &data_set_per_slot,
@@ -776,6 +925,7 @@ pub(crate) fn gpu_batched_experts_encode(
 pub(crate) fn gpu_batched_experts_encode_pre_staged(
     metal: &mut MetalContext,
     bufs: &mut MoeBuffers,
+    buffer_pool: &MetalBufferPool,
     actual_k: i32,
     input: &BufferRef,
     h_mid: &BufferRef,
@@ -812,7 +962,13 @@ pub(crate) fn gpu_batched_experts_encode_pre_staged(
     // the caller's responsibility (data_synced via 5d-6a's parallel
     // pread, data_prefetch via 5d-6b's async prefetch).
     {
-        let params = bufs.combine_params.as_mut_slice();
+        let buf = buffer_pool.handle(bufs.combine_params_id());
+        let params: &mut [f32] = unsafe {
+            std::slice::from_raw_parts_mut(
+                buf.contents() as *mut f32,
+                18,
+            )
+        };
         params.fill(0.0);
         params[..k].copy_from_slice(expert_weights);
         params[16] = shared_gate_score;
@@ -825,6 +981,7 @@ pub(crate) fn gpu_batched_experts_encode_pre_staged(
         &swiglu,
         Some(&combine),
         bufs,
+        buffer_pool,
         input,
         h_mid,
         shared_out,
@@ -891,6 +1048,7 @@ fn emit_batched_experts(
     swiglu: &ComputePipelineState,
     combine: Option<&ComputePipelineState>,
     bufs: &MoeBuffers,
+    buffer_pool: &MetalBufferPool,
     input: &BufferRef,
     h_mid: &BufferRef,
     shared_out: &BufferRef,
@@ -905,16 +1063,21 @@ fn emit_batched_experts(
     // Encoder B (SwiGLU then down). Two encoders per expert exposes
     // GPU parallelism across slots; within an encoder the dispatches
     // serialize by Metal's encoder-internal ordering.
-    let pick = |slot: usize| -> &MtlBuffer<u8> {
-        match data_set_per_slot[slot] {
-            super::SlotSource::Synced => &bufs.data_synced[slot],
+    let pick = |slot: usize| -> &Buffer {
+        let id = match data_set_per_slot[slot] {
+            super::SlotSource::Synced => bufs.data_synced_id(slot),
             super::SlotSource::Prefetched(buf_idx) => {
-                &bufs.data_prefetch[prefetch_set][buf_idx]
+                bufs.data_prefetch_id(prefetch_set, buf_idx)
             }
-        }
+        };
+        buffer_pool.handle(id)
     };
     for slot in 0..k {
         let weights_buf = pick(slot);
+        let gate_buf = buffer_pool.handle(bufs.gate_id(slot));
+        let up_buf = buffer_pool.handle(bufs.up_id(slot));
+        let act_buf = buffer_pool.handle(bufs.act_id(slot));
+        let out_buf = buffer_pool.handle(bufs.out_id(slot));
         // Encoder A — gate + up
         {
             let enc = cmdbuf.new_compute_command_encoder();
@@ -927,7 +1090,7 @@ fn emit_batched_experts(
                 v.gate_s_off_4bit(),
                 v.gate_b_off_4bit(),
                 input,
-                bufs.gate[slot].raw(),
+                gate_buf,
                 v.moe_intermediate as u32,
                 v.hidden_dim as u32,
             );
@@ -940,7 +1103,7 @@ fn emit_batched_experts(
                 v.up_s_off_4bit(),
                 v.up_b_off_4bit(),
                 input,
-                bufs.up[slot].raw(),
+                up_buf,
                 v.moe_intermediate as u32,
                 v.hidden_dim as u32,
             );
@@ -953,9 +1116,9 @@ fn emit_batched_experts(
             encode_swiglu_into_buf(
                 enc,
                 swiglu,
-                bufs.gate[slot].raw(),
-                bufs.up[slot].raw(),
-                bufs.act[slot].raw(),
+                gate_buf,
+                up_buf,
+                act_buf,
                 v.moe_intermediate as u32,
             );
             encode_matvec_into(
@@ -965,8 +1128,8 @@ fn emit_batched_experts(
                 v.down_w_off_4bit(),
                 v.down_s_off_4bit(),
                 v.down_b_off_4bit(),
-                bufs.act[slot].raw(),
-                bufs.out[slot].raw(),
+                act_buf,
+                out_buf,
                 v.hidden_dim as u32,
                 v.moe_intermediate as u32,
             );
@@ -986,10 +1149,13 @@ fn emit_batched_experts(
     // produce the next layer's normalized input (`chain.chain_normed`).
     // Mirrors C's gpu_combine fast path (`infer.m:5677..5750`).
     if let Some(combine) = combine {
+        let moe_hidden_buf = buffer_pool.handle(bufs.moe_hidden_id());
         let combine_out: &BufferRef = match chain.as_ref() {
             Some(c) => c.combine_out,
-            None => bufs.moe_hidden.raw(),
+            None => moe_hidden_buf,
         };
+        let combine_params_buf =
+            buffer_pool.handle(bufs.combine_params_id());
         let enc = cmdbuf.new_compute_command_encoder();
         enc.set_compute_pipeline_state(combine);
         enc.set_buffer(0, Some(h_mid), 0);
@@ -998,11 +1164,11 @@ fn emit_batched_experts(
         for slot in 0..MAX_K {
             enc.set_buffer(
                 3 + slot as NSUInteger,
-                Some(bufs.out[slot].raw()),
+                Some(buffer_pool.handle(bufs.out_id(slot))),
                 0,
             );
         }
-        enc.set_buffer(19, Some(bufs.combine_params.raw()), 0);
+        enc.set_buffer(19, Some(combine_params_buf), 0);
         let dim = v.hidden_dim as u32;
         let k_val = k as u32;
         enc.set_bytes(20, 4, (&dim as *const u32).cast());
@@ -1052,12 +1218,12 @@ fn emit_batched_experts(
 fn encode_matvec_into(
     enc: &metal::ComputeCommandEncoderRef,
     pipes: &MatvecPipelines,
-    data: &MtlBuffer<u8>,
+    data: &Buffer,
     w_off: usize,
     s_off: usize,
     b_off: usize,
     input: &BufferRef,
-    output: &BufferRef,
+    output: &Buffer,
     out_dim: u32,
     in_dim: u32,
 ) {
@@ -1069,9 +1235,9 @@ fn encode_matvec_into(
         &pipes.fast_4bit
     };
     enc.set_compute_pipeline_state(pipeline);
-    enc.set_buffer(0, Some(data.raw()), w_off as NSUInteger);
-    enc.set_buffer(1, Some(data.raw()), s_off as NSUInteger);
-    enc.set_buffer(2, Some(data.raw()), b_off as NSUInteger);
+    enc.set_buffer(0, Some(data), w_off as NSUInteger);
+    enc.set_buffer(1, Some(data), s_off as NSUInteger);
+    enc.set_buffer(2, Some(data), b_off as NSUInteger);
     enc.set_buffer(3, Some(input), 0);
     enc.set_buffer(4, Some(output), 0);
     enc.set_bytes(5, 4, (&out_dim as *const u32).cast());
@@ -1094,9 +1260,9 @@ fn encode_matvec_into(
 fn encode_swiglu_into_buf(
     enc: &metal::ComputeCommandEncoderRef,
     pipeline: &metal::ComputePipelineState,
-    gate: &BufferRef,
-    up: &BufferRef,
-    act: &BufferRef,
+    gate: &Buffer,
+    up: &Buffer,
+    act: &Buffer,
     dim: u32,
 ) {
     enc.set_compute_pipeline_state(pipeline);
