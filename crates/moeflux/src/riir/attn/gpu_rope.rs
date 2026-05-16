@@ -28,6 +28,7 @@ use metal::{
     MTLSize, NSUInteger,
 };
 
+use crate::riir::backend::gpu::encoder::ComputeEncoder;
 use crate::riir::backend::gpu::metal::{buffer_as_slice, MetalContext, MetalError};
 
 /// Errors from the GPU YaRN RoPE dispatch.
@@ -79,19 +80,18 @@ pub fn encode_yarn_rope_apply(
     }
     let half = rotary_dim / 2;
     let pos_f = pos as f32;
-    let enc = cmdbuf.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(pipe);
-    enc.set_buffer(0, Some(x_buf), 0);
-    enc.set_buffer(1, Some(inv_freq_buf), 0);
-    enc.set_bytes(2, 4, (&num_heads as *const u32).cast());
-    enc.set_bytes(3, 4, (&rotary_dim as *const u32).cast());
-    enc.set_bytes(4, 4, (&pos_f as *const f32).cast());
-    enc.set_bytes(5, 4, (&mscale as *const f32).cast());
-    enc.dispatch_thread_groups(
-        MTLSize::new(num_heads as NSUInteger, half as NSUInteger, 1),
-        MTLSize::new(1, 1, 1),
-    );
-    enc.end_encoding();
+    ComputeEncoder::begin(cmdbuf)
+        .pipeline(pipe)
+        .buffer(0, x_buf, 0)
+        .buffer(1, inv_freq_buf, 0)
+        .bytes(2, &num_heads)
+        .bytes(3, &rotary_dim)
+        .bytes(4, &pos_f)
+        .bytes(5, &mscale)
+        .dispatch(
+            MTLSize::new(num_heads as NSUInteger, half as NSUInteger, 1),
+            MTLSize::new(1, 1, 1),
+        );
     Ok(())
 }
 
