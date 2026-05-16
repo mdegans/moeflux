@@ -38,12 +38,12 @@
 use std::fs;
 use std::path::PathBuf;
 
-use moeflux::riir::graph::{
+use moeflux::riir::backend::{
     Backend, BufferPool, CpuBackend, Graph, MetalBackend, Op,
 };
-use moeflux::riir::metal::MetalContext;
-use moeflux::riir::mtl_weight_buf::MtlWeightBuf;
-use moeflux::riir::weight_file::WeightFile;
+use moeflux::riir::MetalContext;
+use moeflux::riir::MtlWeightBuf;
+use moeflux::riir::WeightFile;
 
 /// Cosine-similarity floor for Op-level diffs. Same as
 /// `batched_diff_oracle.rs`'s COSINE_FLOOR.
@@ -627,9 +627,9 @@ fn graph_metal_matches_cpu_colored() {
 
     // Build a Graph against the given (pool, a, b, tmps) IDs.
     let build_graph =
-        |a: moeflux::riir::graph::BufId,
-         b: moeflux::riir::graph::BufId,
-         tmps: &[moeflux::riir::graph::BufId]| {
+        |a: moeflux::riir::backend::BufId,
+         b: moeflux::riir::backend::BufId,
+         tmps: &[moeflux::riir::backend::BufId]| {
             let mut g = Graph::new();
             // op 0: tmp_0 = a + b
             g.push(Op::ResidualAddNTokens {

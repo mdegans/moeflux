@@ -21,14 +21,14 @@
 use std::path::Path;
 
 use metal::{MTLResourceOptions, NSUInteger};
-use moeflux::riir::dense_mlp_gpu::{
+use moeflux::riir::backend::gpu::dense_mlp_gpu::{
     encode_dense_mlp_layer_forward_gpu, DenseMlpPipelines,
 };
-use moeflux::riir::metal::MetalContext;
-use moeflux::riir::mlp_cpu::dense_mlp_swiglu_cpu;
-use moeflux::riir::mtl_weight_buf::MtlWeightBuf;
+use moeflux::riir::MetalContext;
+use moeflux::riir::moe::mlp_cpu::dense_mlp_swiglu_cpu;
+use moeflux::riir::MtlWeightBuf;
 use moeflux::riir::variants::VARIANT;
-use moeflux::riir::weight_file::WeightFile;
+use moeflux::riir::WeightFile;
 
 const ROOT: &str =
     "/Volumes/Temp Backup/models/blallama/cogito-v2-671b";

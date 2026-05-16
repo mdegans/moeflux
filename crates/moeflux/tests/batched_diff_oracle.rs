@@ -20,27 +20,27 @@
 
 use metal::{Buffer, MTLResourceOptions, NSUInteger};
 
-use moeflux::riir::cpu_matvec::{bf16_matvec_cpu, dequant_matvec_4bit_cpu};
-use moeflux::riir::expert_forward::{
+use moeflux::riir::backend::cpu::cpu_matvec::{bf16_matvec_cpu, dequant_matvec_4bit_cpu};
+use moeflux::riir::moe::expert_forward::{
     encode_moe_batched_permute_fuse, gpu_expert_forward,
 };
-use moeflux::riir::gpu_attn::{
+use moeflux::riir::attn::gpu_attn::{
     encode_sdpa_causal_tiled, BatchedSdpaPipelines,
 };
-use moeflux::riir::gpu_matvec::{
+use moeflux::riir::backend::gpu::gpu_matvec::{
     encode_bf16_matmul_n_tokens, encode_matvec_n_tokens, BfMatvecPipelines,
     MatvecPipelines,
 };
-use moeflux::riir::gpu_moe_router::{
+use moeflux::riir::moe::gpu_moe_router::{
     encode_moe_router, MoeRouterPipelines,
 };
-use moeflux::riir::gpu_norm::{
+use moeflux::riir::backend::gpu::gpu_norm::{
     encode_residual_add_n_tokens_into, encode_rms_norm_bf16_fused_n_tokens,
     RmsNormBf16FusedNTokensPipeline,
 };
-use moeflux::riir::metal::MetalContext;
-use moeflux::riir::moe_router::{build_expert_buckets, moe_router_cpu};
-use moeflux::riir::sdpa::sdpa_cpu;
+use moeflux::riir::MetalContext;
+use moeflux::riir::moe::moe_router::{build_expert_buckets, moe_router_cpu};
+use moeflux::riir::sdpa_cpu;
 use moeflux::riir::variants::VARIANT;
 use moeflux::riir::MtlBuffer;
 
@@ -238,7 +238,7 @@ fn bf16_matmul_n_tokens_matches_cpu() {
 #[test]
 #[ignore = "long-running GPU test"]
 fn bf16_matmul_n_tokens_n1_matches_single_matvec() {
-    use moeflux::riir::gpu_matvec::encode_bf16_matvec;
+    use moeflux::riir::backend::gpu::gpu_matvec::encode_bf16_matvec;
 
     let in_dim: u32 = 1024;
     let out_dim: u32 = 256;
@@ -460,7 +460,7 @@ fn dequant_matvec_4bit_n_tokens_fast_matches_cpu() {
 #[test]
 #[ignore = "long-running GPU test"]
 fn dequant_matvec_4bit_n_tokens_v3_n1_matches_single() {
-    use moeflux::riir::gpu_matvec::encode_matvec;
+    use moeflux::riir::backend::gpu::gpu_matvec::encode_matvec;
 
     let in_dim: u32 = 1024;
     let out_dim: u32 = 256;

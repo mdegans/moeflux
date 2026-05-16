@@ -2236,7 +2236,7 @@ fn gated_delta_recurrence_cpu_close_c_vs_rust() {
 #[test]
 #[ignore = "long running; needs Metal device + moeflux artifacts"]
 fn gpu_expert_forward_close_c_vs_rust() {
-    use moeflux::riir::expert_forward::synth;
+    use moeflux::riir::moe::expert_forward::synth;
     use moeflux::riir::VARIANT;
 
     let mut c: CBackend = open_backend();
@@ -2480,7 +2480,7 @@ fn load_expert_bytes_byte_exact_c_vs_rust() {
 #[test]
 #[ignore = "long running; needs Metal device + moeflux artifacts"]
 fn gpu_batched_experts_forward_close_c_vs_rust() {
-    use moeflux::riir::expert_forward::synth;
+    use moeflux::riir::moe::expert_forward::synth;
     use moeflux::riir::VARIANT;
 
     let mut c: CBackend = open_backend();
@@ -2926,7 +2926,7 @@ fn sigmoid_gate_close_c_vs_rust() {
 #[test]
 #[ignore = "long running; needs Metal device + moeflux artifacts"]
 fn deferred_experts_begin_complete_close_c_vs_rust() {
-    use moeflux::riir::expert_forward::synth;
+    use moeflux::riir::moe::expert_forward::synth;
     use moeflux::riir::VARIANT;
 
     let mut c: CBackend = open_backend();
@@ -3025,7 +3025,7 @@ fn deferred_experts_begin_complete_close_c_vs_rust() {
 #[test]
 #[ignore = "long running; needs Metal device + moeflux artifacts"]
 fn deferred_experts_discard_clears_state_c_vs_rust() {
-    use moeflux::riir::expert_forward::synth;
+    use moeflux::riir::moe::expert_forward::synth;
     use moeflux::riir::VARIANT;
 
     let mut c: CBackend = open_backend();

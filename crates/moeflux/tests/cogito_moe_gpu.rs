@@ -20,18 +20,18 @@
 
 use std::path::Path;
 
-use moeflux::riir::cogito_moe_gpu::{
+use moeflux::riir::moe::cogito_moe_gpu::{
     cogito_moe_layer_forward_gpu, SharedExpertBuffers,
 };
-use moeflux::riir::dense_mlp_gpu::DenseMlpPipelines;
-use moeflux::riir::expert_forward::MoeBuffers;
-use moeflux::riir::expert_io::ExpertFiles;
-use moeflux::riir::gpu_matvec::BfMatvecPipelines;
-use moeflux::riir::metal::MetalContext;
-use moeflux::riir::moe_cpu::deepseek_moe_cpu;
-use moeflux::riir::mtl_weight_buf::MtlWeightBuf;
+use moeflux::riir::backend::gpu::dense_mlp_gpu::DenseMlpPipelines;
+use moeflux::riir::MoeBuffers;
+use moeflux::riir::ExpertFiles;
+use moeflux::riir::backend::gpu::gpu_matvec::BfMatvecPipelines;
+use moeflux::riir::MetalContext;
+use moeflux::riir::moe::moe_cpu::deepseek_moe_cpu;
+use moeflux::riir::MtlWeightBuf;
 use moeflux::riir::variants::VARIANT;
-use moeflux::riir::weight_file::WeightFile;
+use moeflux::riir::WeightFile;
 
 const ROOT: &str =
     "/Volumes/Temp Backup/models/blallama/cogito-v2-671b";

@@ -30,11 +30,11 @@
 
 use metal::{Buffer, MTLResourceOptions, NSUInteger};
 
-use moeflux::riir::gpu_mla::{
+use moeflux::riir::attn::gpu_mla::{
     encode_mla_sdpa_folded, encode_mla_sdpa_folded_tiled, MlaPipelines,
     MLA_MAX_CACHE_TG,
 };
-use moeflux::riir::metal::MetalContext;
+use moeflux::riir::MetalContext;
 use moeflux::riir::variants::VARIANT;
 
 fn make_buf_f32(metal: &MetalContext, n: usize) -> Buffer {
