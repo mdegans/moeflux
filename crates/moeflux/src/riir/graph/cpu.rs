@@ -288,20 +288,24 @@ impl CpuBackend {
     // ------------------------------------------------------------------
 
     fn read_f32(&self, id: BufId) -> Ref<'_, [f32]> {
-        Ref::map(self.pool.handle(id).borrow(), bytes_as_f32_panic)
+        Ref::map(self.pool.handle(id).borrow(), |v| bytes_as::<f32>(v))
     }
 
     fn write_f32(&self, id: BufId) -> RefMut<'_, [f32]> {
-        RefMut::map(self.pool.handle(id).borrow_mut(), bytes_as_f32_mut_panic)
+        RefMut::map(self.pool.handle(id).borrow_mut(), |v| {
+            bytes_as_mut::<f32>(v)
+        })
     }
 
     #[allow(dead_code)]
     fn read_i32(&self, id: BufId) -> Ref<'_, [i32]> {
-        Ref::map(self.pool.handle(id).borrow(), bytes_as_i32_panic)
+        Ref::map(self.pool.handle(id).borrow(), |v| bytes_as::<i32>(v))
     }
 
     fn write_i32(&self, id: BufId) -> RefMut<'_, [i32]> {
-        RefMut::map(self.pool.handle(id).borrow_mut(), bytes_as_i32_mut_panic)
+        RefMut::map(self.pool.handle(id).borrow_mut(), |v| {
+            bytes_as_mut::<i32>(v)
+        })
     }
 
     fn read_bytes(&self, id: BufId) -> Ref<'_, [u8]> {
@@ -320,68 +324,31 @@ impl CpuBackend {
 // caller bug we want loud.
 // ----------------------------------------------------------------------------
 
-fn bytes_as_f32_panic(v: &Vec<u8>) -> &[f32] {
-    // SAFETY: align_to is safe by definition; we panic on misalignment.
-    let (head, body, tail) = unsafe { v.align_to::<f32>() };
+/// Reinterpret a pool byte buffer as `&[T]`. Panics if the buffer is
+/// not `T`-aligned — that signals a misaligned pool alloc, a caller
+/// bug we want loud rather than silently wrong.
+fn bytes_as<T>(b: &[u8]) -> &[T] {
+    // SAFETY: `align_to` is safe by definition; the assert guarantees
+    // `body` covers the whole slice (empty head/tail).
+    let (head, body, tail) = unsafe { b.align_to::<T>() };
     assert!(
         head.is_empty() && tail.is_empty(),
-        "pool buffer not f32-aligned (head={}, tail={})",
+        "pool buffer not {}-aligned (head={}, tail={})",
+        std::any::type_name::<T>(),
         head.len(),
         tail.len()
     );
     body
 }
 
-fn bytes_as_f32_mut_panic(v: &mut Vec<u8>) -> &mut [f32] {
-    let (head, body, tail) = unsafe { v.align_to_mut::<f32>() };
+/// Mutable counterpart of [`bytes_as`].
+fn bytes_as_mut<T>(b: &mut [u8]) -> &mut [T] {
+    // SAFETY: see [`bytes_as`].
+    let (head, body, tail) = unsafe { b.align_to_mut::<T>() };
     assert!(
         head.is_empty() && tail.is_empty(),
-        "pool buffer not f32-aligned (head={}, tail={})",
-        head.len(),
-        tail.len()
-    );
-    body
-}
-
-#[allow(dead_code)]
-fn bytes_as_i32_panic(v: &Vec<u8>) -> &[i32] {
-    let (head, body, tail) = unsafe { v.align_to::<i32>() };
-    assert!(
-        head.is_empty() && tail.is_empty(),
-        "pool buffer not i32-aligned (head={}, tail={})",
-        head.len(),
-        tail.len()
-    );
-    body
-}
-
-fn bytes_as_i32_mut_panic(v: &mut Vec<u8>) -> &mut [i32] {
-    let (head, body, tail) = unsafe { v.align_to_mut::<i32>() };
-    assert!(
-        head.is_empty() && tail.is_empty(),
-        "pool buffer not i32-aligned (head={}, tail={})",
-        head.len(),
-        tail.len()
-    );
-    body
-}
-
-fn bytes_as_u16_panic(b: &[u8]) -> &[u16] {
-    let (head, body, tail) = unsafe { b.align_to::<u16>() };
-    assert!(
-        head.is_empty() && tail.is_empty(),
-        "byte slice not u16-aligned (head={}, tail={})",
-        head.len(),
-        tail.len()
-    );
-    body
-}
-
-fn bytes_as_u32_panic(b: &[u8]) -> &[u32] {
-    let (head, body, tail) = unsafe { b.align_to::<u32>() };
-    assert!(
-        head.is_empty() && tail.is_empty(),
-        "byte slice not u32-aligned (head={}, tail={})",
+        "pool buffer not {}-aligned (head={}, tail={})",
+        std::any::type_name::<T>(),
         head.len(),
         tail.len()
     );
@@ -710,7 +677,7 @@ fn lm_head_cpu(
         normed[i] = hr[i] * inv_rms * w;
     }
     // lm_head matvec: BF16 weight, shape [vocab_size, hidden_dim].
-    let lm_w = bytes_as_u16_panic(lm_head_weight);
+    let lm_w = bytes_as::<u16>(lm_head_weight);
     for r in 0..vocab_size {
         let mut acc = 0.0f32;
         for c in 0..hidden_dim {
@@ -841,9 +808,9 @@ impl Backend for CpuBackend {
                     .wf
                     .bytes_at(weight.b_off, in_scales * 2)
                     .expect("weight.b_off out of mmap");
-                let packed = bytes_as_u32_panic(w_bytes);
-                let scales = bytes_as_u16_panic(s_bytes);
-                let biases = bytes_as_u16_panic(b_bytes);
+                let packed = bytes_as::<u32>(w_bytes);
+                let scales = bytes_as::<u16>(s_bytes);
+                let biases = bytes_as::<u16>(b_bytes);
                 for t in 0..n_tokens {
                     let x_t =
                         &input_buf[in_skip + t * in_dim..in_skip + (t + 1) * in_dim];
