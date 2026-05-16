@@ -246,6 +246,10 @@ pub struct RsCtx<B: Backend = MetalBackend> {
     layer_caches: Option<Vec<LayerWeightCache>>,
     /// Lazily-built persistent buffer set for the linear-attn forward.
     linear_buffers: Option<LinearAttnBuffers>,
+    /// S10b-2: run-lifetime scratch BufIds for the batched linear-attn
+    /// graph (allocated once at max chunk width, reused every step /
+    /// layer). Built by [`Self::ensure_linear_resources`].
+    batched_graph_scratch: Option<linear_attn_forward::BatchedGraphScratch>,
     /// Slice 4e — pending deferred-experts state. Originally a
     /// single `Option<DeferredState>` (one in-flight K-expert dispatch
     /// at a time); slice 5d-9 widened it to a depth-2
@@ -372,6 +376,7 @@ impl RsCtx<MetalBackend> {
             k_active,
             layer_caches: None,
             linear_buffers: None,
+            batched_graph_scratch: None,
             deferred: DeferredRing::new(),
             lm_head_gpu: None,
             io_pool,
@@ -1286,6 +1291,13 @@ impl RsCtx<MetalBackend> {
                 self.backend.as_mut().expect("just-set").pool_mut();
             self.linear_buffers = Some(LinearAttnBuffers::new(pool));
         }
+        if self.batched_graph_scratch.is_none() {
+            let pool =
+                self.backend.as_mut().expect("just-set").pool_mut();
+            self.batched_graph_scratch = Some(
+                linear_attn_forward::BatchedGraphScratch::new(pool),
+            );
+        }
         if self.moe_buffers.is_none() {
             let pool =
                 self.backend.as_mut().expect("just-set").pool_mut();
@@ -1495,6 +1507,7 @@ impl RsCtx<MetalBackend> {
             layer_states,
             layer_caches,
             linear_buffers,
+            batched_graph_scratch,
             deferred,
             lm_head_gpu,
             io_pool,
@@ -1511,6 +1524,9 @@ impl RsCtx<MetalBackend> {
             layer_caches.as_ref().expect("ensure_linear_resources");
         let linear_buffers =
             linear_buffers.as_mut().expect("ensure_linear_resources");
+        let batched_graph_scratch = batched_graph_scratch
+            .as_ref()
+            .expect("ensure_linear_resources");
         let moe_buffers =
             moe_buffers.as_mut().expect("ensure_linear_resources");
         let lm_head_gpu =
@@ -1552,30 +1568,25 @@ impl RsCtx<MetalBackend> {
             )
             .map_err(|_| RsError::EvalFailed)?;
         }
-        // S7-6c-1: allocate hidden_a / hidden_b in the graph-mode
-        // pool. Transient (released by `pool.reset_transient()` at
-        // step end) — sized exactly to this step's n × hidden_dim.
-        // S10b-1a-ii: scope the pool borrow so `backend` is freely
-        // re-borrowable inside the layer loop.
+        // S10b-2: hidden_a / hidden_b are run-lifetime scratch BufIds
+        // (allocated once at max chunk width). The orchestrator owns
+        // the alternating pair and uploads this step's embeddings into
+        // hidden_a via a prefix upload (the scratch buffer's max-chunk
+        // tail is unused for n < BATCHED_CHUNK_SIZE).
         let hidden_bytes = n * hidden_dim * std::mem::size_of::<f32>();
-        let (mut hidden_a_id, mut hidden_b_id) = {
+        let (mut hidden_a_id, mut hidden_b_id) =
+            (batched_graph_scratch.hidden_a, batched_graph_scratch.hidden_b);
+        {
             let pool = backend.pool_mut();
-            let a = pool
-                .alloc(hidden_bytes, "step.hidden_a", false)
-                .expect("pool alloc hidden_a");
-            let b = pool
-                .alloc(hidden_bytes, "step.hidden_b", false)
-                .expect("pool alloc hidden_b");
             let stack_bytes: &[u8] = unsafe {
                 std::slice::from_raw_parts(
                     hidden_stack_host.as_ptr() as *const u8,
                     std::mem::size_of_val(&hidden_stack_host[..]),
                 )
             };
-            pool.upload(a, stack_bytes)
+            pool.upload(hidden_a_id, stack_bytes)
                 .expect("pool upload hidden_a embeddings");
-            (a, b)
-        };
+        }
 
         for layer_idx in 0..v.num_layers {
             let prefetch_set = layer_idx % 2;
@@ -1675,6 +1686,7 @@ impl RsCtx<MetalBackend> {
                     prefetch_env,
                     hidden_a_id,
                     hidden_b_id,
+                    batched_graph_scratch,
                 )
                 .map_err(|_| RsError::EvalFailed)?;
             }

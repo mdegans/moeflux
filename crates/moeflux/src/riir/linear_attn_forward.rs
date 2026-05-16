@@ -181,6 +181,95 @@ pub struct LayerForwardBuffers {
 /// Backwards-compat alias for the original 4c name.
 pub type LinearAttnBuffers = LayerForwardBuffers;
 
+/// Run-lifetime scratch BufIds for the batched linear-attn graph
+/// (S10b-2). Allocated once, sized at `BATCHED_CHUNK_SIZE` token
+/// width; every step and every layer reuses these ids. A smaller
+/// chunk (or a decode step at `n_tokens = 1`) processes only a
+/// prefix — the `*NTokens` Ops stride by the real `n_tokens`.
+///
+/// All buffers are allocated `persistent = true` so the per-step
+/// `reset_transient()` leaves them intact. Two classes for the
+/// S10b-2 Phase-4 `commit_plan` pass:
+/// - **Intra-graph1 transients** (`normed` … `gate_logits`): written
+///   and last-read inside the pre-MoE graph. Phase 4 temporarily
+///   flips them to `persistent = false`, runs `commit_plan` to
+///   lifetime-color them down to a small physical set, then re-pins
+///   them to `persistent = true`.
+/// - **Graph1→graph2 boundary buffers** (`h_mid` … `hidden_b`):
+///   written in graph1, read in the MoE block / next layer. Stay
+///   `persistent = true` throughout — never aliased, so they safely
+///   bridge the CPU-readback split and the cross-layer double-buffer.
+pub struct BatchedGraphScratch {
+    // Intra-graph1 transients (colorable).
+    pub normed: BufId,
+    pub qkv_stack: BufId,
+    pub z_stack: BufId,
+    pub beta_stack: BufId,
+    pub alpha_stack: BufId,
+    pub conv_out_stack: BufId,
+    pub g_decay_stack: BufId,
+    pub beta_gate_stack: BufId,
+    pub delta_out_stack: BufId,
+    pub value_out_stack: BufId,
+    pub o_proj_stack: BufId,
+    pub gate_logits: BufId,
+    // Graph1→graph2 boundary (persistent, never aliased).
+    pub h_mid: BufId,
+    pub h_post: BufId,
+    pub shared_gate: BufId,
+    pub routing_indices: BufId,
+    pub routing_weights: BufId,
+    // Cross-layer hidden double-buffer (orchestrator swaps per layer).
+    pub hidden_a: BufId,
+    pub hidden_b: BufId,
+}
+
+impl BatchedGraphScratch {
+    /// Allocate every batched-graph scratch buffer at max chunk
+    /// width, all `persistent = true`.
+    pub fn new(pool: &mut MetalBufferPool) -> Self {
+        let v = VARIANT;
+        let chunk = super::BATCHED_CHUNK_SIZE;
+        let f32_sz = std::mem::size_of::<f32>();
+        let mut alloc = |elems_per_token: usize, label: &'static str| {
+            pool.alloc(chunk * elems_per_token * f32_sz, label, true)
+                .expect("BatchedGraphScratch::new pool alloc")
+        };
+        let hidden = v.hidden_dim;
+        let conv = v.linear_conv_dim();
+        let total_value = v.linear_total_value();
+        let num_v = v.linear_num_v_heads;
+        let delta_out = num_v * Variant::LINEAR_VALUE_DIM;
+        Self {
+            normed: alloc(hidden, "bgs.normed"),
+            qkv_stack: alloc(conv, "bgs.qkv_stack"),
+            z_stack: alloc(total_value, "bgs.z_stack"),
+            beta_stack: alloc(num_v, "bgs.beta_stack"),
+            alpha_stack: alloc(num_v, "bgs.alpha_stack"),
+            conv_out_stack: alloc(conv, "bgs.conv_out_stack"),
+            g_decay_stack: alloc(num_v, "bgs.g_decay_stack"),
+            beta_gate_stack: alloc(num_v, "bgs.beta_gate_stack"),
+            delta_out_stack: alloc(delta_out, "bgs.delta_out_stack"),
+            value_out_stack: alloc(total_value, "bgs.value_out_stack"),
+            o_proj_stack: alloc(hidden, "bgs.o_proj_stack"),
+            gate_logits: alloc(v.num_experts, "bgs.gate_logits"),
+            h_mid: alloc(hidden, "bgs.h_mid"),
+            h_post: alloc(hidden, "bgs.h_post"),
+            shared_gate: alloc(1, "bgs.shared_gate"),
+            routing_indices: alloc(
+                super::expert_forward::MAX_K,
+                "bgs.routing_indices",
+            ),
+            routing_weights: alloc(
+                super::expert_forward::MAX_K,
+                "bgs.routing_weights",
+            ),
+            hidden_a: alloc(hidden, "bgs.hidden_a"),
+            hidden_b: alloc(hidden, "bgs.hidden_b"),
+        }
+    }
+}
+
 impl LayerForwardBuffers {
     /// Allocate every per-layer / per-step buffer as a persistent BufId
     /// in the graph-mode pool. `pool.alloc` zero-fills under the hood,
@@ -1939,6 +2028,10 @@ pub(super) fn batched_linear_attn_layer_forward(
     // `buffer_pool.handle(...)` at the top of the body.
     hidden_in_id: super::graph::BufId,
     hidden_out_id: super::graph::BufId,
+    // S10b-2: run-lifetime scratch BufIds for the batched graph,
+    // allocated once at max chunk width. Replaces the per-layer
+    // `pool.alloc` of the pre-MoE transients.
+    scratch: &BatchedGraphScratch,
 ) -> Result<(), LayerForwardError> {
     use super::expert_forward::{
         encode_moe_batched_permute_fuse, encode_moe_combine_residual_n_tokens,
@@ -2050,79 +2143,32 @@ pub(super) fn batched_linear_attn_layer_forward(
     // scope so the `pool` borrow ends before `backend.execute(&graph)`.
     // BufIds for buffers consumed by the imperative MoE block (1f-1h)
     // and the host-side routing readback are returned out.
-    let (
-        graph,
-        h_mid_id,
-        h_post_id,
-        shared_gate_id,
-        routing_indices_id,
-        routing_weights_id,
-    ) = {
+    let graph = {
         let mut g = Graph::new();
-        let pool = backend.pool_mut();
 
-        // Phase 1a–1d transients.
-        let normed_id = pool
-            .alloc(n_tokens * hidden_dim * f32_sz_u, "linear_attn.normed", false)
-            ?;
-        let qkv_stack_id = pool
-            .alloc(n_tokens * conv_dim * f32_sz_u, "linear_attn.qkv_stack", false)
-            ?;
-        let z_stack_id = pool
-            .alloc(n_tokens * total_value * f32_sz_u, "linear_attn.z_stack", false)
-            ?;
-        let beta_stack_id = pool
-            .alloc(n_tokens * num_v_heads * f32_sz_u, "linear_attn.beta_stack", false)
-            ?;
-        let alpha_stack_id = pool
-            .alloc(n_tokens * num_v_heads * f32_sz_u, "linear_attn.alpha_stack", false)
-            ?;
-        let conv_out_stack_id = pool
-            .alloc(n_tokens * conv_dim * f32_sz_u, "linear_attn.conv_out_stack", false)
-            ?;
-        let g_decay_stack_id = pool
-            .alloc(n_tokens * num_v_heads * f32_sz_u, "linear_attn.g_decay_stack", false)
-            ?;
-        let beta_gate_stack_id = pool
-            .alloc(n_tokens * num_v_heads * f32_sz_u, "linear_attn.beta_gate_stack", false)
-            ?;
-        let delta_out_stack_id = pool
-            .alloc(
-                n_tokens * (num_v_heads as usize) * (value_dim as usize) * f32_sz_u,
-                "linear_attn.delta_out_stack",
-                false,
-            )
-            ?;
-        let value_out_stack_id = pool
-            .alloc(n_tokens * total_value * f32_sz_u, "linear_attn.value_out_stack", false)
-            ?;
-        let o_proj_stack_id = pool
-            .alloc(n_tokens * hidden_dim * f32_sz_u, "linear_attn.o_proj_stack", false)
-            ?;
-
-        // Phase 1e outputs that feed Phase 1f-1h (or the host readback).
-        let h_mid_id = pool
-            .alloc(n_tokens * hidden_dim * f32_sz_u, "linear_attn.h_mid", false)
-            ?;
-        let h_post_id = pool
-            .alloc(n_tokens * hidden_dim * f32_sz_u, "linear_attn.h_post", false)
-            ?;
-        let gate_logits_id = pool
-            .alloc(n_tokens * v.num_experts * f32_sz_u, "linear_attn.gate_logits", false)
-            ?;
-        let shared_gate_id = pool
-            .alloc(n_tokens * f32_sz_u, "linear_attn.shared_gate", false)
-            ?;
-        let routing_indices_id = pool
-            .alloc(
-                n_tokens * k_active * std::mem::size_of::<i32>(),
-                "linear_attn.routing_indices",
-                false,
-            )
-            ?;
-        let routing_weights_id = pool
-            .alloc(n_tokens * k_active * f32_sz_u, "linear_attn.routing_weights", false)
-            ?;
+        // S10b-2: transient + boundary BufIds come from the
+        // run-lifetime `BatchedGraphScratch` (allocated once at max
+        // chunk width) instead of a fresh per-layer `pool.alloc`.
+        // Same local names so the Op pushes below are unchanged; the
+        // `*NTokens` Ops stride by the real `n_tokens` and the
+        // scratch buffers' max-chunk tail is simply unused.
+        let normed_id = scratch.normed;
+        let qkv_stack_id = scratch.qkv_stack;
+        let z_stack_id = scratch.z_stack;
+        let beta_stack_id = scratch.beta_stack;
+        let alpha_stack_id = scratch.alpha_stack;
+        let conv_out_stack_id = scratch.conv_out_stack;
+        let g_decay_stack_id = scratch.g_decay_stack;
+        let beta_gate_stack_id = scratch.beta_gate_stack;
+        let delta_out_stack_id = scratch.delta_out_stack;
+        let value_out_stack_id = scratch.value_out_stack;
+        let o_proj_stack_id = scratch.o_proj_stack;
+        let gate_logits_id = scratch.gate_logits;
+        let h_mid_id = scratch.h_mid;
+        let h_post_id = scratch.h_post;
+        let shared_gate_id = scratch.shared_gate;
+        let routing_indices_id = scratch.routing_indices;
+        let routing_weights_id = scratch.routing_weights;
 
         // Phase 1a — input rms_norm.
         g.push(Op::RmsNormBf16NTokens {
@@ -2317,8 +2363,16 @@ pub(super) fn batched_linear_attn_layer_forward(
             k: k_active as u32,
         });
 
-        (g, h_mid_id, h_post_id, shared_gate_id, routing_indices_id, routing_weights_id)
+        g
     };
+
+    // S10b-2: boundary BufIds are scratch fields — named here for the
+    // imperative MoE block (1f-1h) + host readback below.
+    let h_mid_id = scratch.h_mid;
+    let h_post_id = scratch.h_post;
+    let shared_gate_id = scratch.shared_gate;
+    let routing_indices_id = scratch.routing_indices;
+    let routing_weights_id = scratch.routing_weights;
 
     // Submit + wait. Single cmdbuf, single commit (the S7-1a fusion
     // is preserved by `MetalBackend::execute`'s default loop body).
