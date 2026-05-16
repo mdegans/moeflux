@@ -173,6 +173,12 @@ pub trait BufferPool {
     /// - Called once, after all `alloc()`s for the graph are done
     ///   and before `Backend::execute`. Multiple calls are allowed
     ///   but unnecessary.
+    /// - After coloring, every colored BufId is **pinned**
+    ///   (`persistent` set true): its physical layout is frozen for
+    ///   the run, so it — and the shared color buffer it now points
+    ///   at — survive [`Self::reset_transient`]. A run-lifetime
+    ///   scratch set is therefore allocated `persistent = false`,
+    ///   `commit_plan`'d once, and thereafter behaves as persistent.
     fn commit_plan(&mut self, _graph: &Graph) {}
 }
 

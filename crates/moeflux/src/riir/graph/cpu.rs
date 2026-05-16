@@ -193,20 +193,30 @@ impl BufferPool for CpuBufferPool {
         // Phase 1: place non-aliasable BufIds (persistent + non-
         // colorable transients) in the new physical layout, moving
         // their existing buffer to preserve content.
+        //
+        // A prior `commit_plan` may already have aliased BufIds onto
+        // a shared physical buffer, so move each physical exactly
+        // once (`old_to_new`) and remap every BufId that shared it to
+        // the same new slot.
         let mut new_buffers: Vec<RefCell<Vec<u8>>> = Vec::new();
         let mut new_bufid_to_physical: Vec<u32> = vec![u32::MAX; n_bufids];
+        let mut old_to_new: HashMap<usize, u32> = HashMap::new();
         for bufid_idx in 0..n_bufids {
             let buf = BufId(bufid_idx as u32);
             if aliasable.contains_key(&buf) {
                 continue;
             }
             let old_physical = self.bufid_to_physical[bufid_idx] as usize;
-            let old_buf = std::mem::replace(
-                &mut self.buffers[old_physical],
-                RefCell::new(Vec::new()),
-            );
-            new_bufid_to_physical[bufid_idx] = new_buffers.len() as u32;
-            new_buffers.push(old_buf);
+            let new_phys = *old_to_new.entry(old_physical).or_insert_with(|| {
+                let old_buf = std::mem::replace(
+                    &mut self.buffers[old_physical],
+                    RefCell::new(Vec::new()),
+                );
+                let np = new_buffers.len() as u32;
+                new_buffers.push(old_buf);
+                np
+            });
+            new_bufid_to_physical[bufid_idx] = new_phys;
         }
 
         // Phase 2: allocate one physical buffer per color group,
@@ -237,6 +247,13 @@ impl BufferPool for CpuBufferPool {
         debug_assert!(new_bufid_to_physical.iter().all(|&p| p != u32::MAX));
         self.buffers = new_buffers;
         self.bufid_to_physical = new_bufid_to_physical;
+
+        // S10b-2: pin every colored BufId. Its physical layout is now
+        // frozen for the run; flipping `persistent` keeps it (and the
+        // shared color buffer it points at) across `reset_transient`.
+        for buf in aliasable.keys() {
+            self.persistent[buf.0 as usize] = true;
+        }
     }
 }
 

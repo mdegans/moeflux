@@ -243,13 +243,20 @@ pub struct BatchedGraphScratch {
     /// bucket a layer hits. Empty in mmap mode (which addresses
     /// expert weights via `ExpertFiles::mmap_id_for_expert`).
     pub expert_blobs: Vec<BufId>,
+    /// One-time latch: cleared at construction, set by the first
+    /// producer call after it `commit_plan`s graph1 + graph2. Gates
+    /// the lifetime-coloring pass to run exactly once per run.
+    pub commit_planned: std::cell::Cell<bool>,
 }
 
 impl BatchedGraphScratch {
     /// Allocate every batched-graph scratch buffer at max chunk
-    /// width, all `persistent = true`. `k_active` sizes the
-    /// bucket-flat MoE buffers; `pread_mode` gates the per-expert
-    /// weight blobs (skipped in mmap mode).
+    /// width. The intra-graph transients are `persistent = false`
+    /// (the first producer call `commit_plan`s + pins them); the
+    /// graph1→graph2 boundary buffers + uploaded inputs are
+    /// `persistent = true`. `k_active` sizes the bucket-flat MoE
+    /// buffers; `pread_mode` gates the per-expert weight blobs
+    /// (skipped in mmap mode).
     pub fn new(
         pool: &mut MetalBufferPool,
         k_active: usize,
@@ -258,10 +265,6 @@ impl BatchedGraphScratch {
         let v = VARIANT;
         let chunk = super::BATCHED_CHUNK_SIZE;
         let f32_sz = std::mem::size_of::<f32>();
-        let mut alloc = |elems_per_token: usize, label: &'static str| {
-            pool.alloc(chunk * elems_per_token * f32_sz, label, true)
-                .expect("BatchedGraphScratch::new pool alloc")
-        };
         let hidden = v.hidden_dim;
         let conv = v.linear_conv_dim();
         let total_value = v.linear_total_value();
@@ -269,14 +272,13 @@ impl BatchedGraphScratch {
         let delta_out = num_v * Variant::LINEAR_VALUE_DIM;
         let shared_inter = v.shared_intermediate;
         let moe_inter = v.moe_intermediate;
-        // Bucket-flat buffers hold `chunk * k_active` assignments.
-        let bkt =
-            |per_assignment: usize| chunk * k_active * per_assignment * f32_sz;
+        // All colorable transients first (`persistent = false`), then
+        // all pinned buffers (`persistent = true`) — two passes so the
+        // two `&mut pool` closures never overlap. BufId order within
+        // the scratch set is irrelevant: `commit_plan` colors by
+        // topology and `reset_transient` keeps everything up to the
+        // last persistent BufId (all of these end up persistent).
         let (
-            shared_ffn_gate,
-            shared_up,
-            shared_act,
-            shared_down,
             normed,
             qkv_stack,
             z_stack,
@@ -289,56 +291,69 @@ impl BatchedGraphScratch {
             value_out_stack,
             o_proj_stack,
             gate_logits,
-            h_mid,
-            h_post,
-            shared_gate,
-            routing_indices,
-            routing_weights,
-            hidden_a,
-            hidden_b,
-        ) = (
-            alloc(shared_inter, "bgs.shared_ffn_gate"),
-            alloc(shared_inter, "bgs.shared_up"),
-            alloc(shared_inter, "bgs.shared_act"),
-            alloc(hidden, "bgs.shared_down"),
-            alloc(hidden, "bgs.normed"),
-            alloc(conv, "bgs.qkv_stack"),
-            alloc(total_value, "bgs.z_stack"),
-            alloc(num_v, "bgs.beta_stack"),
-            alloc(num_v, "bgs.alpha_stack"),
-            alloc(conv, "bgs.conv_out_stack"),
-            alloc(num_v, "bgs.g_decay_stack"),
-            alloc(num_v, "bgs.beta_gate_stack"),
-            alloc(delta_out, "bgs.delta_out_stack"),
-            alloc(total_value, "bgs.value_out_stack"),
-            alloc(hidden, "bgs.o_proj_stack"),
-            alloc(v.num_experts, "bgs.gate_logits"),
-            alloc(hidden, "bgs.h_mid"),
-            alloc(hidden, "bgs.h_post"),
-            alloc(1, "bgs.shared_gate"),
-            alloc(super::expert_forward::MAX_K, "bgs.routing_indices"),
-            alloc(super::expert_forward::MAX_K, "bgs.routing_weights"),
-            alloc(hidden, "bgs.hidden_a"),
-            alloc(hidden, "bgs.hidden_b"),
-        );
-        let mut alloc_bytes = |bytes: usize, label: &'static str| {
+            shared_ffn_gate,
+            shared_up,
+            shared_act,
+            shared_down,
+            bucket_gate,
+            bucket_up,
+            bucket_act,
+            bucket_out,
+            out_sum,
+        ) = {
+            let mut c = |elems: usize, label: &'static str| {
+                pool.alloc(chunk * elems * f32_sz, label, false)
+                    .expect("BatchedGraphScratch::new pool alloc")
+            };
+            (
+                c(hidden, "bgs.normed"),
+                c(conv, "bgs.qkv_stack"),
+                c(total_value, "bgs.z_stack"),
+                c(num_v, "bgs.beta_stack"),
+                c(num_v, "bgs.alpha_stack"),
+                c(conv, "bgs.conv_out_stack"),
+                c(num_v, "bgs.g_decay_stack"),
+                c(num_v, "bgs.beta_gate_stack"),
+                c(delta_out, "bgs.delta_out_stack"),
+                c(total_value, "bgs.value_out_stack"),
+                c(hidden, "bgs.o_proj_stack"),
+                c(v.num_experts, "bgs.gate_logits"),
+                c(shared_inter, "bgs.shared_ffn_gate"),
+                c(shared_inter, "bgs.shared_up"),
+                c(shared_inter, "bgs.shared_act"),
+                c(hidden, "bgs.shared_down"),
+                c(k_active * moe_inter, "bgs.bucket_gate"),
+                c(k_active * moe_inter, "bgs.bucket_up"),
+                c(k_active * moe_inter, "bgs.bucket_act"),
+                c(k_active * hidden, "bgs.bucket_out"),
+                c(hidden, "bgs.out_sum"),
+            )
+        };
+        let mut p = |bytes: usize, label: &'static str| {
             pool.alloc(bytes, label, true)
                 .expect("BatchedGraphScratch::new pool alloc")
         };
-        let bucket_input = alloc_bytes(bkt(hidden), "bgs.bucket_input");
-        let bucket_gate = alloc_bytes(bkt(moe_inter), "bgs.bucket_gate");
-        let bucket_up = alloc_bytes(bkt(moe_inter), "bgs.bucket_up");
-        let bucket_act = alloc_bytes(bkt(moe_inter), "bgs.bucket_act");
-        let bucket_out = alloc_bytes(bkt(hidden), "bgs.bucket_out");
+        let chk = |elems: usize| chunk * elems * f32_sz;
+        // Bucket-flat buffers hold `chunk * k_active` assignments.
+        let bkt = |per: usize| chunk * k_active * per * f32_sz;
+        let h_mid = p(chk(hidden), "bgs.h_mid");
+        let h_post = p(chk(hidden), "bgs.h_post");
+        let shared_gate = p(chk(1), "bgs.shared_gate");
+        let routing_indices =
+            p(chk(super::expert_forward::MAX_K), "bgs.routing_indices");
+        let routing_weights =
+            p(chk(super::expert_forward::MAX_K), "bgs.routing_weights");
+        let hidden_a = p(chk(hidden), "bgs.hidden_a");
+        let hidden_b = p(chk(hidden), "bgs.hidden_b");
+        let bucket_input = p(bkt(hidden), "bgs.bucket_input");
         let bucket_token_idx =
-            alloc_bytes(chunk * k_active * f32_sz, "bgs.bucket_token_idx");
+            p(chunk * k_active * f32_sz, "bgs.bucket_token_idx");
         let bucket_weights =
-            alloc_bytes(chunk * k_active * f32_sz, "bgs.bucket_weights");
-        let out_sum = alloc_bytes(chunk * hidden * f32_sz, "bgs.out_sum");
+            p(chunk * k_active * f32_sz, "bgs.bucket_weights");
         let expert_blobs: Vec<BufId> = if pread_mode {
             let blob_bytes = v.expert_size_4bit();
             (0..v.num_experts)
-                .map(|_| alloc_bytes(blob_bytes, "bgs.expert_blob"))
+                .map(|_| p(blob_bytes, "bgs.expert_blob"))
                 .collect()
         } else {
             Vec::new()
@@ -376,6 +391,7 @@ impl BatchedGraphScratch {
             bucket_weights,
             out_sum,
             expert_blobs,
+            commit_planned: std::cell::Cell::new(false),
         }
     }
 }
@@ -2480,6 +2496,12 @@ pub(super) fn batched_linear_attn_layer_forward(
     let routing_indices_id = scratch.routing_indices;
     let routing_weights_id = scratch.routing_weights;
 
+    // S10b-2 Phase 4: on the first call, lifetime-color graph1's
+    // transient BufIds (and pin them). Topology is layer- and
+    // step-invariant, so one pass holds for the whole run.
+    if !scratch.commit_planned.get() {
+        backend.pool_mut().commit_plan(&graph);
+    }
     // Submit + wait. Single cmdbuf, single commit (the S7-1a fusion
     // is preserved by `MetalBackend::execute`'s default loop body).
     backend.execute(&graph)?;
@@ -2731,6 +2753,12 @@ pub(super) fn batched_linear_attn_layer_forward(
         });
         g
     };
+    // S10b-2 Phase 4: color graph2's transients on the first call,
+    // then latch — `commit_plan` runs exactly once per run.
+    if !scratch.commit_planned.get() {
+        backend.pool_mut().commit_plan(&graph2);
+        scratch.commit_planned.set(true);
+    }
     backend.execute(&graph2)?;
 
     // Phase 3: record this layer's actual routing as the prediction
