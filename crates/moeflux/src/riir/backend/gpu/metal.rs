@@ -9,9 +9,7 @@
 //! `shaders.metal` lives at `crates/moeflux/shaders/shaders.metal`
 //! and is embedded into the binary at compile time via
 //! [`include_str!`]. No env vars, no path discovery, no runtime IO
-//! to find the source. The C-side oracle (`mod imp`, gated behind
-//! the `diff-oracle` feature) reads from the same file via the path
-//! `moeflux-sys`'s `build.rs` bakes in.
+//! to find the source.
 //!
 //! ## What's cached, what isn't
 //!

@@ -5,5 +5,4 @@
 //! test does `mod common;`. This is the canonical place for shared
 //! test scaffolding.
 
-pub mod c_backend;
 pub mod diff_helpers;

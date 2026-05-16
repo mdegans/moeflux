@@ -9,15 +9,8 @@
 //!
 //! ## Adding a new variant
 //!
-//! 1. Add the matching Cargo feature to `crates/moeflux/Cargo.toml`
-//!    (and in `moeflux-sys/Cargo.toml` if there's a C-side oracle for
-//!    it; the C header has compile-time variant gating that we keep
-//!    in lockstep with the Rust variants).
+//! 1. Add the matching Cargo feature to `crates/moeflux/Cargo.toml`.
 //! 2. Add a new `#[cfg(feature = "…")]` `VARIANT` block below.
-//! 3. Confirm via the integration-test helper `assert_matches_c`
-//!    in `tests/common/c_backend.rs` — boots a C ctx and asserts
-//!    every public field matches. New variants without a C oracle
-//!    skip this check (see e.g. `model-cogito-v2-671b`).
 //!
 //! ## Sync invariant
 //!
@@ -608,15 +601,6 @@ const _: () = {
         "first_k_dense_replace must be strictly less than num_layers"
     );
 };
-
-// --- Runtime cross-check against the C path ----------------------
-//
-// `assert_matches_c` lives in the integration-test layer at
-// `tests/common/c_backend.rs` since Phase 6 — it's the only consumer
-// of the C-API safe wrapper, and that wrapper is no longer part of
-// moeflux's lib surface. Variants without a C-side counterpart
-// (currently `model-cogito-v2-671b`) skip this check; their Phase A
-// regression coverage is the static asserts above.
 
 /// Compile-time invariants this module relies on. No-op at runtime;
 /// presence forces the static asserts above to be evaluated when

@@ -28,10 +28,12 @@
 //!
 //! ## Differential oracle
 //!
-//! The original C-via-Objective-C implementation is wrapped as a
-//! test-only helper at `tests/common/c_backend.rs`. moeflux's lib
-//! ships only the Rust port; the C oracle exists solely to validate
-//! the port via `tests/diff_oracle.rs`.
+//! moeflux is a pure-Rust port; the original C/Objective-C reference
+//! implementation has been retired. The port is validated by
+//! Rust-internal differential oracles — `tests/graph_diff_oracle.rs`
+//! (the CPU backend vs. the Metal backend, per `Op`) and
+//! `tests/batched_diff_oracle.rs` (batched vs. per-token paths), with
+//! `tests/diff_oracle.rs` carrying the remaining Rust-internal checks.
 
 #![cfg_attr(not(target_os = "macos"), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]

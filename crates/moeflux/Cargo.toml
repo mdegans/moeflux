@@ -12,16 +12,13 @@ readme        = "../../README.md"
 [features]
 default = []
 
-# Model variant features. Select exactly one. The same name on
-# moeflux-sys (a dev-dep) is forwarded so the C-side oracle gets
-# the matching `MOEFLUX_MODEL_*` define when integration tests run.
-model-qwen3-5-a17b      = ["moeflux-sys/model-qwen3-5-a17b"]
-model-qwen3-6-35b-a3b   = ["moeflux-sys/model-qwen3-6-35b-a3b"]
-# Cogito-V2-Preview-671B (DeepSeek-V3 architecture). No C-side
-# oracle today — moeflux-sys gets the feature for symmetry but its
-# build.rs skips the C compile (no model_variant.h block exists for
-# this variant).
-model-cogito-v2-671b    = ["moeflux-sys/model-cogito-v2-671b"]
+# Model variant features. Select exactly one. These gate the
+# per-variant shape constants in `riir/variants.rs` and the
+# integration test binaries.
+model-qwen3-5-a17b      = []
+model-qwen3-6-35b-a3b   = []
+# Cogito-V2-Preview-671B (DeepSeek-V3 architecture).
+model-cogito-v2-671b    = []
 
 [dependencies]
 thiserror   = { workspace = true }
@@ -34,7 +31,3 @@ libc        = { workspace = true }
 bytemuck    = { workspace = true }
 
 [dev-dependencies]
-# Test-only access to the upstream C/Objective-C reference
-# implementation. Used by `tests/diff_oracle.rs` to validate the
-# Rust port; not part of the public API or production builds.
-moeflux-sys = { workspace = true }

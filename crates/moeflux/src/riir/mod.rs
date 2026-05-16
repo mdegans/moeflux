@@ -1,12 +1,10 @@
 //! Pure-Rust port of moeflux's host-side dispatch.
 //!
-//! Under construction. While the port is in progress, this module
-//! coexists with the C-via-`moeflux-sys` path that
-//! [`crate::imp::Ctx`] wraps. The differential test harness in
-//! `tests/diff_oracle.rs` runs both side-by-side and asserts they
-//! agree at well-defined checkpoints — bit-exact for deterministic
-//! per-kernel comparisons (Phase 3), within Metal-MoE nondeterminism
-//! tolerances for end-to-end logits (Phase 4+).
+//! This module is the sole host-side path: the C/Objective-C
+//! reference implementation it was ported from has been retired.
+//! Correctness is held by the Rust-internal differential oracles in
+//! `tests/graph_diff_oracle.rs` and `tests/batched_diff_oracle.rs`
+//! (CPU backend vs. Metal backend, and batched vs. per-token).
 //!
 //! # Status
 //!
