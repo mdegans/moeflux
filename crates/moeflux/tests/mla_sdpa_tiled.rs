@@ -89,7 +89,7 @@ fn run_case(cache_len: u32) -> (Vec<f32>, Vec<f32>) {
     let softmax_scale = 1.0 / ((v.qk_nope_head_dim + v.qk_rope_head_dim) as f32).sqrt();
 
     let mut metal = MetalContext::new().expect("MetalContext::new");
-    let pipes = MlaPipelines::new(&mut metal).expect("MlaPipelines::new");
+    let pipes = MlaPipelines::fetch(&mut metal).expect("MlaPipelines::fetch");
 
     // Synthetic inputs — sin patterns, deterministic.
     let q_prime_data: Vec<f32> = (0..num_heads * kv_lora_rank)

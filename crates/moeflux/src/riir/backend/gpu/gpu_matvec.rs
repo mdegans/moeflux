@@ -24,11 +24,9 @@
 //! Per the Phase 3 finding, both kernels are bit-exact per-PSO on
 //! the same device.
 
-use metal::{
-    Buffer, CommandBufferRef, ComputePipelineState, MTLSize, NSUInteger,
-};
+use metal::{Buffer, CommandBufferRef, MTLSize, NSUInteger};
 
-use super::metal::{MetalContext, MetalError};
+use super::encoder::pipeline_bundle;
 use crate::riir::io::mtl_weight_buf::MtlWeightBuf;
 use crate::riir::variants::GROUP_SIZE;
 
@@ -58,40 +56,23 @@ pub struct MatvecSpec<'a> {
     pub bits: u32,
 }
 
-/// Pre-fetched matvec pipelines. All three flavors compile lazily on
-/// first request via [`MetalContext::pipeline`].
-///
-/// `*_n_tokens` variants are the batched-prefill versions: same weights
-/// applied to N stacked input vectors in one dispatch. See
-/// [`encode_matvec_n_tokens`]. 8-bit batched is not implemented yet —
-/// the 8-bit projections (gate logits etc.) on Qwen3-A3B are small
-/// enough that per-token dispatch is cheap; revisit if measurement
-/// flags it.
-pub struct MatvecPipelines {
-    pub v3_4bit: ComputePipelineState,
-    pub fast_4bit: ComputePipelineState,
-    pub v3_8bit: ComputePipelineState,
-    pub v3_4bit_n: ComputePipelineState,
-    pub fast_4bit_n: ComputePipelineState,
-    pub v3_8bit_n: ComputePipelineState,
-}
-
-impl MatvecPipelines {
-    pub fn fetch(metal: &mut MetalContext) -> Result<Self, MetalError> {
-        Ok(Self {
-            v3_4bit: metal.pipeline("dequant_matvec_4bit_v3")?.clone(),
-            fast_4bit: metal.pipeline("dequant_matvec_4bit_fast")?.clone(),
-            v3_8bit: metal.pipeline("dequant_matvec_8bit_v3")?.clone(),
-            v3_4bit_n: metal
-                .pipeline("dequant_matvec_4bit_v3_n_tokens")?
-                .clone(),
-            fast_4bit_n: metal
-                .pipeline("dequant_matvec_4bit_fast_n_tokens")?
-                .clone(),
-            v3_8bit_n: metal
-                .pipeline("dequant_matvec_8bit_v3_n_tokens")?
-                .clone(),
-        })
+pipeline_bundle! {
+    /// Pre-fetched matvec pipelines. All three flavors compile lazily on
+    /// first request via [`crate::riir::backend::gpu::metal::MetalContext::pipeline`].
+    ///
+    /// `*_n_tokens` variants are the batched-prefill versions: same weights
+    /// applied to N stacked input vectors in one dispatch. See
+    /// [`encode_matvec_n_tokens`]. 8-bit batched is not implemented yet —
+    /// the 8-bit projections (gate logits etc.) on Qwen3-A3B are small
+    /// enough that per-token dispatch is cheap; revisit if measurement
+    /// flags it.
+    pub struct MatvecPipelines {
+        v3_4bit => "dequant_matvec_4bit_v3",
+        fast_4bit => "dequant_matvec_4bit_fast",
+        v3_8bit => "dequant_matvec_8bit_v3",
+        v3_4bit_n => "dequant_matvec_4bit_v3_n_tokens",
+        fast_4bit_n => "dequant_matvec_4bit_fast_n_tokens",
+        v3_8bit_n => "dequant_matvec_8bit_v3_n_tokens",
     }
 }
 
@@ -224,24 +205,17 @@ pub fn encode_matvec_n_tokens(
 // BF16-weight matvec (no dequant) — Cogito-V2 / DeepSeek-V3 router gate
 // ---------------------------------------------------------------------------
 
-/// Pipelines for the BF16-weight matvec. Used by the MoE router gate
-/// (`model.layers.{i}.mlp.gate.weight`, `[num_experts, hidden_dim]`
-/// BF16) which the 4-bit dequant matvec can't handle. Sibling of
-/// [`MatvecPipelines`].
-///
-/// `bf16_n` is the batched-prefill variant: same weights applied to N
-/// token activations in one dispatch. See [`encode_bf16_matmul_n_tokens`].
-pub struct BfMatvecPipelines {
-    pub bf16: ComputePipelineState,
-    pub bf16_n: ComputePipelineState,
-}
-
-impl BfMatvecPipelines {
-    pub fn fetch(metal: &mut MetalContext) -> Result<Self, MetalError> {
-        Ok(Self {
-            bf16: metal.pipeline("bf16_matvec")?.clone(),
-            bf16_n: metal.pipeline("bf16_matmul_n_tokens")?.clone(),
-        })
+pipeline_bundle! {
+    /// Pipelines for the BF16-weight matvec. Used by the MoE router gate
+    /// (`model.layers.{i}.mlp.gate.weight`, `[num_experts, hidden_dim]`
+    /// BF16) which the 4-bit dequant matvec can't handle. Sibling of
+    /// [`MatvecPipelines`].
+    ///
+    /// `bf16_n` is the batched-prefill variant: same weights applied to N
+    /// token activations in one dispatch. See [`encode_bf16_matmul_n_tokens`].
+    pub struct BfMatvecPipelines {
+        bf16 => "bf16_matvec",
+        bf16_n => "bf16_matmul_n_tokens",
     }
 }
 

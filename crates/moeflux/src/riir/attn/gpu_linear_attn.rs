@@ -23,28 +23,18 @@ use metal::{
     Buffer, CommandBufferRef, ComputePipelineState, MTLSize, NSUInteger,
 };
 
-use crate::riir::backend::gpu::metal::{MetalContext, MetalError};
+use crate::riir::backend::gpu::encoder::pipeline_bundle;
 use crate::riir::variants::{Variant, VARIANT};
 
-/// All linear-attn pipelines pre-fetched. Used by the layer-forward
-/// composer so the encode loop doesn't borrow `metal` mid-encode.
-pub struct LinearAttnPipelines {
-    pub conv1d_step: ComputePipelineState,
-    pub rms_norm_qk: ComputePipelineState,
-    pub compute_decay_beta: ComputePipelineState,
-    pub delta_net_step: ComputePipelineState,
-    pub gated_rms_norm: ComputePipelineState,
-}
-
-impl LinearAttnPipelines {
-    pub fn fetch(metal: &mut MetalContext) -> Result<Self, MetalError> {
-        Ok(Self {
-            conv1d_step: metal.pipeline("conv1d_step")?.clone(),
-            rms_norm_qk: metal.pipeline("rms_norm_qk")?.clone(),
-            compute_decay_beta: metal.pipeline("compute_decay_beta")?.clone(),
-            delta_net_step: metal.pipeline("gated_delta_net_step")?.clone(),
-            gated_rms_norm: metal.pipeline("gated_rms_norm")?.clone(),
-        })
+pipeline_bundle! {
+    /// All linear-attn pipelines pre-fetched. Used by the layer-forward
+    /// composer so the encode loop doesn't borrow `metal` mid-encode.
+    pub struct LinearAttnPipelines {
+        conv1d_step => "conv1d_step",
+        rms_norm_qk => "rms_norm_qk",
+        compute_decay_beta => "compute_decay_beta",
+        delta_net_step => "gated_delta_net_step",
+        gated_rms_norm => "gated_rms_norm",
     }
 }
 

@@ -12,6 +12,7 @@
 //! full-attn producer rewrite in S7-7.
 
 pub mod dense_mlp_gpu;
+pub mod encoder;
 pub mod gpu_ctx;
 pub mod gpu_matvec;
 pub mod gpu_norm;

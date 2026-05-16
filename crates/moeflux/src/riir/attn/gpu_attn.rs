@@ -41,6 +41,7 @@ use metal::{
     NSUInteger,
 };
 
+use crate::riir::backend::gpu::encoder::pipeline_bundle;
 use crate::riir::backend::gpu::metal::{MetalContext, MetalError, MtlBuffer};
 
 /// Errors from the GPU attention kernels.
@@ -85,24 +86,15 @@ fn check_len(
     Ok(())
 }
 
-/// Pre-fetched pipelines for the 4 GPU attention kernels. Used by the
-/// per-layer fast path (slice 5d-7b); fetching once per layer-forward
-/// avoids the lazy-compile in the hot inner dispatch.
-pub struct GpuAttnPipelines {
-    pub scores: ComputePipelineState,
-    pub softmax: ComputePipelineState,
-    pub values: ComputePipelineState,
-    pub gate: ComputePipelineState,
-}
-
-impl GpuAttnPipelines {
-    pub fn fetch(metal: &mut MetalContext) -> Result<Self, MetalError> {
-        Ok(Self {
-            scores: metal.pipeline("attn_scores_batched")?.clone(),
-            softmax: metal.pipeline("attn_softmax_batched")?.clone(),
-            values: metal.pipeline("attn_values_batched")?.clone(),
-            gate: metal.pipeline("sigmoid_gate")?.clone(),
-        })
+pipeline_bundle! {
+    /// Pre-fetched pipelines for the 4 GPU attention kernels. Used by the
+    /// per-layer fast path (slice 5d-7b); fetching once per layer-forward
+    /// avoids the lazy-compile in the hot inner dispatch.
+    pub struct GpuAttnPipelines {
+        scores => "attn_scores_batched",
+        softmax => "attn_softmax_batched",
+        values => "attn_values_batched",
+        gate => "sigmoid_gate",
     }
 }
 
@@ -423,27 +415,15 @@ pub fn gpu_sigmoid_gate(
 const BATCHED_SDPA_TILE_SIZE: u32 = 4096;
 const BATCHED_SDPA_THREADS: u32 = 128;
 
-/// Pipelines for the Phase 3 batched-prefill causal SDPA kernels.
-/// Tiled online-softmax: `init` zeros running state, `accumulate`
-/// processes one tile and updates the running (max, denom, v_partial),
-/// `finalize` divides v_partial by denom for the final output.
-pub struct BatchedSdpaPipelines {
-    pub init: ComputePipelineState,
-    pub accumulate: ComputePipelineState,
-    pub finalize: ComputePipelineState,
-}
-
-impl BatchedSdpaPipelines {
-    pub fn fetch(metal: &mut MetalContext) -> Result<Self, MetalError> {
-        Ok(Self {
-            init: metal.pipeline("attn_sdpa_causal_init_running")?.clone(),
-            accumulate: metal
-                .pipeline("attn_sdpa_causal_tile_accumulate")?
-                .clone(),
-            finalize: metal
-                .pipeline("attn_sdpa_causal_tile_finalize")?
-                .clone(),
-        })
+pipeline_bundle! {
+    /// Pipelines for the Phase 3 batched-prefill causal SDPA kernels.
+    /// Tiled online-softmax: `init` zeros running state, `accumulate`
+    /// processes one tile and updates the running (max, denom, v_partial),
+    /// `finalize` divides v_partial by denom for the final output.
+    pub struct BatchedSdpaPipelines {
+        init => "attn_sdpa_causal_init_running",
+        accumulate => "attn_sdpa_causal_tile_accumulate",
+        finalize => "attn_sdpa_causal_tile_finalize",
     }
 }
 

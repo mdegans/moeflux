@@ -26,27 +26,16 @@
 //! - Weights: cosine ≥ 0.9999 — values match within the softmax
 //!   reduction-order tolerance.
 
-use metal::{
-    Buffer, CommandBufferRef, ComputePipelineState, MTLSize, NSUInteger,
-};
+use metal::{Buffer, CommandBufferRef, MTLSize, NSUInteger};
 
-use crate::riir::backend::gpu::metal::{MetalContext, MetalError};
+use crate::riir::backend::gpu::encoder::pipeline_bundle;
 
-/// Pipelines used by [`encode_moe_router`]. Fetch once per orchestrator
-/// scope so subsequent calls are O(1).
-pub struct MoeRouterPipelines {
-    pub softmax_topk: ComputePipelineState,
-    pub normalize: ComputePipelineState,
-}
-
-impl MoeRouterPipelines {
-    pub fn fetch(metal: &mut MetalContext) -> Result<Self, MetalError> {
-        let softmax_topk = metal.pipeline("moe_softmax_topk")?.clone();
-        let normalize = metal.pipeline("moe_normalize_weights")?.clone();
-        Ok(Self {
-            softmax_topk,
-            normalize,
-        })
+pipeline_bundle! {
+    /// Pipelines used by [`encode_moe_router`]. Fetch once per orchestrator
+    /// scope so subsequent calls are O(1).
+    pub struct MoeRouterPipelines {
+        softmax_topk => "moe_softmax_topk",
+        normalize => "moe_normalize_weights",
     }
 }
 

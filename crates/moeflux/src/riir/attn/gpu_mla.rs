@@ -34,7 +34,10 @@ use metal::{
     Buffer, CommandBufferRef, ComputePipelineState, MTLSize, NSUInteger,
 };
 
-use crate::riir::backend::gpu::metal::{MetalContext, MetalError};
+use crate::riir::backend::gpu::encoder::pipeline_bundle;
+use crate::riir::backend::gpu::metal::MetalError;
+#[cfg(test)]
+use crate::riir::backend::gpu::metal::MetalContext;
 
 /// Errors from the GPU MLA dispatchers.
 #[derive(Debug, thiserror::Error)]
@@ -54,39 +57,23 @@ pub const MLA_MAX_CACHE_TG: u32 = 4096;
 /// `MLA_THREADS_PER_HEAD` Metal constant.
 pub const MLA_THREADS_PER_HEAD: u32 = 128;
 
-/// Pre-fetched compute pipelines for the MLA kernels. Built once per
-/// `RsCtx` and threaded into per-token dispatch helpers. Phase 4a
-/// added `split_q_kv` and `cache_append` so the whole MLA forward
-/// fits in one Metal command buffer (no host bounces between
-/// projections, RoPE, and SDPA).
-pub struct MlaPipelines {
-    pub q_prime: ComputePipelineState,
-    pub sdpa: ComputePipelineState,
-    pub out_per_head: ComputePipelineState,
-    pub split_q_kv: ComputePipelineState,
-    pub cache_append: ComputePipelineState,
-    /// Phase 6 — tiled SDPA accumulator + finalize, used when
-    /// `cache_len > MLA_MAX_CACHE_TG` to keep `scores[]` within the
-    /// 32 KB threadgroup-memory budget.
-    pub sdpa_tile_accumulate: ComputePipelineState,
-    pub sdpa_tile_finalize: ComputePipelineState,
-}
-
-impl MlaPipelines {
-    pub fn new(metal: &mut MetalContext) -> Result<Self, MetalError> {
-        Ok(Self {
-            q_prime: metal.pipeline("mla_q_prime_4bit")?.clone(),
-            sdpa: metal.pipeline("mla_sdpa_folded")?.clone(),
-            out_per_head: metal.pipeline("mla_out_per_head_4bit")?.clone(),
-            split_q_kv: metal.pipeline("mla_split_q_kv")?.clone(),
-            cache_append: metal.pipeline("mla_kv_cache_append")?.clone(),
-            sdpa_tile_accumulate: metal
-                .pipeline("mla_sdpa_tile_accumulate")?
-                .clone(),
-            sdpa_tile_finalize: metal
-                .pipeline("mla_sdpa_tile_finalize")?
-                .clone(),
-        })
+pipeline_bundle! {
+    /// Pre-fetched compute pipelines for the MLA kernels. Built once per
+    /// `RsCtx` and threaded into per-token dispatch helpers. Phase 4a
+    /// added `split_q_kv` and `cache_append` so the whole MLA forward
+    /// fits in one Metal command buffer (no host bounces between
+    /// projections, RoPE, and SDPA).
+    pub struct MlaPipelines {
+        q_prime => "mla_q_prime_4bit",
+        sdpa => "mla_sdpa_folded",
+        out_per_head => "mla_out_per_head_4bit",
+        split_q_kv => "mla_split_q_kv",
+        cache_append => "mla_kv_cache_append",
+        /// Phase 6 — tiled SDPA accumulator + finalize, used when
+        /// `cache_len > MLA_MAX_CACHE_TG` to keep `scores[]` within the
+        /// 32 KB threadgroup-memory budget.
+        sdpa_tile_accumulate => "mla_sdpa_tile_accumulate",
+        sdpa_tile_finalize => "mla_sdpa_tile_finalize",
     }
 }
 
@@ -521,7 +508,7 @@ mod tests {
             }
         }
 
-        let pipe = MlaPipelines::new(&mut metal).unwrap();
+        let pipe = MlaPipelines::fetch(&mut metal).unwrap();
         let device = metal.device().to_owned();
         let buf_w = shared_buf_with_data(&device, &packed);
         let buf_s = shared_buf_with_data(&device, &scales);
@@ -644,7 +631,7 @@ mod tests {
             }
         }
 
-        let pipe = MlaPipelines::new(&mut metal).unwrap();
+        let pipe = MlaPipelines::fetch(&mut metal).unwrap();
         let device = metal.device().to_owned();
         let buf_qp = shared_buf_with_data(&device, &q_prime);
         let buf_qpe = shared_buf_with_data(&device, &q_pe);
@@ -748,7 +735,7 @@ mod tests {
             }
         }
 
-        let pipe = MlaPipelines::new(&mut metal).unwrap();
+        let pipe = MlaPipelines::fetch(&mut metal).unwrap();
         let device = metal.device().to_owned();
         let buf_w = shared_buf_with_data(&device, &packed);
         let buf_s = shared_buf_with_data(&device, &scales);

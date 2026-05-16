@@ -30,6 +30,7 @@ use metal::{
     MTLSize, NSUInteger,
 };
 
+use super::encoder::pipeline_bundle;
 use super::metal::{MetalContext, MetalError, MtlBuffer};
 use crate::riir::variants::{RMS_NORM_EPS, VARIANT};
 
@@ -131,21 +132,14 @@ pub fn gpu_rms_norm_fused(
     Ok(())
 }
 
-/// Pre-fetched pipelines for the bf16-weighted RMSNorm chain. Used by
-/// the per-layer fast path ([`encode_rms_norm_bf16_into`]); fetching
-/// once per layer-forward avoids the lazy-compile in the hot inner
-/// dispatch.
-pub struct RmsNormBf16Pipelines {
-    pub sum: ComputePipelineState,
-    pub apply: ComputePipelineState,
-}
-
-impl RmsNormBf16Pipelines {
-    pub fn fetch(metal: &mut MetalContext) -> Result<Self, MetalError> {
-        Ok(Self {
-            sum: metal.pipeline("rms_norm_sum_sq")?.clone(),
-            apply: metal.pipeline("rms_norm_apply_bf16")?.clone(),
-        })
+pipeline_bundle! {
+    /// Pre-fetched pipelines for the bf16-weighted RMSNorm chain. Used by
+    /// the per-layer fast path ([`encode_rms_norm_bf16_into`]); fetching
+    /// once per layer-forward avoids the lazy-compile in the hot inner
+    /// dispatch.
+    pub struct RmsNormBf16Pipelines {
+        sum => "rms_norm_sum_sq",
+        apply => "rms_norm_apply_bf16",
     }
 }
 
@@ -214,18 +208,12 @@ pub fn encode_rms_norm_bf16_into(
     }
 }
 
-/// Pipeline for the fused batched RMSNorm-bf16 kernel. One dispatch
-/// covers the full `[n_tokens, dim]` stack; intermediate `sum_sq`
-/// lives in threadgroup memory only.
-pub struct RmsNormBf16FusedNTokensPipeline {
-    pub pso: ComputePipelineState,
-}
-
-impl RmsNormBf16FusedNTokensPipeline {
-    pub fn fetch(metal: &mut MetalContext) -> Result<Self, MetalError> {
-        Ok(Self {
-            pso: metal.pipeline("rms_norm_bf16_fused_n_tokens")?.clone(),
-        })
+pipeline_bundle! {
+    /// Pipeline for the fused batched RMSNorm-bf16 kernel. One dispatch
+    /// covers the full `[n_tokens, dim]` stack; intermediate `sum_sq`
+    /// lives in threadgroup memory only.
+    pub struct RmsNormBf16FusedNTokensPipeline {
+        pso => "rms_norm_bf16_fused_n_tokens",
     }
 }
 

@@ -169,7 +169,7 @@ pub struct MlaForwardPipelines {
 impl MlaForwardPipelines {
     pub fn new(metal: &mut MetalContext) -> Result<Self, MetalError> {
         Ok(Self {
-            mla: MlaPipelines::new(metal)?,
+            mla: MlaPipelines::fetch(metal)?,
             matvec: MatvecPipelines::fetch(metal)?,
             norms: RmsNormBf16Pipelines::fetch(metal)?,
             yarn_rope: metal.pipeline("yarn_rope_apply")?.clone(),
