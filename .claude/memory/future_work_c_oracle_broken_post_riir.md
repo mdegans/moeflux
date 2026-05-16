@@ -48,11 +48,16 @@ end-to-end net is the Rust per-token oracle
 (`eval_prompt_matches_per_token_oracle`, green under a3b) plus the
 synthetic `batched_diff_oracle` / `graph_diff_oracle` suites.
 
-Before the kernel arc, decide the C oracle's fate (intersects the
-existing `project_phase6_gate_c` plan): either re-wire enough C
-host-dispatch to make it a real end-to-end oracle again, or formally
-retire the C end-to-end tests and lean on the Rust per-token oracle.
-The 1-ULP `rms_norm_per_head` nit is separate — a tolerance review.
+Mike's steer (2026-05-16): the C is to be **removed** eventually — the
+`project_phase6_gate_c` "keep C as the oracle" plan is superseded. A
+new CPU oracle exists (the `CpuBackend` graph path + the Rust per-token
+oracle); whether it matches the old C is unknown, and the C has known
+bugs regardless. So the end-to-end regression net for the kernel arc is
+the **Rust/CPU oracle**, not C. Action before the kernel arc: formally
+retire the 10 broken C end-to-end tests (or `#[ignore]` them with an
+honest "C oracle dead post-RIIR" reason) so the gate is clean, and
+confirm the CPU oracle covers what they did. The 1-ULP
+`rms_norm_per_head` nit is separate — a tolerance review.
 
 ## Gate-command correction (also discovered here)
 
