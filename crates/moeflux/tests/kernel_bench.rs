@@ -31,7 +31,8 @@ use std::time::{Duration, Instant};
 use metal::{Buffer, CommandBufferRef, MTLResourceOptions, NSUInteger};
 
 use moeflux::riir::attn::gpu_attn::{
-    encode_sdpa_causal_tiled, BatchedSdpaPipelines,
+    encode_sdpa_causal_flash, encode_sdpa_causal_tiled, BatchedSdpaPipelines,
+    FlashSdpaPipelines,
 };
 use moeflux::riir::backend::gpu::gpu_matvec::{
     encode_matvec_n_tokens, MatvecPipelines,
@@ -229,6 +230,8 @@ fn sdpa_flops(m: u64, start_pos: u64, num_heads: u64, head_dim: u64) -> f64 {
 fn bench_sdpa(metal: &mut MetalContext) {
     let pipes =
         BatchedSdpaPipelines::fetch(metal).expect("fetch BatchedSdpaPipelines");
+    let flash_pipes =
+        FlashSdpaPipelines::fetch(metal).expect("fetch FlashSdpaPipelines");
 
     let num_heads = VARIANT.num_attn_heads as u32;
     let num_kv_heads = VARIANT.num_kv_heads as u32;
@@ -286,9 +289,23 @@ fn bench_sdpa(metal: &mut MetalContext) {
         };
         bench(
             metal,
-            &format!("sdpa M={m} kv_len={kv_len}"),
+            &format!("sdpa-tiled M={m} kv_len={kv_len}"),
             flops,
             &encode,
+        );
+
+        let encode_flash = |cmd: &CommandBufferRef| {
+            encode_sdpa_causal_flash(
+                cmd, &flash_pipes, &q_buf, &k_buf, &v_buf, &out_buf, m,
+                num_heads, heads_per_kv, head_dim, kv_dim, start_pos,
+                kv_len, scale,
+            );
+        };
+        bench(
+            metal,
+            &format!("sdpa-flash M={m} kv_len={kv_len}"),
+            flops,
+            &encode_flash,
         );
     }
 }

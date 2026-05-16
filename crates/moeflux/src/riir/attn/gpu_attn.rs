@@ -551,7 +551,7 @@ pub fn encode_sdpa_causal_tiled(
 
 /// Query-tile size of `attn_sdpa_causal_flash` (must match the shader's
 /// `FA_BR`). One threadgroup processes this many query tokens.
-pub const FA_BR: u32 = 32;
+pub const FA_BR: u32 = 64;
 /// Threads per `attn_sdpa_causal_flash` threadgroup (must match `FA_THREADS`).
 pub const FA_THREADS: u32 = 256;
 

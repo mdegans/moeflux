@@ -1661,13 +1661,14 @@ kernel void attn_sdpa_causal_tile_finalize(
 // (own arcs): simdgroup_matrix QK^T/AV; GQA-fold (one TG per (q_tile,kv_h),
 // K/V block reused across the 8 shared query-heads).
 
-constant uint FA_BR      = 32;   // query tile
+constant uint FA_BR      = 64;   // query tile
 constant uint FA_BC      = 16;   // KV block
 constant uint FA_HD      = 256;  // head_dim (a3b)
 constant uint FA_THREADS = 256;  // 8 simdgroups
 constant uint FA_SIMDS   = FA_THREADS / 32;   // 8
-constant uint FA_RPS     = FA_BR / FA_SIMDS;  // rows per simdgroup = 4
-constant uint FA_VPL     = FA_HD / 32;        // values per lane    = 8
+constant uint FA_RPS     = FA_BR / FA_SIMDS;  // rows per simdgroup
+constant uint FA_VPL     = FA_HD / 32;        // values per lane = 8
+constant uint FA_TPR     = FA_THREADS / FA_BR; // Phase-3 threads per row
 
 kernel void attn_sdpa_causal_flash(
     device const float* Q             [[buffer(0)]],  // [M, num_heads, head_dim]
@@ -1761,18 +1762,19 @@ kernel void attn_sdpa_causal_flash(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // -- Phase 3: per-row online-softmax update. 8 threads / row;
-        //    the 8 lanes are contiguous within one simdgroup. --
+        // -- Phase 3: per-row online-softmax update. FA_TPR threads
+        //    per row; FA_TPR divides 32, so a row's lanes are
+        //    contiguous within one simdgroup. --
         {
-            uint row = lid / 8;          // 0..FA_BR-1
-            uint sub = lid % 8;          // 0..7
+            uint row = lid / FA_TPR;     // 0..FA_BR-1
+            uint sub = lid % FA_TPR;
             float lm = -INFINITY;
-            for (uint c = sub; c < FA_BC; c += 8) {
+            for (uint c = sub; c < FA_BC; c += FA_TPR) {
                 lm = max(lm, scores[row * FA_BC + c]);
             }
-            lm = max(lm, simd_shuffle_xor(lm, 1));
-            lm = max(lm, simd_shuffle_xor(lm, 2));
-            lm = max(lm, simd_shuffle_xor(lm, 4));
+            for (uint s = 1; s < FA_TPR; s <<= 1) {
+                lm = max(lm, simd_shuffle_xor(lm, s));
+            }
             float blk_max = lm;
 
             float m_old = row_m[row];
@@ -1781,16 +1783,16 @@ kernel void attn_sdpa_causal_flash(
             float corr = (m_old == -INFINITY) ? 0.0f : exp(m_old - m_new);
 
             float ls = 0.0f;
-            for (uint c = sub; c < FA_BC; c += 8) {
+            for (uint c = sub; c < FA_BC; c += FA_TPR) {
                 float p = active
                     ? exp(scores[row * FA_BC + c] - m_new)
                     : 0.0f;
                 scores[row * FA_BC + c] = p;
                 ls += p;
             }
-            ls += simd_shuffle_xor(ls, 1);
-            ls += simd_shuffle_xor(ls, 2);
-            ls += simd_shuffle_xor(ls, 4);
+            for (uint s = 1; s < FA_TPR; s <<= 1) {
+                ls += simd_shuffle_xor(ls, s);
+            }
 
             if (sub == 0) {
                 row_m[row]    = m_new;
