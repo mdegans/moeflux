@@ -45,27 +45,24 @@
 use metal::NSUInteger;
 
 use super::expert_forward::MoeBuffers;
-use super::graph::{BufferPool, MetalBufferPool};
+use super::graph::BufferPool;
 use super::expert_io::ExpertFiles;
 use super::gpu_attn::{encode_sdpa_causal_tiled, BatchedSdpaPipelines};
 use super::gpu_matvec::{encode_matvec, MatvecPipelines, MatvecSpec};
 use super::gpu_norm::{encode_rms_norm_bf16_into, RmsNormBf16Pipelines};
-use super::layer_weight_cache::LayerWeightCache;
+use super::gpu_ctx::GpuLayerCtx;
 use super::gpu_matvec::encode_matvec_n_tokens;
 use super::linear_attn_forward::{
     bits_of, full_attn_layer_idx_for, moe_dispatch_per_token,
     post_attention_pre_moe, read_buffer_to_vec, GpuAttnEncodeArgs,
-    LayerForwardBuffers,
     LayerForwardError, OProj, PostAttnIntermediates,
 };
 use super::metal::MetalContext;
-use super::mtl_weight_buf::MtlWeightBuf;
 use super::rms_norm::rms_norm_per_head_cpu;
 use super::rope::apply_rotary_emb;
 use super::sdpa::sdpa_cpu;
 use super::state::KvCache;
 use super::variants::VARIANT;
-use super::weight_file::WeightFile;
 
 /// Run one full-attention layer's forward pass — the pre-MoE half.
 ///
@@ -85,11 +82,7 @@ use super::weight_file::WeightFile;
 #[allow(clippy::too_many_arguments)]
 pub(super) fn full_attn_pre_moe_layer_forward(
     metal: &mut MetalContext,
-    wf: &WeightFile,
-    wf_buf: &MtlWeightBuf,
-    layer_cache: &LayerWeightCache,
-    buffers: &LayerForwardBuffers,
-    buffer_pool: &MetalBufferPool,
+    gpu: &GpuLayerCtx<'_>,
     layer_idx: usize,
     pos: i32,
     k_active: usize,
@@ -97,6 +90,8 @@ pub(super) fn full_attn_pre_moe_layer_forward(
     // Slice 5d-8: see `linear_attn_layer_forward` for the contract.
     prev_layer_chained: bool,
 ) -> Result<PostAttnIntermediates, LayerForwardError> {
+    let GpuLayerCtx { wf, wf_buf, layer_cache, buffers, buffer_pool } =
+        *gpu;
     let v = VARIANT;
 
     // Reject linear-attn layers up front. Mirror the symmetric guard
@@ -403,11 +398,7 @@ pub(super) fn full_attn_pre_moe_layer_forward(
     let intermediates = post_attention_pre_moe(
         metal,
         cmdbuf,
-        wf,
-        wf_buf,
-        layer_cache,
-        buffers,
-        buffer_pool,
+        gpu,
         layer_idx,
         k_active,
         OProj {
@@ -431,11 +422,7 @@ pub(super) fn full_attn_pre_moe_layer_forward(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn full_attn_layer_forward(
     metal: &mut MetalContext,
-    wf: &WeightFile,
-    wf_buf: &MtlWeightBuf,
-    layer_cache: &LayerWeightCache,
-    buffers: &LayerForwardBuffers,
-    buffer_pool: &MetalBufferPool,
+    gpu: &GpuLayerCtx<'_>,
     moe: &mut MoeBuffers,
     deferred: &mut super::deferred::DeferredRing,
     layer_idx: usize,
@@ -453,13 +440,11 @@ pub(super) fn full_attn_layer_forward(
     prev_layer_chained: bool,
     chain_next_norm_off: Option<u64>,
 ) -> Result<(), LayerForwardError> {
+    let GpuLayerCtx { wf: _, wf_buf, layer_cache: _, buffers, buffer_pool } =
+        *gpu;
     let intermediates = full_attn_pre_moe_layer_forward(
         metal,
-        wf,
-        wf_buf,
-        layer_cache,
-        buffers,
-        buffer_pool,
+        gpu,
         layer_idx,
         pos,
         k_active,
@@ -510,11 +495,7 @@ pub(super) fn full_attn_layer_forward(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn batched_full_attn_layer_forward(
     metal: &mut MetalContext,
-    wf: &WeightFile,
-    wf_buf: &MtlWeightBuf,
-    layer_cache: &LayerWeightCache,
-    _buffers: &LayerForwardBuffers,
-    buffer_pool: &MetalBufferPool,
+    gpu: &GpuLayerCtx<'_>,
     layer_idx: usize,
     start_pos: i32,
     n_tokens: usize,
@@ -541,6 +522,8 @@ pub(super) fn batched_full_attn_layer_forward(
     use super::metal::MtlBuffer;
     use super::moe_router::build_expert_buckets;
 
+    let GpuLayerCtx { wf, wf_buf, layer_cache, buffers: _, buffer_pool } =
+        *gpu;
     let v = VARIANT;
     debug_assert!(k_active <= MAX_K);
 

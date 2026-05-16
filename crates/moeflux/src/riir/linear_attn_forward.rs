@@ -55,6 +55,7 @@ use super::gpu_linear_attn::{
 };
 use super::gpu_matvec::{encode_matvec, MatvecPipelines, MatvecSpec};
 use super::gpu_norm::{encode_rms_norm_bf16_into, RmsNormBf16Pipelines};
+use super::gpu_ctx::GpuLayerCtx;
 use super::layer_weight_cache::LayerWeightCache;
 use super::metal::{MetalContext, MetalError};
 use super::moe_router::moe_router_cpu;
@@ -682,11 +683,7 @@ pub(super) struct GpuAttnEncodeArgs {
 #[allow(clippy::too_many_arguments)]
 pub fn linear_attn_layer_forward(
     metal: &mut MetalContext,
-    wf: &WeightFile,
-    wf_buf: &MtlWeightBuf,
-    layer_cache: &LayerWeightCache,
-    buffers: &LayerForwardBuffers,
-    buffer_pool: &MetalBufferPool,
+    gpu: &GpuLayerCtx<'_>,
     moe: &mut MoeBuffers,
     deferred: &mut super::DeferredRing,
     layer_idx: usize,
@@ -712,6 +709,8 @@ pub fn linear_attn_layer_forward(
     // disables the chain — used for the last layer and the dump hook.
     chain_next_norm_off: Option<u64>,
 ) -> Result<(), LayerForwardError> {
+    let GpuLayerCtx { wf, wf_buf, layer_cache, buffers, buffer_pool } =
+        *gpu;
     let v = VARIANT;
     let linear_layer_idx = linear_layer_idx_for(layer_idx).ok_or(
         LayerForwardError::MissingTensor {
@@ -953,11 +952,7 @@ pub fn linear_attn_layer_forward(
     post_attention_tail(
         metal,
         cmdbuf,
-        wf,
-        wf_buf,
-        layer_cache,
-        buffers,
-        buffer_pool,
+        gpu,
         moe,
         deferred,
         layer_idx,
@@ -1043,11 +1038,7 @@ pub(super) fn post_attention_tail(
     // happens inside this function; the caller must not commit before
     // returning.
     cmdbuf: &CommandBufferRef,
-    wf: &WeightFile,
-    wf_buf: &MtlWeightBuf,
-    layer_cache: &LayerWeightCache,
-    buffers: &LayerForwardBuffers,
-    buffer_pool: &MetalBufferPool,
+    gpu: &GpuLayerCtx<'_>,
     moe: &mut MoeBuffers,
     deferred: &mut super::DeferredRing,
     layer_idx: usize,
@@ -1069,14 +1060,12 @@ pub(super) fn post_attention_tail(
     // CMD1. `None` (or CPU-combine) disables the chain.
     chain_next_norm_off: Option<u64>,
 ) -> Result<(), LayerForwardError> {
+    let GpuLayerCtx { wf: _, wf_buf, layer_cache: _, buffers, buffer_pool } =
+        *gpu;
     let intermediates = post_attention_pre_moe(
         metal,
         cmdbuf,
-        wf,
-        wf_buf,
-        layer_cache,
-        buffers,
-        buffer_pool,
+        gpu,
         layer_idx,
         k_active,
         o_proj,
@@ -1120,16 +1109,14 @@ pub(super) fn post_attention_tail(
 pub(super) fn post_attention_pre_moe(
     metal: &mut MetalContext,
     cmdbuf: &CommandBufferRef,
-    wf: &WeightFile,
-    wf_buf: &MtlWeightBuf,
-    layer_cache: &LayerWeightCache,
-    buffers: &LayerForwardBuffers,
-    buffer_pool: &MetalBufferPool,
+    gpu: &GpuLayerCtx<'_>,
     layer_idx: usize,
     k_active: usize,
     o_proj: OProj,
     gpu_attn_args: Option<GpuAttnEncodeArgs>,
 ) -> Result<PostAttnIntermediates, LayerForwardError> {
+    let GpuLayerCtx { wf, wf_buf, layer_cache, buffers, buffer_pool } =
+        *gpu;
     let v = VARIANT;
 
     // Per-tensor bit widths for the MoE-side matvecs.

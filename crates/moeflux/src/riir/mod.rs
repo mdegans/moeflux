@@ -37,6 +37,7 @@ pub mod expert_io;
 pub mod full_attn_forward;
 pub mod graph;
 pub mod gpu_attn;
+pub mod gpu_ctx;
 pub mod gpu_linear_attn;
 pub mod gpu_lm_head;
 pub mod gpu_matvec;
@@ -994,13 +995,16 @@ impl RsCtx<MetalBackend> {
                     return Err(RsError::EvalFailed);
                 }
             };
-            full_attn_layer_forward(
-                metal,
+            let layer_ctx = gpu_ctx::GpuLayerCtx {
                 wf,
                 wf_buf,
-                &layer_caches[layer_idx_us],
-                linear_buffers,
+                layer_cache: &layer_caches[layer_idx_us],
+                buffers: linear_buffers,
                 buffer_pool,
+            };
+            full_attn_layer_forward(
+                metal,
+                &layer_ctx,
                 moe_buffers,
                 deferred,
                 layer_idx_us,
@@ -1023,13 +1027,16 @@ impl RsCtx<MetalBackend> {
                     return Err(RsError::EvalFailed);
                 }
             };
-            linear_attn_layer_forward(
-                metal,
+            let layer_ctx = gpu_ctx::GpuLayerCtx {
                 wf,
                 wf_buf,
-                &layer_caches[layer_idx_us],
-                linear_buffers,
+                layer_cache: &layer_caches[layer_idx_us],
+                buffers: linear_buffers,
                 buffer_pool,
+            };
+            linear_attn_layer_forward(
+                metal,
+                &layer_ctx,
                 moe_buffers,
                 deferred,
                 layer_idx_us,
@@ -1636,13 +1643,16 @@ impl RsCtx<MetalBackend> {
                 // S10b-1a-ii: parts_mut local to the full-attn
                 // branch; the borrow ends with the call.
                 let (metal, wf_buf, pool) = backend.parts_mut();
-                batched_full_attn_layer_forward(
-                    metal,
+                let layer_ctx = gpu_ctx::GpuLayerCtx {
                     wf,
                     wf_buf,
-                    &layer_caches[layer_idx],
-                    linear_buffers,
-                    pool,
+                    layer_cache: &layer_caches[layer_idx],
+                    buffers: linear_buffers,
+                    buffer_pool: pool,
+                };
+                batched_full_attn_layer_forward(
+                    metal,
+                    &layer_ctx,
                     layer_idx,
                     start_pos,
                     n,
@@ -2349,13 +2359,16 @@ impl RsCtx<MetalBackend> {
                         return Err(RsError::EvalFailed);
                     }
                 };
-                full_attn_layer_forward(
-                    metal,
+                let layer_ctx = gpu_ctx::GpuLayerCtx {
                     wf,
                     wf_buf,
-                    &layer_caches[layer_idx],
-                    linear_buffers,
+                    layer_cache: &layer_caches[layer_idx],
+                    buffers: linear_buffers,
                     buffer_pool,
+                };
+                full_attn_layer_forward(
+                    metal,
+                    &layer_ctx,
                     moe_buffers,
                     deferred,
                     layer_idx,
@@ -2378,13 +2391,16 @@ impl RsCtx<MetalBackend> {
                         return Err(RsError::EvalFailed);
                     }
                 };
-                linear_attn_layer_forward(
-                    metal,
+                let layer_ctx = gpu_ctx::GpuLayerCtx {
                     wf,
                     wf_buf,
-                    &layer_caches[layer_idx],
-                    linear_buffers,
+                    layer_cache: &layer_caches[layer_idx],
+                    buffers: linear_buffers,
                     buffer_pool,
+                };
+                linear_attn_layer_forward(
+                    metal,
+                    &layer_ctx,
                     moe_buffers,
                     deferred,
                     layer_idx,
