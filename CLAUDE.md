@@ -33,7 +33,14 @@ cargo test --no-fail-fast --features model-qwen3-6-35b-a3b -- --include-ignored
 
 `--no-fail-fast` so one model-mismatched test binary doesn't mask the
 rest. `checkpoint_restore.rs` is a3b-only and fails under a17b — that
-is expected. "Green" means all Rust-path tests pass.
+is expected. `resuming_prefill_after_seq_rm_matches_full_prefill` is
+a known failure (linear-attn recurrence state is not
+position-truncatable — see the fn-level comment); `--skip` it.
+"Green" means every other Rust-path test passes.
+
+`cargo fmt` is *not* a gate — the crate predates machine formatting
+and is ~600 hunks off default rustfmt with no `rustfmt.toml`. Match
+surrounding style by eye; don't bulk-reformat.
 
 ## Architecture
 
