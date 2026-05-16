@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Export a decoder-side vocab.bin from a HuggingFace tokenizer.json.
 
-This is the format that infer.m's `load_vocab` reads (used only for
+This is the format moeflux's vocab loader reads (used only for
 token-id → string decoding in log output; does not carry merges).
 The companion `export_tokenizer.py` script produces the BPET format
-used by tokenizer.h for *encoding* text → tokens. The C inference
-engine needs both files: tokenizer.bin (BPET) and vocab.bin (this).
+moeflux uses for *encoding* text → tokens. moeflux needs both files:
+tokenizer.bin (BPET) and vocab.bin (this).
 
 Binary format (little-endian):
     uint32 num_entries
@@ -16,8 +16,8 @@ Binary format (little-endian):
 
 If a token_id is unused (gap in the vocab), byte_len is written as 0
 and no bytes follow. That way the reader can walk the file purely
-sequentially without an index — matching load_vocab's sequential
-fread loop.
+sequentially without an index — matching the loader's sequential
+read loop.
 
 Usage:
     python export_vocab.py <tokenizer.json> <vocab.bin>

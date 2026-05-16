@@ -16,7 +16,7 @@
 //!
 //! ```text
 //! uv run --with mlx --with mlx-lm python3 \
-//!   metal_infer/tests/mlx_reference/generate_goldens.py \
+//!   tools/mlx_reference/generate_goldens.py \
 //!   --model <mlx-model-dir> --variant <slug> \
 //!   --out crates/moeflux/tests/fixtures/mlx_golden_<slug>.txt
 //! ```
@@ -100,7 +100,7 @@ fn load_golden_or_skip(path: &Path, variant: &str) -> Golden {
             // this file.
             eprintln!(
                 "[{variant}] SKIP  fixture not found at {path:?} — \
-                 regenerate with metal_infer/tests/mlx_reference/generate_goldens.py"
+                 regenerate with tools/mlx_reference/generate_goldens.py"
             );
             std::process::exit(0);
         }

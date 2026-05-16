@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export HuggingFace tokenizer.json to a compact binary format for C.
+"""Export HuggingFace tokenizer.json to a compact binary format for moeflux.
 
 Usage: python export_tokenizer.py [tokenizer.json] [output.bin]
 

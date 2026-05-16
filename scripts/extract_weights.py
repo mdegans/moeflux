@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 extract_weights.py — Extract all non-expert weights from Qwen3.5-397B-A17B-4bit
-into a single binary file that the C inference engine can mmap.
+into a single binary file that moeflux can mmap.
 
 Outputs:
   - model_weights.bin: binary blob containing all non-expert weight tensors
@@ -142,7 +142,7 @@ def main():
         filepath = model_path / filename
         header_cache[filename] = parse_safetensors_header(str(filepath))
 
-    # Sanitize tensor names: remove "language_model." prefix for the C engine
+    # Sanitize tensor names: remove "language_model." prefix for moeflux
     def sanitize_name(name):
         if name.startswith("language_model."):
             return name[len("language_model."):]
@@ -158,7 +158,7 @@ def main():
     # Write binary file
     bin_path = output_dir / 'model_weights.bin'
     # Pull config from the model's HuggingFace config.json; each key
-    # maps 1:1 to a field the C engine expects.
+    # maps 1:1 to a field moeflux expects.
     rope_params = text_config.get('rope_parameters', {})
     cfg_out = {
         "hidden_size":                     text_config['hidden_size'],
