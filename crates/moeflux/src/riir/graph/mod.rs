@@ -130,10 +130,17 @@ pub trait BufferPool {
 
     /// Bulk-copy `host` bytes into the buffer at `id`. Used at
     /// graph-build time for inputs (embeddings, routing tables).
+    ///
+    /// Prefix semantics: `host` may be *shorter* than the buffer, in
+    /// which case only the leading `host.len()` bytes are written.
+    /// This lets once-per-run buffers be sized at max chunk width
+    /// while a smaller chunk uploads only its rows. A `host` *longer*
+    /// than the buffer is rejected with `SizeMismatch`.
     fn upload(&mut self, id: BufId, host: &[u8]) -> Result<(), Self::Error>;
 
     /// Bulk-copy bytes out of the buffer at `id` into `host`. Used
-    /// for the routing readback at the two-phase split.
+    /// for the routing readback at the two-phase split. Prefix
+    /// semantics mirror [`Self::upload`].
     fn download(&self, id: BufId, host: &mut [u8]) -> Result<(), Self::Error>;
 
     /// Release all non-persistent allocations. Persistent buffers

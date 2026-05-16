@@ -99,7 +99,10 @@ impl BufferPool for CpuBufferPool {
         let idx = id.0 as usize;
         let label = *self.labels.get(idx).ok_or(GraphError::BadBufId(id))?;
         let expected = self.byte_sizes[idx];
-        if host.len() != expected {
+        // Prefix semantics: `host` may be shorter than the buffer
+        // (once-per-run buffers are sized at max chunk width; a
+        // smaller chunk uploads only its rows). Too-large is rejected.
+        if host.len() > expected {
             return Err(GraphError::SizeMismatch {
                 label,
                 expected,
@@ -108,7 +111,7 @@ impl BufferPool for CpuBufferPool {
         }
         let physical = self.bufid_to_physical[idx] as usize;
         let mut buf_mut = self.buffers[physical].borrow_mut();
-        buf_mut[..expected].copy_from_slice(host);
+        buf_mut[..host.len()].copy_from_slice(host);
         Ok(())
     }
 
@@ -116,7 +119,8 @@ impl BufferPool for CpuBufferPool {
         let idx = id.0 as usize;
         let label = *self.labels.get(idx).ok_or(GraphError::BadBufId(id))?;
         let expected = self.byte_sizes[idx];
-        if host.len() != expected {
+        // Prefix semantics: see `upload`.
+        if host.len() > expected {
             return Err(GraphError::SizeMismatch {
                 label,
                 expected,
@@ -125,7 +129,7 @@ impl BufferPool for CpuBufferPool {
         }
         let physical = self.bufid_to_physical[idx] as usize;
         let buf = self.buffers[physical].borrow();
-        host.copy_from_slice(&buf[..expected]);
+        host.copy_from_slice(&buf[..host.len()]);
         Ok(())
     }
 
