@@ -273,6 +273,7 @@ mod tests {
             num_k_heads: 4,
             key_dim: 128,
             key_offset_per_token: 512,
+            per_token_total: 1024,
             n_tokens: 1,
         });
         let lt = analyze_lifetimes(&g);
