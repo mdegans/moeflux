@@ -340,8 +340,19 @@ fn fresh_ctx_open_after_drop_works() {
     );
 }
 
+// KNOWN-FAILING — kept ignored, and skipped in CI gates, on purpose.
+// moeflux's `memory_seq_rm` cannot cleanly truncate the GatedDeltaNet
+// linear-attention layers: their recurrence state (conv_state +
+// ssm_state) is not position-indexed, so a partial-end truncate is
+// lossy and resuming prefill diverges from a fresh full prefill.
+// Downstream (drama_llama::Session) this surfaces as prefix-cache
+// *misses* — a perf cost, not wrong output. A real fix is a session
+// of its own; see drama_llama's
+// `.claude/memory/future_work_resuming_prefill_failure.md`.
 #[test]
-#[ignore]
+#[ignore = "known breakage: linear-attn recurrence state is not \
+            position-truncatable, so resuming prefill diverges — \
+            see the fn-level comment"]
 fn resuming_prefill_after_seq_rm_matches_full_prefill() {
     // Mirrors the exact path drama_llama::Session takes: prompt 1 is
     // prefilled and decoded, the suffix-and-generation are dropped
