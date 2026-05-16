@@ -48,6 +48,13 @@ end-to-end net is the Rust per-token oracle
 (`eval_prompt_matches_per_token_oracle`, green under a3b) plus the
 synthetic `batched_diff_oracle` / `graph_diff_oracle` suites.
 
+Update (Phase 4b gate, same day): the C oracle is also
+**non-deterministic** — `layer_forward_dump_c_self_sanity` (a C-only
+NaN check, no Rust) failed with `hidden_out contains NaN/Inf`, and the
+failing-test set drifted 11 → 13 between two runs of the same tree. So
+there is no fixed list of "the broken C tests"; the whole C
+end-to-end path is unstable.
+
 Mike's steer (2026-05-16): the C is to be **removed** eventually — the
 `project_phase6_gate_c` "keep C as the oracle" plan is superseded. A
 new CPU oracle exists (the `CpuBackend` graph path + the Rust per-token
