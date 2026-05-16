@@ -63,6 +63,7 @@ const SHADER_SOURCE: &str = include_str!("../../../../shaders/shaders.metal");
 /// is the canary.
 pub const ALL_KERNELS: &[&str] = &[
     "attn_scores_batched",
+    "attn_sdpa_causal_flash",
     "attn_softmax_batched",
     "attn_values_batched",
     "bf16_matvec",

@@ -25,7 +25,8 @@ use moeflux::riir::moe::expert_forward::{
     encode_moe_batched_permute_fuse, gpu_expert_forward,
 };
 use moeflux::riir::attn::gpu_attn::{
-    encode_sdpa_causal_tiled, BatchedSdpaPipelines,
+    encode_sdpa_causal_flash, encode_sdpa_causal_tiled, BatchedSdpaPipelines,
+    FlashSdpaPipelines,
 };
 use moeflux::riir::backend::gpu::gpu_matvec::{
     encode_bf16_matmul_n_tokens, encode_matvec_n_tokens, BfMatvecPipelines,
@@ -860,6 +861,162 @@ fn sdpa_causal_tiled_n4_matches_tokenwise_cpu() {
             COSINE_FLOOR
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// FlashAttention-2 causal SDPA — diff vs tokenwise sdpa_cpu oracle.
+// ---------------------------------------------------------------------------
+
+/// Dispatch `encode_sdpa_causal_flash` over freshly-written input buffers
+/// and read back `out`. No scratch buffers (the flash kernel keeps its
+/// running state threadgroup/register-resident).
+#[allow(clippy::too_many_arguments)]
+fn run_batched_sdpa_flash(
+    metal: &mut MetalContext,
+    pipes: &FlashSdpaPipelines,
+    q_data: &[f32],
+    k_data: &[f32],
+    v_data: &[f32],
+    n_tokens: u32,
+    num_heads: u32,
+    heads_per_kv: u32,
+    head_dim: u32,
+    kv_dim: u32,
+    start_pos: u32,
+    kv_len: u32,
+    scale: f32,
+) -> Vec<f32> {
+    let out_total =
+        n_tokens as usize * num_heads as usize * head_dim as usize;
+
+    let q_buf = make_buf::<f32>(metal, q_data.len());
+    write_buf(&q_buf, q_data);
+    let k_buf = make_buf::<f32>(metal, k_data.len());
+    write_buf(&k_buf, k_data);
+    let v_buf = make_buf::<f32>(metal, v_data.len());
+    write_buf(&v_buf, v_data);
+    let out_buf = make_buf::<f32>(metal, out_total);
+
+    let queue = metal.queue();
+    let cmdbuf = queue.new_command_buffer();
+    encode_sdpa_causal_flash(
+        cmdbuf, pipes, &q_buf, &k_buf, &v_buf, &out_buf, n_tokens,
+        num_heads, heads_per_kv, head_dim, kv_dim, start_pos, kv_len,
+        scale,
+    );
+    cmdbuf.commit();
+    cmdbuf.wait_until_completed();
+
+    read_buf_f32(&out_buf, out_total)
+}
+
+/// Diff `attn_sdpa_causal_flash` for `n_tokens` queries starting at
+/// absolute position `start_pos` against a per-token `sdpa_cpu` oracle
+/// (each query `q` attends to `KV[0 .. start_pos+q+1]`). Per-token
+/// cosine must clear `COSINE_FLOOR`.
+fn flash_diff_tokenwise(n_tokens: u32, start_pos: u32, seed: u64) {
+    let num_heads = VARIANT.num_attn_heads as u32;
+    let num_kv_heads = VARIANT.num_kv_heads as u32;
+    let head_dim = VARIANT.head_dim as u32;
+    let heads_per_kv = num_heads / num_kv_heads;
+    let kv_dim = num_kv_heads * head_dim;
+    let q_dim = num_heads as usize * head_dim as usize;
+    let kv_len = start_pos + n_tokens;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+    let mut rng = XorShift64::new(seed);
+    let q_data: Vec<f32> = (0..n_tokens as usize * q_dim)
+        .map(|_| rng.next_f32() * 0.1)
+        .collect();
+    let k_data: Vec<f32> = (0..kv_len as usize * kv_dim as usize)
+        .map(|_| rng.next_f32() * 0.1)
+        .collect();
+    let v_data: Vec<f32> = (0..kv_len as usize * kv_dim as usize)
+        .map(|_| rng.next_f32() * 0.1)
+        .collect();
+
+    // Tokenwise CPU oracle: query q attends to KV[0 .. start_pos+q+1].
+    let gate = gate_off(q_dim);
+    let mut cpu = vec![0.0f32; n_tokens as usize * q_dim];
+    for q in 0..(n_tokens as usize) {
+        let kv_max = start_pos as usize + q + 1;
+        sdpa_cpu(
+            kv_max as i32,
+            &q_data[q * q_dim..(q + 1) * q_dim],
+            &gate,
+            &k_data[..kv_max * kv_dim as usize],
+            &v_data[..kv_max * kv_dim as usize],
+            &mut cpu[q * q_dim..(q + 1) * q_dim],
+        )
+        .expect("sdpa_cpu");
+    }
+
+    let mut metal = MetalContext::new().expect("open Metal");
+    let pipes = FlashSdpaPipelines::fetch(&mut metal)
+        .expect("fetch FlashSdpaPipelines");
+    let gpu = run_batched_sdpa_flash(
+        &mut metal, &pipes, &q_data, &k_data, &v_data, n_tokens,
+        num_heads, heads_per_kv, head_dim, kv_dim, start_pos, kv_len,
+        scale,
+    );
+
+    assert!(
+        gpu.iter().all(|x| x.is_finite()),
+        "flash GPU output has non-finite values"
+    );
+    let mut worst = 1.0f32;
+    for q in 0..(n_tokens as usize) {
+        let g = &gpu[q * q_dim..(q + 1) * q_dim];
+        let c = &cpu[q * q_dim..(q + 1) * q_dim];
+        let cos = cosine_sim(g, c);
+        worst = worst.min(cos);
+        assert!(
+            cos >= COSINE_FLOOR,
+            "flash N={n_tokens} start_pos={start_pos} token {q} \
+             cosine {cos} below floor {COSINE_FLOOR}"
+        );
+    }
+    eprintln!(
+        "flash N={n_tokens} start_pos={start_pos}: \
+         worst per-token cosine = {worst:.9}"
+    );
+}
+
+/// N=1, kv_len=64 — single KV block.
+#[test]
+#[ignore = "long-running GPU test"]
+fn sdpa_causal_flash_n1_single_block() {
+    flash_diff_tokenwise(1, 63, 0x5DA0_F1A5_0000_0001);
+}
+
+/// N=1, kv_len=5000 — many KV blocks, exercises the online merge.
+#[test]
+#[ignore = "long-running GPU test"]
+fn sdpa_causal_flash_n1_multi_block() {
+    flash_diff_tokenwise(1, 4999, 0x5DA0_F1A5_0000_0002);
+}
+
+/// N=4, start_pos=4 — per-query causal cutoff across a small tile.
+#[test]
+#[ignore = "long-running GPU test"]
+fn sdpa_causal_flash_n4_tokenwise() {
+    flash_diff_tokenwise(4, 4, 0x5DA0_F1A5_0000_0003);
+}
+
+/// M=512, start_pos=0 — square causal: 16 query tiles, heavy causal
+/// block-skipping.
+#[test]
+#[ignore = "long-running GPU test"]
+fn sdpa_causal_flash_m512_square_causal() {
+    flash_diff_tokenwise(512, 0, 0x5DA0_F1A5_0000_0004);
+}
+
+/// M=1500, start_pos=4096 — deep chunk (kv_len > M), and 1500 is not a
+/// multiple of FA_BR=32 so the last tile is partial (`br_valid < FA_BR`).
+#[test]
+#[ignore = "long-running GPU test"]
+fn sdpa_causal_flash_m1500_deep_chunk() {
+    flash_diff_tokenwise(1500, 4096, 0x5DA0_F1A5_0000_0005);
 }
 
 // ---------------------------------------------------------------------------
