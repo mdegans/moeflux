@@ -34,8 +34,7 @@
 //! markers (`// ── step N: …`) make it scannable.
 
 use metal::{
-    Buffer, CommandBufferRef, ComputePipelineState, Device,
-    MTLResourceOptions, MTLSize, NSUInteger,
+    Buffer, CommandBufferRef, ComputePipelineState, MTLSize, NSUInteger,
 };
 
 use super::graph::{Backend, BufId, BufferPool, MetalBufferPool};
@@ -1451,8 +1450,7 @@ pub(super) fn post_attention_pre_moe(
 /// owned `cmdbuf`.
 ///
 /// B4 superseded this for `batched_full_attn_layer_forward` by also
-/// batching the shared FFN externally via
-/// [`post_attention_residual_norm_route`] — the routing-only helper.
+/// batching the shared FFN externally.
 /// Kept here as a forward-looking building block for callers (e.g.
 /// a future eval_token path) that want o_proj batched but per-token
 /// shared FFN inside one cmdbuf.
@@ -1623,124 +1621,6 @@ pub(super) fn post_attention_post_o_proj_to_intermediates(
         },
     );
     metal.commit_and_wait_labeled(cmdbuf, "post_attn_post_oproj.cmd");
-
-    let mut scores =
-        read_buffer_to_vec(buffer_pool.handle(buffers.batch_out[4]), v.num_experts);
-    let mut routing_indices = vec![0i32; k_active];
-    let mut routing_weights = vec![0f32; k_active];
-    moe_router_cpu(
-        &mut scores,
-        k_active,
-        &mut routing_indices,
-        &mut routing_weights,
-    )?;
-    let shared_gate_score = {
-        let s = read_buffer_to_vec(buffer_pool.handle(buffers.batch_out[5]), 1);
-        s[0]
-    };
-    Ok(PostAttnIntermediates {
-        routing_indices,
-        routing_weights,
-        shared_gate_score,
-    })
-}
-
-/// Routing-only variant of [`post_attention_pre_moe`] (skipping o_proj
-/// + shared FFN) for the Phase B4 batched-shared-FFN path. Runs residual_add +
-/// post-attn rms_norm + gate logits matvec + shared-gate scalar
-/// matvec + CPU MoE router. Skips the shared FFN entirely so the
-/// caller can batch it across N tokens externally.
-///
-/// On return, `buffers.h_mid` and `buffers.normed` (= h_post) hold the
-/// per-token values; `buffers.shared_out` is untouched (caller fills
-/// it from the batched shared FFN). [`PostAttnIntermediates`] carries
-/// routing + `shared_gate_score`.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn post_attention_residual_norm_route(
-    metal: &mut MetalContext,
-    cmdbuf: &CommandBufferRef,
-    wf: &WeightFile,
-    wf_buf: &MtlWeightBuf,
-    layer_cache: &LayerWeightCache,
-    buffers: &LayerForwardBuffers,
-    buffer_pool: &MetalBufferPool,
-    layer_idx: usize,
-    k_active: usize,
-) -> Result<PostAttnIntermediates, LayerForwardError> {
-    let v = VARIANT;
-
-    let gate_bits =
-        bits_of(wf, &format!("model.layers.{layer_idx}.mlp.gate.weight"));
-    let seg_bits = bits_of(
-        wf,
-        &format!(
-            "model.layers.{layer_idx}.mlp.shared_expert_gate.weight"
-        ),
-    );
-
-    let post_attn_norm_w = layer_cache.post_attention_layernorm_w;
-    let gate_w = layer_cache.gate.w;
-    let gate_s = layer_cache.gate.s;
-    let gate_b = layer_cache.gate.b;
-    let seg_w = layer_cache.shared.seg_w;
-    let seg_s = layer_cache.shared.seg_s;
-    let seg_b = layer_cache.shared.seg_b;
-
-    let mv = MatvecPipelines::fetch(metal)?;
-    let sum_sq = metal.pipeline("rms_norm_sum_sq")?.clone();
-    let apply = metal.pipeline("rms_norm_apply_bf16")?.clone();
-    let resid_add = metal.pipeline("residual_add")?.clone();
-
-    encode_residual_add(
-        cmdbuf,
-        &resid_add,
-        buffer_pool.handle(buffers.output),
-        buffer_pool.handle(buffers.input),
-        buffer_pool.handle(buffers.h_mid),
-        v.hidden_dim as u32,
-    );
-    encode_rms_norm_pair(
-        cmdbuf,
-        &sum_sq,
-        &apply,
-        buffer_pool.handle(buffers.h_mid),
-        wf_buf.buffer(),
-        post_attn_norm_w,
-        buffer_pool.handle(buffers.normed),
-        buffer_pool.handle(buffers.sum_sq),
-        v.hidden_dim as u32,
-    );
-    encode_matvec(
-        cmdbuf,
-        &mv,
-        wf_buf,
-        &MatvecSpec {
-            w_off: gate_w,
-            s_off: gate_s,
-            b_off: gate_b,
-            input: buffer_pool.handle(buffers.normed),
-            output: buffer_pool.handle(buffers.batch_out[4]),
-            out_dim: v.num_experts as u32,
-            in_dim: v.hidden_dim as u32,
-            bits: gate_bits,
-        },
-    );
-    encode_matvec(
-        cmdbuf,
-        &mv,
-        wf_buf,
-        &MatvecSpec {
-            w_off: seg_w,
-            s_off: seg_s,
-            b_off: seg_b,
-            input: buffer_pool.handle(buffers.normed),
-            output: buffer_pool.handle(buffers.batch_out[5]),
-            out_dim: 1,
-            in_dim: v.hidden_dim as u32,
-            bits: seg_bits,
-        },
-    );
-    metal.commit_and_wait_labeled(cmdbuf, "post_attn_residual_norm_route");
 
     let mut scores =
         read_buffer_to_vec(buffer_pool.handle(buffers.batch_out[4]), v.num_experts);
@@ -2110,7 +1990,7 @@ fn encode_residual_add(
 ///    `value_out_stack` (gated_rms_norm output) → `o_proj_stack`.
 /// 5. **Per-token post-attn tail** (Phase 1e): residual_add +
 ///    post-attn rms_norm + gate logits + shared-expert gate scalar +
-///    CPU routing via [`post_attention_residual_norm_route`]. Same
+///    CPU MoE routing. Same
 ///    pattern as full-attn's Phase 3c.
 /// 6. **Batched shared FFN** (Phase 1f): three `encode_matvec_n_tokens`
 ///    + flat-dispatch `swiglu_fused` over `h_post_stack`. Mirrors
@@ -2186,7 +2066,6 @@ where
     let conv_dim = v.linear_conv_dim();
     let total_value = v.linear_total_value();
     let num_v_heads = v.linear_num_v_heads;
-    let f32_sz = std::mem::size_of::<f32>() as u64;
 
     // Per-tensor bit widths. Same lookups as the per-token path.
     let qkv_bits = bits_of(

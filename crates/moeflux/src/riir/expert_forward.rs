@@ -466,9 +466,6 @@ impl MoeBuffers {
     pub(crate) fn out_id(&self, slot: usize) -> BufId {
         self.out[slot]
     }
-    pub(crate) fn out_ids(&self) -> [BufId; MAX_K] {
-        self.out
-    }
     pub(crate) fn gate_id(&self, slot: usize) -> BufId {
         self.gate[slot]
     }
@@ -477,9 +474,6 @@ impl MoeBuffers {
     }
     pub(crate) fn act_id(&self, slot: usize) -> BufId {
         self.act[slot]
-    }
-    pub(crate) fn input_id(&self) -> BufId {
-        self.input
     }
     pub(crate) fn h_mid_id(&self) -> BufId {
         self.h_mid
@@ -490,14 +484,8 @@ impl MoeBuffers {
     pub(crate) fn combine_params_id(&self) -> BufId {
         self.combine_params
     }
-    pub(crate) fn gate_logits_id(&self) -> BufId {
-        self.gate_logits
-    }
     pub(crate) fn data_synced_id(&self, slot: usize) -> BufId {
         self.data_synced[slot]
-    }
-    pub(crate) fn data_synced_ids(&self) -> [BufId; MAX_K] {
-        self.data_synced
     }
     pub(crate) fn data_prefetch_id(
         &self,
@@ -508,30 +496,7 @@ impl MoeBuffers {
         debug_assert!(slot < MAX_K);
         self.data_prefetch[set][slot]
     }
-    pub(crate) fn data_prefetch_ids(&self, set: usize) -> [BufId; MAX_K] {
-        debug_assert!(set < 2);
-        self.data_prefetch[set]
-    }
-
     // -------- &Buffer accessors via pool (imperative encoders) --------
-
-    /// The post-combine hidden buffer (`buf_moe_hidden` in C).
-    pub(crate) fn moe_hidden_buffer<'p>(
-        &self,
-        pool: &'p MetalBufferPool,
-    ) -> &'p metal::Buffer {
-        pool.handle(self.moe_hidden)
-    }
-
-    /// One per-expert output slot — the readback source for the CPU-
-    /// combine path. `slot` must be `< actual_k`.
-    pub(crate) fn out_buffer<'p>(
-        &self,
-        pool: &'p MetalBufferPool,
-        slot: usize,
-    ) -> &'p metal::Buffer {
-        pool.handle(self.out[slot])
-    }
 
     /// One per-slot `data_prefetch[set][slot]` Metal buffer. Caller
     /// guarantees the slot was the target of a completed

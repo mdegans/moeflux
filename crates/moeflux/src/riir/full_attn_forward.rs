@@ -54,8 +54,8 @@ use super::layer_weight_cache::LayerWeightCache;
 use super::gpu_matvec::encode_matvec_n_tokens;
 use super::linear_attn_forward::{
     bits_of, full_attn_layer_idx_for, moe_dispatch_per_token,
-    post_attention_pre_moe, post_attention_residual_norm_route,
-    read_buffer_to_vec, GpuAttnEncodeArgs, LayerForwardBuffers,
+    post_attention_pre_moe, read_buffer_to_vec, GpuAttnEncodeArgs,
+    LayerForwardBuffers,
     LayerForwardError, OProj, PostAttnIntermediates,
 };
 use super::metal::MetalContext;
@@ -513,7 +513,7 @@ pub(super) fn batched_full_attn_layer_forward(
     wf: &WeightFile,
     wf_buf: &MtlWeightBuf,
     layer_cache: &LayerWeightCache,
-    buffers: &LayerForwardBuffers,
+    _buffers: &LayerForwardBuffers,
     buffer_pool: &MetalBufferPool,
     layer_idx: usize,
     start_pos: i32,

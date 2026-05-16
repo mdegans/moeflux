@@ -134,7 +134,7 @@ impl MlaKvCacheGpu {
     /// Both are virtual reservations until pages are touched.
     pub fn ensure_buffers(&mut self, device: &Device) {
         // Phase 3 (cogito-v2 full-GPU): drop the explicit
-        // `zero_shared_buffer` here. macOS Metal `StorageModeShared`
+        // buffer-zeroing here. macOS Metal `StorageModeShared`
         // buffers come from the Mach VM via the same anonymous-mapping
         // path `mmap(MAP_ANON)` uses — pages are zero-filled on first
         // touch by the kernel. The 17.5 GB explicit memset that
@@ -314,17 +314,6 @@ impl MlaKvCacheGpu {
 impl Default for MlaKvCacheGpu {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-/// Zero every byte of a shared-storage Metal buffer. Used at buffer
-/// allocation and on `truncate` window-clears. Caller guarantees no
-/// in-flight GPU work on the buffer.
-fn zero_shared_buffer(b: &Buffer) {
-    let bytes = b.length() as usize;
-    // SAFETY: see fn docs.
-    unsafe {
-        std::ptr::write_bytes(b.contents() as *mut u8, 0, bytes);
     }
 }
 

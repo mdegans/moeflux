@@ -39,7 +39,7 @@
 //! returning, but a defensive `discard_deferred_experts_in` in
 //! `state_save` keeps the contract robust against a buggy caller.
 
-use metal::{Buffer, Device, MTLResourceOptions, NSUInteger};
+use metal::{Buffer, Device};
 
 use super::deferred;
 use super::linear_attn_forward::{
