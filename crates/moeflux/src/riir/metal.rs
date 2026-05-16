@@ -395,10 +395,19 @@ impl<T: Copy> MtlBuffer<T> {
     /// buffer is still in flight. Shared-storage memory is read
     /// directly from CPU; concurrent GPU writes produce UB.
     pub fn to_vec(&self) -> Vec<T> {
-        let ptr = self.inner.contents() as *const T;
-        // SAFETY: see method docs. Caller has ensured no in-flight
-        // writers. Length matches the allocation.
-        unsafe { std::slice::from_raw_parts(ptr, self.len).to_vec() }
+        // SAFETY: see method docs — caller has ensured no in-flight
+        // writers; `self.len` matches the allocation.
+        unsafe { buffer_as_slice::<T>(&self.inner, self.len).to_vec() }
+    }
+
+    /// Immutable slice view over the buffer's contents.
+    ///
+    /// # Safety
+    ///
+    /// See [`Self::to_vec`].
+    pub fn as_slice(&self) -> &[T] {
+        // SAFETY: see method docs.
+        unsafe { buffer_as_slice::<T>(&self.inner, self.len) }
     }
 
     /// Mutable byte slice view. Only valid while no GPU operation
@@ -409,9 +418,39 @@ impl<T: Copy> MtlBuffer<T> {
     ///
     /// See [`Self::to_vec`].
     pub fn as_mut_slice(&mut self) -> &mut [T] {
-        let ptr = self.inner.contents() as *mut T;
         // SAFETY: see method docs.
-        unsafe { std::slice::from_raw_parts_mut(ptr, self.len) }
+        unsafe { buffer_as_mut_slice::<T>(&self.inner, self.len) }
+    }
+}
+
+/// View `n` elements of type `T` over a shared-storage Metal buffer's
+/// `contents()` pointer.
+///
+/// # Safety
+///
+/// No GPU command buffer that reads or writes `buf` may be in flight:
+/// shared-storage memory is read directly from the CPU, and a
+/// concurrent GPU writer is undefined behaviour. `n * size_of::<T>()`
+/// must not exceed the buffer's byte length, and `contents()` must be
+/// `T`-aligned (Metal shared buffers are page-aligned).
+pub unsafe fn buffer_as_slice<T>(buf: &metal::BufferRef, n: usize) -> &[T] {
+    // SAFETY: forwarded to the caller's contract above.
+    unsafe { std::slice::from_raw_parts(buf.contents() as *const T, n) }
+}
+
+/// Mutable counterpart of [`buffer_as_slice`].
+///
+/// # Safety
+///
+/// See [`buffer_as_slice`]; the caller additionally holds unique
+/// access to the buffer for the returned slice's lifetime.
+pub unsafe fn buffer_as_mut_slice<T>(
+    buf: &metal::BufferRef,
+    n: usize,
+) -> &mut [T] {
+    // SAFETY: forwarded to the caller's contract above.
+    unsafe {
+        std::slice::from_raw_parts_mut(buf.contents() as *mut T, n)
     }
 }
 

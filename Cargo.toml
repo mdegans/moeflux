@@ -30,6 +30,8 @@ rayon       = "1.10"
 # Used for `fcntl(F_RDAHEAD, 0)` on layer fds — disables kernel
 # readahead for the random per-token expert access pattern.
 libc        = "0.2"
+# POD reinterpret casts (&[f32] <-> &[u8]) for state snapshot I/O.
+bytemuck    = "1"
 
 [profile.release]
 opt-level = 3

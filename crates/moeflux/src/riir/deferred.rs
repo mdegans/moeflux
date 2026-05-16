@@ -47,7 +47,7 @@ use super::expert_forward::{
     ChainToNormed, ExpertForwardError, MoeBuffers, gpu_batched_experts_encode,
     gpu_batched_experts_encode_pre_staged,
 };
-use super::metal::MetalContext;
+use super::metal::{buffer_as_slice, MetalContext};
 use super::variants::VARIANT;
 use super::graph::{Backend as _, BufferPool as _, MetalBackend, MetalBufferPool};
 use super::{RsCtx, RsError};
@@ -422,12 +422,8 @@ fn cpu_combine(
         // SAFETY: caller has awaited the cmdbuf via
         // `wait_until_completed`; no concurrent GPU dispatch reads
         // from `bufs.out[k]`.
-        let expert_k: &[f32] = unsafe {
-            std::slice::from_raw_parts(
-                out_buf.contents() as *const f32,
-                dim,
-            )
-        };
+        let expert_k: &[f32] =
+            unsafe { buffer_as_slice::<f32>(out_buf, dim) };
         super::cpu_ops::cpu_vec_madd(&mut moe_out, expert_k, expert_weights[k]);
     }
 

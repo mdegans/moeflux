@@ -283,18 +283,12 @@ pub fn state_save(
                     off += 4;
                     if len > 0 {
                         let bytes = (len as usize) * fa_stride;
-                        let k_src = unsafe {
-                            std::slice::from_raw_parts(
-                                kv.k_cache.as_ptr() as *const u8,
-                                bytes,
-                            )
-                        };
-                        let v_src = unsafe {
-                            std::slice::from_raw_parts(
-                                kv.v_cache.as_ptr() as *const u8,
-                                bytes,
-                            )
-                        };
+                        let k_src = &bytemuck::cast_slice::<f32, u8>(
+                            &kv.k_cache,
+                        )[..bytes];
+                        let v_src = &bytemuck::cast_slice::<f32, u8>(
+                            &kv.v_cache,
+                        )[..bytes];
                         buf[off..off + bytes].copy_from_slice(k_src);
                         off += bytes;
                         buf[off..off + bytes].copy_from_slice(v_src);
@@ -581,20 +575,14 @@ pub fn state_load(
                 };
                 if len > 0 {
                     let bytes = (len as usize) * fa_stride;
-                    let k_dst = unsafe {
-                        std::slice::from_raw_parts_mut(
-                            kv.k_cache.as_mut_ptr() as *mut u8,
-                            bytes,
-                        )
-                    };
+                    let k_dst = &mut bytemuck::cast_slice_mut::<f32, u8>(
+                        &mut kv.k_cache,
+                    )[..bytes];
                     k_dst.copy_from_slice(&buf[off..off + bytes]);
                     off += bytes;
-                    let v_dst = unsafe {
-                        std::slice::from_raw_parts_mut(
-                            kv.v_cache.as_mut_ptr() as *mut u8,
-                            bytes,
-                        )
-                    };
+                    let v_dst = &mut bytemuck::cast_slice_mut::<f32, u8>(
+                        &mut kv.v_cache,
+                    )[..bytes];
                     v_dst.copy_from_slice(&buf[off..off + bytes]);
                     off += bytes;
                 }

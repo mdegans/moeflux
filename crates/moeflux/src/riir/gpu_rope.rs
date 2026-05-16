@@ -28,7 +28,7 @@ use metal::{
     MTLSize, NSUInteger,
 };
 
-use super::metal::{MetalContext, MetalError};
+use super::metal::{buffer_as_slice, MetalContext, MetalError};
 
 /// Errors from the GPU YaRN RoPE dispatch.
 #[derive(Debug, thiserror::Error)]
@@ -153,8 +153,7 @@ pub fn yarn_rope_apply_oneshot(
 
     // SAFETY: shared-storage buffer, GPU work has completed.
     unsafe {
-        let p = buf_x.contents() as *const f32;
-        let s = std::slice::from_raw_parts(p, x.len());
+        let s = buffer_as_slice::<f32>(&buf_x, x.len());
         x.copy_from_slice(s);
     }
     Ok(())

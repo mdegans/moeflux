@@ -53,7 +53,10 @@ use metal::{
 use super::graph::{BufId, BufferPool, MetalBufferPool};
 use super::gpu_matvec::{encode_matvec_n_tokens, MatvecPipelines};
 use super::gpu_norm::{encode_rms_norm_bf16_into, RmsNormBf16Pipelines};
-use super::metal::{MetalContext, MetalError, MtlBuffer};
+use super::metal::{
+    buffer_as_mut_slice, buffer_as_slice, MetalContext, MetalError,
+    MtlBuffer,
+};
 use super::moe_router::ExpertBuckets;
 use super::variants::{SharedExpertGate, Variant, GROUP_SIZE, VARIANT};
 
@@ -572,12 +575,8 @@ impl MoeBuffers {
         // ensures no concurrent GPU read. Shared-storage buffer is
         // alive while `buf` is held; alignment of f32 on the
         // posix_memalign / Metal allocation is guaranteed.
-        let dst: &mut [f32] = unsafe {
-            std::slice::from_raw_parts_mut(
-                buf.contents() as *mut f32,
-                VARIANT.hidden_dim,
-            )
-        };
+        let dst: &mut [f32] =
+            unsafe { buffer_as_mut_slice::<f32>(buf, VARIANT.hidden_dim) };
         dst.copy_from_slice(hidden);
     }
 
@@ -585,12 +584,8 @@ impl MoeBuffers {
     /// should equal `Σ moe + shared_out` exactly.
     pub(crate) fn stage_host_h_mid_zero(&self, pool: &MetalBufferPool) {
         let buf = pool.handle(self.h_mid);
-        let dst: &mut [f32] = unsafe {
-            std::slice::from_raw_parts_mut(
-                buf.contents() as *mut f32,
-                VARIANT.hidden_dim,
-            )
-        };
+        let dst: &mut [f32] =
+            unsafe { buffer_as_mut_slice::<f32>(buf, VARIANT.hidden_dim) };
         dst.fill(0.0);
     }
 
@@ -601,12 +596,8 @@ impl MoeBuffers {
         pool: &MetalBufferPool,
     ) -> Vec<f32> {
         let buf = pool.handle(self.moe_hidden);
-        let src: &[f32] = unsafe {
-            std::slice::from_raw_parts(
-                buf.contents() as *const f32,
-                VARIANT.hidden_dim,
-            )
-        };
+        let src: &[f32] =
+            unsafe { buffer_as_slice::<f32>(buf, VARIANT.hidden_dim) };
         src.to_vec()
     }
 
@@ -637,12 +628,7 @@ impl MoeBuffers {
     ) -> Vec<f32> {
         let buf = pool.handle(self.gate_logits);
         let n = VARIANT.num_experts.max(1);
-        let src: &[f32] = unsafe {
-            std::slice::from_raw_parts(
-                buf.contents() as *const f32,
-                n,
-            )
-        };
+        let src: &[f32] = unsafe { buffer_as_slice::<f32>(buf, n) };
         src.to_vec()
     }
 }
@@ -810,32 +796,20 @@ pub(crate) fn gpu_batched_experts_encode(
     // h_mid + shared_out: f32 copies through raw slice cast.
     {
         let buf = buffer_pool.handle(bufs.h_mid_id());
-        let dst: &mut [f32] = unsafe {
-            std::slice::from_raw_parts_mut(
-                buf.contents() as *mut f32,
-                v.hidden_dim,
-            )
-        };
+        let dst: &mut [f32] =
+            unsafe { buffer_as_mut_slice::<f32>(buf, v.hidden_dim) };
         dst.copy_from_slice(h_mid);
     }
     {
         let buf = buffer_pool.handle(bufs.shared_out_id());
-        let dst: &mut [f32] = unsafe {
-            std::slice::from_raw_parts_mut(
-                buf.contents() as *mut f32,
-                v.hidden_dim,
-            )
-        };
+        let dst: &mut [f32] =
+            unsafe { buffer_as_mut_slice::<f32>(buf, v.hidden_dim) };
         dst.copy_from_slice(shared_out);
     }
     {
         let buf = buffer_pool.handle(bufs.combine_params_id());
-        let params: &mut [f32] = unsafe {
-            std::slice::from_raw_parts_mut(
-                buf.contents() as *mut f32,
-                18,
-            )
-        };
+        let params: &mut [f32] =
+            unsafe { buffer_as_mut_slice::<f32>(buf, 18) };
         params.fill(0.0);
         params[..k].copy_from_slice(expert_weights);
         params[16] = shared_gate_score;
@@ -928,12 +902,8 @@ pub(crate) fn gpu_batched_experts_encode_pre_staged(
     // pread, data_prefetch via 5d-6b's async prefetch).
     {
         let buf = buffer_pool.handle(bufs.combine_params_id());
-        let params: &mut [f32] = unsafe {
-            std::slice::from_raw_parts_mut(
-                buf.contents() as *mut f32,
-                18,
-            )
-        };
+        let params: &mut [f32] =
+            unsafe { buffer_as_mut_slice::<f32>(buf, 18) };
         params.fill(0.0);
         params[..k].copy_from_slice(expert_weights);
         params[16] = shared_gate_score;

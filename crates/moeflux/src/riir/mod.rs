@@ -1056,8 +1056,8 @@ impl RsCtx<MetalBackend> {
         // what does the wait. After it returns, no GPU work is in
         // flight against `linear_buffers.input`.
         let buf_input_slice = unsafe {
-            std::slice::from_raw_parts_mut(
-                buffer_pool.handle(linear_buffers.input).contents() as *mut f32,
+            metal::buffer_as_mut_slice::<f32>(
+                buffer_pool.handle(linear_buffers.input),
                 v.hidden_dim,
             )
         };
