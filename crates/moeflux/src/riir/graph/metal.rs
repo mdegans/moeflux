@@ -563,6 +563,15 @@ impl Backend for MetalBackend {
                     *dim,
                 );
             }
+            Op::ZeroBuffer { buf, n_bytes, .. } => {
+                let blit = cmd.new_blit_command_encoder();
+                blit.fill_buffer(
+                    self.pool.handle(*buf),
+                    metal::NSRange::new(0, *n_bytes as NSUInteger),
+                    0,
+                );
+                blit.end_encoding();
+            }
             Op::MatvecNTokens {
                 weight,
                 input,

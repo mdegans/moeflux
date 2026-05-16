@@ -290,6 +290,10 @@ impl CpuBackend {
     fn read_bytes(&self, id: BufId) -> Ref<'_, [u8]> {
         Ref::map(self.pool.handle(id).borrow(), |v| v.as_slice())
     }
+
+    fn write_bytes(&self, id: BufId) -> RefMut<'_, [u8]> {
+        RefMut::map(self.pool.handle(id).borrow_mut(), |v| v.as_mut_slice())
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -782,6 +786,10 @@ impl Backend for CpuBackend {
                 let b_buf = self.read_f32(*b);
                 let mut out_buf = self.write_f32(*out);
                 residual_add_n_tokens_cpu(&a_buf, &b_buf, &mut out_buf);
+            }
+            Op::ZeroBuffer { buf, n_bytes, .. } => {
+                let mut b = self.write_bytes(*buf);
+                b[..*n_bytes as usize].fill(0);
             }
             Op::MatvecNTokens {
                 weight,

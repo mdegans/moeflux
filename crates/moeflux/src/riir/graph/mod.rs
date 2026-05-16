@@ -328,6 +328,17 @@ pub enum Op {
         dim: u32,
     },
 
+    /// Zero the leading `n_bytes` of `buf`. Used to clear a
+    /// run-lifetime scratch accumulator (e.g. the MoE permute-fuse
+    /// `out_sum`, which the bucket kernel scatter-*adds* into) before
+    /// it is reused for a new step. `buf` is treated as written-only
+    /// (no read) so lifetime coloring sees a clean def point.
+    ZeroBuffer {
+        label: &'static str,
+        buf: BufId,
+        n_bytes: u32,
+    },
+
     /// Quantized matvec over n_tokens. 4-bit or 8-bit is selected
     /// by `weight.bits`. Offsets allow the input/output to be
     /// views into larger stacked buffers (Q/K/V proj split).
@@ -516,6 +527,7 @@ impl Op {
             Op::RmsNormBf16NTokens { label, .. } => label,
             Op::RmsNormQkNTokens { label, .. } => label,
             Op::ResidualAddNTokens { label, .. } => label,
+            Op::ZeroBuffer { label, .. } => label,
             Op::MatvecNTokens { label, .. } => label,
             Op::SwigluFusedBatched { label, .. } => label,
             Op::SdpaCausalTiled { label, .. } => label,
@@ -538,6 +550,7 @@ impl Op {
             Op::RmsNormBf16NTokens { .. } => "RmsNormBf16NTokens",
             Op::RmsNormQkNTokens { .. } => "RmsNormQkNTokens",
             Op::ResidualAddNTokens { .. } => "ResidualAddNTokens",
+            Op::ZeroBuffer { .. } => "ZeroBuffer",
             Op::MatvecNTokens { .. } => "MatvecNTokens",
             Op::SwigluFusedBatched { .. } => "SwigluFusedBatched",
             Op::SdpaCausalTiled { .. } => "SdpaCausalTiled",
@@ -564,6 +577,7 @@ impl Op {
             Op::RmsNormBf16NTokens { x, .. } => vec![*x],
             Op::RmsNormQkNTokens { x, .. } => vec![*x],
             Op::ResidualAddNTokens { a, b, .. } => vec![*a, *b],
+            Op::ZeroBuffer { .. } => vec![],
             Op::MatvecNTokens { input, .. } => vec![*input],
             Op::SwigluFusedBatched { gate, up, .. } => vec![*gate, *up],
             Op::SdpaCausalTiled {
@@ -627,6 +641,7 @@ impl Op {
             Op::RmsNormBf16NTokens { out, .. } => vec![*out],
             Op::RmsNormQkNTokens { x, .. } => vec![*x], // in-place
             Op::ResidualAddNTokens { out, .. } => vec![*out],
+            Op::ZeroBuffer { buf, .. } => vec![*buf],
             Op::MatvecNTokens { output, .. } => vec![*output],
             Op::SwigluFusedBatched { out, .. } => vec![*out],
             Op::SdpaCausalTiled {
