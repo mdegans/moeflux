@@ -175,6 +175,23 @@ fn eval_token_mode() -> EvalTokenMode {
     })
 }
 
+/// Resolve the full-attention KV cache for `layer_states[idx]`.
+///
+/// MLA / linear-attention layers route through a separate dispatch
+/// (Phase F); reaching the GPU GQA path with one means the dispatch
+/// wasn't wired — fail loudly at runtime.
+fn full_kv_mut(
+    layer_states: &mut [LayerState],
+    idx: usize,
+) -> Result<&mut KvCache, RsError> {
+    match &mut layer_states[idx] {
+        LayerState::FullAttn(kv) => Ok(kv),
+        LayerState::Mla(_) | LayerState::LinearAttn(_) => {
+            Err(RsError::EvalFailed)
+        }
+    }
+}
+
 pub struct RsCtx<B: Backend = MetalBackend> {
     wf: WeightFile,
     /// Session 10a — graph-mode backend. Owns
@@ -957,15 +974,7 @@ impl RsCtx<MetalBackend> {
         let prefetch_set = layer_idx_us % 2;
 
         if is_full {
-            let kv_state = match &mut layer_states[layer_idx_us] {
-                LayerState::FullAttn(kv) => kv,
-                // MLA layers route through a separate dispatch (Phase F).
-                // Reaching the GPU GQA path with an MLA layer means the
-                // dispatch wasn't wired — fail loudly at runtime.
-                LayerState::Mla(_) | LayerState::LinearAttn(_) => {
-                    return Err(RsError::EvalFailed);
-                }
-            };
+            let kv_state = full_kv_mut(layer_states, layer_idx_us)?;
             let layer_ctx = backend::gpu::gpu_ctx::GpuLayerCtx {
                 wf,
                 wf_buf,
@@ -1605,12 +1614,7 @@ impl RsCtx<MetalBackend> {
             let is_full = v.layer_kind(layer_idx)
                 == variants::LayerKind::FullAttn;
             if is_full {
-                let kv_state = match &mut layer_states[layer_idx] {
-                    LayerState::FullAttn(kv) => kv,
-                    LayerState::Mla(_) | LayerState::LinearAttn(_) => {
-                        return Err(RsError::EvalFailed);
-                    }
-                };
+                let kv_state = full_kv_mut(layer_states, layer_idx)?;
                 // S10b-1a-ii: parts_mut local to the full-attn
                 // branch; the borrow ends with the call.
                 let (metal, wf_buf, pool) = backend.parts_mut();
@@ -2320,16 +2324,7 @@ impl RsCtx<MetalBackend> {
             let is_full = v.layer_kind(layer_idx)
                 == variants::LayerKind::FullAttn;
             if is_full {
-                let kv_state = match &mut layer_states[layer_idx] {
-                    LayerState::FullAttn(kv) => kv,
-                    // MLA layers route through a separate dispatch
-                    // (Phase F). Reaching the GPU GQA path with an
-                    // MLA layer means the dispatch wasn't wired —
-                    // fail loudly at runtime.
-                    LayerState::Mla(_) | LayerState::LinearAttn(_) => {
-                        return Err(RsError::EvalFailed);
-                    }
-                };
+                let kv_state = full_kv_mut(layer_states, layer_idx)?;
                 let layer_ctx = backend::gpu::gpu_ctx::GpuLayerCtx {
                     wf,
                     wf_buf,
