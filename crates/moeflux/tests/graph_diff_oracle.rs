@@ -473,6 +473,126 @@ fn graph_metal_matches_cpu_moe_router_normalize() {
 }
 
 // ============================================================================
+// Test: MoeCombineResidualNTokens through both backends
+// ============================================================================
+//
+// hidden_out[t,i] = h_mid[t,i] + moe_sum[t,i]
+//                 + sigmoid(shared_gate[t]) * shared_out[t,i]
+//
+// Weight-free. `shared_gate` is one scalar per token; the other three
+// inputs are [n_tokens, dim]. Promoted in S10b-2; this closes the
+// per-Op diff gap before the linear-attn producer builds it.
+
+#[test]
+#[ignore = "long-running GPU test"]
+fn graph_metal_matches_cpu_moe_combine() {
+    let n_tokens: u32 = 8;
+    let dim: u32 = 64;
+    let total = (n_tokens * dim) as usize;
+    let mut rng = Rng::new(0xA3B_C0FFEE);
+    let h_mid_data: Vec<f32> = (0..total).map(|_| rng.next_f32_unit()).collect();
+    let moe_sum_data: Vec<f32> = (0..total).map(|_| rng.next_f32_unit()).collect();
+    let shared_out_data: Vec<f32> =
+        (0..total).map(|_| rng.next_f32_unit()).collect();
+    // Spread the gate across the sigmoid's interesting range.
+    let shared_gate_data: Vec<f32> = (0..n_tokens as usize)
+        .map(|_| rng.next_f32_unit() * 4.0)
+        .collect();
+
+    let build_graph = |h_mid, moe_sum, shared_out, shared_gate, hidden_out| {
+        let mut g = Graph::new();
+        g.push(Op::MoeCombineResidualNTokens {
+            label: "test_combine",
+            h_mid,
+            moe_sum,
+            shared_out,
+            shared_gate,
+            hidden_out,
+            n_tokens,
+            dim,
+        });
+        g
+    };
+
+    // CPU path
+    let mut cpu_wf = dummy_weight_file("moe_combine_cpu");
+    let mut cpu = CpuBackend::new(cpu_wf.take());
+    let cpu_h_mid = cpu.pool_mut().alloc(total * 4, "h_mid", false).unwrap();
+    let cpu_moe_sum = cpu.pool_mut().alloc(total * 4, "moe_sum", false).unwrap();
+    let cpu_shared_out =
+        cpu.pool_mut().alloc(total * 4, "shared_out", false).unwrap();
+    let cpu_shared_gate = cpu
+        .pool_mut()
+        .alloc(n_tokens as usize * 4, "shared_gate", false)
+        .unwrap();
+    let cpu_out = cpu.pool_mut().alloc(total * 4, "hidden_out", false).unwrap();
+    cpu.pool_mut().upload(cpu_h_mid, bytes_of_f32(&h_mid_data)).unwrap();
+    cpu.pool_mut().upload(cpu_moe_sum, bytes_of_f32(&moe_sum_data)).unwrap();
+    cpu.pool_mut()
+        .upload(cpu_shared_out, bytes_of_f32(&shared_out_data))
+        .unwrap();
+    cpu.pool_mut()
+        .upload(cpu_shared_gate, bytes_of_f32(&shared_gate_data))
+        .unwrap();
+    let g_cpu = build_graph(
+        cpu_h_mid, cpu_moe_sum, cpu_shared_out, cpu_shared_gate, cpu_out,
+    );
+    cpu.execute(&g_cpu).unwrap();
+    let mut cpu_out_bytes = vec![0u8; total * 4];
+    cpu.pool().download(cpu_out, &mut cpu_out_bytes).unwrap();
+    let cpu_out_f32 = f32_of_bytes(&cpu_out_bytes);
+
+    // GPU path
+    let mut gpu_wf = dummy_weight_file("moe_combine_gpu");
+    let metal_ctx = MetalContext::new().expect("MetalContext::new");
+    let wf_buf = MtlWeightBuf::wrap(gpu_wf.wf.as_ref().unwrap(), metal_ctx.device());
+    let _ = gpu_wf.take();
+    let mut gpu = MetalBackend::new(metal_ctx, wf_buf).expect("MetalBackend::new");
+    let gpu_h_mid = gpu.pool_mut().alloc(total * 4, "h_mid", false).unwrap();
+    let gpu_moe_sum = gpu.pool_mut().alloc(total * 4, "moe_sum", false).unwrap();
+    let gpu_shared_out =
+        gpu.pool_mut().alloc(total * 4, "shared_out", false).unwrap();
+    let gpu_shared_gate = gpu
+        .pool_mut()
+        .alloc(n_tokens as usize * 4, "shared_gate", false)
+        .unwrap();
+    let gpu_out = gpu.pool_mut().alloc(total * 4, "hidden_out", false).unwrap();
+    gpu.pool_mut().upload(gpu_h_mid, bytes_of_f32(&h_mid_data)).unwrap();
+    gpu.pool_mut().upload(gpu_moe_sum, bytes_of_f32(&moe_sum_data)).unwrap();
+    gpu.pool_mut()
+        .upload(gpu_shared_out, bytes_of_f32(&shared_out_data))
+        .unwrap();
+    gpu.pool_mut()
+        .upload(gpu_shared_gate, bytes_of_f32(&shared_gate_data))
+        .unwrap();
+    let g_gpu = build_graph(
+        gpu_h_mid, gpu_moe_sum, gpu_shared_out, gpu_shared_gate, gpu_out,
+    );
+    gpu.execute(&g_gpu).unwrap();
+    let mut gpu_out_bytes = vec![0u8; total * 4];
+    gpu.pool().download(gpu_out, &mut gpu_out_bytes).unwrap();
+    let gpu_out_f32 = f32_of_bytes(&gpu_out_bytes);
+
+    let cos = cosine_sim(&cpu_out_f32, &gpu_out_f32);
+    let max_abs = cpu_out_f32
+        .iter()
+        .zip(gpu_out_f32.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    eprintln!(
+        "[s7-4 moe_combine] N={} dim={}: cos={:.9}, max_abs={:.3e}",
+        n_tokens, dim, cos, max_abs
+    );
+    assert!(
+        cos >= COSINE_FLOOR,
+        "cosine {} below floor {} (max_abs={})",
+        cos,
+        COSINE_FLOOR,
+        max_abs
+    );
+}
+
+// ============================================================================
 // Test: graph_metal_matches_cpu_colored — load-bearing S7-5 gate
 // ============================================================================
 //
