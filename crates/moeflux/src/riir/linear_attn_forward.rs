@@ -2131,8 +2131,8 @@ fn encode_residual_add(
 /// today (parity with [`linear_attn_layer_forward`]'s `_layer_state`),
 /// kept on the signature for symmetry with the per-token oracle.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn batched_linear_attn_layer_forward(
-    backend: &mut super::graph::MetalBackend,
+pub(super) fn batched_linear_attn_layer_forward<B>(
+    backend: &mut B,
     wf: &WeightFile,
     layer_cache: &LayerWeightCache,
     buffers: &LayerForwardBuffers,
@@ -2158,7 +2158,12 @@ pub(super) fn batched_linear_attn_layer_forward(
     // allocated once at max chunk width. Replaces the per-layer
     // `pool.alloc` of the pre-MoE transients.
     scratch: &BatchedGraphScratch,
-) -> Result<(), LayerForwardError> {
+) -> Result<(), LayerForwardError>
+where
+    B: Backend,
+    LayerForwardError: From<B::Error>,
+    LayerForwardError: From<<B::Pool as BufferPool>::Error>,
+{
     use super::expert_forward::MAX_K;
     use super::moe_router::build_expert_buckets;
 
