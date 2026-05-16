@@ -44,8 +44,8 @@
 use std::collections::VecDeque;
 
 use super::expert_forward::{
-    ChainToNormed, ExpertForwardError, MoeBuffers, gpu_batched_experts_encode,
-    gpu_batched_experts_encode_pre_staged,
+    ChainToNormed, ExpertForwardError, ExpertPayload, MoeBuffers,
+    gpu_batched_experts_encode, gpu_batched_experts_encode_pre_staged,
 };
 use super::metal::{buffer_as_slice, MetalContext};
 use super::variants::VARIANT;
@@ -217,14 +217,17 @@ pub(crate) fn gpu_batched_experts_begin(
     ring: &mut DeferredRing,
     actual_k: i32,
     expert_data: &[u8],
-    h_post: &[f32],
-    h_mid: &[f32],
-    shared_out: &[f32],
-    expert_weights: &[f32],
-    shared_gate_score: f32,
+    payload: ExpertPayload<'_>,
     layer_idx: i32,
     gpu_combine: bool,
 ) -> Result<(), DeferredError> {
+    let ExpertPayload {
+        h_post: _,
+        h_mid,
+        shared_out,
+        expert_weights,
+        shared_gate_score,
+    } = payload;
     if ring.is_full() {
         return Err(DeferredError::RingFull);
     }
@@ -234,11 +237,7 @@ pub(crate) fn gpu_batched_experts_begin(
         buffer_pool,
         actual_k,
         expert_data,
-        h_post,
-        h_mid,
-        shared_out,
-        expert_weights,
-        shared_gate_score,
+        payload,
         gpu_combine,
     )?;
     cmd_buffer.commit();
@@ -498,6 +497,13 @@ impl RsCtx<MetalBackend> {
             backend.as_mut().expect("metal_and_moe_mut just-set");
         let (metal, _wf_buf, pool) = backend.parts_mut();
         let bufs = moe_buffers.as_mut().expect("metal_and_moe_mut just-set");
+        let payload = ExpertPayload {
+            h_post,
+            h_mid,
+            shared_out,
+            expert_weights,
+            shared_gate_score,
+        };
         gpu_batched_experts_begin(
             metal,
             bufs,
@@ -505,11 +511,7 @@ impl RsCtx<MetalBackend> {
             deferred,
             actual_k,
             expert_data,
-            h_post,
-            h_mid,
-            shared_out,
-            expert_weights,
-            shared_gate_score,
+            payload,
             layer_idx,
             /* gpu_combine = */ true,
         )

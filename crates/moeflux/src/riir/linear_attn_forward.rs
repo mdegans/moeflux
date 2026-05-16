@@ -42,7 +42,7 @@ use super::deferred::{
     gpu_batched_experts_begin, gpu_batched_experts_begin_pre_staged,
     DeferredError,
 };
-use super::expert_forward::{ChainToNormed, MoeBuffers};
+use super::expert_forward::{ChainToNormed, ExpertPayload, MoeBuffers};
 use super::expert_io::ExpertFiles;
 use super::gpu_attn::{
     encode_attn_scores_batched_into, encode_attn_softmax_batched_into,
@@ -1819,6 +1819,13 @@ pub(super) fn moe_dispatch_per_token(
         let shared_out_host =
             read_buffer_to_vec(buffer_pool.handle(buffers.shared_out), v.hidden_dim);
         let normed_host = read_buffer_to_vec(buffer_pool.handle(buffers.normed), v.hidden_dim);
+        let payload = ExpertPayload {
+            h_post: &normed_host,
+            h_mid: &h_mid_host,
+            shared_out: &shared_out_host,
+            expert_weights: weights,
+            shared_gate_score,
+        };
         gpu_batched_experts_begin(
             metal,
             moe,
@@ -1826,11 +1833,7 @@ pub(super) fn moe_dispatch_per_token(
             deferred,
             k as i32,
             &expert_data,
-            &normed_host,
-            &h_mid_host,
-            &shared_out_host,
-            weights,
-            shared_gate_score,
+            payload,
             layer_idx as i32,
             /* gpu_combine = */ false,
         )?;

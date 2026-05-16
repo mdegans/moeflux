@@ -840,17 +840,20 @@ impl RsCtx<MetalBackend> {
             backend.as_mut().expect("ensure_backend just-set");
         let (metal, _wf_buf, pool) = backend.parts_mut();
         let bufs = moe_buffers.as_mut().expect("just-set");
+        let payload = expert_forward::ExpertPayload {
+            h_post,
+            h_mid,
+            shared_out,
+            expert_weights,
+            shared_gate_score,
+        };
         gpu_batched_experts_forward(
             metal,
             bufs,
             pool,
             actual_k,
             expert_data,
-            h_post,
-            h_mid,
-            shared_out,
-            expert_weights,
-            shared_gate_score,
+            payload,
             hidden_out,
         )
         .map_err(|_| RsError::EvalFailed)

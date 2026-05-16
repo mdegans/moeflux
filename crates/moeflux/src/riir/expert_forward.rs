@@ -96,6 +96,26 @@ pub(crate) struct ChainToNormed<'a> {
 /// regardless of the active `K`).
 pub const MAX_K: usize = 16;
 
+/// Host-side per-token inputs to a batched K-expert dispatch.
+///
+/// `gpu_batched_experts_forward` / `_encode` and
+/// `gpu_batched_experts_begin` all thread these five values in
+/// lockstep; bundling them keeps the call sites legible. All slices
+/// are `[HIDDEN_DIM]` except `expert_weights` (`[actual_K]`).
+#[derive(Clone, Copy)]
+pub struct ExpertPayload<'a> {
+    /// Shared input to every expert's matvec (post-attn-norm hidden).
+    pub h_post: &'a [f32],
+    /// Residual added by the combine kernel.
+    pub h_mid: &'a [f32],
+    /// The shared expert's output.
+    pub shared_out: &'a [f32],
+    /// Per-slot routing weights.
+    pub expert_weights: &'a [f32],
+    /// Pre-sigmoid gate logit for the shared expert.
+    pub shared_gate_score: f32,
+}
+
 /// Errors from GPU expert FFN dispatch (slice 9a + 9b).
 #[derive(Debug, thiserror::Error)]
 pub enum ExpertForwardError {
@@ -673,11 +693,7 @@ pub fn gpu_batched_experts_forward(
     buffer_pool: &MetalBufferPool,
     actual_k: i32,
     expert_data: &[u8],
-    h_post: &[f32],
-    h_mid: &[f32],
-    shared_out: &[f32],
-    expert_weights: &[f32],
-    shared_gate_score: f32,
+    payload: ExpertPayload<'_>,
     hidden_out: &mut [f32],
 ) -> Result<(), ExpertForwardError> {
     let v = VARIANT;
@@ -693,11 +709,7 @@ pub fn gpu_batched_experts_forward(
         buffer_pool,
         actual_k,
         expert_data,
-        h_post,
-        h_mid,
-        shared_out,
-        expert_weights,
-        shared_gate_score,
+        payload,
         /* gpu_combine = */ true,
     )?;
     cmdbuf.commit();
@@ -740,13 +752,16 @@ pub(crate) fn gpu_batched_experts_encode(
     buffer_pool: &MetalBufferPool,
     actual_k: i32,
     expert_data: &[u8],
-    h_post: &[f32],
-    h_mid: &[f32],
-    shared_out: &[f32],
-    expert_weights: &[f32],
-    shared_gate_score: f32,
+    payload: ExpertPayload<'_>,
     gpu_combine: bool,
 ) -> Result<metal::CommandBuffer, ExpertForwardError> {
+    let ExpertPayload {
+        h_post,
+        h_mid,
+        shared_out,
+        expert_weights,
+        shared_gate_score,
+    } = payload;
     let v = VARIANT;
     validate_inputs(actual_k, expert_data, expert_weights)?;
     let k = actual_k as usize;
