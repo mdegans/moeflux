@@ -1,147 +1,67 @@
-# Flash-MoE: Running a 397B Parameter Model on a Laptop
+# CLAUDE.md
 
-> **[Read the paper](paper/flash_moe.pdf)** — Full technical details, 90+ experiments, and the story of how an AI and a human built this in 24 hours.
+Guidance for Claude Code working in the moeflux repository.
 
-Pure C/Metal inference engine that runs **Qwen3.5-397B-A17B** (a 397 billion parameter Mixture-of-Experts model) on a MacBook Pro with 48GB RAM at **4.4+ tokens/second** with production-quality output including tool calling.
+## What moeflux is
 
-The entire 209GB model streams from SSD through a custom Metal compute pipeline. No Python. No frameworks. Just C, Objective-C, and hand-tuned Metal shaders.
+moeflux is a pure-Rust streaming-experts Mixture-of-Experts inference
+engine for Apple Silicon. It began as a fork of danveloper's flash-moe
+and has been rewritten in Rust on `metal-rs`; the Metal kernels were
+authored by Claude Opus 4.6 for flash-moe and carry over. See
+`README.md` for provenance.
 
-## Results
+moeflux is consumed by
+[`drama_llama`](https://github.com/mdegans/drama_llama), which is
+where this work is usually launched from — drama_llama is the
+downstream consumer and is path-pointed at this crate. Treat
+drama_llama's needs as the API's north star.
 
-![Progress](progress.png)
+## Build & test
 
-| Configuration | tok/s | Quality | Notes |
-|--------------|-------|---------|-------|
-| 4-bit experts, FMA kernel | **4.36** | Excellent | Current best. Full tool calling. 209GB on disk. |
-| 4-bit experts, baseline | 3.90 | Excellent | Before FMA kernel optimization. |
-| 2-bit experts, trust OS | 5.74 | Good* | 120GB on disk. *Breaks JSON/tool calling. |
-| 2-bit peak single token | 7.05 | Good* | Warm cache burst. *Not suitable for tool use. |
+macOS only; on other targets the crate exposes no symbols. Exactly
+one model-variant feature must be selected:
 
-*2-bit quantization produces `\name\` instead of `"name"` in JSON output, making tool calling unreliable. 4-bit is the production configuration.
+```bash
+# Build, per variant
+cargo build --features model-qwen3-6-35b-a3b
+cargo build --features model-qwen3-5-a17b
+cargo build --features model-cogito-v2-671b
 
-## Hardware
+# Behavioral gate — the oracle suites load the a3b model
+cargo test --no-fail-fast --features model-qwen3-6-35b-a3b -- --include-ignored
+```
 
-- **Machine**: MacBook Pro, Apple M3 Max
-- **Chip**: 16-core CPU (12P + 4E), 40-core GPU, 16-core ANE
-- **Memory**: 48 GB unified (~400 GB/s bandwidth)
-- **SSD**: 1TB Apple Fabric, **17.5 GB/s sequential read** (measured)
-- **macOS**: 26.2 (Darwin 25.2.0)
+`--no-fail-fast` so one model-mismatched test binary doesn't mask the
+rest. `checkpoint_restore.rs` is a3b-only and fails under a17b — that
+is expected. "Green" means all Rust-path tests pass.
 
 ## Architecture
 
-The model has 60 transformer layers: 45 GatedDeltaNet (linear attention) + 15 standard full attention. Each layer has 512 experts, of which K=4 are activated per token (plus one shared expert). Hidden dimension is 4096.
+- `crates/moeflux/` — the only crate. `RsCtx::open` opens a model;
+  `eval_prompt` / `eval_token` / `state_save` / `state_load` are the
+  public surface (`RsCtx` is re-exported as `Ctx`).
+- `src/riir/` — the engine. `backend/{cpu,gpu}/` is the `Backend`
+  trait with CPU and Metal implementations; `attn/`, `moe/`, `io/`
+  (weight streaming), `snapshot/` (state save/load) hold the rest.
+- `src/riir/variants.rs` — compile-time per-variant shape constants,
+  gated by the model features. See `docs/model_variants.md`.
+- `crates/moeflux/shaders/shaders.metal` — the Metal kernels, embedded
+  via `include_str!` and compiled at runtime.
 
-### Key Techniques
+## Conventions
 
-1. **SSD Expert Streaming** — Expert weights (209GB at 4-bit) are read from NVMe SSD on demand via parallel `pread()` with GCD dispatch groups. Only the K=4 active experts per layer are loaded (~6.75MB each). The OS page cache manages caching — no custom cache needed ("Trust the OS" principle). Inspired by Apple's "LLM in a Flash" paper.
+- **Land work directly on `main`** while drama_llama is the sole
+  consumer. Revisit when external users appear.
+- **Model shape is compile-time.** One `model-*` feature at a time;
+  runtime variant dispatch is future work.
+- **The C oracle is retired.** moeflux is C-free; correctness is
+  cross-checked Rust-internally — `graph_diff_oracle` (CpuBackend vs
+  MetalBackend), `batched_diff_oracle` (batched vs per-token), and
+  `mlx_regression` (vs an MLX reference). See
+  `.claude/memory/future_work_c_oracle_broken_post_riir.md` for why.
 
-2. **FMA-Optimized Dequant Kernel** — The inner loop of the 4-bit dequantized matrix-vector multiply rearranges the math from `(nibble * scale + bias) * x` to `fma(nibble, scale*x, bias*x)`. Pre-computing `scale*x` and `bias*x` lets the GPU fused multiply-add unit do dequant+multiply in one instruction. 12% faster than the naive formulation.
+## Durable context
 
-3. **Metal Compute Shaders** — Hand-written Metal kernels for:
-   - 4-bit and 2-bit dequantized matrix-vector multiply (tiled, SIMD-reduced, shared input cache, FMA-optimized)
-   - Fused SwiGLU activation
-   - RMS normalization (two-pass: sum-of-squares reduction + apply)
-   - Batched GPU attention (Q@K^T, softmax, scores@V) for full attention layers
-   - GPU RoPE (fused with Q deinterleave and K normalization)
-   - MoE combine + residual + sigmoid gate (fused kernel)
-
-4. **Deferred GPU Expert Compute** — CMD3 (expert forward pass) is submitted without waiting. The GPU executes it while the CPU prepares the next layer. The combine + residual + norm are also on GPU, feeding directly into the next layer's attention projections.
-
-5. **Accelerate BLAS for Linear Attention** — The GatedDeltaNet recurrence uses `cblas_sscal`, `cblas_sgemv`, and `cblas_sger` for the 64-head × 128×128 state matrix update. 64% faster than scalar code.
-
-6. **Trust the OS** — No custom expert cache. The OS page cache (~35GB) manages expert data caching via standard LRU. Every custom caching approach we tested (Metal LRU, malloc cache, LZ4 compressed cache) was slower due to GPU memory pressure or overhead. The page cache achieves ~71% hit rate naturally.
-
-### Pipeline Per Layer (4.28ms average at 4-bit)
-
-```
-CMD3(prev) → CMD1: attention projections + delta-net  [1.22ms GPU]
-           → CPU: flush results                       [0.01ms CPU]
-           → CMD2: o_proj + norm + routing + shared    [0.55ms GPU]
-           → CPU: softmax + topK routing               [0.003ms]
-           → I/O: parallel pread K=4 experts           [2.41ms SSD]
-           → CMD3: expert forward + combine + norm     [0.04ms encode, DEFERRED]
-```
-
-### Unified Memory Constraint
-
-On Apple Silicon, SSD DMA and GPU compute share the same memory controller and cannot be profitably overlapped. The GPU's dequant kernels are bandwidth-saturated at ~418 GiB/s. Even small background SSD DMA causes disproportionate GPU latency spikes through memory controller arbitration. The serial pipeline (GPU → SSD → GPU) is hardware-optimal.
-
-## Quick Start
-
-```bash
-cd metal_infer
-make
-# 4-bit inference (needs packed_experts/ directory)
-./infer --prompt "Explain quantum computing" --tokens 100
-
-# 2-bit inference (faster but breaks tool calling)
-./infer --prompt "Explain quantum computing" --tokens 100 --2bit
-
-# Interactive chat with tool calling
-./chat
-
-# Per-layer timing breakdown
-./infer --prompt "Hello" --tokens 20 --timing
-```
-
-## Project Structure
-
-```
-metal_infer/
-  infer.m              # Complete inference engine (~7000 lines)
-  shaders.metal        # Metal compute kernels (~1200 lines)
-  chat.m               # Interactive chat TUI with tool calling
-  tokenizer.h          # C BPE tokenizer (single-header, 449 lines)
-  main.m               # MoE-only benchmark
-  Makefile             # Build system
-  extract_weights.py   # Creates model_weights.bin from safetensors
-  repack_experts_2bit.py  # 4-bit → 2-bit expert requantization
-  train_predictor.py   # Expert routing prediction analysis
-  model_weights.bin    # Non-expert weights (5.5GB, mmap'd)
-  model_weights.json   # Tensor manifest
-  vocab.bin            # Vocabulary for token decoding
-  tokenizer.bin        # Pre-exported BPE tokenizer data
-
-repack_experts.py      # 4-bit expert packing from safetensors
-progress.py            # Results visualization (Q2/Q4 tracks)
-results.tsv            # Experiment log (58 experiments)
-```
-
-## What We Tried (and What Worked)
-
-### Kept
-| Approach | Result | Impact |
-|----------|--------|--------|
-| FMA dequant kernel | GPU compute -12% | **+12% tok/s** |
-| Trust OS page cache | Deleted Metal LRU → +38% | **Foundational** |
-| GPU combine+norm in CMD3 | Eliminates CPU round-trip | **Pipeline** |
-| BLAS delta-net (Accelerate) | cpu_attn 0.78→0.28ms | **+64% attn** |
-| F_NOCACHE for 2-bit | +3% from avoiding page thrash | **2-bit only** |
-| GPU fused attention (RoPE) | +2% for full-attn layers | **Small** |
-| C BPE tokenizer | 180ms vs 3500ms startup | **20x startup** |
-| Deferred CMD3 execution | GPU/CPU overlap | **Pipeline** |
-
-### Discarded (58 experiments, highlights)
-| Approach | Result | Why |
-|----------|--------|-----|
-| LZ4 expert compression | -13% | Decompress overhead > warm cache savings |
-| F_RDADVISE prefetch | net 0% | Unified memory: SSD DMA slows GPU -73% |
-| Temporal expert prediction | -18% | 25% hit rate, SSD bandwidth waste |
-| MLP routing predictor | 31% accuracy | Worse than temporal baseline |
-| GPU LUT dequant kernel | -2% | Indirect register access serializes |
-| GPU private buffer compression | -20% pipeline | Blit cost 4×7MB > matvec savings |
-| Spin-poll GPU wait | -23% | CPU thermal competes with GPU |
-| Expert file clustering | 0% | NVMe ignores scatter at 7MB granularity |
-| dispatch_io | -70% | dispatch_data management overhead |
-| mmap expert files | -5x | Per-page fault overhead on cold data |
-| Speculative early routing | -38% | Cache pollution + overhead |
-| MTP speculative decoding | break-even | MoE I/O scales per-token (unlike dense) |
-
-## Safety
-
-This is a primary development machine. The engine explicitly controls memory:
-- Non-expert weights: 5.5GB (mmap'd, read-only)
-- Metal scratch buffers: ~200MB
-- Total: ~6GB, leaving 42GB for OS + page cache
-- No OOM risk. Expert data streams from SSD on demand.
-- No custom caches. Trust the OS.
+Session-spanning notes live in `.claude/memory/` — graph-mode arc
+landings, the cleanup arc, future-work items. Read the most recent
+`*_landed.md` when picking up.

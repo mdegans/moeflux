@@ -1,7 +1,7 @@
 //! Pure-Rust [moeflux](https://github.com/mdegans/moeflux) — streaming-experts
 //! MoE inference on Metal.
 //!
-//! Forked from [flash-moe](https://github.com/SuperEpic/flash-moe);
+//! Forked from [flash-moe](https://github.com/danveloper/flash-moe);
 //! the Metal kernels at `crates/moeflux/shaders/shaders.metal` retain
 //! flash-moe's attribution. Everything else is original Rust.
 //!
