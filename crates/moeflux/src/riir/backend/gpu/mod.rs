@@ -544,9 +544,9 @@ impl Backend for MetalBackend {
     fn submit_and_wait(
         &self,
         ctx: MetalEncodeCtx,
+        label: &'static str,
     ) -> Result<(), GraphError> {
-        ctx.cmdbuf.commit();
-        ctx.cmdbuf.wait_until_completed();
+        self.metal.commit_and_wait_labeled(&ctx.cmdbuf, label);
         Ok(())
     }
 

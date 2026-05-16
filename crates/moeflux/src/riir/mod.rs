@@ -52,7 +52,9 @@ pub use attn::linear_attn::{
 use backend::BufferPool as _;
 use backend::{Backend, MetalBackend};
 pub use io::lm_head::{lm_head_cpu, LmHeadError};
-pub use backend::gpu::metal::{MetalContext, MetalError, MtlBuffer};
+pub use backend::gpu::metal::{
+    CmdbufStat, MetalContext, MetalError, MtlBuffer,
+};
 pub use moe::moe_router::{moe_router_cpu, MoeRouterError};
 pub use attn::rms_norm::{rms_norm_cpu, rms_norm_per_head_cpu, RmsNormError};
 pub use attn::rope::{apply_rotary_emb, RopeError};
@@ -457,6 +459,27 @@ impl RsCtx<MetalBackend> {
     /// Zero the prefetch hit/miss counters.
     pub fn reset_prefetch_stats(&self) {
         self.prefetch.reset_stats();
+    }
+
+    /// Snapshot the Metal backend's per-label cmdbuf timing stats
+    /// (see [`MetalContext::commit_and_wait_labeled`]). Returns
+    /// `(label, stat)` pairs sorted by label. Empty until the backend
+    /// is built (lazily, on the first forward pass) and at least one
+    /// labeled commit has run. Profiling/diagnostics only.
+    pub fn cmdbuf_stats(&self) -> Vec<(&'static str, CmdbufStat)> {
+        self.backend
+            .as_ref()
+            .map(|b| b.metal().cmdbuf_stats())
+            .unwrap_or_default()
+    }
+
+    /// Zero the Metal backend's per-label cmdbuf timing stats. Call
+    /// before a measured prefill to scope the numbers to it. No-op if
+    /// the backend has not been built yet.
+    pub fn reset_cmdbuf_stats(&self) {
+        if let Some(b) = self.backend.as_ref() {
+            b.metal().reset_cmdbuf_stats();
+        }
     }
 
     /// Embed a single token. Writes `HIDDEN_DIM` floats into `out`.

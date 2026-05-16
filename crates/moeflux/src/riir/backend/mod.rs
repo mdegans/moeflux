@@ -244,17 +244,32 @@ pub trait Backend {
 
     /// Submit the encoded work and block until done.
     ///
-    /// - **Metal:** `cmdbuf.commit()` + `wait_until_completed()`.
+    /// `label` is a `'static` tag for this submission. Backends that
+    /// track per-label cmdbuf timing record the wall-clock under it
+    /// (Metal, via `commit_and_wait_labeled`); other backends ignore
+    /// it.
+    ///
+    /// - **Metal:** `cmdbuf.commit()` + `wait_until_completed()`,
+    ///   timed under `label`.
     /// - **CPU:** no-op (already executed inline during
     ///   [`Self::encode_op`]).
     /// - **CoreML (future):** `executable.run()`.
-    fn submit_and_wait(&self, ctx: Self::EncodeCtx) -> Result<(), Self::Error>;
+    fn submit_and_wait(
+        &self,
+        ctx: Self::EncodeCtx,
+        label: &'static str,
+    ) -> Result<(), Self::Error>;
 
-    /// Convenience: full begin → encode → submit cycle.
-    fn execute(&self, graph: &Graph) -> Result<(), Self::Error> {
+    /// Convenience: full begin → encode → submit cycle. `label` tags
+    /// the submission for per-label timing — see [`Self::submit_and_wait`].
+    fn execute(
+        &self,
+        graph: &Graph,
+        label: &'static str,
+    ) -> Result<(), Self::Error> {
         let mut ctx = self.begin_encoding();
         self.encode_graph(graph, &mut ctx);
-        self.submit_and_wait(ctx)
+        self.submit_and_wait(ctx, label)
     }
 }
 

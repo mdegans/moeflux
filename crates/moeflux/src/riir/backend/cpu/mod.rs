@@ -721,7 +721,11 @@ impl Backend for CpuBackend {
         &mut self.pool
     }
     fn begin_encoding(&self) {}
-    fn submit_and_wait(&self, _: ()) -> Result<(), GraphError> {
+    fn submit_and_wait(
+        &self,
+        _: (),
+        _label: &'static str,
+    ) -> Result<(), GraphError> {
         Ok(())
     }
 

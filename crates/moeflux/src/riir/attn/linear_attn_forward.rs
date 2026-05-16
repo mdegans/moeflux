@@ -2378,7 +2378,7 @@ where
     }
     // Submit + wait. Single cmdbuf, single commit (the S7-1a fusion
     // is preserved by `MetalBackend::execute`'s default loop body).
-    backend.execute(&graph)?;
+    backend.execute(&graph, "graph_linear_attn")?;
 
     // Host readback at the graph1 → MoE-graph split: h_post (for the
     // bucket_input gather) + routing indices/weights (for
@@ -2633,7 +2633,7 @@ where
         backend.pool_mut().commit_plan(&graph2);
         scratch.commit_planned.set(true);
     }
-    backend.execute(&graph2)?;
+    backend.execute(&graph2, "graph_moe")?;
 
     // Phase 3: record this layer's actual routing as the prediction
     // for the next token's same layer. Only meaningful at N=1
