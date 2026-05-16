@@ -205,7 +205,7 @@ fn graph_metal_matches_cpu_residual_add() {
         n_tokens,
         dim,
     });
-    cpu.execute(&g_cpu).unwrap();
+    cpu.execute(&g_cpu, "diff_oracle").unwrap();
     let mut cpu_out_bytes = vec![0u8; total * 4];
     cpu.pool().download(cpu_out, &mut cpu_out_bytes).unwrap();
     let cpu_out_f32 = f32_of_bytes(&cpu_out_bytes);
@@ -231,7 +231,7 @@ fn graph_metal_matches_cpu_residual_add() {
         n_tokens,
         dim,
     });
-    gpu.execute(&g_gpu).unwrap();
+    gpu.execute(&g_gpu, "diff_oracle").unwrap();
     let mut gpu_out_bytes = vec![0u8; total * 4];
     gpu.pool().download(gpu_out, &mut gpu_out_bytes).unwrap();
     let gpu_out_f32 = f32_of_bytes(&gpu_out_bytes);
@@ -288,7 +288,7 @@ fn graph_metal_matches_cpu_swiglu() {
         out: cpu_out,
         total,
     });
-    cpu.execute(&g_cpu).unwrap();
+    cpu.execute(&g_cpu, "diff_oracle").unwrap();
     let mut cpu_out_bytes = vec![0u8; total as usize * 4];
     cpu.pool().download(cpu_out, &mut cpu_out_bytes).unwrap();
     let cpu_out_f32 = f32_of_bytes(&cpu_out_bytes);
@@ -313,7 +313,7 @@ fn graph_metal_matches_cpu_swiglu() {
         out: gpu_out,
         total,
     });
-    gpu.execute(&g_gpu).unwrap();
+    gpu.execute(&g_gpu, "diff_oracle").unwrap();
     let mut gpu_out_bytes = vec![0u8; total as usize * 4];
     gpu.pool().download(gpu_out, &mut gpu_out_bytes).unwrap();
     let gpu_out_f32 = f32_of_bytes(&gpu_out_bytes);
@@ -375,7 +375,7 @@ fn graph_metal_matches_cpu_moe_router_normalize() {
         n_tokens,
         k,
     });
-    cpu.execute(&g_cpu).unwrap();
+    cpu.execute(&g_cpu, "diff_oracle").unwrap();
     let mut cpu_ib = vec![0u8; (n_tokens * k) as usize * 4];
     let mut cpu_wb = vec![0u8; (n_tokens * k) as usize * 4];
     cpu.pool().download(cpu_i, &mut cpu_ib).unwrap();
@@ -412,7 +412,7 @@ fn graph_metal_matches_cpu_moe_router_normalize() {
         n_tokens,
         k,
     });
-    gpu.execute(&g_gpu).unwrap();
+    gpu.execute(&g_gpu, "diff_oracle").unwrap();
     let mut gpu_ib = vec![0u8; (n_tokens * k) as usize * 4];
     let mut gpu_wb = vec![0u8; (n_tokens * k) as usize * 4];
     gpu.pool().download(gpu_i, &mut gpu_ib).unwrap();
@@ -537,7 +537,7 @@ fn graph_metal_matches_cpu_moe_combine() {
     let g_cpu = build_graph(
         cpu_h_mid, cpu_moe_sum, cpu_shared_out, cpu_shared_gate, cpu_out,
     );
-    cpu.execute(&g_cpu).unwrap();
+    cpu.execute(&g_cpu, "diff_oracle").unwrap();
     let mut cpu_out_bytes = vec![0u8; total * 4];
     cpu.pool().download(cpu_out, &mut cpu_out_bytes).unwrap();
     let cpu_out_f32 = f32_of_bytes(&cpu_out_bytes);
@@ -568,7 +568,7 @@ fn graph_metal_matches_cpu_moe_combine() {
     let g_gpu = build_graph(
         gpu_h_mid, gpu_moe_sum, gpu_shared_out, gpu_shared_gate, gpu_out,
     );
-    gpu.execute(&g_gpu).unwrap();
+    gpu.execute(&g_gpu, "diff_oracle").unwrap();
     let mut gpu_out_bytes = vec![0u8; total * 4];
     gpu.pool().download(gpu_out, &mut gpu_out_bytes).unwrap();
     let gpu_out_f32 = f32_of_bytes(&gpu_out_bytes);
@@ -669,7 +669,7 @@ fn graph_metal_matches_cpu_colored() {
     // Apply coloring.
     cpu.pool_mut().commit_plan(&g_cpu);
     let cpu_phys = cpu.pool().physical_buffer_count();
-    cpu.execute(&g_cpu).unwrap();
+    cpu.execute(&g_cpu, "diff_oracle").unwrap();
     let mut cpu_out_bytes = vec![0u8; total * 4];
     cpu.pool()
         .download(*cpu_tmps.last().unwrap(), &mut cpu_out_bytes)
@@ -694,7 +694,7 @@ fn graph_metal_matches_cpu_colored() {
     let g_gpu = build_graph(gpu_a, gpu_b, &gpu_tmps);
     gpu.pool_mut().commit_plan(&g_gpu);
     let gpu_phys = gpu.pool().physical_buffer_count();
-    gpu.execute(&g_gpu).unwrap();
+    gpu.execute(&g_gpu, "diff_oracle").unwrap();
     let mut gpu_out_bytes = vec![0u8; total * 4];
     gpu.pool()
         .download(*gpu_tmps.last().unwrap(), &mut gpu_out_bytes)
@@ -782,7 +782,7 @@ fn graph_metal_matches_cpu_rms_norm_qk() {
         per_token_total: key_offset_per_token + num_k_heads * key_dim,
         n_tokens,
     });
-    cpu.execute(&g_cpu).unwrap();
+    cpu.execute(&g_cpu, "diff_oracle").unwrap();
     let mut cpu_out_bytes = vec![0u8; total * 4];
     cpu.pool().download(cpu_x, &mut cpu_out_bytes).unwrap();
     let cpu_out_f32 = f32_of_bytes(&cpu_out_bytes);
@@ -806,7 +806,7 @@ fn graph_metal_matches_cpu_rms_norm_qk() {
         per_token_total: key_offset_per_token + num_k_heads * key_dim,
         n_tokens,
     });
-    gpu.execute(&g_gpu).unwrap();
+    gpu.execute(&g_gpu, "diff_oracle").unwrap();
     let mut gpu_out_bytes = vec![0u8; total * 4];
     gpu.pool().download(gpu_x, &mut gpu_out_bytes).unwrap();
     let gpu_out_f32 = f32_of_bytes(&gpu_out_bytes);
@@ -889,7 +889,7 @@ fn graph_metal_matches_cpu_gated_rms_norm() {
         n_tokens,
         eps,
     });
-    cpu.execute(&g_cpu).unwrap();
+    cpu.execute(&g_cpu, "diff_oracle").unwrap();
     let mut cpu_out_bytes = vec![0u8; total * 4];
     cpu.pool().download(cpu_out, &mut cpu_out_bytes).unwrap();
     let cpu_out_f32 = f32_of_bytes(&cpu_out_bytes);
@@ -918,7 +918,7 @@ fn graph_metal_matches_cpu_gated_rms_norm() {
         n_tokens,
         eps,
     });
-    gpu.execute(&g_gpu).unwrap();
+    gpu.execute(&g_gpu, "diff_oracle").unwrap();
     let mut gpu_out_bytes = vec![0u8; total * 4];
     gpu.pool().download(gpu_out, &mut gpu_out_bytes).unwrap();
     let gpu_out_f32 = f32_of_bytes(&gpu_out_bytes);
@@ -1017,7 +1017,7 @@ fn graph_metal_matches_cpu_compute_decay_beta() {
         num_v_heads,
         n_tokens,
     });
-    cpu.execute(&g_cpu).unwrap();
+    cpu.execute(&g_cpu, "diff_oracle").unwrap();
     let mut cpu_g_bytes = vec![0u8; total * 4];
     let mut cpu_bg_bytes = vec![0u8; total * 4];
     cpu.pool().download(cpu_g, &mut cpu_g_bytes).unwrap();
@@ -1050,7 +1050,7 @@ fn graph_metal_matches_cpu_compute_decay_beta() {
         num_v_heads,
         n_tokens,
     });
-    gpu.execute(&g_gpu).unwrap();
+    gpu.execute(&g_gpu, "diff_oracle").unwrap();
     let mut gpu_g_bytes = vec![0u8; total * 4];
     let mut gpu_bg_bytes = vec![0u8; total * 4];
     gpu.pool().download(gpu_g, &mut gpu_g_bytes).unwrap();
@@ -1135,7 +1135,7 @@ fn graph_metal_matches_cpu_conv1d_step() {
         conv_dim,
         n_tokens,
     });
-    cpu.execute(&g_cpu).unwrap();
+    cpu.execute(&g_cpu, "diff_oracle").unwrap();
     let mut cpu_out_bytes = vec![0u8; out_total * 4];
     cpu.pool().download(cpu_out, &mut cpu_out_bytes).unwrap();
     let cpu_out_f32 = f32_of_bytes(&cpu_out_bytes);
@@ -1166,7 +1166,7 @@ fn graph_metal_matches_cpu_conv1d_step() {
         conv_dim,
         n_tokens,
     });
-    gpu.execute(&g_gpu).unwrap();
+    gpu.execute(&g_gpu, "diff_oracle").unwrap();
     let mut gpu_out_bytes = vec![0u8; out_total * 4];
     gpu.pool().download(gpu_out, &mut gpu_out_bytes).unwrap();
     let gpu_out_f32 = f32_of_bytes(&gpu_out_bytes);
@@ -1265,7 +1265,7 @@ fn graph_metal_matches_cpu_gated_delta_net_step() {
         k_heads_per_v,
         n_tokens,
     });
-    cpu.execute(&g_cpu).unwrap();
+    cpu.execute(&g_cpu, "diff_oracle").unwrap();
     let mut cpu_out_bytes = vec![0u8; out_total * 4];
     cpu.pool().download(cpu_out, &mut cpu_out_bytes).unwrap();
     let cpu_out_f32 = f32_of_bytes(&cpu_out_bytes);
@@ -1302,7 +1302,7 @@ fn graph_metal_matches_cpu_gated_delta_net_step() {
         k_heads_per_v,
         n_tokens,
     });
-    gpu.execute(&g_gpu).unwrap();
+    gpu.execute(&g_gpu, "diff_oracle").unwrap();
     let mut gpu_out_bytes = vec![0u8; out_total * 4];
     gpu.pool().download(gpu_out, &mut gpu_out_bytes).unwrap();
     let gpu_out_f32 = f32_of_bytes(&gpu_out_bytes);

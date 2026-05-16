@@ -31,8 +31,7 @@ use std::time::{Duration, Instant};
 use metal::{Buffer, CommandBufferRef, MTLResourceOptions, NSUInteger};
 
 use moeflux::riir::attn::gpu_attn::{
-    encode_sdpa_causal_flash, encode_sdpa_causal_tiled, BatchedSdpaPipelines,
-    FlashSdpaPipelines,
+    encode_sdpa_causal_flash, FlashSdpaPipelines,
 };
 use moeflux::riir::backend::gpu::gpu_matvec::{
     encode_matvec_n_tokens, MatvecPipelines,
@@ -228,8 +227,6 @@ fn sdpa_flops(m: u64, start_pos: u64, num_heads: u64, head_dim: u64) -> f64 {
 }
 
 fn bench_sdpa(metal: &mut MetalContext) {
-    let pipes =
-        BatchedSdpaPipelines::fetch(metal).expect("fetch BatchedSdpaPipelines");
     let flash_pipes =
         FlashSdpaPipelines::fetch(metal).expect("fetch FlashSdpaPipelines");
 
@@ -268,11 +265,7 @@ fn bench_sdpa(metal: &mut MetalContext) {
         write_buf(&v_buf, &v);
         let out_total =
             m as usize * num_heads as usize * head_dim as usize;
-        let state_total = m as usize * num_heads as usize;
         let out_buf = make_buf::<f32>(metal, out_total);
-        let rmax = make_buf::<f32>(metal, state_total);
-        let rden = make_buf::<f32>(metal, state_total);
-        let vpart = make_buf::<f32>(metal, out_total);
 
         let flops = sdpa_flops(
             m as u64,
@@ -280,20 +273,6 @@ fn bench_sdpa(metal: &mut MetalContext) {
             num_heads as u64,
             head_dim as u64,
         );
-        let encode = |cmd: &CommandBufferRef| {
-            encode_sdpa_causal_tiled(
-                cmd, &pipes, &q_buf, &k_buf, &v_buf, &out_buf, &rmax,
-                &rden, &vpart, m, num_heads, heads_per_kv, head_dim,
-                kv_dim, start_pos, kv_len, scale,
-            );
-        };
-        bench(
-            metal,
-            &format!("sdpa-tiled M={m} kv_len={kv_len}"),
-            flops,
-            &encode,
-        );
-
         let encode_flash = |cmd: &CommandBufferRef| {
             encode_sdpa_causal_flash(
                 cmd, &flash_pipes, &q_buf, &k_buf, &v_buf, &out_buf, m,
@@ -303,7 +282,7 @@ fn bench_sdpa(metal: &mut MetalContext) {
         };
         bench(
             metal,
-            &format!("sdpa-flash M={m} kv_len={kv_len}"),
+            &format!("sdpa M={m} kv_len={kv_len}"),
             flops,
             &encode_flash,
         );

@@ -47,7 +47,7 @@ use metal::NSUInteger;
 use crate::riir::moe::expert_forward::MoeBuffers;
 use crate::riir::backend::BufferPool;
 use crate::riir::io::expert_io::ExpertFiles;
-use crate::riir::attn::gpu_attn::{encode_sdpa_causal_tiled, BatchedSdpaPipelines};
+use crate::riir::attn::gpu_attn::{encode_sdpa_causal_flash, FlashSdpaPipelines};
 use crate::riir::backend::gpu::gpu_matvec::{encode_matvec, MatvecPipelines, MatvecSpec};
 use crate::riir::backend::gpu::gpu_norm::{encode_rms_norm_bf16_into, RmsNormBf16Pipelines};
 use crate::riir::backend::gpu::gpu_ctx::GpuLayerCtx;
@@ -718,30 +718,19 @@ pub(in crate::riir) fn batched_full_attn_layer_forward(
     );
     let attn_out_buf =
         MtlBuffer::<f32>::with_len(&device, n_tokens * q_dim);
-    let state_total = (n_tokens as u32) * (v.num_attn_heads as u32);
-    let running_max = MtlBuffer::<f32>::with_len(&device, state_total as usize);
-    let running_denom =
-        MtlBuffer::<f32>::with_len(&device, state_total as usize);
-    let v_partial = MtlBuffer::<f32>::with_len(
-        &device,
-        (state_total as usize) * v.head_dim,
-    );
 
-    let sdpa_pipes = BatchedSdpaPipelines::fetch(metal)?;
+    let sdpa_pipes = FlashSdpaPipelines::fetch(metal)?;
     let softmax_scale = 1.0f32 / (v.head_dim as f32).sqrt();
     let heads_per_kv = (v.num_attn_heads / v.num_kv_heads) as u32;
     let queue = metal.queue_clone();
     let cmdbuf = queue.new_command_buffer();
-    encode_sdpa_causal_tiled(
+    encode_sdpa_causal_flash(
         cmdbuf,
         &sdpa_pipes,
         q_buf.buffer(),
         k_gpu.buffer(),
         v_gpu.buffer(),
         attn_out_buf.buffer(),
-        running_max.buffer(),
-        running_denom.buffer(),
-        v_partial.buffer(),
         n_tokens as u32,
         v.num_attn_heads as u32,
         heads_per_kv,
@@ -751,7 +740,7 @@ pub(in crate::riir) fn batched_full_attn_layer_forward(
         kv_len_total,
         softmax_scale,
     );
-    metal.commit_and_wait_labeled(cmdbuf, "batched_sdpa_causal_tiled");
+    metal.commit_and_wait_labeled(cmdbuf, "batched_sdpa_causal_flash");
     // Tiled SDPA output is gate-free (per session-2 Phase 3 design).
     // Apply sigmoid_gate per token on host below.
     let attn_out_stack = attn_out_buf.to_vec();
