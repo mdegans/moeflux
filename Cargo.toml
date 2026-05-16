@@ -12,6 +12,7 @@ license       = "MIT"
 repository    = "https://github.com/mdegans/moeflux"
 authors       = [
     "Michael de Gans <michael.john.degans@gmail.com>",
+    "Claude Opus 4.6 (Anthropic) <noreply@anthropic.com>",
     "Claude Opus 4.7 (Anthropic) <noreply@anthropic.com>",
 ]
 
