@@ -54,9 +54,7 @@ use super::gpu_linear_attn::{
     encode_compute_decay_beta, encode_conv1d_step, encode_delta_net_step,
     encode_gated_rms_norm, encode_rms_norm_qk, LinearAttnPipelines,
 };
-use super::gpu_matvec::{
-    encode_matvec, encode_matvec_n_tokens, MatvecPipelines, MatvecSpec,
-};
+use super::gpu_matvec::{encode_matvec, MatvecPipelines, MatvecSpec};
 use super::gpu_norm::{encode_rms_norm_bf16_into, RmsNormBf16Pipelines};
 use super::layer_weight_cache::LayerWeightCache;
 use super::metal::{MetalContext, MetalError};
@@ -222,12 +220,41 @@ pub struct BatchedGraphScratch {
     // Cross-layer hidden double-buffer (orchestrator swaps per layer).
     pub hidden_a: BufId,
     pub hidden_b: BufId,
+    // MoE block (graph2) — shared FFN intermediates.
+    pub shared_ffn_gate: BufId,
+    pub shared_up: BufId,
+    pub shared_act: BufId,
+    pub shared_down: BufId,
+    // MoE block (graph2) — bucket-flat scratch. Sized for
+    // `BATCHED_CHUNK_SIZE * k_active` assignments.
+    pub bucket_input: BufId,
+    pub bucket_gate: BufId,
+    pub bucket_up: BufId,
+    pub bucket_act: BufId,
+    pub bucket_out: BufId,
+    pub bucket_token_idx: BufId,
+    pub bucket_weights: BufId,
+    /// MoE permute-fuse scatter accumulator. `Op::ZeroBuffer` clears
+    /// it each layer before `Op::MoeBatchedPermuteFuse` accumulates.
+    pub out_sum: BufId,
+    /// Pread-mode expert weight blobs, indexed by `expert_id`
+    /// (`num_experts` entries, `expert_size_4bit` bytes each). The
+    /// producer `read_expert`s + `upload`s into the entry for each
+    /// bucket a layer hits. Empty in mmap mode (which addresses
+    /// expert weights via `ExpertFiles::mmap_id_for_expert`).
+    pub expert_blobs: Vec<BufId>,
 }
 
 impl BatchedGraphScratch {
     /// Allocate every batched-graph scratch buffer at max chunk
-    /// width, all `persistent = true`.
-    pub fn new(pool: &mut MetalBufferPool) -> Self {
+    /// width, all `persistent = true`. `k_active` sizes the
+    /// bucket-flat MoE buffers; `pread_mode` gates the per-expert
+    /// weight blobs (skipped in mmap mode).
+    pub fn new(
+        pool: &mut MetalBufferPool,
+        k_active: usize,
+        pread_mode: bool,
+    ) -> Self {
         let v = VARIANT;
         let chunk = super::BATCHED_CHUNK_SIZE;
         let f32_sz = std::mem::size_of::<f32>();
@@ -240,32 +267,115 @@ impl BatchedGraphScratch {
         let total_value = v.linear_total_value();
         let num_v = v.linear_num_v_heads;
         let delta_out = num_v * Variant::LINEAR_VALUE_DIM;
+        let shared_inter = v.shared_intermediate;
+        let moe_inter = v.moe_intermediate;
+        // Bucket-flat buffers hold `chunk * k_active` assignments.
+        let bkt =
+            |per_assignment: usize| chunk * k_active * per_assignment * f32_sz;
+        let (
+            shared_ffn_gate,
+            shared_up,
+            shared_act,
+            shared_down,
+            normed,
+            qkv_stack,
+            z_stack,
+            beta_stack,
+            alpha_stack,
+            conv_out_stack,
+            g_decay_stack,
+            beta_gate_stack,
+            delta_out_stack,
+            value_out_stack,
+            o_proj_stack,
+            gate_logits,
+            h_mid,
+            h_post,
+            shared_gate,
+            routing_indices,
+            routing_weights,
+            hidden_a,
+            hidden_b,
+        ) = (
+            alloc(shared_inter, "bgs.shared_ffn_gate"),
+            alloc(shared_inter, "bgs.shared_up"),
+            alloc(shared_inter, "bgs.shared_act"),
+            alloc(hidden, "bgs.shared_down"),
+            alloc(hidden, "bgs.normed"),
+            alloc(conv, "bgs.qkv_stack"),
+            alloc(total_value, "bgs.z_stack"),
+            alloc(num_v, "bgs.beta_stack"),
+            alloc(num_v, "bgs.alpha_stack"),
+            alloc(conv, "bgs.conv_out_stack"),
+            alloc(num_v, "bgs.g_decay_stack"),
+            alloc(num_v, "bgs.beta_gate_stack"),
+            alloc(delta_out, "bgs.delta_out_stack"),
+            alloc(total_value, "bgs.value_out_stack"),
+            alloc(hidden, "bgs.o_proj_stack"),
+            alloc(v.num_experts, "bgs.gate_logits"),
+            alloc(hidden, "bgs.h_mid"),
+            alloc(hidden, "bgs.h_post"),
+            alloc(1, "bgs.shared_gate"),
+            alloc(super::expert_forward::MAX_K, "bgs.routing_indices"),
+            alloc(super::expert_forward::MAX_K, "bgs.routing_weights"),
+            alloc(hidden, "bgs.hidden_a"),
+            alloc(hidden, "bgs.hidden_b"),
+        );
+        let mut alloc_bytes = |bytes: usize, label: &'static str| {
+            pool.alloc(bytes, label, true)
+                .expect("BatchedGraphScratch::new pool alloc")
+        };
+        let bucket_input = alloc_bytes(bkt(hidden), "bgs.bucket_input");
+        let bucket_gate = alloc_bytes(bkt(moe_inter), "bgs.bucket_gate");
+        let bucket_up = alloc_bytes(bkt(moe_inter), "bgs.bucket_up");
+        let bucket_act = alloc_bytes(bkt(moe_inter), "bgs.bucket_act");
+        let bucket_out = alloc_bytes(bkt(hidden), "bgs.bucket_out");
+        let bucket_token_idx =
+            alloc_bytes(chunk * k_active * f32_sz, "bgs.bucket_token_idx");
+        let bucket_weights =
+            alloc_bytes(chunk * k_active * f32_sz, "bgs.bucket_weights");
+        let out_sum = alloc_bytes(chunk * hidden * f32_sz, "bgs.out_sum");
+        let expert_blobs: Vec<BufId> = if pread_mode {
+            let blob_bytes = v.expert_size_4bit();
+            (0..v.num_experts)
+                .map(|_| alloc_bytes(blob_bytes, "bgs.expert_blob"))
+                .collect()
+        } else {
+            Vec::new()
+        };
         Self {
-            normed: alloc(hidden, "bgs.normed"),
-            qkv_stack: alloc(conv, "bgs.qkv_stack"),
-            z_stack: alloc(total_value, "bgs.z_stack"),
-            beta_stack: alloc(num_v, "bgs.beta_stack"),
-            alpha_stack: alloc(num_v, "bgs.alpha_stack"),
-            conv_out_stack: alloc(conv, "bgs.conv_out_stack"),
-            g_decay_stack: alloc(num_v, "bgs.g_decay_stack"),
-            beta_gate_stack: alloc(num_v, "bgs.beta_gate_stack"),
-            delta_out_stack: alloc(delta_out, "bgs.delta_out_stack"),
-            value_out_stack: alloc(total_value, "bgs.value_out_stack"),
-            o_proj_stack: alloc(hidden, "bgs.o_proj_stack"),
-            gate_logits: alloc(v.num_experts, "bgs.gate_logits"),
-            h_mid: alloc(hidden, "bgs.h_mid"),
-            h_post: alloc(hidden, "bgs.h_post"),
-            shared_gate: alloc(1, "bgs.shared_gate"),
-            routing_indices: alloc(
-                super::expert_forward::MAX_K,
-                "bgs.routing_indices",
-            ),
-            routing_weights: alloc(
-                super::expert_forward::MAX_K,
-                "bgs.routing_weights",
-            ),
-            hidden_a: alloc(hidden, "bgs.hidden_a"),
-            hidden_b: alloc(hidden, "bgs.hidden_b"),
+            normed,
+            qkv_stack,
+            z_stack,
+            beta_stack,
+            alpha_stack,
+            conv_out_stack,
+            g_decay_stack,
+            beta_gate_stack,
+            delta_out_stack,
+            value_out_stack,
+            o_proj_stack,
+            gate_logits,
+            h_mid,
+            h_post,
+            shared_gate,
+            routing_indices,
+            routing_weights,
+            hidden_a,
+            hidden_b,
+            shared_ffn_gate,
+            shared_up,
+            shared_act,
+            shared_down,
+            bucket_input,
+            bucket_gate,
+            bucket_up,
+            bucket_act,
+            bucket_out,
+            bucket_token_idx,
+            bucket_weights,
+            out_sum,
+            expert_blobs,
         }
     }
 }
@@ -2033,11 +2143,7 @@ pub(super) fn batched_linear_attn_layer_forward(
     // `pool.alloc` of the pre-MoE transients.
     scratch: &BatchedGraphScratch,
 ) -> Result<(), LayerForwardError> {
-    use super::expert_forward::{
-        encode_moe_batched_permute_fuse, encode_moe_combine_residual_n_tokens,
-        MAX_K,
-    };
-    use super::metal::MtlBuffer;
+    use super::expert_forward::MAX_K;
     use super::moe_router::build_expert_buckets;
 
     // S10b-1b (session 11): no parts_mut destructure here — Phase 2's
@@ -2378,54 +2484,37 @@ pub(super) fn batched_linear_attn_layer_forward(
     // is preserved by `MetalBackend::execute`'s default loop body).
     backend.execute(&graph)?;
 
-    // Re-borrow parts now that the graph executed and the pool isn't
-    // mutably borrowed. Imperative MoE block (1f-1h) consumes h_mid /
-    // shared_gate / hidden_out via `buffer_pool.handle(id)`.
-    let (metal, wf_buf, buffer_pool) = backend.parts_mut();
-    let device = metal.device().clone();
-    let mv = MatvecPipelines::fetch(metal)?;
-    let hidden_out_buf = buffer_pool.handle(hidden_out_id);
-    // Bulk readback: h_post_stack (for bucket_input gather), routing
-    // indices + weights (for build_expert_buckets). h_mid + shared_gate
-    // stay on GPU.
+    // Host readback at the graph1 → MoE-graph split: h_post (for the
+    // bucket_input gather) + routing indices/weights (for
+    // build_expert_buckets). h_mid / shared_gate stay on GPU.
     let mut h_post_stack = vec![0.0f32; n_tokens * hidden_dim];
+    let mut all_routing_indices = vec![0i32; n_tokens * k_active];
+    let mut all_routing_weights = vec![0.0f32; n_tokens * k_active];
     {
-        let bytes_out: &mut [u8] = unsafe {
+        let pool = backend.pool();
+        pool.download(h_post_id, unsafe {
             std::slice::from_raw_parts_mut(
                 h_post_stack.as_mut_ptr() as *mut u8,
                 n_tokens * hidden_dim * f32_sz_u,
             )
-        };
-        buffer_pool
-            .download(h_post_id, bytes_out)
-            ?;
-    }
-    let mut all_routing_indices = vec![0i32; n_tokens * k_active];
-    {
-        let bytes_out: &mut [u8] = unsafe {
+        })?;
+        pool.download(routing_indices_id, unsafe {
             std::slice::from_raw_parts_mut(
                 all_routing_indices.as_mut_ptr() as *mut u8,
                 n_tokens * k_active * std::mem::size_of::<i32>(),
             )
-        };
-        buffer_pool
-            .download(routing_indices_id, bytes_out)
-            ?;
-    }
-    let mut all_routing_weights = vec![0.0f32; n_tokens * k_active];
-    {
-        let bytes_out: &mut [u8] = unsafe {
+        })?;
+        pool.download(routing_weights_id, unsafe {
             std::slice::from_raw_parts_mut(
                 all_routing_weights.as_mut_ptr() as *mut u8,
                 n_tokens * k_active * f32_sz_u,
             )
-        };
-        buffer_pool
-            .download(routing_weights_id, bytes_out)
-            ?;
+        })?;
     }
 
-    // ── Phase 1f: batched shared FFN. ───────────────────────────
+    // ── Phases 1f-1h as graph2: shared FFN + MoE permute-fuse +
+    //    combine. The shared-expert weight-file bit widths feed the
+    //    matvec WeightRefs.
     let s_gate_bits = bits_of(
         wf,
         &format!(
@@ -2434,9 +2523,7 @@ pub(super) fn batched_linear_attn_layer_forward(
     );
     let s_up_bits = bits_of(
         wf,
-        &format!(
-            "model.layers.{layer_idx}.mlp.shared_expert.up_proj.weight"
-        ),
+        &format!("model.layers.{layer_idx}.mlp.shared_expert.up_proj.weight"),
     );
     let s_down_bits = bits_of(
         wf,
@@ -2444,107 +2531,8 @@ pub(super) fn batched_linear_attn_layer_forward(
             "model.layers.{layer_idx}.mlp.shared_expert.down_proj.weight"
         ),
     );
-    let shared_gate_w = layer_cache.shared.gate_w;
-    let shared_gate_s = layer_cache.shared.gate_s;
-    let shared_gate_b = layer_cache.shared.gate_b;
-    let shared_up_w = layer_cache.shared.up_w;
-    let shared_up_s = layer_cache.shared.up_s;
-    let shared_up_b = layer_cache.shared.up_b;
-    let shared_down_w = layer_cache.shared.down_w;
-    let shared_down_s = layer_cache.shared.down_s;
-    let shared_down_b = layer_cache.shared.down_b;
-    let h_post_buf =
-        MtlBuffer::<f32>::with_data(&device, &h_post_stack);
-    // Shared FFN's gate-proj output (NOT the per-token sigmoid scalar
-    // from Phase 1e — that one is `shared_gate_buf` and is still in
-    // scope). Renamed from `shared_gate_buf` to `shared_ffn_gate_buf`
-    // so the GPU combine kernel below reads the right buffer.
-    let shared_ffn_gate_buf = MtlBuffer::<f32>::with_len(
-        &device,
-        n_tokens * v.shared_intermediate,
-    );
-    let shared_up_buf = MtlBuffer::<f32>::with_len(
-        &device,
-        n_tokens * v.shared_intermediate,
-    );
-    let shared_act_buf = MtlBuffer::<f32>::with_len(
-        &device,
-        n_tokens * v.shared_intermediate,
-    );
-    let shared_down_buf =
-        MtlBuffer::<f32>::with_len(&device, n_tokens * hidden_dim);
-    let swiglu_pso = metal.pipeline("swiglu_fused")?.clone();
-    // S7-1a fusion: 1f (shared FFN) + 1g (MoE permute-fuse) share
-    // one cmdbuf. GPU encodes 1f while CPU prepares 1g's bucket data;
-    // 1g dispatches on the same cmdbuf after 1f.
-    let moe_queue = metal.queue_clone();
-    let moe_cmdbuf = moe_queue.new_command_buffer();
-    encode_matvec_n_tokens(
-        moe_cmdbuf,
-        &mv,
-        wf_buf.buffer(),
-        shared_gate_w,
-        shared_gate_s,
-        shared_gate_b,
-        h_post_buf.buffer(),
-        0,
-        shared_ffn_gate_buf.buffer(),
-        0,
-        hidden_dim as u32,
-        v.shared_intermediate as u32,
-        n_tokens as u32,
-        s_gate_bits,
-    );
-    encode_matvec_n_tokens(
-        moe_cmdbuf,
-        &mv,
-        wf_buf.buffer(),
-        shared_up_w,
-        shared_up_s,
-        shared_up_b,
-        h_post_buf.buffer(),
-        0,
-        shared_up_buf.buffer(),
-        0,
-        hidden_dim as u32,
-        v.shared_intermediate as u32,
-        n_tokens as u32,
-        s_up_bits,
-    );
-    {
-        let enc = moe_cmdbuf.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&swiglu_pso);
-        enc.set_buffer(0, Some(shared_ffn_gate_buf.buffer()), 0);
-        enc.set_buffer(1, Some(shared_up_buf.buffer()), 0);
-        enc.set_buffer(2, Some(shared_act_buf.buffer()), 0);
-        let dim = (n_tokens * v.shared_intermediate) as u32;
-        enc.set_bytes(3, 4, (&dim as *const u32).cast());
-        let num_tgs = (dim + 255) / 256;
-        enc.dispatch_thread_groups(
-            MTLSize::new(num_tgs as NSUInteger, 1, 1),
-            MTLSize::new(256, 1, 1),
-        );
-        enc.end_encoding();
-    }
-    encode_matvec_n_tokens(
-        moe_cmdbuf,
-        &mv,
-        wf_buf.buffer(),
-        shared_down_w,
-        shared_down_s,
-        shared_down_b,
-        shared_act_buf.buffer(),
-        0,
-        shared_down_buf.buffer(),
-        0,
-        v.shared_intermediate as u32,
-        hidden_dim as u32,
-        n_tokens as u32,
-        s_down_bits,
-    );
-    // 1f encoded — fall through to 1g CPU bucket prep without committing.
 
-    // ── Phase 1g: batched MoE permute-fuse. ─────────────────────
+    // CPU bucket prep — needs the routing readback above.
     let buckets = build_expert_buckets(
         &all_routing_indices,
         &all_routing_weights,
@@ -2555,20 +2543,6 @@ pub(super) fn batched_linear_attn_layer_forward(
     let total_assignments = buckets.token_idx.len();
     debug_assert_eq!(total_assignments, n_tokens * k_active);
 
-    // Expert weight buffers — three sources, evaluated per bucket:
-    //
-    // - **Prefetch hit** (Phase 3): caller dispatched async prefetch
-    //   before this call. If this bucket's expert matches any of the
-    //   predicted-and-loaded indices, bind `moe.data_prefetch[set][slot]`.
-    // - **Mmap miss**: `mode == Mmap` → bind the layer-wide mmap'd
-    //   Metal buffer with `expert_idx * expert_size` offset. Zero I/O.
-    // - **Pread miss**: read into a fresh `MtlBuffer<u8>` via
-    //   `read_expert` + `MtlBuffer::with_data`. Same as the pre-Phase-3
-    //   path.
-    //
-    // Mmap mode is hot-pathed: no prefetch (caller passes `None`), no
-    // owned blobs. Pread mode at small N may have prefetch hits.
-    let expert_size = v.expert_size_4bit();
     let mode = expert_files.mode();
     let num_buckets = buckets.expert_ids.len();
     let mut bucket_prefetch_slot: Vec<Option<usize>> = vec![None; num_buckets];
@@ -2585,53 +2559,59 @@ pub(super) fn batched_linear_attn_layer_forward(
                 }
             }
         }
-        pe.prefetch.record_outcome(
-            hit_count,
-            num_buckets as u64 - hit_count,
-        );
+        pe.prefetch
+            .record_outcome(hit_count, num_buckets as u64 - hit_count);
     }
 
-    let mut owned_blobs: Vec<Option<MtlBuffer<u8>>> = (0..num_buckets)
-        .map(|_| None)
-        .collect();
+    // Pread misses: read the expert blob into a host scratch, then
+    // upload it into this expert's run-lifetime `expert_blobs` slot
+    // (indexed by `expert_id` — distinct per bucket).
     if mode == super::expert_io::ExpertIoMode::Pread {
-        let mut blob_scratch = vec![0u8; expert_size];
+        let mut blob_scratch = vec![0u8; v.expert_size_4bit()];
+        let pool = backend.pool_mut();
         for (bi, &expert_id) in buckets.expert_ids.iter().enumerate() {
             if bucket_prefetch_slot[bi].is_some() {
                 continue;
             }
-            expert_files
-                .read_expert(layer_idx, expert_id as usize, &mut blob_scratch)?;
-            owned_blobs[bi] =
-                Some(MtlBuffer::<u8>::with_data(&device, &blob_scratch));
+            expert_files.read_expert(
+                layer_idx,
+                expert_id as usize,
+                &mut blob_scratch,
+            )?;
+            pool.upload(
+                scratch.expert_blobs[expert_id as usize],
+                &blob_scratch,
+            )?;
         }
     }
 
-    let expert_refs: Vec<super::expert_forward::ExpertRef<'_>> = buckets
+    // Per-bucket expert weight `(BufId, byte offset)` — three sources:
+    // prefetch hit, mmap layer buffer, or the uploaded pread blob.
+    let expert_refs: Vec<(super::graph::BufId, u64)> = buckets
         .expert_ids
         .iter()
         .enumerate()
         .map(|(bi, &expert_id)| {
             if let Some(buf_idx) = bucket_prefetch_slot[bi] {
-                let pe = prefetch.as_ref().expect("prefetch slot requires env");
-                let buf = moe_buffers.data_prefetch_buffer(
-                    buffer_pool,
-                    pe.prefetch_set,
-                    buf_idx,
-                );
-                (buf, 0u64)
+                let pe =
+                    prefetch.as_ref().expect("prefetch slot requires env");
+                (
+                    moe_buffers.data_prefetch_id(pe.prefetch_set, buf_idx),
+                    0u64,
+                )
             } else if mode == super::expert_io::ExpertIoMode::Mmap {
                 expert_files
-                    .mmap_buffer_for_expert(layer_idx, expert_id as u32)
+                    .mmap_id_for_expert(layer_idx, expert_id as u32)
                     .expect("mmap layer present in mmap mode")
             } else {
-                let blob =
-                    owned_blobs[bi].as_ref().expect("synced miss has owned blob");
-                (blob.buffer(), 0u64)
+                (scratch.expert_blobs[expert_id as usize], 0u64)
             }
         })
         .collect();
 
+    // bucket_input host permute: gather each assignment's token row
+    // from h_post into bucket-flat order. Then upload it + the small
+    // routing tables into the run-lifetime scratch buffers.
     let mut bucket_input_host = vec![0.0f32; total_assignments * hidden_dim];
     for assignment_idx in 0..total_assignments {
         let t = buckets.token_idx[assignment_idx] as usize;
@@ -2639,70 +2619,119 @@ pub(super) fn batched_linear_attn_layer_forward(
         let dst_off = assignment_idx * hidden_dim;
         bucket_input_host[dst_off..dst_off + hidden_dim].copy_from_slice(src);
     }
+    {
+        let pool = backend.pool_mut();
+        pool.upload(scratch.bucket_input, unsafe {
+            std::slice::from_raw_parts(
+                bucket_input_host.as_ptr() as *const u8,
+                total_assignments * hidden_dim * f32_sz_u,
+            )
+        })?;
+        pool.upload(scratch.bucket_token_idx, unsafe {
+            std::slice::from_raw_parts(
+                buckets.token_idx.as_ptr() as *const u8,
+                total_assignments * std::mem::size_of::<i32>(),
+            )
+        })?;
+        pool.upload(scratch.bucket_weights, unsafe {
+            std::slice::from_raw_parts(
+                buckets.weights.as_ptr() as *const u8,
+                total_assignments * f32_sz_u,
+            )
+        })?;
+    }
 
-    let bucket_input =
-        MtlBuffer::<f32>::with_data(&device, &bucket_input_host);
-    let bucket_gate = MtlBuffer::<f32>::with_len(
-        &device,
-        total_assignments * v.moe_intermediate,
-    );
-    let bucket_up = MtlBuffer::<f32>::with_len(
-        &device,
-        total_assignments * v.moe_intermediate,
-    );
-    let bucket_act = MtlBuffer::<f32>::with_len(
-        &device,
-        total_assignments * v.moe_intermediate,
-    );
-    let bucket_out =
-        MtlBuffer::<f32>::with_len(&device, total_assignments * hidden_dim);
-    let bucket_token_idx =
-        MtlBuffer::<i32>::with_data(&device, &buckets.token_idx);
-    let bucket_weights =
-        MtlBuffer::<f32>::with_data(&device, &buckets.weights);
-    let out_sum_zeros = vec![0.0f32; n_tokens * hidden_dim];
-    let out_sum = MtlBuffer::<f32>::with_data(&device, &out_sum_zeros);
-
-    let bucket_accumulate =
-        metal.pipeline("moe_bucket_accumulate")?.clone();
-    // 1g encodes into the same cmdbuf the 1f block opened above —
-    // single commit fuses shared FFN + MoE permute-fuse.
-    encode_moe_batched_permute_fuse(
-        moe_cmdbuf,
-        &mv,
-        &swiglu_pso,
-        &bucket_accumulate,
-        &expert_refs,
-        bucket_input.buffer(),
-        bucket_gate.buffer(),
-        bucket_up.buffer(),
-        bucket_act.buffer(),
-        bucket_out.buffer(),
-        bucket_token_idx.buffer(),
-        bucket_weights.buffer(),
-        out_sum.buffer(),
-        &buckets,
-        v,
-    );
-    // S7-2: GPU combine into hidden_out_buf — replaces the CPU loop
-    // that read h_mid_stack / shared_out_stack / shared_gate_scores /
-    // moe_sum_host. Encoded into the same moe_cmdbuf as 1f/1g.
-    let combine_pso = metal
-        .pipeline("moe_combine_residual_n_tokens")?
-        .clone();
-    encode_moe_combine_residual_n_tokens(
-        moe_cmdbuf,
-        &combine_pso,
-        // S10b-1b: h_mid + shared_gate live in the graph-mode pool now.
-        buffer_pool.handle(h_mid_id),
-        out_sum.buffer(),
-        shared_down_buf.buffer(),
-        buffer_pool.handle(shared_gate_id),
-        hidden_out_buf,
-        n_tokens as u32,
-        hidden_dim as u32,
-    );
-    metal.commit_and_wait_labeled(moe_cmdbuf, "batched_la_shared_ffn_moe_combine");
+    // graph2: shared FFN (gate/up matvec → swiglu → down matvec),
+    // zero the out_sum accumulator, MoE permute-fuse, combine into
+    // hidden_out.
+    let graph2 = {
+        let mut g = Graph::new();
+        g.push(Op::MatvecNTokens {
+            label: "linear_attn.shared_gate_proj",
+            weight: WeightRef {
+                w_off: layer_cache.shared.gate_w,
+                s_off: layer_cache.shared.gate_s,
+                b_off: layer_cache.shared.gate_b,
+                bits: s_gate_bits,
+            },
+            input: h_post_id,
+            input_off: 0,
+            output: scratch.shared_ffn_gate,
+            output_off: 0,
+            in_dim: hidden_dim as u32,
+            out_dim: v.shared_intermediate as u32,
+            n_tokens: n_tokens as u32,
+        });
+        g.push(Op::MatvecNTokens {
+            label: "linear_attn.shared_up_proj",
+            weight: WeightRef {
+                w_off: layer_cache.shared.up_w,
+                s_off: layer_cache.shared.up_s,
+                b_off: layer_cache.shared.up_b,
+                bits: s_up_bits,
+            },
+            input: h_post_id,
+            input_off: 0,
+            output: scratch.shared_up,
+            output_off: 0,
+            in_dim: hidden_dim as u32,
+            out_dim: v.shared_intermediate as u32,
+            n_tokens: n_tokens as u32,
+        });
+        g.push(Op::SwigluFusedBatched {
+            label: "linear_attn.shared_swiglu",
+            gate: scratch.shared_ffn_gate,
+            up: scratch.shared_up,
+            out: scratch.shared_act,
+            total: (n_tokens * v.shared_intermediate) as u32,
+        });
+        g.push(Op::MatvecNTokens {
+            label: "linear_attn.shared_down_proj",
+            weight: WeightRef {
+                w_off: layer_cache.shared.down_w,
+                s_off: layer_cache.shared.down_s,
+                b_off: layer_cache.shared.down_b,
+                bits: s_down_bits,
+            },
+            input: scratch.shared_act,
+            input_off: 0,
+            output: scratch.shared_down,
+            output_off: 0,
+            in_dim: v.shared_intermediate as u32,
+            out_dim: hidden_dim as u32,
+            n_tokens: n_tokens as u32,
+        });
+        g.push(Op::ZeroBuffer {
+            label: "linear_attn.moe_out_sum_zero",
+            buf: scratch.out_sum,
+            n_bytes: (n_tokens * hidden_dim * f32_sz_u) as u32,
+        });
+        g.push(Op::MoeBatchedPermuteFuse {
+            label: "linear_attn.moe_permute_fuse",
+            expert_refs,
+            bucket_input: scratch.bucket_input,
+            bucket_gate: scratch.bucket_gate,
+            bucket_up: scratch.bucket_up,
+            bucket_act: scratch.bucket_act,
+            bucket_out: scratch.bucket_out,
+            bucket_token_idx: scratch.bucket_token_idx,
+            bucket_weights: scratch.bucket_weights,
+            out_sum: scratch.out_sum,
+            buckets,
+        });
+        g.push(Op::MoeCombineResidualNTokens {
+            label: "linear_attn.moe_combine",
+            h_mid: h_mid_id,
+            moe_sum: scratch.out_sum,
+            shared_out: scratch.shared_down,
+            shared_gate: shared_gate_id,
+            hidden_out: hidden_out_id,
+            n_tokens: n_tokens as u32,
+            dim: hidden_dim as u32,
+        });
+        g
+    };
+    backend.execute(&graph2)?;
 
     // Phase 3: record this layer's actual routing as the prediction
     // for the next token's same layer. Only meaningful at N=1

@@ -1292,10 +1292,15 @@ impl RsCtx<MetalBackend> {
             self.linear_buffers = Some(LinearAttnBuffers::new(pool));
         }
         if self.batched_graph_scratch.is_none() {
+            let k_active = self.k_active;
+            let pread =
+                self.experts.mode() == expert_io::ExpertIoMode::Pread;
             let pool =
                 self.backend.as_mut().expect("just-set").pool_mut();
             self.batched_graph_scratch = Some(
-                linear_attn_forward::BatchedGraphScratch::new(pool),
+                linear_attn_forward::BatchedGraphScratch::new(
+                    pool, k_active, pread,
+                ),
             );
         }
         if self.moe_buffers.is_none() {
