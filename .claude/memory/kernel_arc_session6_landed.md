@@ -206,7 +206,10 @@ P7's gather GEMM already landed there; revisit the gather kernel's
 tile efficiency for ragged M only after the recurrence.
 
 ## Next
-The prefill arc's next target is named: **`gated_delta_net_step`**.
-Needs a design pass (chunkwise-parallel recurrence) → plan → execute.
+1. Warm-up: the binary↔weights mismatch guard —
+   `future_work_model_binary_mismatch_guard.md` (3-part: moeflux
+   descriptive error + drama_llama un-panic + blallama mapping).
+2. The prefill arc's headline target: **`gated_delta_net_step`** —
+   design pass (chunkwise-parallel recurrence) → plan → execute.
 Optional: claim-grade reboot-clean P7 bench A/B (the directional
 figures are already trustworthy).
