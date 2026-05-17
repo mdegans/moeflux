@@ -152,7 +152,32 @@ zero-warning. moeflux-mlx 12/12; moeflux lib 69/69; canary cosine
 - `f97ddcf` P7 Part 2 — dense matmuls → MLX `qmm_t`; gather-QMM bind.
 - `16e82e1` P7 Part 1 — MoE permute-fuse via MLX gather-QMM.
 
+## Directional bench (2026-05-17)
+`MOEFLUX_MOE_GATHER` env A/B on one binary, n=3, `prefill_prompt.txt`
+992 tokens single chunk. Machine rebooted ~1h before the session,
+lightly used — close to claim-grade; both configs share a binary and
+the OFF run went second (warmer cache → conservative for the win).
+
+| model | gather OFF | gather ON (warm) | speedup |
+|-------|-----------|------------------|---------|
+| a3b   | 137.5 tok/s | 231.5 tok/s     | 1.68×   |
+| a17b  | 10.66 tok/s | 12.58 tok/s     | 1.18×   |
+
+a17b's win is IO-capped: it streams far more expert weight per token,
+so prefill is partly `pread`/mmap-bound and the GEMM speedup can't
+recover that share. a3b is compute-dominated → near-full-value. (a3b
+session-6 992-token prefill was 74.66 tok/s; P7 + session-7+ kernel
+work compound to 231.)
+
+a17b generation (essay, 512 tok, n=3): **1.817 tok/s** (stdev 0.017,
+`decode_hit=0.289`). Within the historical ~1.75–1.97 band — no
+detectable movement. Expected: gather is prefill-only; Part 2's
+`qmm_t` touches the per-token path but decode is IO-bound, so the
+matmul was never the decode pole.
+
 ## Next
-Bench A/B (Mike action) — reboot, n≥3, `MOEFLUX_MOE_GATHER` on vs off,
-quantify the gather-GEMM win on a3b prefill. P7 is functionally
-complete but unmeasured.
+Claim-grade bench A/B (Mike, reboot-clean) optional — the directional
+figures above are already trustworthy. Then the kernel/prefill arc
+per `qwen_graph_mode_session12_landed`; a17b's IO-bound prefill is a
+candidate target (expert-IO refactor) since compute wins are capped
+there.
