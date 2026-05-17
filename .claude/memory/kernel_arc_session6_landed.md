@@ -175,9 +175,38 @@ detectable movement. Expected: gather is prefill-only; Part 2's
 `qmm_t` touches the per-token path but decode is IO-bound, so the
 matmul was never the decode pole.
 
+## Per-op prefill breakdown (2026-05-17)
+`MOEFLUX_PROFILE_PER_OP=1`, a3b, 992-token prefill. The per-op
+breakdown is now *emitted* — drama_llama `f650d64` wired
+`MoefluxDecoder/Session::log_cmdbuf_stats` → blallama logs one
+`moeflux_cmdbuf_op` event per label. (The profiler itself was never
+broken; an earlier "crash" was a stale `--no-build` a17b binary on
+a3b weights.) Proportion analysis only — per-op forfeits commit
+fusion, absolute time inflated.
+
+a3b is 40 layers: **30 linear-attn + 10 full-attn**. Top Ops by
+share of prefill GPU wait:
+
+| share | Op | per |
+|-------|----|----|
+| 27.9% | `linear_attn.gated_delta_net_step` | ×30 |
+| 20.6% | `linear_attn.moe_permute_fuse` | ×30 |
+| 12.1% | `batched_shared_ffn_moe_combine` | ×10 |
+|  7.4% | `batched_sdpa_causal_flash` | ×10 |
+|  5.6% | `linear_attn.qkv_proj` | ×30 |
+
+Top-2 = 48%; top-4 = 68%. **The headline target is the GatedDeltaNet
+recurrence (`gated_delta_net_step`, `Op::GatedDeltaNetStepNTokens`)
+at 28%** — the linear-attn state recurrence. Session-5 batched the
+linear-attn *projections* (3.42×) but the recurrence core is still
+the pole. Likely fix: the **chunkwise-parallel DeltaNet** formulation
+(intra-chunk parallel matmuls + inter-chunk sequential state carry)
+rather than a token-stepped scan. `moe_permute_fuse` at 21% is #2 —
+P7's gather GEMM already landed there; revisit the gather kernel's
+tile efficiency for ragged M only after the recurrence.
+
 ## Next
-Claim-grade bench A/B (Mike, reboot-clean) optional — the directional
-figures above are already trustworthy. Then the kernel/prefill arc
-per `qwen_graph_mode_session12_landed`; a17b's IO-bound prefill is a
-candidate target (expert-IO refactor) since compute wins are capped
-there.
+The prefill arc's next target is named: **`gated_delta_net_step`**.
+Needs a design pass (chunkwise-parallel recurrence) → plan → execute.
+Optional: claim-grade reboot-clean P7 bench A/B (the directional
+figures are already trustworthy).
