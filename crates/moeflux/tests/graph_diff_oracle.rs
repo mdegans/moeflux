@@ -756,7 +756,7 @@ fn graph_metal_matches_cpu_colored() {
 #[test]
 #[ignore = "long-running GPU test"]
 fn graph_metal_matches_cpu_rms_norm_qk() {
-    let n_tokens: u32 = 4;
+    let n_tokens: u32 = 16;
     let num_k_heads: u32 = 8;
     let key_dim: u32 = 32;
     // No gap between q and k (key_offset_per_token == q region size).
@@ -838,7 +838,7 @@ fn graph_metal_matches_cpu_rms_norm_qk() {
 #[test]
 #[ignore = "long-running GPU test"]
 fn graph_metal_matches_cpu_gated_rms_norm() {
-    let n_tokens: u32 = 4;
+    let n_tokens: u32 = 16;
     let num_v_heads: u32 = 8;
     let value_dim: u32 = 32;
     let eps: f32 = 1e-6;
@@ -949,7 +949,7 @@ fn graph_metal_matches_cpu_gated_rms_norm() {
 #[test]
 #[ignore = "long-running GPU test"]
 fn graph_metal_matches_cpu_compute_decay_beta() {
-    let n_tokens: u32 = 4;
+    let n_tokens: u32 = 16;
     let num_v_heads: u32 = 8;
     let per_token = num_v_heads as usize;
     let total = n_tokens as usize * per_token;

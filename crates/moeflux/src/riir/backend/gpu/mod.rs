@@ -796,36 +796,36 @@ impl Backend for MetalBackend {
                 ..
             } => {
                 // In-place per-head RMS-norm on q and k regions of `x`.
-                // Each token's slot is `per_token_total` floats; q
-                // region at offset 0, k region at offset
-                // `key_offset_per_token`. For q|k|v layouts (linear-
-                // attn `conv_out`) `per_token_total` includes the V
-                // region trailing K. Matches `rms_norm_qk_n_tokens_cpu`.
+                // Single batched dispatch: `(num_k_heads, n_tokens)`
+                // threadgroups × `key_dim` threads. Each token's slot
+                // is `per_token_total` floats; q region at offset 0, k
+                // region at offset `key_offset_per_token`. For q|k|v
+                // layouts (linear-attn `conv_out`) `per_token_total`
+                // includes the V region trailing K. Matches
+                // `rms_norm_qk_n_tokens_cpu`.
                 let inv_scale = 1.0f32 / (*key_dim as f32).sqrt();
-                let per_token_bytes = (*per_token_total as u64) * 4;
-                let k_byte_off = (*key_offset_per_token as u64) * 4;
                 let x_buf = self.pool.handle(*x);
                 let key_dim_arg = *key_dim;
-                for t in 0..*n_tokens {
-                    let token_base = (t as u64) * per_token_bytes;
-                    let enc = cmd.new_compute_command_encoder();
-                    enc.set_compute_pipeline_state(
-                        &self.linear_attn_pipes.rms_norm_qk,
-                    );
-                    enc.set_buffer(0, Some(x_buf), token_base as NSUInteger);
-                    enc.set_buffer(
+                let ptt = *per_token_total;
+                let kopt = *key_offset_per_token;
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(
+                    &self.linear_attn_pipes.rms_norm_qk,
+                );
+                enc.set_buffer(0, Some(x_buf), 0);
+                enc.set_bytes(1, 4, (&key_dim_arg as *const u32).cast());
+                enc.set_bytes(2, 4, (&inv_scale as *const f32).cast());
+                enc.set_bytes(3, 4, (&ptt as *const u32).cast());
+                enc.set_bytes(4, 4, (&kopt as *const u32).cast());
+                enc.dispatch_thread_groups(
+                    MTLSize::new(
+                        *num_k_heads as NSUInteger,
+                        *n_tokens as NSUInteger,
                         1,
-                        Some(x_buf),
-                        (token_base + k_byte_off) as NSUInteger,
-                    );
-                    enc.set_bytes(2, 4, (&key_dim_arg as *const u32).cast());
-                    enc.set_bytes(3, 4, (&inv_scale as *const f32).cast());
-                    enc.dispatch_thread_groups(
-                        MTLSize::new(*num_k_heads as NSUInteger, 1, 1),
-                        MTLSize::new(*key_dim as NSUInteger, 1, 1),
-                    );
-                    enc.end_encoding();
-                }
+                    ),
+                    MTLSize::new(*key_dim as NSUInteger, 1, 1),
+                );
+                enc.end_encoding();
             }
             Op::SdpaCausalTiled { .. } => {
                 todo!(
@@ -930,46 +930,40 @@ impl Backend for MetalBackend {
                 n_tokens,
                 ..
             } => {
-                // Per-token loop: each token's alpha / beta are
-                // `num_v_heads` floats, tightly packed token-major.
-                // Outputs `g_decay` and `beta_gate` follow the same
-                // layout. a_log + dt_bias are shared per-head weights.
-                let per_token_bytes = (*num_v_heads as u64) * 4;
+                // Single batched dispatch: `(n_tokens)` threadgroups ×
+                // `(num_v_heads)` threads. alpha / beta / g_decay /
+                // beta_gate are token-major `[n_tokens * num_v_heads]`;
+                // the kernel flattens `idx = t * num_v_heads + head`.
+                // a_log + dt_bias are shared per-head weights.
                 let alpha_buf = self.pool.handle(*alpha_in);
                 let beta_buf = self.pool.handle(*beta_in);
                 let g_decay_buf = self.pool.handle(*g_decay_out);
                 let beta_gate_buf = self.pool.handle(*beta_gate_out);
                 let nvh = *num_v_heads;
-                for t in 0..*n_tokens {
-                    let off = (t as u64) * per_token_bytes;
-                    let enc = cmd.new_compute_command_encoder();
-                    enc.set_compute_pipeline_state(
-                        &self.linear_attn_pipes.compute_decay_beta,
-                    );
-                    enc.set_buffer(0, Some(alpha_buf), off as NSUInteger);
-                    enc.set_buffer(1, Some(beta_buf), off as NSUInteger);
-                    enc.set_buffer(
-                        2,
-                        Some(self.wf_buf.buffer()),
-                        *a_log_off as NSUInteger,
-                    );
-                    enc.set_buffer(
-                        3,
-                        Some(self.wf_buf.buffer()),
-                        *dt_bias_off as NSUInteger,
-                    );
-                    enc.set_buffer(4, Some(g_decay_buf), off as NSUInteger);
-                    enc.set_buffer(
-                        5,
-                        Some(beta_gate_buf),
-                        off as NSUInteger,
-                    );
-                    enc.dispatch_thread_groups(
-                        MTLSize::new(1, 1, 1),
-                        MTLSize::new(nvh as NSUInteger, 1, 1),
-                    );
-                    enc.end_encoding();
-                }
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(
+                    &self.linear_attn_pipes.compute_decay_beta,
+                );
+                enc.set_buffer(0, Some(alpha_buf), 0);
+                enc.set_buffer(1, Some(beta_buf), 0);
+                enc.set_buffer(
+                    2,
+                    Some(self.wf_buf.buffer()),
+                    *a_log_off as NSUInteger,
+                );
+                enc.set_buffer(
+                    3,
+                    Some(self.wf_buf.buffer()),
+                    *dt_bias_off as NSUInteger,
+                );
+                enc.set_buffer(4, Some(g_decay_buf), 0);
+                enc.set_buffer(5, Some(beta_gate_buf), 0);
+                enc.set_bytes(6, 4, (&nvh as *const u32).cast());
+                enc.dispatch_thread_groups(
+                    MTLSize::new(*n_tokens as NSUInteger, 1, 1),
+                    MTLSize::new(nvh as NSUInteger, 1, 1),
+                );
+                enc.end_encoding();
             }
             Op::GatedDeltaNetStepNTokens {
                 state,
@@ -1047,39 +1041,42 @@ impl Backend for MetalBackend {
                 eps,
                 ..
             } => {
-                // Per-token loop. Each token reads one per-head slot
-                // from `values` and `z` (tightly packed token-major)
-                // and writes to `output` at the matching slot.
-                // Weight is shared across tokens (value_dim bf16).
-                let per_token_bytes =
-                    (*num_v_heads * *value_dim) as u64 * 4;
+                // Single batched dispatch: `(num_v_heads, n_tokens)`
+                // threadgroups × `value_dim` threads. values / z /
+                // output are token-major `[n_tokens * num_v_heads *
+                // value_dim]`; the kernel addresses each per-head slot
+                // via `(t * num_v_heads + head) * value_dim`. Weight is
+                // shared across heads and tokens (value_dim bf16).
                 let values_buf = self.pool.handle(*values);
                 let z_buf = self.pool.handle(*z);
                 let output_buf = self.pool.handle(*output);
                 let value_dim_arg = *value_dim;
                 let eps_arg = *eps;
-                for t in 0..*n_tokens {
-                    let off = (t as u64) * per_token_bytes;
-                    let enc = cmd.new_compute_command_encoder();
-                    enc.set_compute_pipeline_state(
-                        &self.linear_attn_pipes.gated_rms_norm,
-                    );
-                    enc.set_buffer(0, Some(values_buf), off as NSUInteger);
-                    enc.set_buffer(1, Some(z_buf), off as NSUInteger);
-                    enc.set_buffer(
-                        2,
-                        Some(self.wf_buf.buffer()),
-                        *weight_off as NSUInteger,
-                    );
-                    enc.set_buffer(3, Some(output_buf), off as NSUInteger);
-                    enc.set_bytes(4, 4, (&value_dim_arg as *const u32).cast());
-                    enc.set_bytes(5, 4, (&eps_arg as *const f32).cast());
-                    enc.dispatch_thread_groups(
-                        MTLSize::new(*num_v_heads as NSUInteger, 1, 1),
-                        MTLSize::new(*value_dim as NSUInteger, 1, 1),
-                    );
-                    enc.end_encoding();
-                }
+                let nvh = *num_v_heads;
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(
+                    &self.linear_attn_pipes.gated_rms_norm,
+                );
+                enc.set_buffer(0, Some(values_buf), 0);
+                enc.set_buffer(1, Some(z_buf), 0);
+                enc.set_buffer(
+                    2,
+                    Some(self.wf_buf.buffer()),
+                    *weight_off as NSUInteger,
+                );
+                enc.set_buffer(3, Some(output_buf), 0);
+                enc.set_bytes(4, 4, (&value_dim_arg as *const u32).cast());
+                enc.set_bytes(5, 4, (&eps_arg as *const f32).cast());
+                enc.set_bytes(6, 4, (&nvh as *const u32).cast());
+                enc.dispatch_thread_groups(
+                    MTLSize::new(
+                        nvh as NSUInteger,
+                        *n_tokens as NSUInteger,
+                        1,
+                    ),
+                    MTLSize::new(value_dim_arg as NSUInteger, 1, 1),
+                );
+                enc.end_encoding();
             }
         }
     }

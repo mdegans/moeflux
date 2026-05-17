@@ -72,8 +72,9 @@ pub fn encode_conv1d_step(
     enc.end_encoding();
 }
 
-/// Encode `rms_norm_qk` with q at offset 0, k at offset
-/// `LINEAR_TOTAL_KEY * sizeof(float)` of the conv-output buffer.
+/// Encode `rms_norm_qk` for a single token — the `n_tokens = 1` case
+/// of the batched kernel. q region at offset 0, k region at
+/// `LINEAR_TOTAL_KEY` floats into the conv-output buffer.
 /// `num_k_heads` threadgroups × `key_dim` threads.
 pub fn encode_rms_norm_qk(
     cmdbuf: &CommandBufferRef,
@@ -83,14 +84,18 @@ pub fn encode_rms_norm_qk(
     key_dim: u32,
 ) {
     let inv_scale = 1.0f32 / (key_dim as f32).sqrt();
-    let k_off = (VARIANT.linear_total_key()) * std::mem::size_of::<f32>();
+    let key_offset_per_token = VARIANT.linear_total_key() as u32;
+    // Stride between tokens — unused at n_tokens=1 (t=0); passed as a
+    // consistent value covering the q and k regions.
+    let per_token_total = key_offset_per_token + num_k_heads * key_dim;
 
     let enc = cmdbuf.new_compute_command_encoder();
     enc.set_compute_pipeline_state(pipeline);
     enc.set_buffer(0, Some(conv_out), 0);
-    enc.set_buffer(1, Some(conv_out), k_off as NSUInteger);
-    enc.set_bytes(2, 4, (&key_dim as *const u32).cast());
-    enc.set_bytes(3, 4, (&inv_scale as *const f32).cast());
+    enc.set_bytes(1, 4, (&key_dim as *const u32).cast());
+    enc.set_bytes(2, 4, (&inv_scale as *const f32).cast());
+    enc.set_bytes(3, 4, (&per_token_total as *const u32).cast());
+    enc.set_bytes(4, 4, (&key_offset_per_token as *const u32).cast());
     enc.dispatch_thread_groups(
         MTLSize::new(num_k_heads as NSUInteger, 1, 1),
         MTLSize::new(key_dim as NSUInteger, 1, 1),
@@ -98,12 +103,13 @@ pub fn encode_rms_norm_qk(
     enc.end_encoding();
 }
 
-/// Encode `compute_decay_beta`. 1 threadgroup × `num_v_heads`
-/// threads, one thread per v-head.
+/// Encode `compute_decay_beta` for a single token. 1 threadgroup ×
+/// `num_v_heads` threads — the `n_tokens = 1` case of the batched
+/// kernel (`idx` flattens to `head`).
 ///
 /// `alpha_in_off` / `beta_in_off` are byte offsets into the stacked
-/// projection buffers — the batched-prefill caller binds the alpha /
-/// beta stacks with a per-token offset. Per-token callers pass 0.
+/// projection buffers — the per-token oracle caller binds the alpha /
+/// beta stacks with a per-token offset.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_compute_decay_beta(
     cmdbuf: &CommandBufferRef,
@@ -127,6 +133,7 @@ pub fn encode_compute_decay_beta(
     enc.set_buffer(3, Some(weight_buf), dt_bias_off as NSUInteger);
     enc.set_buffer(4, Some(g_decay_out), 0);
     enc.set_buffer(5, Some(beta_gate_out), 0);
+    enc.set_bytes(6, 4, (&num_v_heads as *const u32).cast());
     enc.dispatch_thread_groups(
         MTLSize::new(1, 1, 1),
         MTLSize::new(num_v_heads as NSUInteger, 1, 1),
@@ -173,13 +180,14 @@ pub fn encode_delta_net_step(
     enc.end_encoding();
 }
 
-/// Encode `gated_rms_norm`. `num_v_heads` threadgroups × `value_dim`
-/// threads.
+/// Encode `gated_rms_norm` for a single token — the `n_tokens = 1`
+/// case of the batched kernel. `num_v_heads` threadgroups ×
+/// `value_dim` threads.
 ///
 /// `z_off` / `output_off` are byte offsets into the stacked z input
-/// and the stacked gated-rms-norm output — the batched-prefill caller
-/// binds the per-token z slice and the per-token output slot.
-/// Per-token callers pass 0.
+/// and the stacked gated-rms-norm output — the per-token oracle caller
+/// binds the per-token z slice and the per-token output slot. The
+/// kernel adds `head * value_dim` on top (t = 0).
 #[allow(clippy::too_many_arguments)]
 pub fn encode_gated_rms_norm(
     cmdbuf: &CommandBufferRef,
@@ -203,6 +211,7 @@ pub fn encode_gated_rms_norm(
     enc.set_buffer(3, Some(output), output_off as NSUInteger);
     enc.set_bytes(4, 4, (&value_dim as *const u32).cast());
     enc.set_bytes(5, 4, (&eps as *const f32).cast());
+    enc.set_bytes(6, 4, (&num_v_heads as *const u32).cast());
     enc.dispatch_thread_groups(
         MTLSize::new(num_v_heads as NSUInteger, 1, 1),
         MTLSize::new(value_dim as NSUInteger, 1, 1),

@@ -1770,28 +1770,35 @@ kernel void conv1d_step(
 
 
 // ============================================================================
-// Kernel 12: Per-head RMS normalize for q and k vectors
+// Kernel 12: Per-head RMS normalize for q and k vectors (batched)
 // ============================================================================
-// q: [num_k_heads * key_dim], k: [num_k_heads * key_dim]
-// Normalize each head independently, then scale by 1/sqrt(key_dim)^2 for q, 1/sqrt(key_dim) for k
-// Dispatch: num_k_heads threadgroups, key_dim threads each
+// `x` is the in/out token-major buffer [n_tokens * per_token_total]; each
+// token's q region starts at `t*per_token_total`, its k region at
+// `t*per_token_total + key_offset_per_token`. Normalize each head
+// independently; scale q by 1/sqrt(key_dim)^2, k by 1/sqrt(key_dim).
+// Dispatch: (num_k_heads, n_tokens) threadgroups × key_dim threads.
 
 kernel void rms_norm_qk(
-    device float *q,              // [num_k_heads * key_dim] in/out
-    device float *k,              // [num_k_heads * key_dim] in/out
-    constant uint &key_dim,       // = 128
-    constant float &inv_scale,    // = 1/sqrt(key_dim)
-    uint head [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]]
+    device float *x,                     // [n_tokens * per_token_total] in/out
+    constant uint &key_dim,              // = 128
+    constant float &inv_scale,           // = 1/sqrt(key_dim)
+    constant uint &per_token_total,      // stride between tokens (floats)
+    constant uint &key_offset_per_token, // q->k region offset (floats)
+    uint3 tg3 [[threadgroup_position_in_grid]],
+    uint3 tid3 [[thread_position_in_threadgroup]]
 ) {
-    uint base = head * key_dim;
+    uint head = tg3.x;
+    uint t = tg3.y;
+    uint tid = tid3.x;
+    uint q_base = t * per_token_total + head * key_dim;
+    uint k_base = q_base + key_offset_per_token;
 
     // RMS norm for q
     threadgroup float q_sum_sq;
     if (tid == 0) q_sum_sq = 0;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    float qval = (tid < key_dim) ? q[base + tid] : 0;
+    float qval = (tid < key_dim) ? x[q_base + tid] : 0;
     // Use threadgroup atomic add for sum of squares
     float q_sq_local = qval * qval;
     // Simple reduction: thread 0 accumulates (key_dim=128, fits in one pass)
@@ -1806,12 +1813,12 @@ kernel void rms_norm_qk(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float q_inv_rms = rsqrt(q_sum_sq / float(key_dim) + 1e-6f);
     if (tid < key_dim) {
-        q[base + tid] = qval * q_inv_rms * inv_scale * inv_scale;  // q gets extra scale
+        x[q_base + tid] = qval * q_inv_rms * inv_scale * inv_scale;  // q gets extra scale
     }
 
     // RMS norm for k
     threadgroup float k_sum_sq;
-    float kval = (tid < key_dim) ? k[base + tid] : 0;
+    float kval = (tid < key_dim) ? x[k_base + tid] : 0;
     threadgroup float k_partial[128];
     k_partial[tid] = kval * kval;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1823,29 +1830,34 @@ kernel void rms_norm_qk(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float k_inv_rms = rsqrt(k_sum_sq / float(key_dim) + 1e-6f);
     if (tid < key_dim) {
-        k[base + tid] = kval * k_inv_rms * inv_scale;
+        x[k_base + tid] = kval * k_inv_rms * inv_scale;
     }
 }
 
 
 // ============================================================================
-// Kernel 13: Compute g_decay and beta_gate for GatedDeltaNet
+// Kernel 13: Compute g_decay and beta_gate for GatedDeltaNet (batched)
 // ============================================================================
-// Per v-head: g_decay = exp(-A * softplus(alpha + dt_bias)), beta_gate = sigmoid(beta)
-// Dispatch: num_v_heads threads (64)
+// Per (v-head, token): g_decay = exp(-A * softplus(alpha + dt_bias)),
+//   beta_gate = sigmoid(beta). alpha/beta/g_decay/beta_gate are token-major
+//   [n_tokens * num_v_heads]; A_log/dt_bias are per-head, shared across tokens.
+// Dispatch: (n_tokens) threadgroups × (num_v_heads) threads — `idx` flattens
+//   to `t * num_v_heads + head`, so `head = idx % num_v_heads`.
 
 kernel void compute_decay_beta(
-    device const float *alpha_out,   // [num_v_heads] from projection
-    device const float *beta_out,    // [num_v_heads] from projection
-    device const float *A_log,       // [num_v_heads] log of decay base (persistent)
-    device const uint16_t *dt_bias,  // [num_v_heads] bf16
-    device float *g_decay,           // [num_v_heads] output
-    device float *beta_gate,         // [num_v_heads] output
+    device const float *alpha_out,   // [n_tokens * num_v_heads] from projection
+    device const float *beta_out,    // [n_tokens * num_v_heads] from projection
+    device const float *A_log,       // [num_v_heads] log of decay base (shared)
+    device const uint16_t *dt_bias,  // [num_v_heads] bf16 (shared)
+    device float *g_decay,           // [n_tokens * num_v_heads] output
+    device float *beta_gate,         // [n_tokens * num_v_heads] output
+    constant uint &num_v_heads,
     uint idx [[thread_position_in_grid]]
 ) {
+    uint head = idx % num_v_heads;
     float a_val = alpha_out[idx];
-    float dt_b = bf16_to_f32(dt_bias[idx]);
-    float A_val = exp(A_log[idx]);
+    float dt_b = bf16_to_f32(dt_bias[head]);
+    float A_val = exp(A_log[head]);
     float softplus_val = log(1.0f + exp(a_val + dt_b));
     g_decay[idx] = exp(-A_val * softplus_val);
     beta_gate[idx] = 1.0f / (1.0f + exp(-beta_out[idx]));
@@ -1853,23 +1865,29 @@ kernel void compute_decay_beta(
 
 
 // ============================================================================
-// Kernel 14: Gated RMS norm (z-gated output normalization)
+// Kernel 14: Gated RMS norm (z-gated output normalization, batched)
 // ============================================================================
 // output[i] = rms_norm(values[i]) * SiLU(z[i]) * weight[i]
-// Per v-head: normalize values, gate with z, scale with weight
-// Dispatch: num_v_heads threadgroups, value_dim threads each
+// Per (v-head, token): normalize values, gate with z, scale with weight.
+// values/z/output are token-major [n_tokens * num_v_heads * value_dim];
+// weight is [value_dim], shared across heads and tokens.
+// Dispatch: (num_v_heads, n_tokens) threadgroups × value_dim threads.
 
 kernel void gated_rms_norm(
-    device const float *values,       // [num_v_heads * value_dim] delta-net output
-    device const float *z,            // [num_v_heads * value_dim] gate values
-    device const uint16_t *weight,    // [value_dim] bf16 norm weights (shared across heads)
-    device float *output,             // [num_v_heads * value_dim]
+    device const float *values,       // [n_tokens * num_v_heads * value_dim]
+    device const float *z,            // [n_tokens * num_v_heads * value_dim]
+    device const uint16_t *weight,    // [value_dim] bf16 norm weights (shared)
+    device float *output,             // [n_tokens * num_v_heads * value_dim]
     constant uint &value_dim,         // = 128
     constant float &eps,              // = 1e-6
-    uint head [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]]
+    constant uint &num_v_heads,
+    uint3 tg3 [[threadgroup_position_in_grid]],
+    uint3 tid3 [[thread_position_in_threadgroup]]
 ) {
-    uint base = head * value_dim;
+    uint head = tg3.x;
+    uint t = tg3.y;
+    uint tid = tid3.x;
+    uint base = (t * num_v_heads + head) * value_dim;
 
     float val = (tid < value_dim) ? values[base + tid] : 0;
 
