@@ -1,11 +1,14 @@
-# Kernel arc — session 6 (P7): MoE gather-QMM — Part 2 landed, Part 1 handed off
+# Kernel arc — session 6 (P7): MoE gather-QMM — both parts landed
 
 2026-05-17. Continues `kernel_arc_session5_landed.md`. P7 targets the
 gathered MoE expert matmul (`graph_moe`, ~35% of prefill) and the dense
 `shared_ffn` / projection matmuls. Split into **Part 2** (dense matmuls
-→ MLX `qmm_t`) and **Part 1** (the gather MoE itself). Part 2 landed and
-verified; Part 1 was implemented backend-side then reverted at the
-caller boundary — see Discovery.
+→ MLX `qmm_t`) and **Part 1** (the gather MoE itself).
+
+**Both parts now landed and committed** — Part 2 `f97ddcf`, Part 1
+`16e82e1` on moeflux main. The sections below kept for the design
+record. Only remaining P7 step: a bench A/B (Mike action — reboot,
+n≥3, per `feedback_bench_discipline`); P7 has not been measured yet.
 
 Plan file: `~/.claude/plans/splendid-dancing-canyon.md`.
 
@@ -38,16 +41,43 @@ Part 1 to consume):
 - `QmmKernels` moved onto `MetalContext` (`metal.qmm()`), compiled once;
   `MetalBackend` no longer holds its own copy.
 
-## NOT landed — Part 1 (the gather MoE)
+## Landed — Part 1 (the gather MoE) — `16e82e1`
 
-The Phase-5 backend refactor (Op enum + both executors + the
-`encode_moe_batched_permute_fuse` rewrite) was implemented, then
-**reverted at the caller boundary** — `git checkout` of `backend/mod.rs`,
-`cpu/mod.rs`, `expert_forward.rs` (pure Phase-5) + hand-revert of 3
-spots in `gpu/mod.rs` (mixed Phase-4/5). Checkpoint compiles clean,
-Part 2 intact. Reverted because the `linear_attn` caller integration is
-deeper than the plan assumed (Discovery) and rushing BufId-space code
-tired was the wrong move.
+Implemented as designed below, with the linear-attn `expert_base`
+strategy resolved (see "The design"). What shipped vs the original
+handoff design:
+- `expert_slots` indexes `expert_base` by **raw expert id** in both
+  IO modes (no `bi`-compaction scheme) — `expert_indices` is the
+  per-row expansion.
+- linear-attn: `BatchedGraphScratch.expert_blobs: Vec<BufId>` →
+  single `expert_base: Option<BufId>` (pread-only; mmap points the
+  Op at the layer mmap BufId) + `expert_indices: BufId`. Prefetch is
+  decode-only and never active on the batched prefill path, so the
+  prefetch-hit memcpy is a cold correctness branch.
+- New `BufferPool::upload_at(id, offset, host)` (Metal + CPU) for
+  filling one expert block in the staging buffer — avoids the old
+  per-expert-BufId design and keeps the linear-attn producer
+  `<B: Backend>`-generic (no `.contents()` leak).
+- The diff test landed in `batched_diff_oracle.rs`
+  (`moe_permute_fuse_n_tokens_matches_tokenwise`, updated to run
+  gather on **and** off) rather than a new synthetic
+  `graph_diff_oracle` test — it already had the synthetic
+  quantized-blob fixture and is a function-level diff with real
+  variant dims. An Op-executor-level `graph_diff_oracle` test was
+  judged redundant (thin executor arms; canary covers the Op
+  end-to-end) — left as optional follow-up.
+
+Verified: `gather_qmm_diff` 7/7, moeflux lib 69/69,
+`moe_permute_fuse_n_tokens_matches_tokenwise` cosine 1.0 (gather
+on+off), canary `eval_prompt_matches_per_token_oracle` cosine
+1.0000000 across {mmap, pread} × {gather on, off}.
+
+### Original handoff state (kept for the record)
+
+The Phase-5 backend refactor was implemented, then **reverted at the
+caller boundary** in the prior session — the `linear_attn` caller
+integration was deeper than the plan assumed (Discovery). This
+session re-applied it from the design below.
 
 ### The design — re-apply next session
 
@@ -115,10 +145,14 @@ a deliberate decision, made *before* writing code:
 
 ## Gate status
 `cargo build -p moeflux --features model-qwen3-6-35b-a3b` clean,
-zero-warning. moeflux-mlx: 12/12 tests (5 `qmm_diff` + 7
-`gather_qmm_diff`) + compile + doctest green. Phase-4 canary cosine
-1.0. Nothing committed — Mike commits Part 2.
+zero-warning. moeflux-mlx 12/12; moeflux lib 69/69; canary cosine
+1.0000000 across {mmap, pread} × {gather on, off}.
 
 ## Commits
-None yet — entire P7 arc is uncommitted working tree. Part 2 is the
-commit-ready unit.
+- `f97ddcf` P7 Part 2 — dense matmuls → MLX `qmm_t`; gather-QMM bind.
+- `16e82e1` P7 Part 1 — MoE permute-fuse via MLX gather-QMM.
+
+## Next
+Bench A/B (Mike action) — reboot, n≥3, `MOEFLUX_MOE_GATHER` on vs off,
+quantify the gather-GEMM win on a3b prefill. P7 is functionally
+complete but unmeasured.
