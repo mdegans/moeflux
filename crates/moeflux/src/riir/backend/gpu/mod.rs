@@ -37,6 +37,7 @@ use crate::riir::backend::gpu::gpu_norm::{
 };
 use crate::riir::backend::gpu::metal::{MetalContext, MetalError, MtlBuffer};
 use crate::riir::io::mtl_weight_buf::MtlWeightBuf;
+use moeflux_mlx::{QmmCall, QmmKernels, QuantWeights};
 
 /// Metal buffer pool. Storage is `Vec<Buffer>` indexed *indirectly*
 /// by `BufId` through `bufid_to_physical`. Pre-`commit_plan` the
@@ -435,6 +436,9 @@ pub struct MetalBackend {
     swiglu_fused_pso: ComputePipelineState,
     moe_combine_residual_n_pso: ComputePipelineState,
     moe_bucket_accumulate_pso: ComputePipelineState,
+    /// MLX-derived tiled quantized GEMM — the 4-bit `MatvecNTokens` path.
+    /// ~12x the old `dequant_matvec_4bit` matvec at prefill shapes.
+    qmm: QmmKernels,
     /// When set (env `MOEFLUX_PROFILE_PER_OP`), [`Backend::execute`]
     /// commits each op as its own labeled cmdbuf so `prefill_profile`
     /// reports a per-op breakdown instead of one figure per graph.
@@ -469,6 +473,11 @@ impl MetalBackend {
         let moe_bucket_accumulate_pso =
             metal.pipeline("moe_bucket_accumulate")?.clone();
 
+        // Compile the MLX-derived quantized-GEMM kernels (separate Metal
+        // library — see the moeflux-mlx crate).
+        let qmm = QmmKernels::new(metal.device())
+            .map_err(|e| MetalError::MlxKernels(e.to_string()))?;
+
         let device = metal.device().clone();
         Ok(Self {
             metal,
@@ -486,6 +495,7 @@ impl MetalBackend {
             swiglu_fused_pso,
             moe_combine_residual_n_pso,
             moe_bucket_accumulate_pso,
+            qmm,
             profile_per_op: std::env::var_os("MOEFLUX_PROFILE_PER_OP")
                 .is_some(),
         })
@@ -642,22 +652,48 @@ impl Backend for MetalBackend {
                 n_tokens,
                 ..
             } => {
-                encode_matvec_n_tokens(
-                    cmd,
-                    &self.matvec_pipes,
-                    self.wf_buf.buffer(),
-                    weight.w_off,
-                    weight.s_off,
-                    weight.b_off,
-                    self.pool.handle(*input),
-                    *input_off,
-                    self.pool.handle(*output),
-                    *output_off,
-                    *in_dim,
-                    *out_dim,
-                    *n_tokens,
-                    weight.bits,
-                );
+                if weight.bits == 4 {
+                    // 4-bit: MLX's tiled quantized GEMM (~12x the old
+                    // dequant_matvec_4bit matvec at prefill shapes).
+                    self.qmm.encode_qmm_t(
+                        cmd,
+                        &QmmCall {
+                            weights: QuantWeights {
+                                buffer: self.wf_buf.buffer(),
+                                packed_offset: weight.w_off,
+                                scales_offset: weight.s_off,
+                                biases_offset: weight.b_off,
+                            },
+                            input: self.pool.handle(*input),
+                            input_offset: *input_off,
+                            output: self.pool.handle(*output),
+                            output_offset: *output_off,
+                            in_dim: *in_dim,
+                            out_dim: *out_dim,
+                            n_tokens: *n_tokens,
+                        },
+                    );
+                } else {
+                    // 8-bit (a3b mlp.gate / shared_expert_gate) stays on
+                    // the per-token dequant matvec — moeflux-mlx's qmm_t
+                    // is instantiated 4-bit only.
+                    encode_matvec_n_tokens(
+                        cmd,
+                        &self.matvec_pipes,
+                        self.wf_buf.buffer(),
+                        weight.w_off,
+                        weight.s_off,
+                        weight.b_off,
+                        self.pool.handle(*input),
+                        *input_off,
+                        self.pool.handle(*output),
+                        *output_off,
+                        *in_dim,
+                        *out_dim,
+                        *n_tokens,
+                        weight.bits,
+                    );
+                }
             }
             Op::SwigluFusedBatched {
                 gate,

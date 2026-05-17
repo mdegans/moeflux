@@ -47,6 +47,8 @@ pub enum MetalError {
     FunctionNotFound { name: String },
     #[error("pipeline-state creation failed for '{name}': {err}")]
     PipelineCreate { name: String, err: String },
+    #[error("building the moeflux-mlx kernel library: {0}")]
+    MlxKernels(String),
 }
 
 /// Embedded `shaders.metal` source — compiled into the binary so
