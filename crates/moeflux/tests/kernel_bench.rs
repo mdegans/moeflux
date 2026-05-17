@@ -34,7 +34,8 @@ use moeflux::riir::attn::gpu_attn::{
     encode_sdpa_causal_flash, FlashSdpaPipelines,
 };
 use moeflux::riir::backend::gpu::gpu_matvec::{
-    encode_matvec_n_tokens, MatvecPipelines,
+    encode_matvec_n_tokens, encode_mul_mm_4bit, MatvecPipelines,
+    MulMm4bitPipelines,
 };
 use moeflux::riir::variants::VARIANT;
 use moeflux::riir::MetalContext;
@@ -296,13 +297,19 @@ fn bench_sdpa(metal: &mut MetalContext) {
 fn bench_matvec(metal: &mut MetalContext) {
     let pipes =
         MatvecPipelines::fetch(metal).expect("fetch MatvecPipelines");
+    let mm_pipes =
+        MulMm4bitPipelines::fetch(metal).expect("fetch MulMm4bitPipelines");
 
-    eprintln!("\n[matvec-4bit]");
+    eprintln!("\n[matvec-4bit]  v3 matvec vs mul_mm_4bit (tiled)");
 
-    // (in_dim, out_dim, name) — a3b projection shapes.
+    // (in_dim, out_dim, name) — a3b projection shapes. qkv_proj / z_proj
+    // are the real linear-attn production shapes (out = conv_dim / total
+    // value); q_proj / o_proj are kept for continuity with session 2.
     let shapes: &[(u32, u32, &str)] = &[
+        (2048, 12288, "qkv_proj"),
+        (2048, 8192, "z_proj"),
+        (8192, 2048, "o_proj"),
         (2048, 4096, "q_proj"),
-        (4096, 2048, "o_proj"),
         (2048, 512, "kv_proj/expert_gate_up"),
         (512, 2048, "expert_down"),
     ];
@@ -333,9 +340,21 @@ fn bench_matvec(metal: &mut MetalContext) {
             };
             bench(
                 metal,
-                &format!("matvec {name} {in_dim}->{out_dim} M={m}"),
+                &format!("v3     {name} {in_dim}->{out_dim} M={m}"),
                 flops,
                 &encode,
+            );
+            let encode_mm = |cmd: &CommandBufferRef| {
+                encode_mul_mm_4bit(
+                    cmd, &mm_pipes, &w_buf, w_off, s_off, b_off, &in_buf,
+                    0, &out_buf, 0, in_dim, out_dim, m,
+                );
+            };
+            bench(
+                metal,
+                &format!("mul_mm {name} {in_dim}->{out_dim} M={m}"),
+                flops,
+                &encode_mm,
             );
         }
     }

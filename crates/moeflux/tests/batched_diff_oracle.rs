@@ -28,8 +28,8 @@ use moeflux::riir::attn::gpu_attn::{
     encode_sdpa_causal_flash, FlashSdpaPipelines,
 };
 use moeflux::riir::backend::gpu::gpu_matvec::{
-    encode_bf16_matmul_n_tokens, encode_matvec_n_tokens, BfMatvecPipelines,
-    MatvecPipelines,
+    encode_bf16_matmul_n_tokens, encode_matvec_n_tokens, encode_mul_mm_4bit,
+    BfMatvecPipelines, MatvecPipelines, MulMm4bitPipelines,
 };
 use moeflux::riir::moe::gpu_moe_router::{
     encode_moe_router, MoeRouterPipelines,
@@ -454,6 +454,110 @@ fn dequant_matvec_4bit_n_tokens_v3_matches_cpu() {
 #[ignore = "long-running GPU test"]
 fn dequant_matvec_4bit_n_tokens_fast_matches_cpu() {
     run_4bit_n_tokens_test(8192, 256, 4, 0xD3CAFE_BABE_0002);
+}
+
+// ---------------------------------------------------------------------------
+// mul_mm_4bit — tiled simdgroup_matrix matmul vs the same CPU oracle.
+// ---------------------------------------------------------------------------
+
+/// Run `encode_mul_mm_4bit` and check every token row against the
+/// per-token `dequant_matvec_4bit_cpu` oracle. Mirrors
+/// [`run_4bit_n_tokens_test`] but exercises the tiled matmul kernel —
+/// the simdgroup reduction reorders the FP adds, so bit-exactness is
+/// not expected; `COSINE_FLOOR` (0.9999) is the contract.
+fn run_mul_mm_4bit_test(in_dim: u32, out_dim: u32, n_tokens: u32, seed: u64) {
+    let mut rng = XorShift64::new(seed);
+    let (packed, scales, biases) =
+        gen_4bit_weights(&mut rng, out_dim as usize, in_dim as usize);
+    let inputs_f32: Vec<f32> = (0..(n_tokens as usize * in_dim as usize))
+        .map(|_| rng.next_f32())
+        .collect();
+
+    // ---- CPU oracle, per-token ----
+    let mut cpu_out = vec![0.0f32; n_tokens as usize * out_dim as usize];
+    for t in 0..(n_tokens as usize) {
+        let x =
+            &inputs_f32[t * in_dim as usize..(t + 1) * in_dim as usize];
+        let out = &mut cpu_out
+            [t * out_dim as usize..(t + 1) * out_dim as usize];
+        dequant_matvec_4bit_cpu(
+            &packed, &scales, &biases, in_dim as usize, out_dim as usize,
+            x, out,
+        )
+        .expect("dequant_matvec_4bit_cpu");
+    }
+
+    // ---- GPU dispatch ----
+    let mut metal = MetalContext::new().expect("open Metal");
+    let pipes = MulMm4bitPipelines::fetch(&mut metal)
+        .expect("fetch MulMm4bitPipelines");
+
+    let (w_buf, w_off, s_off, b_off) =
+        pack_weights_into_buf(&metal, &packed, &scales, &biases);
+    let in_buf = make_buf::<f32>(&metal, inputs_f32.len());
+    write_buf(&in_buf, &inputs_f32);
+    let out_buf =
+        make_buf::<f32>(&metal, n_tokens as usize * out_dim as usize);
+
+    let cmdbuf = metal.queue().new_command_buffer();
+    encode_mul_mm_4bit(
+        cmdbuf, &pipes, &w_buf, w_off, s_off, b_off, &in_buf, 0,
+        &out_buf, 0, in_dim, out_dim, n_tokens,
+    );
+    cmdbuf.commit();
+    cmdbuf.wait_until_completed();
+
+    let gpu_out =
+        read_buf_f32(&out_buf, n_tokens as usize * out_dim as usize);
+    assert!(
+        gpu_out.iter().all(|x| x.is_finite()),
+        "mul_mm_4bit output has non-finite values"
+    );
+
+    let mut worst = 1.0f32;
+    for t in 0..(n_tokens as usize) {
+        let g = &gpu_out[t * out_dim as usize..(t + 1) * out_dim as usize];
+        let c = &cpu_out[t * out_dim as usize..(t + 1) * out_dim as usize];
+        let cos = cosine_sim(g, c);
+        worst = worst.min(cos);
+        assert!(
+            cos >= COSINE_FLOOR,
+            "shape {in_dim}->{out_dim} N={n_tokens} token {t}: \
+             cosine {cos} below floor {COSINE_FLOOR}"
+        );
+    }
+    eprintln!(
+        "mul_mm_4bit {in_dim}->{out_dim} N={n_tokens}: worst cosine = \
+         {worst:.9}"
+    );
+}
+
+/// Tile-aligned shape — n_tokens and out_dim both multiples of 64.
+#[test]
+#[ignore = "long-running GPU test"]
+fn mul_mm_4bit_aligned_matches_cpu() {
+    run_mul_mm_4bit_test(2048, 512, 128, 0x3A11_u64);
+}
+
+/// Ragged out_dim — last n-tile is a partial 8x8 edge.
+#[test]
+#[ignore = "long-running GPU test"]
+fn mul_mm_4bit_ragged_out_dim_matches_cpu() {
+    run_mul_mm_4bit_test(2048, 576, 64, 0xB22_u64);
+}
+
+/// Ragged n_tokens — last m-tile is partial.
+#[test]
+#[ignore = "long-running GPU test"]
+fn mul_mm_4bit_ragged_n_tokens_matches_cpu() {
+    run_mul_mm_4bit_test(2048, 512, 100, 0xC33_u64);
+}
+
+/// Both axes ragged, small — stresses the edge-store path hardest.
+#[test]
+#[ignore = "long-running GPU test"]
+fn mul_mm_4bit_ragged_both_matches_cpu() {
+    run_mul_mm_4bit_test(2048, 300, 70, 0xD44_u64);
 }
 
 /// N=1 degenerate case for the v3 path: bit-exact vs encode_matvec.
