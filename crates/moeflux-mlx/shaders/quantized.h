@@ -568,7 +568,11 @@ template <
     short reduction_dim,
     short tgp_size,
     short group_size,
-    short bits>
+    short bits,
+    // moeflux-mlx: scale/bias element type. Defaults to T so every
+    // non-moeflux instantiation is unchanged; moeflux passes bfloat16_t
+    // so the loader reads bf16 scales/biases and converts to T (f32).
+    typename ScaleT = T>
 struct QuantizedBlockLoader {
   static_assert(
       BCOLS <= group_size,
@@ -599,13 +603,13 @@ struct QuantizedBlockLoader {
 
   threadgroup T* dst;
   const device uint8_t* src;
-  const device T* scales;
-  const device T* biases;
+  const device ScaleT* scales;  // moeflux-mlx: ScaleT (was T)
+  const device ScaleT* biases;  // moeflux-mlx: ScaleT (was T)
 
   QuantizedBlockLoader(
       const device uint8_t* src_,
-      const device T* scales_,
-      const device T* biases_,
+      const device ScaleT* scales_,  // moeflux-mlx: ScaleT (was T)
+      const device ScaleT* biases_,  // moeflux-mlx: ScaleT (was T)
       const int src_ld_,
       threadgroup T* dst_,
       ushort simd_group_id [[simdgroup_index_in_threadgroup]],
@@ -1091,11 +1095,12 @@ template <
     const bool aligned_N,
     const int BM = 32,
     const int BK = 32,
-    const int BN = 32>
+    const int BN = 32,
+    typename ScaleT = T>  // moeflux-mlx: scale/bias dtype, defaults to T
 METAL_FUNC void qmm_t_impl(
     const device uint32_t* w,
-    const device T* scales,
-    const device T* biases,
+    const device ScaleT* scales,  // moeflux-mlx: ScaleT (was T)
+    const device ScaleT* biases,  // moeflux-mlx: ScaleT (was T)
     const device T* x,
     device T* y,
     threadgroup T* Xs,
@@ -1133,7 +1138,8 @@ METAL_FUNC void qmm_t_impl(
       1,
       WM * WN * SIMD_SIZE,
       group_size,
-      bits>;
+      bits,
+      ScaleT>;  // moeflux-mlx: thread the scale dtype to the quant loader
 
   // Set the block
   const int K_w = K * bytes_per_pack / pack_factor;
@@ -1718,11 +1724,12 @@ template <
     const bool batched,
     const int BM = 32,
     const int BK = 32,
-    const int BN = 32>
+    const int BN = 32,
+    typename ScaleT = T>  // moeflux-mlx: scale/bias dtype, defaults to T
 [[kernel]] void affine_qmm_t(
     const device uint32_t* w [[buffer(0)]],
-    const device T* scales [[buffer(1)]],
-    const device T* biases [[buffer(2)]],
+    const device ScaleT* scales [[buffer(1)]],  // moeflux-mlx: ScaleT (was T)
+    const device ScaleT* biases [[buffer(2)]],  // moeflux-mlx: ScaleT (was T)
     const device T* x [[buffer(3)]],
     device T* y [[buffer(4)]],
     const constant int& K [[buffer(5)]],
@@ -1747,7 +1754,11 @@ template <
   threadgroup T Xs[BM * BK_padded];
   threadgroup T Ws[BN * BK_padded];
 
-  if (batched) {
+  // moeflux-mlx: `if constexpr` so the batched branch is discarded (not
+  // type-checked) when batched=0 — adjust_matrix_offsets<T> takes T* scales
+  // and would clash with the ScaleT* scales argument otherwise. moeflux
+  // only ever dispatches the non-batched (batched=0) instantiation.
+  if constexpr (batched) {
     adjust_matrix_offsets<T>(
         x,
         w,
@@ -1765,7 +1776,7 @@ template <
         b_strides,
         tid);
   }
-  qmm_t_impl<T, group_size, bits, aligned_N, BM, BK, BN>(
+  qmm_t_impl<T, group_size, bits, aligned_N, BM, BK, BN, ScaleT>(
       w,
       scales,
       biases,
