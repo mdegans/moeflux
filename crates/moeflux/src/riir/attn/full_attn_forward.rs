@@ -51,7 +51,7 @@ use crate::riir::attn::gpu_attn::{encode_sdpa_causal_flash, FlashSdpaPipelines};
 use crate::riir::backend::gpu::gpu_matvec::{encode_matvec, MatvecPipelines, MatvecSpec};
 use crate::riir::backend::gpu::gpu_norm::{encode_rms_norm_bf16_into, RmsNormBf16Pipelines};
 use crate::riir::backend::gpu::gpu_ctx::GpuLayerCtx;
-use crate::riir::backend::gpu::gpu_matvec::encode_matvec_n_tokens;
+use crate::riir::backend::gpu::gpu_matvec::encode_dense_matmul_n_tokens;
 use crate::riir::attn::linear_attn_forward::{
     bits_of, full_attn_layer_idx_for, moe_dispatch_per_token,
     post_attention_pre_moe, read_buffer_to_vec, GpuAttnEncodeArgs,
@@ -597,8 +597,9 @@ pub(in crate::riir) fn batched_full_attn_layer_forward(
             n_tokens as u32,
             crate::riir::variants::RMS_NORM_EPS,
         );
-        encode_matvec_n_tokens(
+        encode_dense_matmul_n_tokens(
             cmdbuf,
+            metal.qmm(),
             &mv,
             wf_buf.buffer(),
             attn.q_proj_w,
@@ -613,8 +614,9 @@ pub(in crate::riir) fn batched_full_attn_layer_forward(
             n_tokens as u32,
             q_bits,
         );
-        encode_matvec_n_tokens(
+        encode_dense_matmul_n_tokens(
             cmdbuf,
+            metal.qmm(),
             &mv,
             wf_buf.buffer(),
             attn.k_proj_w,
@@ -629,8 +631,9 @@ pub(in crate::riir) fn batched_full_attn_layer_forward(
             n_tokens as u32,
             k_bits,
         );
-        encode_matvec_n_tokens(
+        encode_dense_matmul_n_tokens(
             cmdbuf,
+            metal.qmm(),
             &mv,
             wf_buf.buffer(),
             attn.v_proj_w,
@@ -792,8 +795,9 @@ pub(in crate::riir) fn batched_full_attn_layer_forward(
     {
         let queue = metal.queue_clone();
         let cmdbuf = queue.new_command_buffer();
-        encode_matvec_n_tokens(
+        encode_dense_matmul_n_tokens(
             cmdbuf,
+            metal.qmm(),
             &mv,
             wf_buf.buffer(),
             attn.o_proj_w,
@@ -828,8 +832,9 @@ pub(in crate::riir) fn batched_full_attn_layer_forward(
             n_tokens as u32,
             crate::riir::variants::RMS_NORM_EPS,
         );
-        encode_matvec_n_tokens(
+        encode_dense_matmul_n_tokens(
             cmdbuf,
+            metal.qmm(),
             &mv,
             wf_buf.buffer(),
             layer_cache.gate.w,
@@ -844,8 +849,9 @@ pub(in crate::riir) fn batched_full_attn_layer_forward(
             n_tokens as u32,
             gate_bits,
         );
-        encode_matvec_n_tokens(
+        encode_dense_matmul_n_tokens(
             cmdbuf,
+            metal.qmm(),
             &mv,
             wf_buf.buffer(),
             layer_cache.shared.seg_w,
@@ -938,8 +944,9 @@ pub(in crate::riir) fn batched_full_attn_layer_forward(
     // CPU prepares 3e's bucket inputs.
     let queue = metal.queue_clone();
     let cmdbuf = queue.new_command_buffer();
-    encode_matvec_n_tokens(
+    encode_dense_matmul_n_tokens(
         cmdbuf,
+        metal.qmm(),
         &mv,
         wf_buf.buffer(),
         shared_gate_w,
@@ -954,8 +961,9 @@ pub(in crate::riir) fn batched_full_attn_layer_forward(
         n_tokens as u32,
         s_gate_bits,
     );
-    encode_matvec_n_tokens(
+    encode_dense_matmul_n_tokens(
         cmdbuf,
+        metal.qmm(),
         &mv,
         wf_buf.buffer(),
         shared_up_w,
@@ -987,8 +995,9 @@ pub(in crate::riir) fn batched_full_attn_layer_forward(
         );
         enc.end_encoding();
     }
-    encode_matvec_n_tokens(
+    encode_dense_matmul_n_tokens(
         cmdbuf,
+        metal.qmm(),
         &mv,
         wf_buf.buffer(),
         shared_down_w,

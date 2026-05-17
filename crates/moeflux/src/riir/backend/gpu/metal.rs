@@ -36,6 +36,8 @@ pub use metal::{
     MTLResourceOptions, NSUInteger,
 };
 
+use moeflux_mlx::QmmKernels;
+
 /// Errors from the Metal backend.
 #[derive(Debug, thiserror::Error)]
 pub enum MetalError {
@@ -132,6 +134,10 @@ pub struct MetalContext {
     /// helper can take `&self` — contention is irrelevant (one
     /// lock per cmdbuf, dwarfed by the wait itself).
     cmdbuf_stats: Mutex<HashMap<&'static str, CmdbufStat>>,
+    /// MLX quantized-GEMM kernels (`qmm_t` + the gathered MoE variant).
+    /// Compiled once here so every consumer — the `Op` executor and the
+    /// direct attn-forward callers alike — shares one compiled library.
+    qmm: QmmKernels,
 }
 
 impl MetalContext {
@@ -151,12 +157,16 @@ impl MetalContext {
             .new_library_with_source(SHADER_SOURCE, &options)
             .map_err(MetalError::LibraryCompile)?;
 
+        let qmm = QmmKernels::new(&device)
+            .map_err(|e| MetalError::MlxKernels(e.to_string()))?;
+
         Ok(Self {
             device,
             queue,
             library,
             pipelines: HashMap::new(),
             cmdbuf_stats: Mutex::new(HashMap::new()),
+            qmm,
         })
     }
 
@@ -169,6 +179,13 @@ impl MetalContext {
     /// Command queue. Reused across every forward pass.
     pub fn queue(&self) -> &CommandQueue {
         &self.queue
+    }
+
+    /// The MLX quantized-GEMM kernels (`qmm_t` + gathered MoE variant),
+    /// compiled once in [`Self::new`]. Shared by the `Op` executor and
+    /// the direct attn-forward callers.
+    pub fn qmm(&self) -> &QmmKernels {
+        &self.qmm
     }
 
     /// Clone the command-queue handle. `metal::CommandQueue` is an

@@ -49,9 +49,11 @@
 
 #![cfg(target_os = "macos")]
 
+use std::ffi::c_void;
+
 use metal::{
     BufferRef, CommandBufferRef, CompileOptions, ComputePipelineState,
-    DeviceRef, MTLSize, NSUInteger,
+    DeviceRef, FunctionConstantValues, MTLDataType, MTLSize, NSUInteger,
 };
 
 /// Errors from building the MLX kernel library.
@@ -85,6 +87,14 @@ const QMM_T_TILE: u32 = 32;
 
 const QMM_T_ALIGNED: &str = "affine_qmm_t_float_gs_64_b_4_alN_true_batch_0";
 const QMM_T_UNALIGNED: &str = "affine_qmm_t_float_gs_64_b_4_alN_false_batch_0";
+
+/// The gathered MoE GEMM. One Metal function; its `align_M/N/K` are
+/// function constants (indices 200/201/202), specialised per PSO.
+const GATHER_QMM_RHS: &str = "affine_gather_qmm_rhs_float_gs_64_b_4_t_true";
+// Function-constant indices for the gather kernel's alignment flags.
+const FC_ALIGN_M: NSUInteger = 200;
+const FC_ALIGN_N: NSUInteger = 201;
+const FC_ALIGN_K: NSUInteger = 202;
 
 /// Vendored MLX headers + the moeflux-mlx instantiation entry, embedded at
 /// build time. Order is the topological order of the files' `#include`
@@ -184,6 +194,44 @@ pub struct QmmCall<'a> {
     pub n_tokens: u32,
 }
 
+/// One gathered quantized matmul for the MoE expert path.
+///
+/// All experts' weights live contiguously in `weights.buffer` at a uniform
+/// per-expert stride; `indices[row]` picks the expert for each input row.
+/// Rows must be grouped into contiguous same-expert runs (the moeflux
+/// bucket-permuted layout) — the kernel collects a run, then GEMMs it.
+///
+/// `output[m, out_dim] = input[m, in_dim] @ dequant(expert indices[m])ᵀ`.
+#[derive(Clone, Copy)]
+pub struct GatherQmmCall<'a> {
+    /// Weight tensor of **expert 0** — `packed_offset`/`scales_offset`/
+    /// `biases_offset` are the sub-tensor offsets within expert 0's block;
+    /// expert `e` is reached by adding `e * stride_w` / `e * stride_s`.
+    pub weights: QuantWeights<'a>,
+    /// Activation buffer — `[n_tokens, in_dim]` f32.
+    pub input: &'a BufferRef,
+    /// Byte offset of the activations within `input`.
+    pub input_offset: u64,
+    /// Output buffer — `[n_tokens, out_dim]` f32.
+    pub output: &'a BufferRef,
+    /// Byte offset of the output within `output`.
+    pub output_offset: u64,
+    /// Per-row expert index — `[n_tokens]` `u32`.
+    pub indices: &'a BufferRef,
+    /// Byte offset of the indices within `indices`.
+    pub indices_offset: u64,
+    /// `K` — input / contraction dimension.
+    pub in_dim: u32,
+    /// `N` — output dimension (rows of one expert's weight matrix).
+    pub out_dim: u32,
+    /// `M` — number of token rows (total expert assignments).
+    pub n_tokens: u32,
+    /// Bytes between consecutive experts' packed-weight blocks.
+    pub stride_w: u64,
+    /// `ScaleT` (bf16) elements between consecutive experts' scale blocks.
+    pub stride_s: u64,
+}
+
 /// The compiled MLX quantized-GEMM kernels, ready to dispatch.
 ///
 /// Construct once via [`Self::new`]; it compiles the vendored MLX library
@@ -194,6 +242,11 @@ pub struct QmmKernels {
     qmm_t_aligned: ComputePipelineState,
     /// Fallback variant with bounds-guarded loads.
     qmm_t_unaligned: ComputePipelineState,
+    /// `affine_gather_qmm_rhs` PSOs, indexed by the alignment triple
+    /// `(align_M) | (align_N << 1) | (align_K << 2)`. All eight are built
+    /// up front so [`Self::encode_gather_qmm_rhs`] picks the exact-fit PSO
+    /// for any M/N/K without a bounds-unsafe fallback in release builds.
+    gather: [ComputePipelineState; 8],
 }
 
 impl QmmKernels {
@@ -224,9 +277,59 @@ impl QmmKernels {
             Ok(pipeline)
         };
 
+        // Build one `affine_gather_qmm_rhs` PSO per alignment triple. The
+        // kernel's align_M/N/K are function constants; `idx` bit 0/1/2 is
+        // align_M/N/K. Specialising all eight keeps `encode_gather_qmm_rhs`
+        // exact-fit (no bounds-unsafe align=true path for ragged dims).
+        let build_gather =
+            |idx: usize| -> Result<ComputePipelineState, MlxError> {
+                let fcv = FunctionConstantValues::new();
+                for (fc_index, bit) in
+                    [(FC_ALIGN_M, 0), (FC_ALIGN_N, 1), (FC_ALIGN_K, 2)]
+                {
+                    let value = (idx >> bit) & 1 == 1;
+                    fcv.set_constant_value_at_index(
+                        &value as *const bool as *const c_void,
+                        MTLDataType::Bool,
+                        fc_index,
+                    );
+                }
+                let function = library
+                    .get_function(GATHER_QMM_RHS, Some(fcv))
+                    .map_err(|e| {
+                        MlxError::Pipeline(GATHER_QMM_RHS.to_string(), e)
+                    })?;
+                let pipeline = device
+                    .new_compute_pipeline_state_with_function(&function)
+                    .map_err(|e| {
+                        MlxError::Pipeline(GATHER_QMM_RHS.to_string(), e)
+                    })?;
+                let got = pipeline.max_total_threads_per_threadgroup();
+                if got < QMM_T_THREADS_PER_GROUP {
+                    return Err(MlxError::ThreadgroupTooSmall {
+                        kernel: GATHER_QMM_RHS.to_string(),
+                        needed: QMM_T_THREADS_PER_GROUP,
+                        got,
+                    });
+                }
+                Ok(pipeline)
+            };
+
+        let gather = [
+            build_gather(0)?,
+            build_gather(1)?,
+            build_gather(2)?,
+            build_gather(3)?,
+            build_gather(4)?,
+            build_gather(5)?,
+            build_gather(6)?,
+            build_gather(7)?,
+        ];
+
         Ok(Self {
             qmm_t_aligned: build(QMM_T_ALIGNED)?,
             qmm_t_unaligned: build(QMM_T_UNALIGNED)?,
+            gather,
         })
     }
 
@@ -273,6 +376,55 @@ impl QmmKernels {
         // the `batched = 0` instantiation, so they stay unbound.
 
         // One threadgroup per 32x32 output tile; threadgroup (32, 2, 2).
+        let grid = MTLSize::new(
+            call.out_dim.div_ceil(QMM_T_TILE) as NSUInteger,
+            call.n_tokens.div_ceil(QMM_T_TILE) as NSUInteger,
+            1,
+        );
+        enc.dispatch_thread_groups(grid, MTLSize::new(32, 2, 2));
+        enc.end_encoding();
+    }
+
+    /// Encode one gathered MoE matmul ([`GatherQmmCall`]) into `cmdbuf`.
+    ///
+    /// Picks the exact-fit PSO for the call's M/N/K alignment — no
+    /// bounds-unsafe path. Encoding cannot fail.
+    pub fn encode_gather_qmm_rhs(
+        &self,
+        cmdbuf: &CommandBufferRef,
+        call: &GatherQmmCall,
+    ) {
+        let align_m = call.n_tokens % QMM_T_TILE == 0;
+        let align_n = call.out_dim % QMM_T_TILE == 0;
+        let align_k = call.in_dim % QMM_T_TILE == 0;
+        let idx = usize::from(align_m)
+            | (usize::from(align_n) << 1)
+            | (usize::from(align_k) << 2);
+        let pipeline = &self.gather[idx];
+
+        // The kernel's K/N/M are `int`; moeflux's dims fit i32. Strides
+        // are `uint64_t` (per-expert block stride — bytes / ScaleT elems).
+        let k = call.in_dim as i32;
+        let n = call.out_dim as i32;
+        let m = call.n_tokens as i32;
+        let stride_w = call.stride_w;
+        let stride_s = call.stride_s;
+
+        let enc = cmdbuf.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(pipeline);
+        enc.set_buffer(0, Some(call.input), call.input_offset);
+        enc.set_buffer(1, Some(call.weights.buffer), call.weights.packed_offset);
+        enc.set_buffer(2, Some(call.weights.buffer), call.weights.scales_offset);
+        enc.set_buffer(3, Some(call.weights.buffer), call.weights.biases_offset);
+        enc.set_buffer(4, Some(call.indices), call.indices_offset);
+        enc.set_buffer(5, Some(call.output), call.output_offset);
+        enc.set_bytes(6, 4, (&m as *const i32).cast());
+        enc.set_bytes(7, 4, (&n as *const i32).cast());
+        enc.set_bytes(8, 4, (&k as *const i32).cast());
+        enc.set_bytes(9, 8, (&stride_w as *const u64).cast());
+        enc.set_bytes(10, 8, (&stride_s as *const u64).cast());
+
+        // One threadgroup per 32x32 output tile; grid is (N tiles, M tiles).
         let grid = MTLSize::new(
             call.out_dim.div_ceil(QMM_T_TILE) as NSUInteger,
             call.n_tokens.div_ceil(QMM_T_TILE) as NSUInteger,

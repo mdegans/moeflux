@@ -2259,17 +2259,25 @@ template <
     int BK,
     int WM,
     int WN,
-    bool transpose>
+    bool transpose,
+    // moeflux-mlx: scale/bias dtype, defaults to T
+    typename ScaleT = T>
 [[kernel]] void affine_gather_qmm_rhs(
     const device T* x [[buffer(0)]],
     const device uint32_t* w [[buffer(1)]],
-    const device T* scales [[buffer(2)]],
-    const device T* biases [[buffer(3)]],
+    const device ScaleT* scales [[buffer(2)]],  // moeflux-mlx: ScaleT (was T)
+    const device ScaleT* biases [[buffer(3)]],  // moeflux-mlx: ScaleT (was T)
     const device uint32_t* indices [[buffer(4)]],
     device T* y [[buffer(5)]],
     const constant int& M [[buffer(6)]],
     const constant int& N [[buffer(7)]],
     const constant int& K [[buffer(8)]],
+    // moeflux-mlx: explicit per-expert strides (was derived from N*K below).
+    // moeflux packs gate|up|down in one expert block, so the inter-expert
+    // stride is the whole block, not one tensor's N*K. stride_w is in bytes
+    // (w is cast to uint8_t* internally); stride_s is in ScaleT elements.
+    const constant uint64_t& stride_w [[buffer(9)]],
+    const constant uint64_t& stride_s [[buffer(10)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint simd_lane_id [[thread_index_in_simdgroup]]) {
@@ -2300,7 +2308,8 @@ template <
       transpose,
       WM * WN * SIMD_SIZE,
       group_size,
-      bits>;
+      bits,
+      ScaleT>;  // moeflux-mlx: thread scale dtype to the quant loader
 
   threadgroup T Xs[BM * BK_padded];
   threadgroup T Ws[transpose ? BN * BK_padded : BK * BN_padded];
@@ -2311,8 +2320,7 @@ template <
   const int N_w = N * bytes_per_pack / pack_factor;
   const int N_g = N / group_size;
   const int K_it = K / BK;
-  const size_t stride_w = transpose ? N * K_w : K * N_w;
-  const size_t stride_s = transpose ? N * K_g : K * N_g;
+  // moeflux-mlx: stride_w / stride_s now arrive as kernel args (buffer 9/10).
   const int y_row = tid.y * BM;
   const int y_col = tid.x * BN;
   const size_t y_row_long = size_t(y_row);

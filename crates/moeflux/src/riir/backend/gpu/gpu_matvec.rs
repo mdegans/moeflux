@@ -25,6 +25,7 @@
 //! the same device.
 
 use metal::{Buffer, CommandBufferRef, MTLSize, NSUInteger};
+use moeflux_mlx::{QmmCall, QmmKernels, QuantWeights};
 
 use super::encoder::pipeline_bundle;
 use crate::riir::io::mtl_weight_buf::MtlWeightBuf;
@@ -199,6 +200,64 @@ pub fn encode_matvec_n_tokens(
         );
     }
     enc.end_encoding();
+}
+
+/// Dense `[n_tokens, out_dim] = input @ dequant(weights)ᵀ` matmul that
+/// routes 4-bit weights through MLX's tuned `qmm_t` GEMM (~65% of GPU
+/// peak vs the hand-rolled matvec's ~5%) and 8-bit through
+/// [`encode_matvec_n_tokens`]. The two paths are cosine-1.0 equivalent
+/// (the moeflux-mlx `qmm_t` diff gate). Use for dense projection /
+/// shared-FFN matmuls reading the shared weight buffer; the **gathered**
+/// per-expert matmul has its own encoder in `expert_forward.rs`.
+///
+/// `input_off` / `output_off` are byte offsets, as in
+/// [`encode_matvec_n_tokens`].
+#[allow(clippy::too_many_arguments)]
+pub fn encode_dense_matmul_n_tokens(
+    cmdbuf: &CommandBufferRef,
+    qmm: &QmmKernels,
+    pipes: &MatvecPipelines,
+    w_buf: &Buffer,
+    w_off: u64,
+    s_off: u64,
+    b_off: u64,
+    input: &Buffer,
+    input_off: u64,
+    output: &Buffer,
+    output_off: u64,
+    in_dim: u32,
+    out_dim: u32,
+    n_tokens: u32,
+    bits: u32,
+) {
+    if n_tokens == 0 {
+        return;
+    }
+    if bits == 4 {
+        qmm.encode_qmm_t(
+            cmdbuf,
+            &QmmCall {
+                weights: QuantWeights {
+                    buffer: w_buf,
+                    packed_offset: w_off,
+                    scales_offset: s_off,
+                    biases_offset: b_off,
+                },
+                input,
+                input_offset: input_off,
+                output,
+                output_offset: output_off,
+                in_dim,
+                out_dim,
+                n_tokens,
+            },
+        );
+    } else {
+        encode_matvec_n_tokens(
+            cmdbuf, pipes, w_buf, w_off, s_off, b_off, input, input_off,
+            output, output_off, in_dim, out_dim, n_tokens, bits,
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

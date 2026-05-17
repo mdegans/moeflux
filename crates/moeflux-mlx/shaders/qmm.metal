@@ -26,3 +26,15 @@ instantiate_kernel(
 instantiate_kernel(
     "affine_qmm_t_float_gs_64_b_4_alN_false_batch_0",
     affine_qmm_t, float, 64, 4, false, 0, 32, 32, 32, bfloat16_t)
+
+// moeflux-mlx: gathered quantized GEMM for the MoE expert matmul. One
+// dispatch handles all experts; `indices` gives each row's expert and the
+// kernel collects contiguous same-expert runs. Template params:
+// <T, group_size, bits, BM, BN, BK, WM, WN, transpose, ScaleT>. transpose
+// = true matches moeflux's [out_dim, in_dim] weight layout (same as the
+// dense affine_qmm_t path). align_M/N/K are function constants (200/201/
+// 202), set per-PSO by the host, NOT a template axis.
+
+instantiate_kernel(
+    "affine_gather_qmm_rhs_float_gs_64_b_4_t_true",
+    affine_gather_qmm_rhs, float, 64, 4, 32, 32, 32, 2, 2, true, bfloat16_t)
