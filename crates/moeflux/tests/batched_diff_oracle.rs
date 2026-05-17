@@ -43,6 +43,8 @@ use moeflux::riir::moe::moe_router::{build_expert_buckets, moe_router_cpu};
 use moeflux::riir::sdpa_cpu;
 use moeflux::riir::variants::VARIANT;
 use moeflux::riir::MtlBuffer;
+use moeflux::riir::backend::{Backend, BufferPool, CpuBackend, Graph, Op};
+use moeflux::riir::WeightFile;
 
 const GROUP_SIZE: u32 = 64;
 
@@ -297,6 +299,37 @@ fn bf16_matmul_n_tokens_n1_matches_single_matvec() {
 /// `[out_dim, in_dim]` quantized weight matrix. Returns (packed,
 /// scales, biases) in the same layout the production weight pipeline
 /// emits. `in_dim` must be a multiple of GROUP_SIZE=64 (and of 8).
+/// Reinterpret a `&[T]` of plain-old-data as raw bytes — for pool
+/// `upload` of typed host buffers.
+fn as_u8<T>(v: &[T]) -> &[u8] {
+    unsafe {
+        std::slice::from_raw_parts(
+            v.as_ptr() as *const u8,
+            std::mem::size_of_val(v),
+        )
+    }
+}
+
+/// Minimal on-disk [`WeightFile`] (one tiny bf16 tensor) so a
+/// [`CpuBackend`] can be constructed for Op-level diff tests. The MoE
+/// Op reads only pool buffers, never the weight file, so the contents
+/// are irrelevant — only that `WeightFile::open` succeeds.
+fn dummy_weight_file(tag: &str) -> WeightFile {
+    let dir = std::env::temp_dir()
+        .join(format!("moeflux-bdo-{}-{}", tag, std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("mkdir dummy WF dir");
+    let bin = dir.join("model_weights.bin");
+    let json = dir.join("model_weights.json");
+    std::fs::write(&bin, vec![0u8; 64]).expect("write dummy .bin");
+    std::fs::write(
+        &json,
+        r#"{"tensors":{"dummy":{"offset":0,"size":64,"shape":[32],"dtype":"BF16","bits":0}}}"#,
+    )
+    .expect("write dummy .json");
+    WeightFile::open(&bin, &json).expect("open dummy WF")
+}
+
 fn gen_4bit_weights(
     rng: &mut XorShift64,
     out_dim: usize,
@@ -963,6 +996,97 @@ fn moe_permute_fuse_n_tokens_matches_tokenwise() {
                 t,
                 cos,
                 COSINE_FLOOR
+            );
+        }
+    }
+
+    // ---- Op-level: run `Op::MoeBatchedPermuteFuse` through the
+    // `CpuBackend` executor (the diff oracle) and check it matches the
+    // same tokenwise reference. Exercises the executor arm's
+    // `expert_base` per-bucket slicing; the GPU Op arm is covered
+    // end-to-end by the `eval_prompt_matches_per_token_oracle` canary.
+    {
+        let f32_sz = std::mem::size_of::<f32>();
+        let mut cpu = CpuBackend::new(dummy_weight_file("moe_pf"));
+        let pool = cpu.pool_mut();
+        let eb = pool
+            .alloc(expert_base_host.len(), "expert_base", false)
+            .unwrap();
+        let ei = pool
+            .alloc(total_assignments * 4, "expert_indices", false)
+            .unwrap();
+        let bin = pool
+            .alloc(total_assignments * h * f32_sz, "bucket_input", false)
+            .unwrap();
+        let bg = pool
+            .alloc(total_assignments * mi * f32_sz, "bucket_gate", false)
+            .unwrap();
+        let bu = pool
+            .alloc(total_assignments * mi * f32_sz, "bucket_up", false)
+            .unwrap();
+        let ba = pool
+            .alloc(total_assignments * mi * f32_sz, "bucket_act", false)
+            .unwrap();
+        let bo = pool
+            .alloc(total_assignments * h * f32_sz, "bucket_out", false)
+            .unwrap();
+        let bti = pool
+            .alloc(total_assignments * 4, "bucket_token_idx", false)
+            .unwrap();
+        let bw = pool
+            .alloc(total_assignments * f32_sz, "bucket_weights", false)
+            .unwrap();
+        let os = pool
+            .alloc(n_tokens * h * f32_sz, "out_sum", false)
+            .unwrap();
+        pool.upload(eb, &expert_base_host).unwrap();
+        pool.upload(ei, as_u8(&expert_indices_host)).unwrap();
+        pool.upload(bin, as_u8(&packed_input)).unwrap();
+        pool.upload(bti, as_u8(&buckets.token_idx)).unwrap();
+        pool.upload(bw, as_u8(&buckets.weights)).unwrap();
+        // `out_sum` is zero from `alloc`; the per-bucket scatter adds.
+
+        let mut g = Graph::new();
+        g.push(Op::MoeBatchedPermuteFuse {
+            label: "test_moe_pf_cpu",
+            expert_base: eb,
+            expert_stride: expert_size as u64,
+            expert_indices: ei,
+            expert_slots: expert_slots.clone(),
+            bucket_input: bin,
+            bucket_gate: bg,
+            bucket_up: bu,
+            bucket_act: ba,
+            bucket_out: bo,
+            bucket_token_idx: bti,
+            bucket_weights: bw,
+            out_sum: os,
+            buckets: buckets.clone(),
+        });
+        cpu.execute(&g, "moe_pf_op_diff").expect("CpuBackend execute");
+
+        let mut out_bytes = vec![0u8; n_tokens * h * f32_sz];
+        cpu.pool().download(os, &mut out_bytes).unwrap();
+        let cpu_out: Vec<f32> = out_bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert!(
+            cpu_out.iter().all(|x| x.is_finite()),
+            "CpuBackend MoE Op output has non-finite values"
+        );
+        for t in 0..n_tokens {
+            let c = &cpu_out[t * h..(t + 1) * h];
+            let r = &per_token_ref[t * h..(t + 1) * h];
+            let cos = cosine_sim(c, r);
+            eprintln!(
+                "[diff:moe_permute_fuse cpu-op] token={} cosine={:.9}",
+                t, cos
+            );
+            assert!(
+                cos >= COSINE_FLOOR,
+                "cpu-op token {} cosine {:.9} below floor {}",
+                t, cos, COSINE_FLOOR
             );
         }
     }
