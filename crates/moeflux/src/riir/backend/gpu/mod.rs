@@ -435,6 +435,13 @@ pub struct MetalBackend {
     swiglu_fused_pso: ComputePipelineState,
     moe_combine_residual_n_pso: ComputePipelineState,
     moe_bucket_accumulate_pso: ComputePipelineState,
+    /// When set (env `MOEFLUX_PROFILE_PER_OP`), [`Backend::execute`]
+    /// commits each op as its own labeled cmdbuf so `prefill_profile`
+    /// reports a per-op breakdown instead of one figure per graph.
+    /// Instrumentation only — it forfeits the S7-1a commit fusion, so
+    /// it inflates wall time; use it for proportion analysis, never
+    /// for an absolute bench.
+    profile_per_op: bool,
 }
 
 impl MetalBackend {
@@ -479,6 +486,8 @@ impl MetalBackend {
             swiglu_fused_pso,
             moe_combine_residual_n_pso,
             moe_bucket_accumulate_pso,
+            profile_per_op: std::env::var_os("MOEFLUX_PROFILE_PER_OP")
+                .is_some(),
         })
     }
 
@@ -548,6 +557,27 @@ impl Backend for MetalBackend {
     ) -> Result<(), GraphError> {
         self.metal.commit_and_wait_labeled(&ctx.cmdbuf, label);
         Ok(())
+    }
+
+    fn execute(
+        &self,
+        graph: &Graph,
+        label: &'static str,
+    ) -> Result<(), GraphError> {
+        if self.profile_per_op {
+            // Instrumentation: one labeled commit per op so
+            // `cmdbuf_stats` carries a per-op breakdown. Forfeits the
+            // commit fusion — see `profile_per_op`.
+            for op in &graph.ops {
+                let mut ctx = self.begin_encoding();
+                self.encode_op(op, &mut ctx);
+                self.submit_and_wait(ctx, op.label())?;
+            }
+            return Ok(());
+        }
+        let mut ctx = self.begin_encoding();
+        self.encode_graph(graph, &mut ctx);
+        self.submit_and_wait(ctx, label)
     }
 
     fn encode_op(&self, op: &Op, ctx: &mut MetalEncodeCtx) {
