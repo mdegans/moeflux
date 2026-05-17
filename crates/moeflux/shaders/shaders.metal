@@ -1660,62 +1660,78 @@ kernel void sigmoid_gate(
 
 
 // ============================================================================
-// Kernel 10: GatedDeltaNet linear attention step (single token, all heads)
+// Kernel 10: GatedDeltaNet linear attention step (batched over the token axis)
 // ============================================================================
 //
-// Implements the GatedDeltaNet recurrence for autoregressive generation:
+// Implements the GatedDeltaNet recurrence, per token:
 //   1. State decay:  S[vi][ki] *= g_decay
 //   2. Memory read:  kv_mem[vi] = sum_ki(S[vi][ki] * k[ki])
 //   3. Delta:        delta[vi] = (v[vi] - kv_mem[vi]) * beta_gate
 //   4. State update: S[vi][ki] += k[ki] * delta[vi]
 //   5. Output:       out[vi] = sum_ki(S[vi][ki] * q[ki])
 //
-// Dispatch: 64 threadgroups (one per v-head), 128 threads each (one per vi).
-// Each thread owns one row S[head_id][vi][:] of the 128x128 state matrix.
+// The recurrence is sequential over time but fully parallel over
+// (head, vi): thread (head_id, vi) owns state row S[head_id][vi][:] and
+// every step is independent across vi (no cross-thread reduction). So
+// the time loop runs INSIDE the kernel — one dispatch for the whole
+// chunk — and the recurrence stays correct because it is each thread's
+// own `for t` loop over its private state row.
 //
-// State layout: [64 * 128 * 128] float = 4MB total, persisted across tokens.
-// k-head sharing: 4 v-heads share 1 k-head (64 v-heads / 16 k-heads).
+// Dispatch: num_v_heads threadgroups, 128 threads each (one per vi).
+// State layout: [num_v_heads * 128 * 128] float, persisted across calls.
+// `conv_out` is [n_tokens * (2*key_total + num_v_heads*128)]: per token,
+// q | k (each `key_total` floats) | v (num_v_heads*128 floats).
+// k-head sharing: `k_heads_per_v` v-heads share 1 k-head.
 
 kernel void gated_delta_net_step(
-    device float *state,             // [64 * 128 * 128] persistent state
-    device const float *q,           // [2048] (16 k-heads * 128)
-    device const float *k,           // [2048] (16 k-heads * 128)
-    device const float *v,           // [8192] (64 v-heads * 128)
-    device const float *g_decay,     // [64] per v-head
-    device const float *beta_gate,   // [64] per v-head
-    device float *output,            // [8192] (64 v-heads * 128)
+    device float *state,             // [num_v_heads * 128 * 128] persistent
+    device const float *conv_out,    // [n_tokens * conv_per_token]
+    device const float *g_decay,     // [n_tokens * num_v_heads]
+    device const float *beta_gate,   // [n_tokens * num_v_heads]
+    device float *output,            // [n_tokens * num_v_heads * 128]
     constant uint &k_heads_per_v,    // = 4
+    constant uint &n_tokens,
+    constant uint &key_total,        // q / k region size per token (= 2048)
+    constant uint &num_v_heads,      // = 64
     uint head_id [[threadgroup_position_in_grid]],
     uint vi [[thread_position_in_threadgroup]]
 ) {
     uint kh = head_id / k_heads_per_v;
-    float g = g_decay[head_id];
-    float beta = beta_gate[head_id];
+    uint value_total = num_v_heads * 128;
+    uint conv_per_token = 2 * key_total + value_total;
 
     uint state_base = head_id * 128 * 128 + vi * 128;
-    uint k_base = kh * 128;
-    uint v_base = head_id * 128;
+    uint k_off_in_token = kh * 128;  // q and k both indexed by kh*128
 
-    // Step 1+2: Decay state row and compute kv_mem = dot(S[vi][:], k[:])
-    float kv_mem = 0.0f;
-    for (uint ki = 0; ki < 128; ki++) {
-        float s = state[state_base + ki] * g;
-        state[state_base + ki] = s;
-        kv_mem += s * k[k_base + ki];
-    }
+    for (uint t = 0; t < n_tokens; t++) {
+        uint tok_base = t * conv_per_token;
+        uint q_base = tok_base + k_off_in_token;
+        uint k_base = tok_base + key_total + k_off_in_token;
+        uint v_base = tok_base + 2 * key_total + head_id * 128;
+        float g = g_decay[t * num_v_heads + head_id];
+        float beta = beta_gate[t * num_v_heads + head_id];
 
-    // Step 3+4: Delta update — S[vi][ki] += k[ki] * delta
-    float delta = (v[v_base + vi] - kv_mem) * beta;
-    for (uint ki = 0; ki < 128; ki++) {
-        state[state_base + ki] += k[k_base + ki] * delta;
-    }
+        // Step 1+2: Decay state row and compute kv_mem = dot(S[vi][:], k[:])
+        float kv_mem = 0.0f;
+        for (uint ki = 0; ki < 128; ki++) {
+            float s = state[state_base + ki] * g;
+            state[state_base + ki] = s;
+            kv_mem += s * conv_out[k_base + ki];
+        }
 
-    // Step 5: Output — out[vi] = dot(S[vi][:], q[:])
-    float out_val = 0.0f;
-    for (uint ki = 0; ki < 128; ki++) {
-        out_val += state[state_base + ki] * q[k_base + ki];
+        // Step 3+4: Delta update — S[vi][ki] += k[ki] * delta
+        float delta = (conv_out[v_base + vi] - kv_mem) * beta;
+        for (uint ki = 0; ki < 128; ki++) {
+            state[state_base + ki] += conv_out[k_base + ki] * delta;
+        }
+
+        // Step 5: Output — out[vi] = dot(S[vi][:], q[:])
+        float out_val = 0.0f;
+        for (uint ki = 0; ki < 128; ki++) {
+            out_val += state[state_base + ki] * conv_out[q_base + ki];
+        }
+        output[t * value_total + head_id * 128 + vi] = out_val;
     }
-    output[v_base + vi] = out_val;
 }
 
 

@@ -1209,11 +1209,19 @@ fn check_conv1d_step(n_tokens: u32) {
 #[test]
 #[ignore = "long-running GPU test"]
 fn graph_metal_matches_cpu_gated_delta_net_step() {
+    // n_tokens=1 is the decode shape; 4/16 are prefill chunk shapes.
+    // The recurrence runs in-kernel over the token axis, so longer
+    // chunks stress that loop and the persistent-state carry.
+    for n_tokens in [1u32, 4, 16] {
+        check_gated_delta_net_step(n_tokens);
+    }
+}
+
+fn check_gated_delta_net_step(n_tokens: u32) {
     // Op assumes VARIANT.linear_total_key() for the conv_out layout
     // and VARIANT::LINEAR_KEY_DIM for the state's key_dim, so test
     // shapes are pinned to Qwen3.6-A3B (linear_num_k_heads=16,
     // linear_num_v_heads=64, LINEAR_KEY_DIM=128, LINEAR_VALUE_DIM=128).
-    let n_tokens: u32 = 4;
     let num_v_heads: u32 = 64;
     let value_dim: u32 = 128;
     let k_heads_per_v: u32 = 4;
@@ -1277,6 +1285,9 @@ fn graph_metal_matches_cpu_gated_delta_net_step() {
     let mut cpu_out_bytes = vec![0u8; out_total * 4];
     cpu.pool().download(cpu_out, &mut cpu_out_bytes).unwrap();
     let cpu_out_f32 = f32_of_bytes(&cpu_out_bytes);
+    let mut cpu_state_bytes = vec![0u8; state_floats * 4];
+    cpu.pool().download(cpu_state, &mut cpu_state_bytes).unwrap();
+    let cpu_state_f32 = f32_of_bytes(&cpu_state_bytes);
 
     let mut gpu_wf = SyntheticWf::build("gated_delta_net_step_gpu", &[(
         "dummy", "BF16", 0, vec![32], vec![0u8; 64],
@@ -1314,6 +1325,9 @@ fn graph_metal_matches_cpu_gated_delta_net_step() {
     let mut gpu_out_bytes = vec![0u8; out_total * 4];
     gpu.pool().download(gpu_out, &mut gpu_out_bytes).unwrap();
     let gpu_out_f32 = f32_of_bytes(&gpu_out_bytes);
+    let mut gpu_state_bytes = vec![0u8; state_floats * 4];
+    gpu.pool().download(gpu_state, &mut gpu_state_bytes).unwrap();
+    let gpu_state_f32 = f32_of_bytes(&gpu_state_bytes);
 
     let cos = cosine_sim(&cpu_out_f32, &gpu_out_f32);
     let max_abs = cpu_out_f32
@@ -1321,9 +1335,25 @@ fn graph_metal_matches_cpu_gated_delta_net_step() {
         .zip(gpu_out_f32.iter())
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
+    // The recurrence's correctness lives in the persistent state — a
+    // batched-kernel time-loop bug shows up there even if the output
+    // looks plausible, so assert it explicitly.
+    let cos_state = cosine_sim(&cpu_state_f32, &gpu_state_f32);
+    let max_abs_state = cpu_state_f32
+        .iter()
+        .zip(gpu_state_f32.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
     eprintln!(
-        "[s7-6b gated_delta_net_step] N={} vh={} vd={} kpv={}: cos={:.9} max_abs={:.3e}",
-        n_tokens, num_v_heads, value_dim, k_heads_per_v, cos, max_abs
+        "[s7-6b gated_delta_net_step] N={} vh={} vd={} kpv={}: out cos={:.9} max_abs={:.3e}; state cos={:.9} max_abs={:.3e}",
+        n_tokens, num_v_heads, value_dim, k_heads_per_v, cos, max_abs,
+        cos_state, max_abs_state
     );
-    assert!(cos >= COSINE_FLOOR, "cosine {} max_abs={}", cos, max_abs);
+    assert!(cos >= COSINE_FLOOR, "out cosine {} max_abs={}", cos, max_abs);
+    assert!(
+        cos_state >= COSINE_FLOOR,
+        "state cosine {} max_abs={}",
+        cos_state,
+        max_abs_state
+    );
 }

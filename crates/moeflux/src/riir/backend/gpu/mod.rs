@@ -994,58 +994,43 @@ impl Backend for MetalBackend {
                 n_tokens,
                 ..
             } => {
-                // Per-token loop. State is persistent and mutated
-                // in-place by the kernel. conv_out is laid out as
-                // [q | k | v] tightly packed per token (3 *
-                // VARIANT.linear_total_key() floats per token); the
-                // kernel reads q/k/v from byte offsets within the
-                // current token's slot. g_decay / beta_gate / output
-                // stride by `num_v_heads` (or `num_v_heads *
-                // value_dim`) per token.
+                // Single batched dispatch: `num_v_heads` threadgroups ×
+                // `value_dim` threads. The recurrence is sequential
+                // over time but parallel over (head, vi); the kernel
+                // runs the `for t` loop internally over its private
+                // state row. `conv_out` is [n_tokens * (2*key_total +
+                // num_v_heads*value_dim)] — q | k | v per token; the
+                // kernel computes the per-token offsets. State is
+                // persistent and mutated in-place.
                 let nvh = *num_v_heads;
                 let vd = *value_dim;
                 let kpv = *k_heads_per_v;
                 let key_total =
-                    crate::riir::variants::VARIANT.linear_total_key();
-                let key_total_bytes = (key_total * 4) as u64;
-                let value_total_bytes = (nvh as u64) * (vd as u64) * 4;
-                // Per-token conv layout = q (key_total) | k (key_total)
-                // | v (num_v_heads * value_dim); v differs from k in
-                // size because v uses `value_dim` channels per v-head.
-                let conv_per_token =
-                    2 * key_total_bytes + value_total_bytes;
-                let gdb_per_token = (nvh as u64) * 4;
-                let out_per_token = value_total_bytes;
+                    crate::riir::variants::VARIANT.linear_total_key() as u32;
+                let n_tokens_arg = *n_tokens;
                 let state_buf = self.pool.handle(*state);
                 let conv_buf = self.pool.handle(*conv_out);
                 let g_buf = self.pool.handle(*g_decay);
                 let bg_buf = self.pool.handle(*beta_gate);
                 let out_buf = self.pool.handle(*output);
-                for t in 0..*n_tokens {
-                    let conv_off = (t as u64) * conv_per_token;
-                    let gdb_off = (t as u64) * gdb_per_token;
-                    let out_off = (t as u64) * out_per_token;
-                    let q_off = conv_off;
-                    let k_off = conv_off + key_total_bytes;
-                    let v_off = conv_off + 2 * key_total_bytes;
-                    let enc = cmd.new_compute_command_encoder();
-                    enc.set_compute_pipeline_state(
-                        &self.linear_attn_pipes.delta_net_step,
-                    );
-                    enc.set_buffer(0, Some(state_buf), 0);
-                    enc.set_buffer(1, Some(conv_buf), q_off as NSUInteger);
-                    enc.set_buffer(2, Some(conv_buf), k_off as NSUInteger);
-                    enc.set_buffer(3, Some(conv_buf), v_off as NSUInteger);
-                    enc.set_buffer(4, Some(g_buf), gdb_off as NSUInteger);
-                    enc.set_buffer(5, Some(bg_buf), gdb_off as NSUInteger);
-                    enc.set_buffer(6, Some(out_buf), out_off as NSUInteger);
-                    enc.set_bytes(7, 4, (&kpv as *const u32).cast());
-                    enc.dispatch_thread_groups(
-                        MTLSize::new(nvh as NSUInteger, 1, 1),
-                        MTLSize::new(vd as NSUInteger, 1, 1),
-                    );
-                    enc.end_encoding();
-                }
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(
+                    &self.linear_attn_pipes.delta_net_step,
+                );
+                enc.set_buffer(0, Some(state_buf), 0);
+                enc.set_buffer(1, Some(conv_buf), 0);
+                enc.set_buffer(2, Some(g_buf), 0);
+                enc.set_buffer(3, Some(bg_buf), 0);
+                enc.set_buffer(4, Some(out_buf), 0);
+                enc.set_bytes(5, 4, (&kpv as *const u32).cast());
+                enc.set_bytes(6, 4, (&n_tokens_arg as *const u32).cast());
+                enc.set_bytes(7, 4, (&key_total as *const u32).cast());
+                enc.set_bytes(8, 4, (&nvh as *const u32).cast());
+                enc.dispatch_thread_groups(
+                    MTLSize::new(nvh as NSUInteger, 1, 1),
+                    MTLSize::new(vd as NSUInteger, 1, 1),
+                );
+                enc.end_encoding();
             }
             Op::GatedRmsNormNTokens {
                 values,

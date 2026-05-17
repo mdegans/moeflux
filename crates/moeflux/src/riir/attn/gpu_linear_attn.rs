@@ -157,10 +157,10 @@ pub fn encode_compute_decay_beta(
     enc.end_encoding();
 }
 
-/// Encode `gated_delta_net_step`. q / k / v live at offsets in the
-/// conv-output buffer. `num_v_heads` threadgroups × `value_dim`
-/// threads (note: dispatch is `value_dim`, not `key_dim` — `vi`
-/// indexes the value channel).
+/// Encode `gated_delta_net_step` for a single token — the
+/// `n_tokens = 1` case of the batched kernel. `conv_out` holds
+/// q | k | v packed; the kernel computes the offsets. `num_v_heads`
+/// threadgroups × `value_dim` threads (`vi` indexes the value channel).
 #[allow(clippy::too_many_arguments)]
 pub fn encode_delta_net_step(
     cmdbuf: &CommandBufferRef,
@@ -174,21 +174,20 @@ pub fn encode_delta_net_step(
     value_dim: u32,
     k_heads_per_v: u32,
 ) {
-    let key_size = std::mem::size_of::<f32>() * VARIANT.linear_total_key();
-    let q_off: u64 = 0;
-    let k_off: u64 = key_size as u64;
-    let v_off: u64 = (key_size * 2) as u64;
+    let key_total = VARIANT.linear_total_key() as u32;
+    let n_tokens: u32 = 1;
 
     let enc = cmdbuf.new_compute_command_encoder();
     enc.set_compute_pipeline_state(pipeline);
     enc.set_buffer(0, Some(state), 0);
-    enc.set_buffer(1, Some(conv_out), q_off as NSUInteger);
-    enc.set_buffer(2, Some(conv_out), k_off as NSUInteger);
-    enc.set_buffer(3, Some(conv_out), v_off as NSUInteger);
-    enc.set_buffer(4, Some(g_decay), 0);
-    enc.set_buffer(5, Some(beta_gate), 0);
-    enc.set_buffer(6, Some(output), 0);
-    enc.set_bytes(7, 4, (&k_heads_per_v as *const u32).cast());
+    enc.set_buffer(1, Some(conv_out), 0);
+    enc.set_buffer(2, Some(g_decay), 0);
+    enc.set_buffer(3, Some(beta_gate), 0);
+    enc.set_buffer(4, Some(output), 0);
+    enc.set_bytes(5, 4, (&k_heads_per_v as *const u32).cast());
+    enc.set_bytes(6, 4, (&n_tokens as *const u32).cast());
+    enc.set_bytes(7, 4, (&key_total as *const u32).cast());
+    enc.set_bytes(8, 4, (&num_v_heads as *const u32).cast());
     enc.dispatch_thread_groups(
         MTLSize::new(num_v_heads as NSUInteger, 1, 1),
         MTLSize::new(value_dim as NSUInteger, 1, 1),
