@@ -37,6 +37,7 @@ use moeflux::riir::backend::gpu::gpu_matvec::{
     encode_matvec_n_tokens, encode_mul_mm_4bit, MatvecPipelines,
     MulMm4bitPipelines,
 };
+use moeflux_mlx::{QmmCall, QmmKernels, QuantWeights};
 use moeflux::riir::variants::VARIANT;
 use moeflux::riir::MetalContext;
 
@@ -299,8 +300,13 @@ fn bench_matvec(metal: &mut MetalContext) {
         MatvecPipelines::fetch(metal).expect("fetch MatvecPipelines");
     let mm_pipes =
         MulMm4bitPipelines::fetch(metal).expect("fetch MulMm4bitPipelines");
+    let qmm = QmmKernels::new(metal.device())
+        .expect("build moeflux-mlx QmmKernels");
 
-    eprintln!("\n[matvec-4bit]  v3 matvec vs mul_mm_4bit (tiled)");
+    eprintln!(
+        "\n[matvec-4bit]  v3 matvec vs mul_mm_4bit (hand-rolled) vs \
+         qmm_t (MLX)"
+    );
 
     // (in_dim, out_dim, name) — a3b projection shapes. qkv_proj / z_proj
     // are the real linear-attn production shapes (out = conv_dim / total
@@ -355,6 +361,32 @@ fn bench_matvec(metal: &mut MetalContext) {
                 &format!("mul_mm {name} {in_dim}->{out_dim} M={m}"),
                 flops,
                 &encode_mm,
+            );
+            let encode_qmm = |cmd: &CommandBufferRef| {
+                qmm.encode_qmm_t(
+                    cmd,
+                    &QmmCall {
+                        weights: QuantWeights {
+                            buffer: &w_buf,
+                            packed_offset: w_off,
+                            scales_offset: s_off,
+                            biases_offset: b_off,
+                        },
+                        input: &in_buf,
+                        input_offset: 0,
+                        output: &out_buf,
+                        output_offset: 0,
+                        in_dim,
+                        out_dim,
+                        n_tokens: m,
+                    },
+                );
+            };
+            bench(
+                metal,
+                &format!("qmm_t  {name} {in_dim}->{out_dim} M={m}"),
+                flops,
+                &encode_qmm,
             );
         }
     }

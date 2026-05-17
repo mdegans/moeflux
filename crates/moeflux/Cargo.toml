@@ -29,5 +29,8 @@ metal       = { workspace = true }
 rayon       = { workspace = true }
 libc        = { workspace = true }
 bytemuck    = { workspace = true }
+# Vendored, MLX-derived Metal kernels — the tiled quantized GEMM that
+# replaces the memory-bound 4-bit dequant matvec.
+moeflux-mlx = { path = "../moeflux-mlx" }
 
 [dev-dependencies]

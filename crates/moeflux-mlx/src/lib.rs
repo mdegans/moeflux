@@ -65,7 +65,8 @@ pub enum MlxError {
     Pipeline(String, String),
     /// The device cannot host the kernel's threadgroup size.
     #[error(
-        "kernel `{0}` needs {needed} threads/threadgroup; device allows {got}"
+        "kernel `{kernel}` needs {needed} threads/threadgroup; \
+         device allows {got}"
     )]
     ThreadgroupTooSmall {
         /// Kernel name.
