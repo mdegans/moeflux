@@ -344,8 +344,10 @@ impl ExpertFiles {
     /// Mmap-mode sibling of [`Self::mmap_buffer_for_expert`]. Returns
     /// `None` in Pread mode and for missing layers.
     ///
-    /// Graph-mode `Op::MoeBatchedPermuteFuse` constructs its
-    /// `expert_refs: Vec<(BufId, u64)>` from this.
+    /// Graph-mode `Op::MoeBatchedPermuteFuse` uses this to address
+    /// the layer's mmap buffer directly as its `expert_base` (the
+    /// layer mmap is already `num_experts` blocks at `expert_size`
+    /// stride, so `expert_idx = 0` gives the base).
     pub fn mmap_id_for_expert(
         &self,
         layer_idx: usize,

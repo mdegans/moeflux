@@ -237,12 +237,17 @@ pub struct BatchedGraphScratch {
     /// MoE permute-fuse scatter accumulator. `Op::ZeroBuffer` clears
     /// it each layer before `Op::MoeBatchedPermuteFuse` accumulates.
     pub out_sum: BufId,
-    /// Pread-mode expert weight blobs, indexed by `expert_id`
-    /// (`num_experts` entries, `expert_size_4bit` bytes each). The
-    /// producer `read_expert`s + `upload`s into the entry for each
-    /// bucket a layer hits. Empty in mmap mode (which addresses
-    /// expert weights via `ExpertFiles::mmap_id_for_expert`).
-    pub expert_blobs: Vec<BufId>,
+    /// Pread-mode expert-weight staging buffer — every expert's block
+    /// packed contiguously at `expert_size_4bit()` stride, the gather
+    /// GEMM's `expert_base`. The producer `read_expert`s each layer's
+    /// hit experts into their slot. `None` in mmap mode, which
+    /// addresses the layer's mmap buffer directly via
+    /// `ExpertFiles::mmap_id_for_expert`.
+    pub expert_base: Option<BufId>,
+    /// Per-assignment-row expert slot table (`u32`), `chunk *
+    /// k_active` wide — the gather kernel's `indices`. Filled per
+    /// layer from `buckets`.
+    pub expert_indices: BufId,
     /// One-time latch: cleared at construction, set by the first
     /// producer call after it `commit_plan`s graph1 + graph2. Gates
     /// the lifetime-coloring pass to run exactly once per run.
@@ -350,14 +355,19 @@ impl BatchedGraphScratch {
             p(chunk * k_active * f32_sz, "bgs.bucket_token_idx");
         let bucket_weights =
             p(chunk * k_active * f32_sz, "bgs.bucket_weights");
-        let expert_blobs: Vec<BufId> = if pread_mode {
-            let blob_bytes = v.expert_size_4bit();
-            (0..v.num_experts)
-                .map(|_| p(blob_bytes, "bgs.expert_blob"))
-                .collect()
-        } else {
-            Vec::new()
-        };
+        // One staging buffer holding every expert's block at
+        // `expert_size_4bit()` stride. Pread-only — mmap mode points
+        // the gather GEMM straight at the layer mmap buffer. (Prefetch
+        // is decode-only; the batched prefill path that reaches here
+        // always runs prefetch-disabled, so pread is the only IO mode
+        // that needs a staging copy.)
+        let expert_base = pread_mode.then(|| {
+            p(v.num_experts * v.expert_size_4bit(), "bgs.expert_base")
+        });
+        let expert_indices = p(
+            chunk * k_active * std::mem::size_of::<u32>(),
+            "bgs.expert_indices",
+        );
         Self {
             normed,
             qkv_stack,
@@ -390,7 +400,8 @@ impl BatchedGraphScratch {
             bucket_token_idx,
             bucket_weights,
             out_sum,
-            expert_blobs,
+            expert_base,
+            expert_indices,
             commit_planned: std::cell::Cell::new(false),
         }
     }
@@ -2460,51 +2471,59 @@ where
             .record_outcome(hit_count, num_buckets as u64 - hit_count);
     }
 
-    // Pread misses: read the expert blob into a host scratch, then
-    // upload it into this expert's run-lifetime `expert_blobs` slot
-    // (indexed by `expert_id` — distinct per bucket).
-    if mode == crate::riir::io::expert_io::ExpertIoMode::Pread {
-        let mut blob_scratch = vec![0u8; v.expert_size_4bit()];
-        let pool = backend.pool_mut();
-        for (bi, &expert_id) in buckets.expert_ids.iter().enumerate() {
-            if bucket_prefetch_slot[bi].is_some() {
-                continue;
+    // Resolve every bucket's expert weights into one uniform-stride
+    // `expert_base` buffer. mmap mode points the gather GEMM straight
+    // at the layer's mmap buffer (zero copy); pread mode `read_expert`s
+    // each hit expert into the run-lifetime staging buffer. Prefetch is
+    // decode-only and never active on this batched prefill path, so the
+    // prefetch-hit memcpy below is a cold correctness path.
+    let expert_base_id: crate::riir::backend::BufId =
+        if mode == crate::riir::io::expert_io::ExpertIoMode::Mmap {
+            expert_files
+                .mmap_id_for_expert(layer_idx, 0)
+                .expect("mmap layer present in mmap mode")
+                .0
+        } else {
+            let base_id =
+                scratch.expert_base.expect("pread mode has expert_base");
+            let expert_size = v.expert_size_4bit();
+            let mut blob_scratch = vec![0u8; expert_size];
+            let pool = backend.pool_mut();
+            for (bi, &expert_id) in buckets.expert_ids.iter().enumerate() {
+                let off = expert_id as usize * expert_size;
+                if let Some(buf_idx) = bucket_prefetch_slot[bi] {
+                    // Cold path: copy a prefetched block into staging.
+                    let pe = prefetch
+                        .as_ref()
+                        .expect("prefetch slot requires env");
+                    let src_id = moe_buffers
+                        .data_prefetch_id(pe.prefetch_set, buf_idx);
+                    pool.download(src_id, &mut blob_scratch)?;
+                } else {
+                    expert_files.read_expert(
+                        layer_idx,
+                        expert_id as usize,
+                        &mut blob_scratch,
+                    )?;
+                }
+                pool.upload_at(base_id, off, &blob_scratch)?;
             }
-            expert_files.read_expert(
-                layer_idx,
-                expert_id as usize,
-                &mut blob_scratch,
-            )?;
-            pool.upload(
-                scratch.expert_blobs[expert_id as usize],
-                &blob_scratch,
-            )?;
-        }
-    }
+            base_id
+        };
 
-    // Per-bucket expert weight `(BufId, byte offset)` — three sources:
-    // prefetch hit, mmap layer buffer, or the uploaded pread blob.
-    let expert_refs: Vec<(crate::riir::backend::BufId, u64)> = buckets
-        .expert_ids
-        .iter()
-        .enumerate()
-        .map(|(bi, &expert_id)| {
-            if let Some(buf_idx) = bucket_prefetch_slot[bi] {
-                let pe =
-                    prefetch.as_ref().expect("prefetch slot requires env");
-                (
-                    moe_buffers.data_prefetch_id(pe.prefetch_set, buf_idx),
-                    0u64,
-                )
-            } else if mode == crate::riir::io::expert_io::ExpertIoMode::Mmap {
-                expert_files
-                    .mmap_id_for_expert(layer_idx, expert_id as u32)
-                    .expect("mmap layer present in mmap mode")
-            } else {
-                (scratch.expert_blobs[expert_id as usize], 0u64)
-            }
-        })
-        .collect();
+    // `expert_slots[bi]` is the block index of `buckets.expert_ids[bi]`
+    // within `expert_base` — the raw expert id in both modes (mmap is
+    // `num_experts` blocks; the pread staging buffer is filled by id).
+    // `expert_indices` expands it per assignment row for the gather
+    // kernel's per-row `indices`.
+    let expert_slots: Vec<u32> =
+        buckets.expert_ids.iter().map(|&e| e as u32).collect();
+    let mut expert_indices_host = vec![0u32; total_assignments];
+    for bi in 0..num_buckets {
+        let start = buckets.offsets[bi] as usize;
+        let end = buckets.offsets[bi + 1] as usize;
+        expert_indices_host[start..end].fill(expert_slots[bi]);
+    }
 
     // bucket_input host permute: gather each assignment's token row
     // from h_post into bucket-flat order. Then upload it + the small
@@ -2534,6 +2553,12 @@ where
             std::slice::from_raw_parts(
                 buckets.weights.as_ptr() as *const u8,
                 total_assignments * f32_sz_u,
+            )
+        })?;
+        pool.upload(scratch.expert_indices, unsafe {
+            std::slice::from_raw_parts(
+                expert_indices_host.as_ptr() as *const u8,
+                total_assignments * std::mem::size_of::<u32>(),
             )
         })?;
     }
@@ -2605,7 +2630,10 @@ where
         });
         g.push(Op::MoeBatchedPermuteFuse {
             label: "linear_attn.moe_permute_fuse",
-            expert_refs,
+            expert_base: expert_base_id,
+            expert_stride: v.expert_size_4bit() as u64,
+            expert_indices: scratch.expert_indices,
+            expert_slots,
             bucket_input: scratch.bucket_input,
             bucket_gate: scratch.bucket_gate,
             bucket_up: scratch.bucket_up,

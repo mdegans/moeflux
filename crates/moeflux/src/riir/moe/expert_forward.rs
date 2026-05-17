@@ -50,6 +50,8 @@ use metal::{
     NSUInteger,
 };
 
+use moeflux_mlx::{GatherQmmCall, QmmKernels, QuantWeights};
+
 use crate::riir::backend::{BufId, BufferPool, MetalBufferPool};
 use crate::riir::backend::gpu::gpu_matvec::{encode_matvec_n_tokens, MatvecPipelines};
 use crate::riir::backend::gpu::gpu_norm::{encode_rms_norm_bf16_into, RmsNormBf16Pipelines};
@@ -1231,15 +1233,31 @@ fn encode_swiglu_into_buf(
 ///
 /// Replaces the per-token K-expert dispatch ([`emit_batched_experts`])
 /// for prefill: instead of reading each expert blob K times per token,
-/// bucket (token, slot, weight) tuples by expert id and read each blob
-/// once per non-empty bucket. Arithmetic matches the tokenwise path
-/// (same gate/up/swiglu/down kernels, same routing weights) — only the
-/// dispatch order differs, so the diff oracle expects cosine ≥ 0.9999
-/// against the tokenwise reference (FP reorder envelope only).
+/// bucket (token, slot, weight) tuples by expert id and process each
+/// bucket once. Arithmetic matches the tokenwise path (same
+/// gate/up/swiglu/down math, same routing weights) — only the dispatch
+/// order differs, so the diff oracle expects cosine ≥ 0.9999 against
+/// the tokenwise reference (FP reorder envelope only).
+///
+/// Two encode paths, selected by `gather`:
+/// - `gather = true` — one MLX `affine_gather_qmm_rhs` GEMM per
+///   gate/up/down over *all* assignments at once (the kernel walks the
+///   per-row `expert_indices` and GEMMs each contiguous same-expert
+///   run), a flat swiglu, then the per-bucket scatter.
+/// - `gather = false` — the per-bucket fallback: a hand-rolled matvec
+///   per non-empty bucket. Kept as the shape the [`CpuBackend`] oracle
+///   mirrors and the `MOEFLUX_MOE_GATHER=0` escape hatch.
+///
+/// Expert weights live in one `expert_base` buffer at uniform
+/// `expert_stride` byte spacing; bucket `bi` uses the expert block at
+/// `expert_base + expert_slots[bi] * expert_stride`, and the gather
+/// kernel reaches the same block via `expert_indices[row]`.
 ///
 /// Caller responsibilities:
-/// - `expert_blobs[bi]` holds the 4-bit-quantized weights for
-///   `buckets.expert_ids[bi]` (parallel arrays).
+/// - `expert_base` holds every needed expert's 4-bit-quantized weight
+///   block; `expert_slots[bi]` is the block index for
+///   `buckets.expert_ids[bi]` (parallel arrays). `expert_indices` is
+///   `expert_slots` expanded per assignment row (`offsets`-driven).
 /// - `bucket_input` is a packed `[total_assignments, hidden_dim]` f32
 ///   buffer of post-attn-norm hidden states gathered per-bucket. The
 ///   bucket-`bi` rows live at offset
@@ -1254,30 +1272,129 @@ fn encode_swiglu_into_buf(
 ///   residual / shared-expert contribution).
 ///
 /// Empty buckets are skipped (they don't appear in
-/// [`ExpertBuckets::expert_ids`] by construction, but the loop also
-/// guards `b_size == 0` defensively).
-/// Per-bucket expert-weight reference: the underlying Metal buffer
-/// plus a byte offset to the start of this expert's blob within it.
-///
-/// - **Pread mode**: `buffer` is a fresh `MtlBuffer<u8>` allocated by
-///   the caller for this expert's blob, `offset` is `0`.
-/// - **Mmap mode**: `buffer` is the layer's mmap-backed Metal buffer,
-///   `offset` is `expert_idx * expert_size`. Multiple `ExpertRef`s
-///   in the same call may share the same `buffer` with different
-///   offsets.
-///
-/// The matvec encoder adds this `offset` to each per-tensor offset
-/// (`gate_w_off_4bit()`, `gate_s_off_4bit()`, etc.) when binding —
-/// the within-blob tensor layout matches in both modes.
-pub type ExpertRef<'a> = (&'a Buffer, u64);
-
+/// [`ExpertBuckets::expert_ids`] by construction; the per-bucket loop
+/// also guards `b_size == 0` defensively).
 #[allow(clippy::too_many_arguments)]
 pub fn encode_moe_batched_permute_fuse(
     cmdbuf: &CommandBufferRef,
     matvec: &MatvecPipelines,
+    qmm: &QmmKernels,
     swiglu: &ComputePipelineState,
     bucket_accumulate: &ComputePipelineState,
-    expert_refs: &[ExpertRef<'_>],
+    expert_base: &Buffer,
+    expert_stride: u64,
+    expert_indices: &Buffer,
+    expert_slots: &[u32],
+    bucket_input: &Buffer,
+    bucket_gate: &Buffer,
+    bucket_up: &Buffer,
+    bucket_act: &Buffer,
+    bucket_out: &Buffer,
+    bucket_token_idx: &Buffer,
+    bucket_weights: &Buffer,
+    out_sum: &Buffer,
+    buckets: &ExpertBuckets,
+    v: Variant,
+    gather: bool,
+) {
+    debug_assert_eq!(expert_slots.len(), buckets.expert_ids.len());
+    if gather {
+        encode_moe_gather(
+            cmdbuf, qmm, swiglu, bucket_accumulate, expert_base,
+            expert_stride, expert_indices, bucket_input, bucket_gate,
+            bucket_up, bucket_act, bucket_out, bucket_token_idx,
+            bucket_weights, out_sum, buckets, v,
+        );
+    } else {
+        encode_moe_per_bucket(
+            cmdbuf, matvec, swiglu, bucket_accumulate, expert_base,
+            expert_stride, expert_slots, bucket_input, bucket_gate,
+            bucket_up, bucket_act, bucket_out, bucket_token_idx,
+            bucket_weights, out_sum, buckets, v,
+        );
+    }
+}
+
+/// Element-wise swiglu `silu(gate) * up → act`, flat-dispatched over
+/// `dim` elements. All three buffers are read/written at byte offset
+/// `off`. Element-wise so the flat dispatch matches the per-token
+/// kernel's row-by-row arithmetic exactly.
+fn encode_swiglu_at(
+    cmdbuf: &CommandBufferRef,
+    swiglu: &ComputePipelineState,
+    gate: &Buffer,
+    up: &Buffer,
+    act: &Buffer,
+    off: u64,
+    dim: u32,
+) {
+    let enc = cmdbuf.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(swiglu);
+    enc.set_buffer(0, Some(gate), off as NSUInteger);
+    enc.set_buffer(1, Some(up), off as NSUInteger);
+    enc.set_buffer(2, Some(act), off as NSUInteger);
+    enc.set_bytes(3, 4, (&dim as *const u32).cast());
+    let num_tgs = (dim + 255) / 256;
+    enc.dispatch_thread_groups(
+        MTLSize::new(num_tgs as NSUInteger, 1, 1),
+        MTLSize::new(256, 1, 1),
+    );
+    enc.end_encoding();
+}
+
+/// `moe_bucket_accumulate`: scatter-add one bucket's weighted expert
+/// outputs into `out_sum`. No atomics — `token_idx[b]` is unique
+/// within a bucket, and cross-bucket sequencing comes from Metal's
+/// encoder ordering within the cmdbuf (each call here is one encoder).
+#[allow(clippy::too_many_arguments)]
+fn encode_bucket_scatter(
+    cmdbuf: &CommandBufferRef,
+    bucket_accumulate: &ComputePipelineState,
+    bucket_out: &Buffer,
+    bucket_token_idx: &Buffer,
+    bucket_weights: &Buffer,
+    out_sum: &Buffer,
+    start: u64,
+    b_size: u32,
+    hidden_dim: u32,
+) {
+    let f32_sz = std::mem::size_of::<f32>() as u64;
+    let i32_sz = std::mem::size_of::<i32>() as u64;
+    let out_off = start * hidden_dim as u64 * f32_sz;
+    let idx_off = start * i32_sz;
+    let w_off_b = start * f32_sz;
+
+    let enc = cmdbuf.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(bucket_accumulate);
+    enc.set_buffer(0, Some(bucket_out), out_off as NSUInteger);
+    enc.set_buffer(1, Some(bucket_token_idx), idx_off as NSUInteger);
+    enc.set_buffer(2, Some(bucket_weights), w_off_b as NSUInteger);
+    enc.set_buffer(3, Some(out_sum), 0);
+    enc.set_bytes(4, 4, (&hidden_dim as *const u32).cast());
+    enc.set_bytes(5, 4, (&b_size as *const u32).cast());
+    let tgs_x = b_size as NSUInteger;
+    let tgs_y = ((hidden_dim + 255) / 256) as NSUInteger;
+    enc.dispatch_thread_groups(
+        MTLSize::new(tgs_x, tgs_y, 1),
+        MTLSize::new(1, 256, 1),
+    );
+    enc.end_encoding();
+}
+
+/// Gather path: one MLX `affine_gather_qmm_rhs` GEMM per gate/up/down
+/// over every assignment row at once, a flat swiglu, then the
+/// per-bucket scatter. The gather kernel walks `expert_indices` (one
+/// `u32` per row) and GEMMs each contiguous same-expert run — so
+/// `bucket_input` must be bucket-permuted (it is, by construction).
+#[allow(clippy::too_many_arguments)]
+fn encode_moe_gather(
+    cmdbuf: &CommandBufferRef,
+    qmm: &QmmKernels,
+    swiglu: &ComputePipelineState,
+    bucket_accumulate: &ComputePipelineState,
+    expert_base: &Buffer,
+    expert_stride: u64,
+    expert_indices: &Buffer,
     bucket_input: &Buffer,
     bucket_gate: &Buffer,
     bucket_up: &Buffer,
@@ -1289,14 +1406,131 @@ pub fn encode_moe_batched_permute_fuse(
     buckets: &ExpertBuckets,
     v: Variant,
 ) {
-    debug_assert_eq!(expert_refs.len(), buckets.expert_ids.len());
+    let total = buckets.token_idx.len() as u32;
+    if total == 0 {
+        return;
+    }
+    let hidden_dim = v.hidden_dim as u32;
+    let moe_inter = v.moe_intermediate as u32;
+    // `stride_s` is in bf16 *elements*; the per-expert block stride is
+    // `expert_stride` bytes, scales are bf16 → /2.
+    let stride_s = expert_stride / 2;
 
+    // One GEMM whose RHS weight is gathered per row. `packed/scales/
+    // biases_offset` are expert 0's sub-tensor offsets within its
+    // block; the kernel reaches expert e via `e * stride_w/stride_s`.
+    let gather = |w_off: u64, s_off: u64, b_off: u64, input: &Buffer,
+                  output: &Buffer, in_dim: u32, out_dim: u32| {
+        qmm.encode_gather_qmm_rhs(
+            cmdbuf,
+            &GatherQmmCall {
+                weights: QuantWeights {
+                    buffer: expert_base,
+                    packed_offset: w_off,
+                    scales_offset: s_off,
+                    biases_offset: b_off,
+                },
+                input,
+                input_offset: 0,
+                output,
+                output_offset: 0,
+                indices: expert_indices,
+                indices_offset: 0,
+                in_dim,
+                out_dim,
+                n_tokens: total,
+                stride_w: expert_stride,
+                stride_s,
+            },
+        );
+    };
+
+    // 1. gate, 2. up — bucket_input → bucket_gate / bucket_up.
+    gather(
+        v.gate_w_off_4bit() as u64,
+        v.gate_s_off_4bit() as u64,
+        v.gate_b_off_4bit() as u64,
+        bucket_input,
+        bucket_gate,
+        hidden_dim,
+        moe_inter,
+    );
+    gather(
+        v.up_w_off_4bit() as u64,
+        v.up_s_off_4bit() as u64,
+        v.up_b_off_4bit() as u64,
+        bucket_input,
+        bucket_up,
+        hidden_dim,
+        moe_inter,
+    );
+
+    // 3. swiglu over the whole flat `[total, moe_inter]` region.
+    encode_swiglu_at(
+        cmdbuf,
+        swiglu,
+        bucket_gate,
+        bucket_up,
+        bucket_act,
+        0,
+        total * moe_inter,
+    );
+
+    // 4. down — bucket_act → bucket_out.
+    gather(
+        v.down_w_off_4bit() as u64,
+        v.down_s_off_4bit() as u64,
+        v.down_b_off_4bit() as u64,
+        bucket_act,
+        bucket_out,
+        moe_inter,
+        hidden_dim,
+    );
+
+    // 5. per-bucket scatter into out_sum.
+    for bi in 0..buckets.expert_ids.len() {
+        let start = buckets.offsets[bi] as u64;
+        let b_size = (buckets.offsets[bi + 1] - buckets.offsets[bi]) as u32;
+        if b_size == 0 {
+            continue;
+        }
+        encode_bucket_scatter(
+            cmdbuf, bucket_accumulate, bucket_out, bucket_token_idx,
+            bucket_weights, out_sum, start, b_size, hidden_dim,
+        );
+    }
+}
+
+/// Per-bucket fallback: a hand-rolled matvec sequence per non-empty
+/// bucket. Bucket `bi` uses the expert block at `expert_base +
+/// expert_slots[bi] * expert_stride`. Kept as the shape the
+/// [`CpuBackend`] oracle mirrors and the `MOEFLUX_MOE_GATHER=0`
+/// escape hatch.
+#[allow(clippy::too_many_arguments)]
+fn encode_moe_per_bucket(
+    cmdbuf: &CommandBufferRef,
+    matvec: &MatvecPipelines,
+    swiglu: &ComputePipelineState,
+    bucket_accumulate: &ComputePipelineState,
+    expert_base: &Buffer,
+    expert_stride: u64,
+    expert_slots: &[u32],
+    bucket_input: &Buffer,
+    bucket_gate: &Buffer,
+    bucket_up: &Buffer,
+    bucket_act: &Buffer,
+    bucket_out: &Buffer,
+    bucket_token_idx: &Buffer,
+    bucket_weights: &Buffer,
+    out_sum: &Buffer,
+    buckets: &ExpertBuckets,
+    v: Variant,
+) {
     let hidden_dim = v.hidden_dim as u32;
     let moe_inter = v.moe_intermediate as u32;
     let f32_sz = std::mem::size_of::<f32>() as u64;
-    let i32_sz = std::mem::size_of::<i32>() as u64;
 
-    for (bi, &(blob, expert_off)) in expert_refs.iter().enumerate() {
+    for (bi, &slot) in expert_slots.iter().enumerate() {
         let start = buckets.offsets[bi] as u64;
         let end = buckets.offsets[bi + 1] as u64;
         let b_size = (end - start) as u32;
@@ -1304,17 +1538,16 @@ pub fn encode_moe_batched_permute_fuse(
             continue;
         }
 
+        let expert_off = slot as u64 * expert_stride;
         let in_off = start * v.hidden_dim as u64 * f32_sz;
         let mid_off = start * v.moe_intermediate as u64 * f32_sz;
         let out_off = start * v.hidden_dim as u64 * f32_sz;
-        let idx_off = start * i32_sz;
-        let w_off_b = start * f32_sz;
 
         // 1. gate matvec: bucket_input → bucket_gate
         encode_matvec_n_tokens(
             cmdbuf,
             matvec,
-            blob,
+            expert_base,
             expert_off + v.gate_w_off_4bit() as u64,
             expert_off + v.gate_s_off_4bit() as u64,
             expert_off + v.gate_b_off_4bit() as u64,
@@ -1332,7 +1565,7 @@ pub fn encode_moe_batched_permute_fuse(
         encode_matvec_n_tokens(
             cmdbuf,
             matvec,
-            blob,
+            expert_base,
             expert_off + v.up_w_off_4bit() as u64,
             expert_off + v.up_s_off_4bit() as u64,
             expert_off + v.up_b_off_4bit() as u64,
@@ -1346,31 +1579,22 @@ pub fn encode_moe_batched_permute_fuse(
             4,
         );
 
-        // 3. swiglu: silu(gate) * up → act, flat-dispatched over
-        //    `b_size * moe_intermediate` because the kernel is purely
-        //    element-wise (matches the per-token kernel's arithmetic
-        //    row-by-row).
-        {
-            let enc = cmdbuf.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(swiglu);
-            enc.set_buffer(0, Some(bucket_gate), mid_off as NSUInteger);
-            enc.set_buffer(1, Some(bucket_up), mid_off as NSUInteger);
-            enc.set_buffer(2, Some(bucket_act), mid_off as NSUInteger);
-            let dim = b_size * moe_inter;
-            enc.set_bytes(3, 4, (&dim as *const u32).cast());
-            let num_tgs = (dim + 255) / 256;
-            enc.dispatch_thread_groups(
-                MTLSize::new(num_tgs as NSUInteger, 1, 1),
-                MTLSize::new(256, 1, 1),
-            );
-            enc.end_encoding();
-        }
+        // 3. swiglu: silu(gate) * up → act
+        encode_swiglu_at(
+            cmdbuf,
+            swiglu,
+            bucket_gate,
+            bucket_up,
+            bucket_act,
+            mid_off,
+            b_size * moe_inter,
+        );
 
         // 4. down matvec: bucket_act → bucket_out
         encode_matvec_n_tokens(
             cmdbuf,
             matvec,
-            blob,
+            expert_base,
             expert_off + v.down_w_off_4bit() as u64,
             expert_off + v.down_s_off_4bit() as u64,
             expert_off + v.down_b_off_4bit() as u64,
@@ -1384,31 +1608,11 @@ pub fn encode_moe_batched_permute_fuse(
             4,
         );
 
-        // 5. moe_bucket_accumulate: scatter-add weighted into out_sum.
-        //    No atomics — `token_idx[b]` is unique within this bucket,
-        //    cross-bucket sequencing comes from Metal's encoder ordering
-        //    within the cmdbuf.
-        {
-            let enc = cmdbuf.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(bucket_accumulate);
-            enc.set_buffer(0, Some(bucket_out), out_off as NSUInteger);
-            enc.set_buffer(
-                1,
-                Some(bucket_token_idx),
-                idx_off as NSUInteger,
-            );
-            enc.set_buffer(2, Some(bucket_weights), w_off_b as NSUInteger);
-            enc.set_buffer(3, Some(out_sum), 0);
-            enc.set_bytes(4, 4, (&hidden_dim as *const u32).cast());
-            enc.set_bytes(5, 4, (&b_size as *const u32).cast());
-            let tgs_x = b_size as NSUInteger;
-            let tgs_y = ((hidden_dim + 255) / 256) as NSUInteger;
-            enc.dispatch_thread_groups(
-                MTLSize::new(tgs_x, tgs_y, 1),
-                MTLSize::new(1, 256, 1),
-            );
-            enc.end_encoding();
-        }
+        // 5. scatter-add weighted into out_sum.
+        encode_bucket_scatter(
+            cmdbuf, bucket_accumulate, bucket_out, bucket_token_idx,
+            bucket_weights, out_sum, start, b_size, hidden_dim,
+        );
     }
 }
 

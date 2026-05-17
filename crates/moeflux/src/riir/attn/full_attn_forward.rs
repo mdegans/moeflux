@@ -42,7 +42,7 @@
 //! Predicted observed: well under those — comparable to 4c's
 //! cosine ≈ 1.0, max_abs_diff ≈ 4.1e-8.
 
-use metal::NSUInteger;
+use metal::{Buffer, NSUInteger};
 
 use crate::riir::moe::expert_forward::MoeBuffers;
 use crate::riir::backend::BufferPool;
@@ -1051,45 +1051,103 @@ pub(in crate::riir) fn batched_full_attn_layer_forward(
         );
     }
 
-    let mut owned_blobs: Vec<Option<MtlBuffer<u8>>> = (0..num_buckets)
-        .map(|_| None)
-        .collect();
-    if mode == crate::riir::io::expert_io::ExpertIoMode::Pread {
+    // Resolve every bucket's expert weights into one uniform-stride
+    // `expert_base` buffer — the layout the gather GEMM and the
+    // per-bucket fallback both index as `expert_base + slot *
+    // expert_stride`. Two cases:
+    //   A. mmap mode, no prefetch hits — the layer's mmap buffer is
+    //      already `num_experts` blocks at `expert_size` stride;
+    //      address it directly (zero copy). `expert_slots` = raw ids.
+    //   B. otherwise — stage each bucket's block into one
+    //      `num_buckets * expert_size` buffer (memcpy prefetch hits,
+    //      copy mmap blocks, pread the misses). `expert_slots` = bi.
+    let any_prefetch_hit =
+        bucket_prefetch_slot.iter().any(|s| s.is_some());
+    let use_mmap_base = mode
+        == crate::riir::io::expert_io::ExpertIoMode::Mmap
+        && !any_prefetch_hit;
+
+    let staged: Option<MtlBuffer<u8>> = if use_mmap_base {
+        None
+    } else {
+        let mut host = vec![0u8; num_buckets * expert_size];
         let mut blob_scratch = vec![0u8; expert_size];
         for (bi, &expert_id) in buckets.expert_ids.iter().enumerate() {
-            if bucket_prefetch_slot[bi].is_some() {
-                continue;
-            }
-            expert_files
-                .read_expert(layer_idx, expert_id as usize, &mut blob_scratch)?;
-            owned_blobs[bi] =
-                Some(MtlBuffer::<u8>::with_data(&device, &blob_scratch));
-        }
-    }
-    let expert_refs: Vec<crate::riir::moe::expert_forward::ExpertRef<'_>> = buckets
-        .expert_ids
-        .iter()
-        .enumerate()
-        .map(|(bi, &expert_id)| {
+            let dst =
+                &mut host[bi * expert_size..(bi + 1) * expert_size];
             if let Some(buf_idx) = bucket_prefetch_slot[bi] {
-                let pe = prefetch.as_ref().expect("prefetch slot requires env");
+                let pe = prefetch
+                    .as_ref()
+                    .expect("prefetch slot requires env");
                 let buf = moe_buffers.data_prefetch_buffer(
                     buffer_pool,
                     pe.prefetch_set,
                     buf_idx,
                 );
-                (buf, 0u64)
-            } else if mode == crate::riir::io::expert_io::ExpertIoMode::Mmap {
-                expert_files
+                // SAFETY: shared-storage Metal buffer, `expert_size`
+                // bytes; no GPU dispatch reads it during this copy.
+                let src = unsafe {
+                    std::slice::from_raw_parts(
+                        buf.contents() as *const u8,
+                        expert_size,
+                    )
+                };
+                dst.copy_from_slice(src);
+            } else if mode
+                == crate::riir::io::expert_io::ExpertIoMode::Mmap
+            {
+                let (buf, off) = expert_files
                     .mmap_buffer_for_expert(layer_idx, expert_id as u32)
-                    .expect("mmap layer present in mmap mode")
+                    .expect("mmap layer present in mmap mode");
+                // SAFETY: as above; `off` is within the mmap buffer.
+                let src = unsafe {
+                    std::slice::from_raw_parts(
+                        (buf.contents() as *const u8)
+                            .add(off as usize),
+                        expert_size,
+                    )
+                };
+                dst.copy_from_slice(src);
             } else {
-                let blob =
-                    owned_blobs[bi].as_ref().expect("synced miss has owned blob");
-                (blob.buffer(), 0u64)
+                expert_files.read_expert(
+                    layer_idx,
+                    expert_id as usize,
+                    &mut blob_scratch,
+                )?;
+                dst.copy_from_slice(&blob_scratch);
             }
-        })
-        .collect();
+        }
+        Some(MtlBuffer::<u8>::with_data(&device, &host))
+    };
+    let (expert_base, expert_slots): (&Buffer, Vec<u32>) = match &staged
+    {
+        Some(buf) => {
+            (buf.buffer(), (0..num_buckets as u32).collect())
+        }
+        None => {
+            let (base, _off) = expert_files
+                .mmap_buffer_for_expert(layer_idx, 0)
+                .expect("mmap layer present in mmap mode");
+            (base, buckets.expert_ids.iter().map(|&e| e as u32).collect())
+        }
+    };
+    let expert_stride = expert_size as u64;
+
+    // Per-assignment-row expansion of `expert_slots` — the gather
+    // kernel's row→slot table.
+    let mut expert_indices_host = vec![0u32; total_assignments];
+    for bi in 0..num_buckets {
+        let start = buckets.offsets[bi] as usize;
+        let end = buckets.offsets[bi + 1] as usize;
+        expert_indices_host[start..end].fill(expert_slots[bi]);
+    }
+    let expert_indices =
+        MtlBuffer::<u32>::with_data(&device, &expert_indices_host);
+
+    // `MOEFLUX_MOE_GATHER=0` opts out of the MLX gather GEMM (mirrors
+    // `MetalBackend`'s field; full-attn runs the imperative path).
+    let moe_gather = std::env::var("MOEFLUX_MOE_GATHER")
+        .map_or(true, |val| val != "0");
 
     let mut bucket_input_host = vec![0.0f32; total_assignments * hidden_dim];
     for assignment_idx in 0..total_assignments {
@@ -1132,9 +1190,13 @@ pub(in crate::riir) fn batched_full_attn_layer_forward(
     encode_moe_batched_permute_fuse(
         cmdbuf,
         &matvec,
+        metal.qmm(),
         &swiglu,
         &bucket_accumulate,
-        &expert_refs,
+        expert_base,
+        expert_stride,
+        expert_indices.buffer(),
+        &expert_slots,
         bucket_input.buffer(),
         bucket_gate.buffer(),
         bucket_up.buffer(),
@@ -1145,6 +1207,7 @@ pub(in crate::riir) fn batched_full_attn_layer_forward(
         out_sum.buffer(),
         &buckets,
         v,
+        moe_gather,
     );
     // S7-2: GPU combine into hidden_out_buf — replaces the CPU loop
     // that read h_mid_stack / shared_out_stack / shared_gate_scores /

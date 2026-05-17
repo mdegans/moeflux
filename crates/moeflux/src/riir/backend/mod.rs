@@ -138,6 +138,18 @@ pub trait BufferPool {
     /// than the buffer is rejected with `SizeMismatch`.
     fn upload(&mut self, id: BufId, host: &[u8]) -> Result<(), Self::Error>;
 
+    /// Bulk-copy `host` bytes into the buffer at `id` starting at
+    /// byte `offset`. Like [`Self::upload`] but for filling one
+    /// sub-region of a larger buffer — e.g. one expert's weight block
+    /// within a packed expert-weight staging buffer. `offset +
+    /// host.len()` must fit the buffer or `SizeMismatch` is returned.
+    fn upload_at(
+        &mut self,
+        id: BufId,
+        offset: usize,
+        host: &[u8],
+    ) -> Result<(), Self::Error>;
+
     /// Bulk-copy bytes out of the buffer at `id` into `host`. Used
     /// for the routing readback at the two-phase split. Prefix
     /// semantics mirror [`Self::upload`].
@@ -433,19 +445,33 @@ pub enum Op {
 
     /// Bucket-driven expert FFN dispatch. The producer pre-builds
     /// [`ExpertBuckets`] on CPU (from the routing readback) and
-    /// embeds the metadata directly in the op. Each non-empty
-    /// bucket is mapped to one expert weight blob via
-    /// `expert_refs[bucket_idx]`.
+    /// embeds the metadata directly in the op.
     ///
-    /// All buffers in this op are bucket-flat: indexed by
+    /// Expert weights live in a single `expert_base` buffer addressed
+    /// at uniform `expert_stride` byte stride: bucket `bi` uses the
+    /// expert block at `expert_base + expert_slots[bi] * expert_
+    /// stride`. `expert_indices` is the per-assignment-row expansion
+    /// of `expert_slots` (`expert_slots` expanded by `buckets.
+    /// offsets`) — the gather kernel's row→slot table.
+    ///
+    /// All bucket buffers in this op are bucket-flat: indexed by
     /// `(bucket_offset + slot_within_bucket)`. The combine into
     /// per-token `out_sum` is the kernel's responsibility (or the
     /// CPU oracle's, in [`CpuBackend`]).
     MoeBatchedPermuteFuse {
         label: &'static str,
-        /// Per-bucket `(expert blob buf, byte offset)`. Length =
-        /// `buckets.expert_ids.len()`.
-        expert_refs: Vec<(BufId, u64)>,
+        /// Base buffer holding every expert's packed weight block.
+        expert_base: BufId,
+        /// Byte stride between consecutive expert blocks in
+        /// `expert_base`.
+        expert_stride: u64,
+        /// Per-assignment-row expert slot (`u32`). Length =
+        /// `total_assignments`; the gather kernel's `indices`.
+        expert_indices: BufId,
+        /// Per-bucket expert slot into `expert_base`. Length =
+        /// `buckets.expert_ids.len()`; the per-bucket fallback's
+        /// selector.
+        expert_slots: Vec<u32>,
         bucket_input: BufId,
         bucket_gate: BufId,
         bucket_up: BufId,
@@ -612,21 +638,19 @@ impl Op {
             Op::MoeSoftmaxTopK { logits, .. } => vec![*logits],
             Op::MoeNormalizeWeights { weights, .. } => vec![*weights],
             Op::MoeBatchedPermuteFuse {
-                expert_refs,
+                expert_base,
+                expert_indices,
                 bucket_input,
                 bucket_token_idx,
                 bucket_weights,
                 ..
-            } => {
-                let mut v = Vec::with_capacity(expert_refs.len() + 3);
-                v.push(*bucket_input);
-                v.push(*bucket_token_idx);
-                v.push(*bucket_weights);
-                for (id, _off) in expert_refs {
-                    v.push(*id);
-                }
-                v
-            }
+            } => vec![
+                *expert_base,
+                *expert_indices,
+                *bucket_input,
+                *bucket_token_idx,
+                *bucket_weights,
+            ],
             Op::MoeCombineResidualNTokens {
                 h_mid,
                 moe_sum,
@@ -848,7 +872,10 @@ mod tests {
         });
         g.push(Op::MoeBatchedPermuteFuse {
             label: "moe_pf",
-            expert_refs: vec![(buf(21), 0)],
+            expert_base: buf(21),
+            expert_stride: 0,
+            expert_indices: buf(35),
+            expert_slots: vec![0],
             bucket_input: buf(22),
             bucket_gate: buf(23),
             bucket_up: buf(24),

@@ -118,6 +118,28 @@ impl BufferPool for CpuBufferPool {
         Ok(())
     }
 
+    fn upload_at(
+        &mut self,
+        id: BufId,
+        offset: usize,
+        host: &[u8],
+    ) -> Result<(), GraphError> {
+        let idx = id.0 as usize;
+        let label = *self.labels.get(idx).ok_or(GraphError::BadBufId(id))?;
+        let expected = self.byte_sizes[idx];
+        if offset + host.len() > expected {
+            return Err(GraphError::SizeMismatch {
+                label,
+                expected,
+                actual: offset + host.len(),
+            });
+        }
+        let physical = self.bufid_to_physical[idx] as usize;
+        let mut buf_mut = self.buffers[physical].borrow_mut();
+        buf_mut[offset..offset + host.len()].copy_from_slice(host);
+        Ok(())
+    }
+
     fn download(&self, id: BufId, host: &mut [u8]) -> Result<(), GraphError> {
         let idx = id.0 as usize;
         let label = *self.labels.get(idx).ok_or(GraphError::BadBufId(id))?;
@@ -908,24 +930,30 @@ impl Backend for CpuBackend {
                 );
             }
             Op::MoeBatchedPermuteFuse {
-                expert_refs,
+                expert_base,
+                expert_stride,
+                expert_slots,
                 bucket_input,
                 buckets,
                 out_sum,
                 ..
             } => {
-                // Each (BufId, offset) in expert_refs identifies a per-bucket
-                // expert blob already uploaded into the pool. We hold all
-                // borrows simultaneously — the buffer IDs are distinct, so
-                // RefCell borrows don't collide.
+                // `expert_base` holds every needed expert's weight
+                // block at uniform `expert_stride` byte spacing;
+                // bucket `bi` reads the block at
+                // `expert_slots[bi] * expert_stride`. One borrow of
+                // one id, sliced per bucket — no RefCell collision.
                 let input_buf = self.read_f32(*bucket_input);
                 let mut out_buf = self.write_f32(*out_sum);
-                let blobs: Vec<Ref<'_, [u8]>> = expert_refs
+                let base = self.read_bytes(*expert_base);
+                let expert_size = VARIANT.expert_size_4bit();
+                let blob_refs: Vec<&[u8]> = expert_slots
                     .iter()
-                    .map(|(id, _off)| self.read_bytes(*id))
+                    .map(|&slot| {
+                        let off = slot as usize * *expert_stride as usize;
+                        &base[off..off + expert_size]
+                    })
                     .collect();
-                let blob_refs: Vec<&[u8]> =
-                    blobs.iter().map(|b| &**b).collect();
                 moe_permute_fuse_cpu(
                     &VARIANT, &blob_refs, &input_buf, buckets, &mut out_buf,
                 )

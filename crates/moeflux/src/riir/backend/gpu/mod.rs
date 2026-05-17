@@ -241,6 +241,34 @@ impl BufferPool for MetalBufferPool {
         Ok(())
     }
 
+    fn upload_at(
+        &mut self,
+        id: BufId,
+        offset: usize,
+        host: &[u8],
+    ) -> Result<(), GraphError> {
+        let idx = id.0 as usize;
+        let label = *self.labels.get(idx).ok_or(GraphError::BadBufId(id))?;
+        let expected = self.byte_sizes[idx];
+        if offset + host.len() > expected {
+            return Err(GraphError::SizeMismatch {
+                label,
+                expected,
+                actual: offset + host.len(),
+            });
+        }
+        let physical = self.bufid_to_physical[idx] as usize;
+        let buf = &self.buffers[physical];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                host.as_ptr(),
+                (buf.contents() as *mut u8).add(offset),
+                host.len(),
+            );
+        }
+        Ok(())
+    }
+
     fn download(
         &self,
         id: BufId,
@@ -443,6 +471,11 @@ pub struct MetalBackend {
     /// it inflates wall time; use it for proportion analysis, never
     /// for an absolute bench.
     profile_per_op: bool,
+    /// When false (env `MOEFLUX_MOE_GATHER=0`), `MoeBatchedPermuteFuse`
+    /// uses the per-bucket matvec fallback instead of the MLX
+    /// `affine_gather_qmm_rhs` GEMM path. Default on; the `=0` escape
+    /// hatch keeps the slower path reachable for A/B and bisecting.
+    moe_gather: bool,
 }
 
 impl MetalBackend {
@@ -489,6 +522,8 @@ impl MetalBackend {
             moe_bucket_accumulate_pso,
             profile_per_op: std::env::var_os("MOEFLUX_PROFILE_PER_OP")
                 .is_some(),
+            moe_gather: std::env::var("MOEFLUX_MOE_GATHER")
+                .map_or(true, |v| v != "0"),
         })
     }
 
@@ -824,7 +859,10 @@ impl Backend for MetalBackend {
                 )
             }
             Op::MoeBatchedPermuteFuse {
-                expert_refs,
+                expert_base,
+                expert_stride,
+                expert_indices,
+                expert_slots,
                 bucket_input,
                 bucket_gate,
                 bucket_up,
@@ -836,25 +874,16 @@ impl Backend for MetalBackend {
                 buckets,
                 ..
             } => {
-                // Resolve per-bucket expert blob BufIds to (Buffer, offset)
-                // pairs in the format the existing encoder consumes. The
-                // `expert_refs` vec is parallel to `buckets.expert_ids`.
-                let blobs: Vec<&Buffer> = expert_refs
-                    .iter()
-                    .map(|(id, _)| self.pool.handle(*id))
-                    .collect();
-                let resolved: Vec<crate::riir::moe::expert_forward::ExpertRef<'_>> =
-                    blobs
-                        .iter()
-                        .zip(expert_refs.iter())
-                        .map(|(buf, (_, off))| (*buf, *off))
-                        .collect();
                 crate::riir::moe::expert_forward::encode_moe_batched_permute_fuse(
                     cmd,
                     &self.matvec_pipes,
+                    self.metal.qmm(),
                     &self.swiglu_fused_pso,
                     &self.moe_bucket_accumulate_pso,
-                    &resolved,
+                    self.pool.handle(*expert_base),
+                    *expert_stride,
+                    self.pool.handle(*expert_indices),
+                    expert_slots,
                     self.pool.handle(*bucket_input),
                     self.pool.handle(*bucket_gate),
                     self.pool.handle(*bucket_up),
@@ -865,6 +894,7 @@ impl Backend for MetalBackend {
                     self.pool.handle(*out_sum),
                     buckets,
                     crate::riir::variants::VARIANT,
+                    self.moe_gather,
                 );
             }
             Op::Conv1dStepNTokens {

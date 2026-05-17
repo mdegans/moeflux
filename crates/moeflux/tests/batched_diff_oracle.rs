@@ -852,15 +852,29 @@ fn moe_permute_fuse_n_tokens_matches_tokenwise() {
     let total_assignments = buckets.token_idx.len();
     assert_eq!(total_assignments, n_tokens * k_active);
 
-    // Upload per-bucket expert blobs (parallel to buckets.expert_ids).
-    let blobs_mtl: Vec<MtlBuffer<u8>> = buckets
-        .expert_ids
-        .iter()
-        .map(|&e| {
-            let idx = expert_to_blob_idx[&e];
-            MtlBuffer::<u8>::with_data(metal.device(), &synth_blobs[idx])
-        })
-        .collect();
+    // Pack every bucket's expert blob into one `expert_base` buffer at
+    // uniform `expert_size` stride — the layout both the gather GEMM
+    // and the per-bucket fallback index. `expert_slots[bi] = bi`;
+    // `expert_indices` expands that per assignment row.
+    let num_buckets = buckets.expert_ids.len();
+    let expert_size = v.expert_size_4bit();
+    let mut expert_base_host = vec![0u8; num_buckets * expert_size];
+    for (bi, &e) in buckets.expert_ids.iter().enumerate() {
+        let blob = &synth_blobs[expert_to_blob_idx[&e]];
+        expert_base_host[bi * expert_size..(bi + 1) * expert_size]
+            .copy_from_slice(blob);
+    }
+    let expert_base =
+        MtlBuffer::<u8>::with_data(metal.device(), &expert_base_host);
+    let expert_slots: Vec<u32> = (0..num_buckets as u32).collect();
+    let mut expert_indices_host = vec![0u32; total_assignments];
+    for bi in 0..num_buckets {
+        let start = buckets.offsets[bi] as usize;
+        let end = buckets.offsets[bi + 1] as usize;
+        expert_indices_host[start..end].fill(bi as u32);
+    }
+    let expert_indices_buf = make_buf::<u32>(&metal, total_assignments);
+    write_buf(&expert_indices_buf, &expert_indices_host);
 
     // Host gather: pack post-attn-norm rows into bucket-major layout.
     let mut packed_input = vec![0.0f32; total_assignments * h];
@@ -880,7 +894,6 @@ fn moe_permute_fuse_n_tokens_matches_tokenwise() {
     let w_buf = make_buf::<f32>(&metal, total_assignments);
     write_buf(&w_buf, &buckets.weights);
     let out_sum_buf = make_buf::<f32>(&metal, n_tokens * h);
-    write_buf(&out_sum_buf, &vec![0.0f32; n_tokens * h]);
 
     let matvec_pipes =
         MatvecPipelines::fetch(&mut metal).expect("fetch MatvecPipelines");
@@ -893,56 +906,65 @@ fn moe_permute_fuse_n_tokens_matches_tokenwise() {
         .expect("moe_bucket_accumulate pipeline")
         .clone();
 
-    let queue = metal.queue();
-    let cmdbuf = queue.new_command_buffer();
-    let blob_refs: Vec<(&metal::Buffer, u64)> =
-        blobs_mtl.iter().map(|b| (b.buffer(), 0u64)).collect();
-    encode_moe_batched_permute_fuse(
-        cmdbuf,
-        &matvec_pipes,
-        &swiglu,
-        &bucket_accumulate,
-        &blob_refs,
-        &in_buf,
-        &gate_buf,
-        &up_buf,
-        &act_buf,
-        &out_buf,
-        &idx_buf,
-        &w_buf,
-        &out_sum_buf,
-        &buckets,
-        v,
-    );
-    cmdbuf.commit();
-    cmdbuf.wait_until_completed();
-
-    let gpu_out = read_buf_f32(&out_sum_buf, n_tokens * h);
-    assert!(
-        gpu_out.iter().all(|x| x.is_finite()),
-        "permute-fuse output has non-finite values"
-    );
-
-    for t in 0..n_tokens {
-        let g = &gpu_out[t * h..(t + 1) * h];
-        let c = &per_token_ref[t * h..(t + 1) * h];
-        let cos = cosine_sim(g, c);
-        let max_abs: f32 = g
-            .iter()
-            .zip(c.iter())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0, f32::max);
-        eprintln!(
-            "[diff:moe_permute_fuse] token={} cosine={:.9} max_abs={:.3e}",
-            t, cos, max_abs
+    // Exercise both encode paths: the MLX gather GEMM (`gather =
+    // true`) and the per-bucket matvec fallback (`gather = false`).
+    // Both must match the tokenwise reference.
+    for &gather in &[true, false] {
+        write_buf(&out_sum_buf, &vec![0.0f32; n_tokens * h]);
+        let cmdbuf = metal.queue().new_command_buffer();
+        encode_moe_batched_permute_fuse(
+            cmdbuf,
+            &matvec_pipes,
+            metal.qmm(),
+            &swiglu,
+            &bucket_accumulate,
+            expert_base.buffer(),
+            expert_size as u64,
+            &expert_indices_buf,
+            &expert_slots,
+            &in_buf,
+            &gate_buf,
+            &up_buf,
+            &act_buf,
+            &out_buf,
+            &idx_buf,
+            &w_buf,
+            &out_sum_buf,
+            &buckets,
+            v,
+            gather,
         );
+        cmdbuf.commit();
+        cmdbuf.wait_until_completed();
+
+        let gpu_out = read_buf_f32(&out_sum_buf, n_tokens * h);
         assert!(
-            cos >= COSINE_FLOOR,
-            "token {} cosine {:.9} below floor {}",
-            t,
-            cos,
-            COSINE_FLOOR
+            gpu_out.iter().all(|x| x.is_finite()),
+            "permute-fuse output (gather={gather}) has non-finite values"
         );
+
+        for t in 0..n_tokens {
+            let g = &gpu_out[t * h..(t + 1) * h];
+            let c = &per_token_ref[t * h..(t + 1) * h];
+            let cos = cosine_sim(g, c);
+            let max_abs: f32 = g
+                .iter()
+                .zip(c.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f32::max);
+            eprintln!(
+                "[diff:moe_permute_fuse gather={}] token={} cosine={:.9} max_abs={:.3e}",
+                gather, t, cos, max_abs
+            );
+            assert!(
+                cos >= COSINE_FLOOR,
+                "gather={} token {} cosine {:.9} below floor {}",
+                gather,
+                t,
+                cos,
+                COSINE_FLOOR
+            );
+        }
     }
 }
 
