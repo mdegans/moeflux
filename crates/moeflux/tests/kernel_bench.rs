@@ -34,8 +34,7 @@ use moeflux::riir::attn::gpu_attn::{
     encode_sdpa_causal_flash, FlashSdpaPipelines,
 };
 use moeflux::riir::backend::gpu::gpu_matvec::{
-    encode_matvec_n_tokens, encode_mul_mm_4bit, MatvecPipelines,
-    MulMm4bitPipelines,
+    encode_matvec_n_tokens, MatvecPipelines,
 };
 use moeflux_mlx::{QmmCall, QmmKernels, QuantWeights};
 use moeflux::riir::variants::VARIANT;
@@ -298,15 +297,10 @@ fn bench_sdpa(metal: &mut MetalContext) {
 fn bench_matvec(metal: &mut MetalContext) {
     let pipes =
         MatvecPipelines::fetch(metal).expect("fetch MatvecPipelines");
-    let mm_pipes =
-        MulMm4bitPipelines::fetch(metal).expect("fetch MulMm4bitPipelines");
     let qmm = QmmKernels::new(metal.device())
         .expect("build moeflux-mlx QmmKernels");
 
-    eprintln!(
-        "\n[matvec-4bit]  v3 matvec vs mul_mm_4bit (hand-rolled) vs \
-         qmm_t (MLX)"
-    );
+    eprintln!("\n[matvec-4bit]  v3 matvec vs qmm_t (MLX)");
 
     // (in_dim, out_dim, name) — a3b projection shapes. qkv_proj / z_proj
     // are the real linear-attn production shapes (out = conv_dim / total
@@ -349,18 +343,6 @@ fn bench_matvec(metal: &mut MetalContext) {
                 &format!("v3     {name} {in_dim}->{out_dim} M={m}"),
                 flops,
                 &encode,
-            );
-            let encode_mm = |cmd: &CommandBufferRef| {
-                encode_mul_mm_4bit(
-                    cmd, &mm_pipes, &w_buf, w_off, s_off, b_off, &in_buf,
-                    0, &out_buf, 0, in_dim, out_dim, m,
-                );
-            };
-            bench(
-                metal,
-                &format!("mul_mm {name} {in_dim}->{out_dim} M={m}"),
-                flops,
-                &encode_mm,
             );
             let encode_qmm = |cmd: &CommandBufferRef| {
                 qmm.encode_qmm_t(
