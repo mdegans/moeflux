@@ -323,9 +323,8 @@ pub enum Op {
     /// + num_k_heads * key_dim`, but for `q|k|v` layouts (linear-
     /// attn `conv_out`) it must include the trailing V region.
     ///
-    /// `n_tokens` triggers an internal per-token loop in
-    /// [`Backend::encode_op`] for now — future work may add a
-    /// truly batched kernel without changing the Op shape.
+    /// Dispatched as a single batched kernel — `(num_k_heads,
+    /// n_tokens)` threadgroups, one per (head, token).
     RmsNormQkNTokens {
         label: &'static str,
         x: BufId,
