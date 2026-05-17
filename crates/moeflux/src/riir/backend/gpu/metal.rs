@@ -70,6 +70,7 @@ pub const ALL_KERNELS: &[&str] = &[
     "attn_values_batched",
     "bf16_matvec",
     "compute_decay_beta",
+    "conv1d_state_update",
     "conv1d_step",
     "dequant_matvec_2bit",
     "dequant_matvec_4bit",

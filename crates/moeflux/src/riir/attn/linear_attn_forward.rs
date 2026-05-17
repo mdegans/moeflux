@@ -878,6 +878,7 @@ pub fn linear_attn_layer_forward(
         encode_conv1d_step(
             cmdbuf,
             &lp.conv1d_step,
+            &lp.conv1d_state_update,
             buffer_pool.handle(buffers.conv_state[linear_layer_idx]),
             buffer_pool.handle(buffers.batch_out[0]),
             0,

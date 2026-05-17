@@ -1720,52 +1720,86 @@ kernel void gated_delta_net_step(
 
 
 // ============================================================================
-// Kernel 11: Conv1d depthwise step (single token, incremental inference)
+// Kernel 11: Conv1d depthwise step — batched compute (causal depthwise conv)
 // ============================================================================
 //
-// Depthwise 1D convolution for one new input token:
-//   output[c] = sum_k(history[k][c] * weight[c][k]) + input[c] * weight[c][3]
-//   then SiLU activation: output[c] = output[c] / (1 + exp(-output[c]))
+// Width-4 causal depthwise 1D convolution over a token chunk. The virtual
+// sequence is `[conv_state[0..3], input[0..n_tokens]]`; output token `t`
+// convolves virtual positions `[t, t+1, t+2, t+3]`:
+//   acc = sum_{j=0..3} virtual[t+j][c] * weight[c][j]
+//   output[t][c] = SiLU(acc) = acc / (1 + exp(-acc))
+// where virtual[vp] = conv_state[vp*conv_dim+c] if vp<3 else input[(vp-3)*..].
 //
-// After computing, shifts the history buffer left and appends the new input.
+// This kernel is compute-only: it reads `conv_state` but does NOT write it.
+// The history shift is a separate dispatch (`conv1d_state_update`) so the
+// state read/write hazard across token threadgroups can't race.
 //
-// Weight layout: [channels * kernel_size] bf16, weight[c * kernel_size + k]
-// Conv state layout: [(kernel_size-1) * channels] row-major, state[k * channels + c]
-// kernel_size = 4 (hardcoded), so 3 history slots + 1 new input.
+// Weight layout: [channels * 4] bf16, weight[c*4 + j].
+// Conv state layout: [3 * conv_dim] row-major, state[r*conv_dim + c].
 //
-// Dispatch: conv_dim threads (12288), one per channel.
+// Dispatch: ((conv_dim+255)/256, n_tokens) threadgroups × 256 threads.
+//   gid.x = channel (guarded), gid.y = token.
 
 kernel void conv1d_step(
-    device float *conv_state,         // [(kernel_size-1) * conv_dim] = [3 * conv_dim]
-    device const float *input,        // [conv_dim] current input
+    device const float *conv_state,   // [3 * conv_dim] history (read-only)
+    device const float *input,        // [n_tokens * conv_dim]
     device const uint16_t *weights,   // [conv_dim * 4] bf16 as uint16
-    device float *output,             // [conv_dim] convolution output
+    device float *output,             // [n_tokens * conv_dim]
     constant uint &conv_dim,          // = 12288
-    uint idx [[thread_position_in_grid]]
+    uint3 gid [[thread_position_in_grid]]
 ) {
-    if (idx >= conv_dim) return;
+    uint c = gid.x;
+    uint t = gid.y;
+    if (c >= conv_dim) return;
 
-    // Convolution: dot product of history + new input with weights
-    // weight layout: weight[c * 4 + k] for channel c, position k
-    uint w_base = idx * 4;
+    uint w_base = c * 4;
     float acc = 0.0f;
-
-    // 3 history slots (k=0,1,2)
-    acc += conv_state[0 * conv_dim + idx] * bf16_to_f32(weights[w_base + 0]);
-    acc += conv_state[1 * conv_dim + idx] * bf16_to_f32(weights[w_base + 1]);
-    acc += conv_state[2 * conv_dim + idx] * bf16_to_f32(weights[w_base + 2]);
-
-    // New input (k=3)
-    float inp = input[idx];
-    acc += inp * bf16_to_f32(weights[w_base + 3]);
-
+    for (uint j = 0; j < 4; j++) {
+        uint vp = t + j;
+        float val = (vp < 3)
+            ? conv_state[vp * conv_dim + c]
+            : input[(vp - 3) * conv_dim + c];
+        acc += val * bf16_to_f32(weights[w_base + j]);
+    }
     // SiLU activation
-    output[idx] = acc / (1.0f + exp(-acc));
+    output[t * conv_dim + c] = acc / (1.0f + exp(-acc));
+}
 
-    // Shift history: move slots 1,2 -> 0,1, append input at slot 2
-    conv_state[0 * conv_dim + idx] = conv_state[1 * conv_dim + idx];
-    conv_state[1 * conv_dim + idx] = conv_state[2 * conv_dim + idx];
-    conv_state[2 * conv_dim + idx] = inp;
+// ============================================================================
+// Kernel 11b: Conv1d history-state update (companion to conv1d_step)
+// ============================================================================
+//
+// After the chunk's outputs are computed, the new `conv_state` is the last
+// 3 entries of the virtual sequence `[conv_state[0..3], input[0..n_tokens]]`:
+//   new_state[r] = virtual[n_tokens + r]   for r in {0,1,2}
+// For n_tokens>=3 this is just input rows [n-3, n-2, n-1]; for n_tokens<3 it
+// straddles old state and input — the `vp<3` branch handles both uniformly.
+//
+// One thread per channel: the thread reads all 3 source values into
+// registers BEFORE writing any, so the n_tokens<3 case (which reads
+// `conv_state` while writing it) has no cross-thread race — each thread
+// touches only its own channel's 3 rows.
+//
+// Dispatch: ((conv_dim+255)/256) threadgroups × 256 threads.
+
+kernel void conv1d_state_update(
+    device float *conv_state,         // [3 * conv_dim] in/out
+    device const float *input,        // [n_tokens * conv_dim]
+    constant uint &conv_dim,
+    constant uint &n_tokens,
+    uint c [[thread_position_in_grid]]
+) {
+    if (c >= conv_dim) return;
+    float nv[3];
+    for (uint r = 0; r < 3; r++) {
+        uint vp = n_tokens + r;
+        nv[r] = (vp < 3)
+            ? conv_state[vp * conv_dim + c]
+            : input[(vp - 3) * conv_dim + c];
+    }
+    for (uint r = 0; r < 3; r++) {
+        conv_state[r * conv_dim + c] = nv[r];
+    }
 }
 
 

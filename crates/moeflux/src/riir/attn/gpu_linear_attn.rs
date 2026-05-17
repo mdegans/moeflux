@@ -31,6 +31,7 @@ pipeline_bundle! {
     /// composer so the encode loop doesn't borrow `metal` mid-encode.
     pub struct LinearAttnPipelines {
         conv1d_step => "conv1d_step",
+        conv1d_state_update => "conv1d_state_update",
         rms_norm_qk => "rms_norm_qk",
         compute_decay_beta => "compute_decay_beta",
         delta_net_step => "gated_delta_net_step",
@@ -38,17 +39,18 @@ pipeline_bundle! {
     }
 }
 
-/// Encode `conv1d_step` with the C-side dispatch shape.
-/// `(conv_dim + 255) / 256` threadgroups × 256 threads.
+/// Encode `conv1d_step` + `conv1d_state_update` for a single token —
+/// the `n_tokens = 1` case of the batched two-pass conv1d.
+/// `(conv_dim + 255) / 256` threadgroups × 256 threads each pass.
 ///
 /// `qkv_in_off` is the byte offset into `qkv_in` where this token's
-/// `linear_conv_dim` floats start — the batched-prefill caller binds
-/// a stacked projection buffer with a per-token offset. Per-token
-/// callers pass 0.
+/// `linear_conv_dim` floats start — the per-token oracle caller binds
+/// a stacked projection buffer with a per-token offset.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_conv1d_step(
     cmdbuf: &CommandBufferRef,
-    pipeline: &ComputePipelineState,
+    compute_pso: &ComputePipelineState,
+    state_update_pso: &ComputePipelineState,
     conv_state: &Buffer,
     qkv_in: &Buffer,
     qkv_in_off: u64,
@@ -57,19 +59,33 @@ pub fn encode_conv1d_step(
     conv_out: &Buffer,
     conv_dim: u32,
 ) {
+    let num_tgs = (conv_dim + 255) / 256;
+    let n_tokens: u32 = 1;
+    // Pass 1 — compute (reads conv_state, writes conv_out).
     let enc = cmdbuf.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(pipeline);
+    enc.set_compute_pipeline_state(compute_pso);
     enc.set_buffer(0, Some(conv_state), 0);
     enc.set_buffer(1, Some(qkv_in), qkv_in_off as NSUInteger);
     enc.set_buffer(2, Some(weight_buf), weight_off as NSUInteger);
     enc.set_buffer(3, Some(conv_out), 0);
     enc.set_bytes(4, 4, (&conv_dim as *const u32).cast());
-    let num_tgs = (conv_dim + 255) / 256;
     enc.dispatch_thread_groups(
         MTLSize::new(num_tgs as NSUInteger, 1, 1),
         MTLSize::new(256, 1, 1),
     );
     enc.end_encoding();
+    // Pass 2 — history-state update.
+    let enc2 = cmdbuf.new_compute_command_encoder();
+    enc2.set_compute_pipeline_state(state_update_pso);
+    enc2.set_buffer(0, Some(conv_state), 0);
+    enc2.set_buffer(1, Some(qkv_in), qkv_in_off as NSUInteger);
+    enc2.set_bytes(2, 4, (&conv_dim as *const u32).cast());
+    enc2.set_bytes(3, 4, (&n_tokens as *const u32).cast());
+    enc2.dispatch_thread_groups(
+        MTLSize::new(num_tgs as NSUInteger, 1, 1),
+        MTLSize::new(256, 1, 1),
+    );
+    enc2.end_encoding();
 }
 
 /// Encode `rms_norm_qk` for a single token — the `n_tokens = 1` case

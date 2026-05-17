@@ -1085,7 +1085,15 @@ fn graph_metal_matches_cpu_compute_decay_beta() {
 #[test]
 #[ignore = "long-running GPU test"]
 fn graph_metal_matches_cpu_conv1d_step() {
-    let n_tokens: u32 = 4;
+    // n_tokens ∈ {1,2} are the decode-shape boundary (the batched
+    // conv1d straddles old `conv_state` and new input); 4/16 are
+    // prefill chunk shapes.
+    for n_tokens in [1u32, 2, 4, 16] {
+        check_conv1d_step(n_tokens);
+    }
+}
+
+fn check_conv1d_step(n_tokens: u32) {
     let conv_dim: u32 = 16;
     let kernel_size: usize = 4; // hardcoded in CPU oracle + Metal kernel
     let state_floats = (kernel_size - 1) * conv_dim as usize;

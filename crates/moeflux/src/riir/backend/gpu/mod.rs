@@ -885,39 +885,56 @@ impl Backend for MetalBackend {
                 n_tokens,
                 ..
             } => {
-                // Per-token loop. Each token reads `conv_dim` floats
-                // from `qkv_in` and writes `conv_dim` floats to
-                // `conv_out`. The Metal kernel updates `conv_state`
-                // in-place (history shift) at the end of each call,
-                // so consecutive token dispatches see the post-shifted
-                // state.
-                let per_token_bytes = (*conv_dim as u64) * 4;
+                // Two batched dispatches in one cmdbuf. Pass 1
+                // (`conv1d_step`) reads `conv_state` + the whole
+                // `qkv_in` chunk and writes `conv_out`; pass 2
+                // (`conv1d_state_update`) reads the originals and
+                // overwrites `conv_state` with the chunk-tail history.
+                // The split avoids the cross-token-threadgroup state
+                // read/write hazard a single kernel would have.
                 let qkv_buf = self.pool.handle(*qkv_in);
                 let state_buf = self.pool.handle(*conv_state);
                 let conv_out_buf = self.pool.handle(*conv_out);
                 let conv_dim_arg = *conv_dim;
+                let n_tokens_arg = *n_tokens;
                 let num_tgs = (conv_dim_arg + 255) / 256;
-                for t in 0..*n_tokens {
-                    let off = (t as u64) * per_token_bytes;
-                    let enc = cmd.new_compute_command_encoder();
-                    enc.set_compute_pipeline_state(
-                        &self.linear_attn_pipes.conv1d_step,
-                    );
-                    enc.set_buffer(0, Some(state_buf), 0);
-                    enc.set_buffer(1, Some(qkv_buf), off as NSUInteger);
-                    enc.set_buffer(
-                        2,
-                        Some(self.wf_buf.buffer()),
-                        *weight_off as NSUInteger,
-                    );
-                    enc.set_buffer(3, Some(conv_out_buf), off as NSUInteger);
-                    enc.set_bytes(4, 4, (&conv_dim_arg as *const u32).cast());
-                    enc.dispatch_thread_groups(
-                        MTLSize::new(num_tgs as NSUInteger, 1, 1),
-                        MTLSize::new(256, 1, 1),
-                    );
-                    enc.end_encoding();
-                }
+                // Pass 1 — compute.
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(
+                    &self.linear_attn_pipes.conv1d_step,
+                );
+                enc.set_buffer(0, Some(state_buf), 0);
+                enc.set_buffer(1, Some(qkv_buf), 0);
+                enc.set_buffer(
+                    2,
+                    Some(self.wf_buf.buffer()),
+                    *weight_off as NSUInteger,
+                );
+                enc.set_buffer(3, Some(conv_out_buf), 0);
+                enc.set_bytes(4, 4, (&conv_dim_arg as *const u32).cast());
+                enc.dispatch_thread_groups(
+                    MTLSize::new(
+                        num_tgs as NSUInteger,
+                        n_tokens_arg as NSUInteger,
+                        1,
+                    ),
+                    MTLSize::new(256, 1, 1),
+                );
+                enc.end_encoding();
+                // Pass 2 — history-state update.
+                let enc2 = cmd.new_compute_command_encoder();
+                enc2.set_compute_pipeline_state(
+                    &self.linear_attn_pipes.conv1d_state_update,
+                );
+                enc2.set_buffer(0, Some(state_buf), 0);
+                enc2.set_buffer(1, Some(qkv_buf), 0);
+                enc2.set_bytes(2, 4, (&conv_dim_arg as *const u32).cast());
+                enc2.set_bytes(3, 4, (&n_tokens_arg as *const u32).cast());
+                enc2.dispatch_thread_groups(
+                    MTLSize::new(num_tgs as NSUInteger, 1, 1),
+                    MTLSize::new(256, 1, 1),
+                );
+                enc2.end_encoding();
             }
             Op::ComputeDecayBetaNTokens {
                 alpha_in,
