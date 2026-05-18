@@ -468,8 +468,18 @@ pub fn gated_delta_recurrence_supplied(
 ///   in/out, carried across the whole call.
 /// - `out_values`: `[n_tokens · v_heads · value_dim]`, token-major.
 ///
-/// `g_decay` is `exp(…)` and therefore strictly positive, so the
-/// log-space cumulative decay never sees `ln(0)`.
+/// `g_decay` is `exp(…)` and so positive in principle — but the
+/// `exp` can underflow to exactly `0.0` in `f32` for a strong-forget
+/// gate. The log-space cumulative decay clamps with [`G_DECAY_LN_FLOOR`]
+/// so `ln` never sees `0`.
+///
+/// Floor for the chunkwise log-decay: `g_decay` is clamped to this
+/// before `ln`, so a zero (or underflowed) forget gate maps to
+/// `ln ≈ -69` (≈hard reset) rather than `-inf`, which would poison the
+/// chunk's `exp(L_l - L_i)` with `(-inf) - (-inf) = NaN`. The Metal
+/// kernel `gated_delta_net_chunkwise` uses the identical floor.
+pub const G_DECAY_LN_FLOOR: f32 = 1e-30;
+
 #[allow(clippy::too_many_arguments)]
 pub fn gated_delta_chunkwise(
     g_decay: &[f32],
@@ -561,7 +571,12 @@ pub fn gated_delta_chunkwise(
                 let v_lo = t * value_total + vh * value_dim;
                 vc[l * value_dim..(l + 1) * value_dim]
                     .copy_from_slice(&v[v_lo..v_lo + value_dim]);
-                acc += g_decay[t * v_heads + vh].ln();
+                // Clamp away from 0: a real forget gate can be exactly
+                // 0.0 (hard reset), and `ln(0) = -inf` makes the later
+                // `exp(L_l - L_i)` compute `(-inf) - (-inf) = NaN`. The
+                // floor makes a zero-gate token behave as ~hard-reset
+                // (gamma ~ 1e-30) instead. Must match the Metal kernel.
+                acc += g_decay[t * v_heads + vh].max(G_DECAY_LN_FLOOR).ln();
                 log_decay[l] = acc;
                 beta[l] = beta_gate[t * v_heads + vh];
             }

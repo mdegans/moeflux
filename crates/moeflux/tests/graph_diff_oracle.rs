@@ -1397,9 +1397,18 @@ fn cpu_chunkwise_matches_cpu_per_token_gated_delta() {
             let conv_data: Vec<f32> = (0..conv_total)
                 .map(|_| rng.next_f32_unit() * 0.5)
                 .collect();
-            let g_data: Vec<f32> = (0..gdb_total)
+            let mut g_data: Vec<f32> = (0..gdb_total)
                 .map(|_| 0.9 + rng.next_f32_unit() * 0.05)
                 .collect();
+            // A real `g_decay` can be exactly 0.0 (strong forget).
+            // Force one zero gate per head so the chunkwise log-space
+            // path is checked against the per-token recurrence's hard
+            // reset — `ln(0)=-inf` produced NaN here before the
+            // `G_DECAY_LN_FLOOR` clamp landed.
+            for vh in 0..num_v_heads as usize {
+                let t = vh % n_tokens as usize;
+                g_data[t * num_v_heads as usize + vh] = 0.0;
+            }
             let bg_data: Vec<f32> = (0..gdb_total)
                 .map(|_| 0.5 + rng.next_f32_unit() * 0.2)
                 .collect();
@@ -1537,9 +1546,19 @@ fn check_gated_delta_chunkwise(n_tokens: u32) {
     let mut rng = Rng::new(0x0A3B_C04E ^ n_tokens as u64);
     let conv_data: Vec<f32> =
         (0..conv_total).map(|_| rng.next_f32_unit() * 0.5).collect();
-    let g_data: Vec<f32> = (0..gdb_total)
+    let mut g_data: Vec<f32> = (0..gdb_total)
         .map(|_| 0.9 + rng.next_f32_unit() * 0.05)
         .collect();
+    // Exercise the strong-forget path: a real `g_decay` can be exactly
+    // 0.0 (or underflow to it), and `ln(0) = -inf` poisons the chunk's
+    // `exp(L_l - L_i)` with NaN unless clamped (see `G_DECAY_LN_FLOOR`).
+    // Force one zero gate per head at a head-varying token position, so
+    // every shape (singleton / ragged / multi-chunk) drives the clamp
+    // through both backends. Pre-fix this reproduced the NaN regression.
+    for vh in 0..num_v_heads as usize {
+        let t = vh % n_tokens as usize;
+        g_data[t * num_v_heads as usize + vh] = 0.0;
+    }
     let bg_data: Vec<f32> = (0..gdb_total)
         .map(|_| 0.5 + rng.next_f32_unit() * 0.2)
         .collect();

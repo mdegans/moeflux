@@ -1804,7 +1804,12 @@ kernel void gated_delta_net_chunkwise(
             float acc = 0.0f;
             for (uint l = 0; l < c; l++) {
                 uint t = chunk_start + l;
-                acc += precise::log(g_decay[t * num_v_heads + head_id]);
+                // Clamp away from 0 — a strong-forget gate can be
+                // exactly 0.0, and ln(0) = -inf poisons the chunk's
+                // exp(L_l - L_i) with (-inf)-(-inf) = NaN. Floor matches
+                // the CPU reference's `G_DECAY_LN_FLOOR` (linear_attn.rs).
+                float g = max(g_decay[t * num_v_heads + head_id], 1e-30f);
+                acc += precise::log(g);
                 log_decay[l] = acc;
                 beta_s[l] = beta_gate[t * num_v_heads + head_id];
             }

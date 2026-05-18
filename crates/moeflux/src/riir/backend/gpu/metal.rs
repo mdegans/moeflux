@@ -84,6 +84,7 @@ pub const ALL_KERNELS: &[&str] = &[
     "dequant_matvec_8bit_v3",
     "dequant_matvec_8bit_v3_n_tokens",
     "fused_gate_up_swiglu",
+    "gated_delta_net_chunkwise",
     "gated_delta_net_step",
     "gated_rms_norm",
     "mla_sdpa_tile_accumulate",
