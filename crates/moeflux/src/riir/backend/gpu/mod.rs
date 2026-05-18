@@ -1053,12 +1053,59 @@ impl Backend for MetalBackend {
                 );
                 enc.end_encoding();
             }
-            Op::GatedDeltaNetChunkwise { .. } => {
-                // Phase 3 (kernel arc session 8): chunkwise-parallel
-                // delta-rule kernels. The CpuBackend arm + the
-                // `gated_delta_chunkwise` CPU reference are the diff
-                // oracle. See `kernel_arc_session8_plan.md`.
-                todo!("GatedDeltaNetChunkwise MetalBackend arm — Phase 3")
+            Op::GatedDeltaNetChunkwise {
+                state,
+                conv_out,
+                g_decay,
+                beta_gate,
+                output,
+                num_v_heads,
+                value_dim,
+                k_heads_per_v,
+                n_tokens,
+                chunk_size,
+                ..
+            } => {
+                // Chunkwise-parallel variant of GatedDeltaNetStepNTokens
+                // above — same buffer/arg signature and same dispatch
+                // (`num_v_heads` threadgroups × `value_dim` threads).
+                // The kernel loops inner chunks of `CW_C` internally;
+                // `CW_C` is a compile-time constant in the shader, so
+                // the Op's `chunk_size` must match it.
+                debug_assert_eq!(
+                    *chunk_size, 16,
+                    "gated_delta_net_chunkwise kernel is built with \
+                     CW_C=16; Op chunk_size must match"
+                );
+                let nvh = *num_v_heads;
+                let vd = *value_dim;
+                let kpv = *k_heads_per_v;
+                let key_total =
+                    crate::riir::variants::VARIANT.linear_total_key() as u32;
+                let n_tokens_arg = *n_tokens;
+                let state_buf = self.pool.handle(*state);
+                let conv_buf = self.pool.handle(*conv_out);
+                let g_buf = self.pool.handle(*g_decay);
+                let bg_buf = self.pool.handle(*beta_gate);
+                let out_buf = self.pool.handle(*output);
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(
+                    &self.linear_attn_pipes.delta_net_chunkwise,
+                );
+                enc.set_buffer(0, Some(state_buf), 0);
+                enc.set_buffer(1, Some(conv_buf), 0);
+                enc.set_buffer(2, Some(g_buf), 0);
+                enc.set_buffer(3, Some(bg_buf), 0);
+                enc.set_buffer(4, Some(out_buf), 0);
+                enc.set_bytes(5, 4, (&kpv as *const u32).cast());
+                enc.set_bytes(6, 4, (&n_tokens_arg as *const u32).cast());
+                enc.set_bytes(7, 4, (&key_total as *const u32).cast());
+                enc.set_bytes(8, 4, (&nvh as *const u32).cast());
+                enc.dispatch_thread_groups(
+                    MTLSize::new(nvh as NSUInteger, 1, 1),
+                    MTLSize::new(vd as NSUInteger, 1, 1),
+                );
+                enc.end_encoding();
             }
             Op::GatedRmsNormNTokens {
                 values,

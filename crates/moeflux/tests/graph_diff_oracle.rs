@@ -1500,3 +1500,148 @@ fn cpu_chunkwise_matches_cpu_per_token_gated_delta() {
         }
     }
 }
+
+// ============================================================================
+// Test: GatedDeltaNetChunkwise through both backends (kernel arc S8, Phase 3)
+// ============================================================================
+
+#[test]
+#[ignore = "long-running GPU test"]
+fn graph_metal_matches_cpu_gated_delta_chunkwise() {
+    // n=1 is decode; 4/16/64 are prefill shapes. C=16, so n=64 is 4
+    // full inner chunks, n=4 is one ragged chunk, n=1 a singleton.
+    for n_tokens in [1u32, 4, 16, 64] {
+        check_gated_delta_chunkwise(n_tokens);
+    }
+}
+
+fn check_gated_delta_chunkwise(n_tokens: u32) {
+    // Pinned to Qwen3.6-A3B linear-attn dims (see
+    // check_gated_delta_net_step).
+    let num_v_heads: u32 = 64;
+    let value_dim: u32 = 128;
+    let k_heads_per_v: u32 = 4;
+    let key_dim: usize = 128;
+    let num_k_heads: usize = 16;
+    let key_total = num_k_heads * key_dim;
+    let value_total = num_v_heads as usize * value_dim as usize;
+    let conv_per_token = 2 * key_total + value_total;
+    let conv_total = n_tokens as usize * conv_per_token;
+    let gdb_total = n_tokens as usize * num_v_heads as usize;
+    let out_total = n_tokens as usize * value_total;
+    let state_floats =
+        num_v_heads as usize * value_dim as usize * key_dim;
+    // Must equal the shader's compile-time CW_C.
+    let chunk_size: u32 = 16;
+
+    let mut rng = Rng::new(0x0A3B_C04E ^ n_tokens as u64);
+    let conv_data: Vec<f32> =
+        (0..conv_total).map(|_| rng.next_f32_unit() * 0.5).collect();
+    let g_data: Vec<f32> = (0..gdb_total)
+        .map(|_| 0.9 + rng.next_f32_unit() * 0.05)
+        .collect();
+    let bg_data: Vec<f32> = (0..gdb_total)
+        .map(|_| 0.5 + rng.next_f32_unit() * 0.2)
+        .collect();
+    let initial_state: Vec<f32> = (0..state_floats)
+        .map(|_| rng.next_f32_unit() * 0.01)
+        .collect();
+
+    let make_op = |state, conv_out, g_decay, beta_gate, output| {
+        Op::GatedDeltaNetChunkwise {
+            label: "test_chunkwise",
+            state,
+            conv_out,
+            g_decay,
+            beta_gate,
+            output,
+            num_v_heads,
+            value_dim,
+            k_heads_per_v,
+            n_tokens,
+            chunk_size,
+        }
+    };
+
+    // --- CpuBackend (oracle — matches the per-token recurrence) ---
+    let mut cpu_wf = SyntheticWf::build(
+        "gd_chunkwise_cpu",
+        &[("dummy", "BF16", 0, vec![32], vec![0u8; 64])],
+    );
+    let mut cpu = CpuBackend::new(cpu_wf.take());
+    let cs =
+        cpu.pool_mut().alloc(state_floats * 4, "state", true).unwrap();
+    let cc =
+        cpu.pool_mut().alloc(conv_total * 4, "conv", false).unwrap();
+    let cg = cpu.pool_mut().alloc(gdb_total * 4, "g", false).unwrap();
+    let cb = cpu.pool_mut().alloc(gdb_total * 4, "bg", false).unwrap();
+    let co = cpu.pool_mut().alloc(out_total * 4, "out", false).unwrap();
+    cpu.pool_mut().upload(cs, bytes_of_f32(&initial_state)).unwrap();
+    cpu.pool_mut().upload(cc, bytes_of_f32(&conv_data)).unwrap();
+    cpu.pool_mut().upload(cg, bytes_of_f32(&g_data)).unwrap();
+    cpu.pool_mut().upload(cb, bytes_of_f32(&bg_data)).unwrap();
+    let mut g_cpu = Graph::new();
+    g_cpu.push(make_op(cs, cc, cg, cb, co));
+    cpu.execute(&g_cpu, "diff_oracle").unwrap();
+    let mut buf = vec![0u8; out_total * 4];
+    cpu.pool().download(co, &mut buf).unwrap();
+    let cpu_out = f32_of_bytes(&buf);
+    let mut buf = vec![0u8; state_floats * 4];
+    cpu.pool().download(cs, &mut buf).unwrap();
+    let cpu_state = f32_of_bytes(&buf);
+
+    // --- MetalBackend ---
+    let mut gpu_wf = SyntheticWf::build(
+        "gd_chunkwise_gpu",
+        &[("dummy", "BF16", 0, vec![32], vec![0u8; 64])],
+    );
+    let metal_ctx = MetalContext::new().expect("MetalContext::new");
+    let wf_ref = gpu_wf.wf.as_ref().unwrap();
+    let wf_buf = MtlWeightBuf::wrap(wf_ref, metal_ctx.device());
+    let _ = gpu_wf.take();
+    let mut gpu =
+        MetalBackend::new(metal_ctx, wf_buf).expect("MetalBackend::new");
+    let gs =
+        gpu.pool_mut().alloc(state_floats * 4, "state", true).unwrap();
+    let gc =
+        gpu.pool_mut().alloc(conv_total * 4, "conv", false).unwrap();
+    let gg = gpu.pool_mut().alloc(gdb_total * 4, "g", false).unwrap();
+    let gb = gpu.pool_mut().alloc(gdb_total * 4, "bg", false).unwrap();
+    let go = gpu.pool_mut().alloc(out_total * 4, "out", false).unwrap();
+    gpu.pool_mut().upload(gs, bytes_of_f32(&initial_state)).unwrap();
+    gpu.pool_mut().upload(gc, bytes_of_f32(&conv_data)).unwrap();
+    gpu.pool_mut().upload(gg, bytes_of_f32(&g_data)).unwrap();
+    gpu.pool_mut().upload(gb, bytes_of_f32(&bg_data)).unwrap();
+    let mut g_gpu = Graph::new();
+    g_gpu.push(make_op(gs, gc, gg, gb, go));
+    gpu.execute(&g_gpu, "diff_oracle").unwrap();
+    let mut buf = vec![0u8; out_total * 4];
+    gpu.pool().download(go, &mut buf).unwrap();
+    let gpu_out = f32_of_bytes(&buf);
+    let mut buf = vec![0u8; state_floats * 4];
+    gpu.pool().download(gs, &mut buf).unwrap();
+    let gpu_state = f32_of_bytes(&buf);
+
+    let cos = cosine_sim(&cpu_out, &gpu_out);
+    let cos_state = cosine_sim(&cpu_state, &gpu_state);
+    let max_abs = cpu_out
+        .iter()
+        .zip(gpu_out.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let max_abs_state = cpu_state
+        .iter()
+        .zip(gpu_state.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    eprintln!(
+        "[s8-p3 gated_delta_chunkwise] N={n_tokens} C={chunk_size}: \
+         out cos={cos:.9} max_abs={max_abs:.3e}; \
+         state cos={cos_state:.9} max_abs={max_abs_state:.3e}"
+    );
+    assert!(cos >= COSINE_FLOOR, "out cosine {cos} max_abs={max_abs}");
+    assert!(
+        cos_state >= COSINE_FLOOR,
+        "state cosine {cos_state} max_abs={max_abs_state}"
+    );
+}

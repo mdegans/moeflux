@@ -1736,6 +1736,178 @@ kernel void gated_delta_net_step(
 
 
 // ============================================================================
+// Kernel 10b: Gated DeltaNet — chunkwise-parallel recurrence
+// ============================================================================
+//
+// Chunkwise-parallel reformulation of `gated_delta_net_step`. Same
+// delta-rule recurrence, but the within-chunk computation is expressed
+// as matmuls + a triangular solve, so only the chunk-to-chunk state
+// carry stays sequential (n / CW_C steps instead of n).
+//
+// CPU reference + math derivation: `gated_delta_chunkwise` in
+// linear_attn.rs. Diff oracle: the CpuBackend `GatedDeltaNetChunkwise`
+// arm (which matches the per-token recurrence). With cumulative
+// log-decay L_l and decay ratio Gamma_{l,i} = exp(L_l - L_i):
+//
+//   A_{l,i} = beta_l * Gamma_{l,i} * (k_i . k_l)   (strictly lower)
+//   B_l     = beta_l * v_l - beta_l * gamma_l * (S_0 . k_l)
+//   (I + A) U = B                                  (forward subst.)
+//   out_l   = gamma_l * (S_0 . q_l) + sum_{i<=l} Gamma_{l,i}(k_i.q_l) U_i
+//   S_C     = gamma_{C-1} * S_0 + sum_i Gamma_{C-1,i} * U_i * k_i^T
+//
+// Dispatch: num_v_heads threadgroups, 128 threads each (one per vi).
+// Each threadgroup loops over inner chunks of CW_C tokens internally.
+// Thread `vi` owns state/output/U row `vi` exclusively — the only
+// shared (cross-thread) threadgroup state is kc / A / kqg / log_decay
+// / beta_s, all written once per chunk then read-only. Buffer layout
+// is identical to `gated_delta_net_step`.
+
+#define CW_C 16          // inner chunk length C
+
+kernel void gated_delta_net_chunkwise(
+    device float *state,             // [num_v_heads * 128 * 128] persistent
+    device const float *conv_out,    // [n_tokens * conv_per_token]
+    device const float *g_decay,     // [n_tokens * num_v_heads]
+    device const float *beta_gate,   // [n_tokens * num_v_heads]
+    device float *output,            // [n_tokens * num_v_heads * 128]
+    constant uint &k_heads_per_v,    // = 4
+    constant uint &n_tokens,
+    constant uint &key_total,        // q / k region size per token (= 2048)
+    constant uint &num_v_heads,      // = 64
+    uint head_id [[threadgroup_position_in_grid]],
+    uint vi [[thread_position_in_threadgroup]]
+) {
+    uint kh = head_id / k_heads_per_v;
+    uint value_total = num_v_heads * 128;
+    uint conv_per_token = 2 * key_total + value_total;
+    uint state_base = head_id * 128 * 128 + vi * 128;
+    uint k_off = kh * 128;  // q and k both indexed by kh*128
+
+    threadgroup float kc[CW_C * 128];      // staged k vectors    (8 KB)
+    threadgroup float Umat[CW_C * 128];    // RHS, solved in place (8 KB)
+    threadgroup float Amat[CW_C * CW_C];   // beta*Gamma*(k.k)    (1 KB)
+    threadgroup float kqg[CW_C * CW_C];    // Gamma*(k.q)         (1 KB)
+    threadgroup float log_decay[CW_C];
+    threadgroup float beta_s[CW_C];
+
+    for (uint chunk_start = 0; chunk_start < n_tokens;
+         chunk_start += CW_C) {
+        uint c = min((uint)CW_C, n_tokens - chunk_start);
+
+        // --- Phase 1: stage kc, cumulative log-decay, beta ---
+        for (uint l = 0; l < c; l++) {
+            uint t = chunk_start + l;
+            kc[l * 128 + vi] =
+                conv_out[t * conv_per_token + key_total + k_off + vi];
+        }
+        if (vi == 0) {
+            float acc = 0.0f;
+            for (uint l = 0; l < c; l++) {
+                uint t = chunk_start + l;
+                acc += precise::log(g_decay[t * num_v_heads + head_id]);
+                log_decay[l] = acc;
+                beta_s[l] = beta_gate[t * num_v_heads + head_id];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // --- Phase 2: build Amat (strictly lower) + kqg (incl. diag) ---
+        // CW_C*CW_C entries spread across the 128 threads.
+        for (uint slot = vi; slot < CW_C * CW_C; slot += 128) {
+            uint l = slot / CW_C;
+            uint i = slot % CW_C;
+            float a = 0.0f;
+            float g = 0.0f;
+            if (l < c && i <= l) {
+                float gamma_li =
+                    precise::exp(log_decay[l] - log_decay[i]);
+                if (i < l) {
+                    float kk = 0.0f;
+                    for (uint d = 0; d < 128; d++) {
+                        kk += kc[i * 128 + d] * kc[l * 128 + d];
+                    }
+                    a = beta_s[l] * gamma_li * kk;
+                }
+                uint q_base =
+                    (chunk_start + l) * conv_per_token + k_off;
+                float kq = 0.0f;
+                for (uint d = 0; d < 128; d++) {
+                    kq += kc[i * 128 + d] * conv_out[q_base + d];
+                }
+                g = gamma_li * kq;
+            }
+            Amat[slot] = a;
+            kqg[slot] = g;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // --- Phase 3: RHS  U_l = beta_l v_l - beta_l gamma_l (S_0.k_l) ---
+        // Thread vi owns column vi of U for the rest of the chunk.
+        for (uint l = 0; l < c; l++) {
+            uint t = chunk_start + l;
+            float s0k = 0.0f;
+            for (uint d = 0; d < 128; d++) {
+                s0k += state[state_base + d] * kc[l * 128 + d];
+            }
+            float v_l = conv_out[t * conv_per_token + 2 * key_total
+                                 + head_id * 128 + vi];
+            float gamma_l = precise::exp(log_decay[l]);
+            Umat[l * 128 + vi] =
+                beta_s[l] * v_l - beta_s[l] * gamma_l * s0k;
+        }
+
+        // --- Phase 4: forward substitution (column vi is thread-private,
+        //     so no barriers) — U_l -= sum_{i<l} A_{l,i} U_i ---
+        for (uint l = 0; l < c; l++) {
+            float acc = Umat[l * 128 + vi];
+            for (uint i = 0; i < l; i++) {
+                acc -= Amat[l * CW_C + i] * Umat[i * 128 + vi];
+            }
+            Umat[l * 128 + vi] = acc;
+        }
+
+        // --- Phase 5: output  out_l = gamma_l (S_0.q_l)
+        //     + sum_{i<=l} Gamma_{l,i}(k_i.q_l) U_i ---
+        for (uint l = 0; l < c; l++) {
+            uint t = chunk_start + l;
+            uint q_base = t * conv_per_token + k_off;
+            float s0q = 0.0f;
+            for (uint d = 0; d < 128; d++) {
+                s0q += state[state_base + d] * conv_out[q_base + d];
+            }
+            float out_val = precise::exp(log_decay[l]) * s0q;
+            for (uint i = 0; i <= l; i++) {
+                out_val += kqg[l * CW_C + i] * Umat[i * 128 + vi];
+            }
+            output[t * value_total + head_id * 128 + vi] = out_val;
+        }
+
+        // --- Phase 6: new state  S_C = gamma_{c-1} S_0
+        //     + sum_i Gamma_{c-1,i} U_i k_i^T ---
+        if (c > 0) {
+            uint last = c - 1;
+            float g_last = precise::exp(log_decay[last]);
+            // Hoist the per-i decay ratio and this column's U_i out of
+            // the ki loop — both are ki-invariant.
+            float ru[CW_C];
+            for (uint i = 0; i < c; i++) {
+                ru[i] = precise::exp(log_decay[last] - log_decay[i])
+                        * Umat[i * 128 + vi];
+            }
+            for (uint ki = 0; ki < 128; ki++) {
+                float s = g_last * state[state_base + ki];
+                for (uint i = 0; i < c; i++) {
+                    s += ru[i] * kc[i * 128 + ki];
+                }
+                state[state_base + ki] = s;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+
+// ============================================================================
 // Kernel 11: Conv1d depthwise step — batched compute (causal depthwise conv)
 // ============================================================================
 //
