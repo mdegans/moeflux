@@ -2267,7 +2267,7 @@ where
             num_v_heads: num_v_heads as u32,
             n_tokens: n_tokens as u32,
         });
-        g.push(Op::GatedDeltaNetStepNTokens {
+        g.push(Op::GatedDeltaNetChunkwise {
             label: "linear_attn.gated_delta_net_step",
             state: buffers.delta_state[linear_layer_idx],
             conv_out: conv_out_stack_id,
@@ -2278,6 +2278,7 @@ where
             value_dim,
             k_heads_per_v,
             n_tokens: n_tokens as u32,
+            chunk_size: 16,
         });
         g.push(Op::GatedRmsNormNTokens {
             label: "linear_attn.gated_rms_norm",
