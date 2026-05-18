@@ -248,11 +248,27 @@ impl MetalContext {
     ///
     /// `label` must be `'static` so the stats map can key on it
     /// without owning a string per call.
+    ///
+    /// Panics if the command buffer completes with an error status —
+    /// a faulting kernel otherwise leaves its output buffers unwritten
+    /// and the failure surfaces far downstream as garbage / NaN logits
+    /// with no hint of where it began. Rerun under `MTL_DEBUG_LAYER=1`
+    /// `MTL_SHADER_VALIDATION=1` for the precise fault.
     pub fn commit_and_wait_labeled(&self, cmdbuf: &CommandBufferRef, label: &'static str) {
         let t0 = std::time::Instant::now();
         cmdbuf.commit();
         cmdbuf.wait_until_completed();
         let cpu_wait_ns = t0.elapsed().as_nanos() as u64;
+
+        // Fail fast — previously a cmdbuf error was silently swallowed.
+        if cmdbuf.status() == metal::MTLCommandBufferStatus::Error {
+            panic!(
+                "Metal command buffer '{label}' completed with error \
+                 status; rerun with MTL_DEBUG_LAYER=1 \
+                 MTL_SHADER_VALIDATION=1 for the fault detail"
+            );
+        }
+
         let mut stats = self
             .cmdbuf_stats
             .lock()
