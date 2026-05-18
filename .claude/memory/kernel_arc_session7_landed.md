@@ -57,11 +57,46 @@ proven in pure Rust before any Metal work.
 No turnkey gated-delta kernel exists. MLX core has only general
 primitives (`steel/gemm`, `scan`/`CumSum`, `sdpa`, …); Gated
 DeltaNet lives in mlx-lm as composed `mx` ops (algorithm reference,
-not vendorable). `moeflux-mlx` is a vendor-and-wrap crate — Phase 3
-can vendor MLX's `steel/gemm` + `scan` for the matmul/cumsum
-building blocks; we hand-write only the C×C triangular solve.
+not vendorable). `moeflux-mlx` is a vendor-and-wrap crate — a future
+decomposed path could vendor MLX's `steel/gemm` + `scan`. (The
+Phase-3 kernel below ended up self-contained, so no vendoring was
+needed yet — kept as a Phase-4 tuning lever.)
+
+## Headline — chunkwise Gated DeltaNet, Phase 2 (landed)
+
+moeflux `b72fc06`. `Op::GatedDeltaNetChunkwise` (same fields/buffer
+roles as `GatedDeltaNetStepNTokens` + `chunk_size: u32`) + CpuBackend
+arm (gathers q|k|v from `conv_out`, calls `gated_delta_chunkwise`) +
+`label`/`variant_name`/`reads`/`writes` arms. MetalBackend arm
+`todo!()` (filled by Phase 3). Diff test
+`cpu_chunkwise_matches_cpu_per_token_gated_delta` — chunkwise Op vs
+per-token Op through CpuBackend, n ∈ {1,4,16,64} × C ∈ {8,16}, all 8
+combos cosine = 1.0.
+
+## Headline — chunkwise Gated DeltaNet, Phase 3 (landed)
+
+moeflux `9310a1a`. The Metal kernel `gated_delta_net_chunkwise` —
+single self-contained kernel (no decomposed pipeline: `encode_op`
+arms can't allocate scratch on the fly). Threadgroup-per-head
+(mirrors `gated_delta_net_step`'s dispatch), inner chunk loop, all
+transients in threadgroup memory. `CW_C = 16` keeps every transient
+within the 32 KB tg-mem budget — no new Op fields, no producer
+change. **Key property**: thread `vi` owns state/output/U row `vi`
+exclusively; only kc/A/kqg/log_decay/beta_s are cross-thread
+(written once per chunk, read-only after) — so the forward
+substitution needs no barriers, only 3 per chunk total.
+
+Diff test `graph_metal_matches_cpu_gated_delta_chunkwise` (`#[ignore]`,
+GPU): Metal vs the CpuBackend chunkwise arm, n ∈ {1,4,16,64}
+(singleton, ragged, multi-chunk) — output and state **cosine = 1.0**,
+max_abs ~1e-6. First try. lib 75/75 green.
+
+Phase 3 touches no live path (producer still emits
+`GatedDeltaNetStepNTokens`) — so the real-model canary cannot
+regress from it; canary belongs to Phase 4.
 
 ## Next
 
-`kernel_arc_session8_plan.md` — Phase 2 (`Op` + CpuBackend graph
-arm + graph diff test), then Phase 3 (Metal kernels).
+`kernel_arc_session8_plan.md` — Phase 4: swap the producer
+(`linear_attn_forward.rs:2270`) to `GatedDeltaNetChunkwise`, run the
+real-model canary, then a reboot-grade prefill A/B bench.

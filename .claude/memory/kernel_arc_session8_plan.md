@@ -1,77 +1,66 @@
-# Kernel arc — session 8 plan
+# Kernel arc — session 8 plan: chunkwise DeltaNet Phase 4
 
 Continues `kernel_arc_session7_landed.md`. The chunkwise Gated
-DeltaNet arc: Phase 1 (CPU reference `gated_delta_chunkwise`, math
-gate at cosine = 1.0) landed `69fe0d9`. Goal of the arc: kill the
-28%-of-prefill `gated_delta_net_step` sequential scan.
+DeltaNet arc — Phases 1 (CPU ref `69fe0d9`), 2 (`Op` + CpuBackend
+arm `b72fc06`), 3 (Metal kernel `9310a1a`) all landed and green at
+cosine = 1.0. **Phase 4 is the last step: make the win real.**
 
-## Task 1 — Phase 2: `Op` + CpuBackend graph arm + graph diff test
+`gated_delta_net_step` was ~28% of a3b prefill (per-op breakdown).
+The chunkwise kernel `gated_delta_net_chunkwise` exists, is wired as
+`Op::GatedDeltaNetChunkwise`, and is bit-equivalent to the per-token
+oracle — but **no live path emits it yet**. Phase 4 swaps it in and
+measures.
 
-Promote the Phase-1 function into the graph. **Self-contained, no
-GPU kernel work** — this is the CpuBackend-first step (session-7
-trait discipline: a backend gets the Op working before Metal).
+## Task 1 — producer swap
 
-1. **New `Op::GatedDeltaNetChunkwise`** in `backend/mod.rs` (near
-   `GatedDeltaNetStepNTokens`, ~line 530). Same fields as
-   `GatedDeltaNetStepNTokens` (state, conv_out, g_decay, beta_gate,
-   output, num_v_heads, value_dim, k_heads_per_v, n_tokens) **plus
-   `chunk_size: u32`**.
-2. **CpuBackend arm** in `backend/cpu/mod.rs` (~line 1070, beside
-   the existing `GatedDeltaNetStepNTokens` arm). Slice `conv_out`
-   into q|k|v views (per-token layout: `[q key_total | k key_total |
-   v value_total]`, see the existing arm) and call
-   `gated_delta_chunkwise`. Note `gated_delta_chunkwise` takes
-   *separate* q/k/v arrays — either gather them, or add a
-   conv_out-slicing variant; gather is simplest for Phase 2.
-3. **Graph diff test** in `tests/graph_diff_oracle.rs` (clone the
-   `check_gated_delta_net_step` harness at line 1220). Run BOTH
-   `GatedDeltaNetStepNTokens` and `GatedDeltaNetChunkwise` through
-   **CpuBackend** with identical inputs; assert output + state
-   cosine ≥ 0.9999. (This is CpuBackend-vs-CpuBackend — the Metal
-   arm comes in Phase 3. The Phase-1 unit test already covers the
-   math; this covers the Op plumbing.)
-4. MetalBackend arm: `todo!()` with a named deferral to Phase 3.
+`crates/moeflux/src/riir/attn/linear_attn_forward.rs:2270` — the
+`g.push(Op::GatedDeltaNetStepNTokens { … })` call site. Swap to
+`Op::GatedDeltaNetChunkwise { …, chunk_size: 16 }`.
 
-Decision deferred to Phase 3, not now: single coarse Op vs
-producer-expands-to-sub-Ops. Keep the coarse Op for Phase 2.
+- `chunk_size` **must be 16** — the kernel's `CW_C` is a compile-time
+  constant; the MetalBackend arm `debug_assert_eq!`s it.
+- Decision: route **all** token counts through chunkwise, including
+  decode (`n_tokens = 1`). The kernel handles `n=1` (diff test
+  cos = 1.0 at n=1 — one chunk, `c=1`). Simpler than keeping the
+  per-token kernel for a decode special-case. If a later decode
+  bench shows a regression, revisit (the per-token `Op` +
+  kernel stay in the tree, unused — cheap to re-route).
+- Check whether 2270 is the only emit site and whether it feeds both
+  prefill and decode (it is the batched linear-attn producer; trace
+  `n_tokens`).
 
-## Task 2 — Phase 3: Metal kernels (the headline, likely its own session)
+## Task 2 — real-model canary
 
-Diff target = Phase 2's CpuBackend arm. Decompose `gated_delta_
-chunkwise` into GPU work; `C` (inner chunk) a tunable const, default
-64. a3b dims: v_heads 64, k_heads 16, key_dim 128, value_dim 128,
-k_heads_per_v 4.
+Phase 3 touched no live path, so nothing has been model-validated
+yet. After the swap, run the canary battery (needs the real a3b
+model dir — not checked out during session 7). Expect 9/9 cosine
+green. This is the gate before trusting the swap — the diff tests
+cover n ≤ 64; a full 60-layer × multi-k-token prefill is what the
+canary exercises.
 
-Building blocks (per v-head, per inner chunk of C):
-- **log-cumsum** of `ln(g)` → `L_l`. Tiny (C≤64 per head) — hand
-  kernel, or MLX `scan`/`CumSum`.
-- **dense matmuls** — `k_i·k_l` (C×C), `S_0·k_l` / `S_0·q_l`
-  (C×value_dim), `k_i·q_l` (C×C), `Σ U_i·k_iᵀ` (value_dim×key_dim).
-  Candidates for vendored MLX `steel/gemm` (`moeflux-mlx`).
-- **C×C triangular solve** `(I+A)·U=B` — the genuinely novel
-  kernel, hand-written. Forward substitution, per head; C=64.
-- elementwise scaling by β, γ, Γ — fold into the above or a small
-  kernel.
+## Task 3 — prefill A/B bench
 
-Likely a new set of `Op`s (or sub-Ops the producer emits) + their
-MetalBackend arms, each diff-tested. Per-token kernel stays for
-decode (`n_tokens=1`).
+Per `feedback_bench_discipline` + `feedback_reboot_before_benches`:
+reboot, high-perf power, n ≥ 3. A = `GatedDeltaNetStepNTokens`
+(revert the swap or a flag), B = chunkwise. Measure 992-token and
+larger prefill. `MOEFLUX_PROFILE_PER_OP=1` — confirm the
+`gated_delta_net_step` 28% pole shrank / moved. `bench.py`.
 
-## Task 3 — Phase 4: orchestrator swap + bench
+Reboot + real model = a **Mike-assisted step**; the swap + canary
+can be done first, the claim-grade bench needs his machine state.
 
-Swap the producer at `linear_attn_forward.rs:2270` from
-`GatedDeltaNetStepNTokens` to the chunkwise Op. Bench with
-`MOEFLUX_PROFILE_PER_OP=1` — confirm the 28% pole moved. Reboot-grade
-A/B per `feedback_bench_discipline` (n≥3, high-perf power).
+## Tuning levers (only if the bench underwhelms)
 
-## Carry-overs / notes
+The Phase-3 kernel is correctness-first, `C = 16`, fully
+self-contained. If prefill doesn't move enough:
+- Larger `C` (32/64) — needs a device-scratch `U` BufId (tg-mem
+  budget); more parallel work per chunk, fewer chunk-steps.
+- Stage `q` in tg-mem (currently device-read in the A/kqg build).
+- MLX `steel/gemm` vendored for the matmul-heavy phases (per the
+  session-7 MLX investigation — `moeflux-mlx` is a vendor-and-wrap
+  crate).
 
-- Design conversation for Phase 3 happened in session 7 (the math
-  is locked in `gated_delta_chunkwise`'s doc comment + Phase-1
-  test). Phase 3 still warrants plan-mode for the kernel
-  decomposition + Op shape.
-- `feedback_design_before_execute`: Phase 2 is small enough to go
-  straight to plan-mode; Phase 3 wants a real design pass on the
-  kernel split and MLX-vendor-vs-handwrite call.
+## Carry-overs
+
 - blallama mismatch-guard Part 3 still pending (do when blallama is
-  checked out) — see `future_work_model_binary_mismatch_guard.md`.
+  checked out) — `future_work_model_binary_mismatch_guard.md`.
