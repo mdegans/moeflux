@@ -1,39 +1,49 @@
-# Future work — fail fast on binary ↔ weights mismatch
+# Binary ↔ weights mismatch guard — LANDED (blallama tail remains)
 
 A moeflux binary is feature-gated to one model (`moeflux-model-*` →
-compile-time `VARIANT`). Point an a17b-built `blallama` at a3b weights
-(trivially easy via `bench.py --no-build` after a different `--model`
-build) and it loads fine, logs `session_ready`, then **panics deep in
-prefill**: `prefill failed in CandidatePredictor::new: InitFailed`
-(drama_llama `predictor.rs:341` `.expect()`s the swallowed moeflux
-error). Cost a real debugging detour on 2026-05-17.
+compile-time `VARIANT`). Pointing it at the wrong weights used to load
+cleanly, log `session_ready`, then panic deep in prefill. Cost a real
+debugging detour on 2026-05-17.
 
-Goal: detect the mismatch and reject with a descriptive message
-instead of an opaque panic.
+## Landed 2026-05-18 (session 7 warm-up)
 
-It is a 3-part fix, not a one-liner:
+- **moeflux** `65ae254`: `RsCtx::open` probes the manifest right after
+  `WeightFile::open` — top `model.layers.{N}` index + 1 vs
+  `VARIANT.num_layers`, layer-0 `input_layernorm.weight` length vs
+  `VARIANT.hidden_dim`. On mismatch returns the new descriptive
+  `RsError::ModelMismatch { expected, detail }`. `probe_variant_match`
+  does the I/O; `check_variant_dims` is the pure decision half, 5
+  unit tests, variant-agnostic.
+- **drama_llama** `f0f8edb`: new `MoefluxError::ModelMismatch(String)`
+  + `From<MfError>` arm. Also fixed: the `moeflux` feature now
+  depends on `tracing` (was an unrelated pre-existing build break).
 
-1. **moeflux — detect + descriptive error.** In `RsCtx::open`
-   (`riir/mod.rs:336`), right after `WeightFile::open` succeeds, probe
-   the manifest against `VARIANT`. Robust signals: max `model.layers.
-   {N}` index in `wf.iter()` vs `VARIANT.num_layers`, and a hidden-dim
-   tensor's shape vs `VARIANT.hidden_dim` (confirm an always-present
-   tensor name from `LayerWeightCache::build_all`). On mismatch return
-   a new `RsError::ModelMismatch { expected: &'static str /* VARIANT.
-   name */, detail: String }` — message should name the binary's
-   variant, what was found, and the remedy ("rebuild with --features
-   moeflux-model-… or point at the matching model dir").
+## Part 2 (un-panic predictor.rs:341) — turned out MOOT for this bug
 
-2. **drama_llama — stop panicking.** `predictor.rs:341` `.expect()`s
-   prefill failure → panic. It must *propagate* the error so the
-   request fails cleanly. Trace `CandidatePredictor::new` /
-   `TokenPredictor::new` prefill error handling.
+The spec assumed the mismatch could only be caught at prefill, so
+predictor.rs:341's `.expect()` had to be un-panicked. But Part 1
+moved detection to `RsCtx::open` — the error now surfaces at
+`MoefluxDecoder::open` / `MoefluxEngine::from_path*`, through the
+existing `Result` path, *before any predictor is constructed*. So the
+predictor.rs panic is never reached for the mismatch case.
 
-3. **blallama — map it.** `map_session_err` turns the error into an
-   HTTP response; the new variant gets a 4xx with the descriptive
-   message so the caller sees why.
+The predictor.rs `.expect()`s (lines 341, 382, 432) are still a
+genuine footgun for *other* prefill/step failures (OOM, eval failure)
+— but un-panicking them makes `CandidatePredictor::new` /
+`TokenPredictor::new` / … fallible, an API-breaking cascade through
+the whole predictor stack + Engine entry points. That is a separate,
+deliberate API change — NOT part of this guard. Left as future work.
 
-Verify: build the a3b binary, point it at the a17b model dir (and
-vice versa) — expect a clean descriptive error, no panic.
+## Remaining: blallama Part 3 (not done — repo not checked out)
 
-Good next-session warm-up before the `gated_delta_net_step` design.
+blallama's `map_session_err` should give `MoefluxError::ModelMismatch`
+a 4xx with the descriptive message. Not done this session — blallama
+isn't checked out under `~/Projects`. Until then the error still
+propagates non-panic with a readable message (via blallama's generic
+error path, likely 500). Low urgency; do it next time blallama is
+open.
+
+## Verify (manual, needs both model dirs)
+
+Build the a3b binary, point it at the a17b model dir (and vice
+versa) — expect a clean `ModelMismatch` error, no panic.
