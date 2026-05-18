@@ -52,13 +52,41 @@ can be done first, the claim-grade bench needs his machine state.
 ## Tuning levers (only if the bench underwhelms)
 
 The Phase-3 kernel is correctness-first, `C = 16`, fully
-self-contained. If prefill doesn't move enough:
-- Larger `C` (32/64) — needs a device-scratch `U` BufId (tg-mem
-  budget); more parallel work per chunk, fewer chunk-steps.
-- Stage `q` in tg-mem (currently device-read in the A/kqg build).
-- MLX `steel/gemm` vendored for the matmul-heavy phases (per the
-  session-7 MLX investigation — `moeflux-mlx` is a vendor-and-wrap
-  crate).
+self-contained. Ordered roughly cheapest → biggest rewrite. If
+prefill doesn't move enough:
+
+1. **Larger `C` (32/64)** — fewer sequential chunk-steps, more
+   parallel work per chunk. `C=32` already busts the 32 KB tg-mem
+   budget (`U` at `C·128` is 16 KB alone), so it needs a
+   device-scratch `U` BufId (one new Op field + producer wire-up +
+   lifetime coloring). Biggest single dial.
+2. **Stage `q` in tg-mem** — currently the A/kqg build reads `q`
+   from device memory; `k` is already staged in `kc`. Cheap, but
+   competes with `U` for the tg-mem budget (see #1).
+3. **Blocked triangular inverse (UT transform)** — the Phase-3
+   forward substitution is per-thread sequential in `l` (a
+   length-`C` dependency chain). At `C=16` this is *not* a
+   bottleneck (~128 MACs/thread, dwarfed by the A-build and
+   matmuls) — but if #1 pushes `C` to 32/64 the chain grows. `A` is
+   strictly-lower-triangular ⇒ nilpotent, so `(I+A)⁻¹` has an exact
+   blocked/recursive-doubling form (standard in the DeltaNet /
+   flash-linear-attention literature). **Only pair this with #1** —
+   pointless at `C=16`.
+4. **Decomposed multi-kernel path** — biggest rewrite. Replace the
+   single fat kernel with separate cumsum / matmul / triangular-
+   solve / output kernels, intermediates in device-memory scratch
+   BufIds. More occupancy and per-phase parallelism; enables
+   vendoring MLX `steel/gemm` for the matmul phases and MLX `scan`
+   for the cumsum (`moeflux-mlx` is a vendor-and-wrap crate — see
+   the session-7 MLX investigation). Costs ~6 scratch BufIds
+   plumbed through the Op + producer + lifetime coloring; that
+   plumbing cost is exactly why Phase 3 chose the single kernel.
+
+Already done inside the Phase-3 kernel (not pending levers, noted so
+they aren't re-suggested): `kc` staged in tg-mem; the phase-6
+per-`i` decay ratio × `U_i` hoisted out of the `ki` loop; `k_i·q_l`
+precomputed once into `kqg` rather than recomputed per output
+thread.
 
 ## Carry-overs
 
