@@ -1357,3 +1357,146 @@ fn check_gated_delta_net_step(n_tokens: u32) {
         max_abs_state
     );
 }
+
+// ============================================================================
+// Test: GatedDeltaNetChunkwise vs GatedDeltaNetStepNTokens on CpuBackend
+// (kernel arc session 8, Phase 2)
+// ============================================================================
+
+/// The chunkwise `Op` plumbed through `CpuBackend` must reproduce the
+/// per-token `Op`. The chunkwise *math* is covered by the
+/// `gated_delta_chunkwise` unit test in `linear_attn.rs`; this covers
+/// the `Op` + backend-arm wiring (the `conv_out` q|k|v gather, the
+/// buffer roles). CPU-vs-CPU — the MetalBackend arm lands in Phase 3,
+/// and this test is its diff target. Not `#[ignore]`d: CPU-only, fast.
+#[test]
+fn cpu_chunkwise_matches_cpu_per_token_gated_delta() {
+    let num_v_heads: u32 = 64;
+    let value_dim: u32 = 128;
+    let k_heads_per_v: u32 = 4;
+    let key_dim: usize = 128;
+    let num_k_heads: usize = 16;
+    let key_total = num_k_heads * key_dim;
+    let value_total = num_v_heads as usize * value_dim as usize;
+    let conv_per_token = 2 * key_total + value_total;
+    let state_floats =
+        num_v_heads as usize * value_dim as usize * key_dim;
+
+    // n=1 is decode; 4/16/64 are prefill chunk shapes. C ∈ {8,16}
+    // forces multi-chunk + ragged splits within those token counts.
+    for n_tokens in [1u32, 4, 16, 64] {
+        for chunk_size in [8u32, 16] {
+            let conv_total = n_tokens as usize * conv_per_token;
+            let gdb_total = n_tokens as usize * num_v_heads as usize;
+            let out_total = n_tokens as usize * value_total;
+            let mut rng = Rng::new(
+                0xC0FFEE
+                    ^ (n_tokens as u64)
+                    ^ ((chunk_size as u64) << 20),
+            );
+            let conv_data: Vec<f32> = (0..conv_total)
+                .map(|_| rng.next_f32_unit() * 0.5)
+                .collect();
+            let g_data: Vec<f32> = (0..gdb_total)
+                .map(|_| 0.9 + rng.next_f32_unit() * 0.05)
+                .collect();
+            let bg_data: Vec<f32> = (0..gdb_total)
+                .map(|_| 0.5 + rng.next_f32_unit() * 0.2)
+                .collect();
+            let initial_state: Vec<f32> = (0..state_floats)
+                .map(|_| rng.next_f32_unit() * 0.01)
+                .collect();
+
+            // Run one Op through a fresh CpuBackend, same inputs.
+            let run = |chunkwise: bool| -> (Vec<f32>, Vec<f32>) {
+                let mut wf = SyntheticWf::build(
+                    "gated_delta_cpu",
+                    &[("dummy", "BF16", 0, vec![32], vec![0u8; 64])],
+                );
+                let mut cpu = CpuBackend::new(wf.take());
+                let s = cpu
+                    .pool_mut()
+                    .alloc(state_floats * 4, "state", true)
+                    .unwrap();
+                let cv = cpu
+                    .pool_mut()
+                    .alloc(conv_total * 4, "conv", false)
+                    .unwrap();
+                let g = cpu
+                    .pool_mut()
+                    .alloc(gdb_total * 4, "g", false)
+                    .unwrap();
+                let bg = cpu
+                    .pool_mut()
+                    .alloc(gdb_total * 4, "bg", false)
+                    .unwrap();
+                let out = cpu
+                    .pool_mut()
+                    .alloc(out_total * 4, "out", false)
+                    .unwrap();
+                cpu.pool_mut()
+                    .upload(s, bytes_of_f32(&initial_state))
+                    .unwrap();
+                cpu.pool_mut()
+                    .upload(cv, bytes_of_f32(&conv_data))
+                    .unwrap();
+                cpu.pool_mut().upload(g, bytes_of_f32(&g_data)).unwrap();
+                cpu.pool_mut()
+                    .upload(bg, bytes_of_f32(&bg_data))
+                    .unwrap();
+                let mut graph = Graph::new();
+                if chunkwise {
+                    graph.push(Op::GatedDeltaNetChunkwise {
+                        label: "test_chunkwise",
+                        state: s,
+                        conv_out: cv,
+                        g_decay: g,
+                        beta_gate: bg,
+                        output: out,
+                        num_v_heads,
+                        value_dim,
+                        k_heads_per_v,
+                        n_tokens,
+                        chunk_size,
+                    });
+                } else {
+                    graph.push(Op::GatedDeltaNetStepNTokens {
+                        label: "test_per_token",
+                        state: s,
+                        conv_out: cv,
+                        g_decay: g,
+                        beta_gate: bg,
+                        output: out,
+                        num_v_heads,
+                        value_dim,
+                        k_heads_per_v,
+                        n_tokens,
+                    });
+                }
+                cpu.execute(&graph, "diff_oracle").unwrap();
+                let mut ob = vec![0u8; out_total * 4];
+                cpu.pool().download(out, &mut ob).unwrap();
+                let mut sb = vec![0u8; state_floats * 4];
+                cpu.pool().download(s, &mut sb).unwrap();
+                (f32_of_bytes(&ob), f32_of_bytes(&sb))
+            };
+
+            let (ref_out, ref_state) = run(false);
+            let (cw_out, cw_state) = run(true);
+            let cos_out = cosine_sim(&ref_out, &cw_out);
+            let cos_state = cosine_sim(&ref_state, &cw_state);
+            eprintln!(
+                "[phase2 chunkwise-op] N={n_tokens} C={chunk_size}: \
+                 out cos={cos_out:.9} state cos={cos_state:.9}"
+            );
+            assert!(
+                cos_out >= COSINE_FLOOR,
+                "N={n_tokens} C={chunk_size}: out cosine {cos_out}"
+            );
+            assert!(
+                cos_state >= COSINE_FLOOR,
+                "N={n_tokens} C={chunk_size}: state cosine {cos_state}"
+            );
+        }
+    }
+}

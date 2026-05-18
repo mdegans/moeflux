@@ -20,7 +20,8 @@ use crate::riir::backend::cpu::cpu_matvec::{
 use crate::riir::backend::cpu::cpu_ops::{cpu_sigmoid_scalar, residual_add_n_tokens_cpu};
 use crate::riir::io::embedding::bf16_to_f32;
 use crate::riir::attn::linear_attn::{
-    compute_decay_beta_cpu, conv1d_step, gated_delta_recurrence_supplied,
+    compute_decay_beta_cpu, conv1d_step, gated_delta_chunkwise,
+    gated_delta_recurrence_supplied,
 };
 use crate::riir::moe::moe_cpu::moe_permute_fuse_cpu;
 use crate::riir::variants::{GROUP_SIZE, VARIANT};
@@ -1128,6 +1129,70 @@ impl Backend for CpuBackend {
                     output_buf[t * value_total..(t + 1) * value_total]
                         .copy_from_slice(&out_t);
                 }
+            }
+            Op::GatedDeltaNetChunkwise {
+                state,
+                conv_out,
+                g_decay,
+                beta_gate,
+                output,
+                num_v_heads,
+                value_dim,
+                k_heads_per_v,
+                n_tokens,
+                chunk_size,
+                ..
+            } => {
+                let v_heads = *num_v_heads as usize;
+                let value_dim = *value_dim as usize;
+                let k_heads_per_v = *k_heads_per_v as usize;
+                let k_heads = v_heads / k_heads_per_v;
+                let key_dim = crate::riir::variants::Variant::LINEAR_KEY_DIM;
+                let n_tokens = *n_tokens as usize;
+                let chunk_size = *chunk_size as usize;
+                let conv_out_buf = self.read_f32(*conv_out);
+                let g_decay_buf = self.read_f32(*g_decay);
+                let beta_gate_buf = self.read_f32(*beta_gate);
+                let mut state_buf = self.write_f32(*state);
+                let mut output_buf = self.write_f32(*output);
+                let key_total = VARIANT.linear_total_key();
+                let value_total = v_heads * value_dim;
+                let per_token_conv = 2 * key_total + value_total;
+                // `gated_delta_chunkwise` takes separate token-major
+                // q/k/v arrays; `conv_out` interleaves them per token
+                // (q | k | v), so gather first.
+                let mut q = vec![0.0f32; n_tokens * key_total];
+                let mut k = vec![0.0f32; n_tokens * key_total];
+                let mut v = vec![0.0f32; n_tokens * value_total];
+                for t in 0..n_tokens {
+                    let conv_t = &conv_out_buf
+                        [t * per_token_conv..(t + 1) * per_token_conv];
+                    q[t * key_total..(t + 1) * key_total]
+                        .copy_from_slice(&conv_t[0..key_total]);
+                    k[t * key_total..(t + 1) * key_total]
+                        .copy_from_slice(&conv_t[key_total..2 * key_total]);
+                    v[t * value_total..(t + 1) * value_total]
+                        .copy_from_slice(
+                            &conv_t[2 * key_total
+                                ..2 * key_total + value_total],
+                        );
+                }
+                gated_delta_chunkwise(
+                    &g_decay_buf,
+                    &beta_gate_buf,
+                    &q,
+                    &k,
+                    &v,
+                    n_tokens,
+                    chunk_size,
+                    v_heads,
+                    k_heads,
+                    key_dim,
+                    value_dim,
+                    &mut state_buf,
+                    &mut output_buf,
+                )
+                .expect("delta net chunkwise");
             }
             Op::GatedRmsNormNTokens {
                 values,

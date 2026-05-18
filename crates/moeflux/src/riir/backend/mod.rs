@@ -540,6 +540,27 @@ pub enum Op {
         n_tokens: u32,
     },
 
+    /// Linear-attn 1d, chunkwise-parallel variant of
+    /// [`Op::GatedDeltaNetStepNTokens`]. Same delta-rule recurrence
+    /// and same buffer roles (`state` is persistent RMW; `conv_out`
+    /// is the per-token `q | k | v` stack), but the within-chunk
+    /// computation is reformulated as matmuls + a triangular solve so
+    /// only the chunk-to-chunk state carry stays sequential.
+    /// `chunk_size` is the inner chunk length `C`.
+    GatedDeltaNetChunkwise {
+        label: &'static str,
+        state: BufId,
+        conv_out: BufId,
+        g_decay: BufId,
+        beta_gate: BufId,
+        output: BufId,
+        num_v_heads: u32,
+        value_dim: u32,
+        k_heads_per_v: u32,
+        n_tokens: u32,
+        chunk_size: u32,
+    },
+
     /// Linear-attn 1e: gated RMS norm over `[n_tokens, num_v_heads
     /// * value_dim]`.
     GatedRmsNormNTokens {
@@ -584,6 +605,7 @@ impl Op {
             Op::Conv1dStepNTokens { label, .. } => label,
             Op::ComputeDecayBetaNTokens { label, .. } => label,
             Op::GatedDeltaNetStepNTokens { label, .. } => label,
+            Op::GatedDeltaNetChunkwise { label, .. } => label,
             Op::GatedRmsNormNTokens { label, .. } => label,
             Op::LmHead { label, .. } => label,
         }
@@ -607,6 +629,7 @@ impl Op {
             Op::Conv1dStepNTokens { .. } => "Conv1dStepNTokens",
             Op::ComputeDecayBetaNTokens { .. } => "ComputeDecayBetaNTokens",
             Op::GatedDeltaNetStepNTokens { .. } => "GatedDeltaNetStepNTokens",
+            Op::GatedDeltaNetChunkwise { .. } => "GatedDeltaNetChunkwise",
             Op::GatedRmsNormNTokens { .. } => "GatedRmsNormNTokens",
             Op::LmHead { .. } => "LmHead",
         }
@@ -673,6 +696,13 @@ impl Op {
                 beta_gate,
                 ..
             } => vec![*state, *conv_out, *g_decay, *beta_gate],
+            Op::GatedDeltaNetChunkwise {
+                state,
+                conv_out,
+                g_decay,
+                beta_gate,
+                ..
+            } => vec![*state, *conv_out, *g_decay, *beta_gate],
             Op::GatedRmsNormNTokens { values, z, .. } => vec![*values, *z],
             Op::LmHead { hidden, .. } => vec![*hidden],
         }
@@ -721,6 +751,7 @@ impl Op {
                 ..
             } => vec![*g_decay_out, *beta_gate_out],
             Op::GatedDeltaNetStepNTokens { state, output, .. } => vec![*state, *output], // state is RMW
+            Op::GatedDeltaNetChunkwise { state, output, .. } => vec![*state, *output], // state is RMW
             Op::GatedRmsNormNTokens { output, .. } => vec![*output],
             Op::LmHead { logits_out, .. } => vec![*logits_out],
         }

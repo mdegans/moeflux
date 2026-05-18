@@ -1053,6 +1053,13 @@ impl Backend for MetalBackend {
                 );
                 enc.end_encoding();
             }
+            Op::GatedDeltaNetChunkwise { .. } => {
+                // Phase 3 (kernel arc session 8): chunkwise-parallel
+                // delta-rule kernels. The CpuBackend arm + the
+                // `gated_delta_chunkwise` CPU reference are the diff
+                // oracle. See `kernel_arc_session8_plan.md`.
+                todo!("GatedDeltaNetChunkwise MetalBackend arm — Phase 3")
+            }
             Op::GatedRmsNormNTokens {
                 values,
                 z,
