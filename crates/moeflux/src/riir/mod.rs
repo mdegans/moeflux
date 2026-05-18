@@ -327,6 +327,97 @@ pub struct RsCtx<B: Backend = MetalBackend> {
     // Future phases populate: vocab.
 }
 
+/// Probe a freshly-opened [`WeightFile`] against the compile-time
+/// [`VARIANT`], rejecting weights whose shape doesn't match the model
+/// this binary was built for.
+///
+/// A moeflux binary is feature-gated to exactly one model
+/// (`moeflux-model-*` → [`VARIANT`]). Pointing it at a different
+/// model's weights otherwise loads cleanly, logs `session_ready`, and
+/// then panics deep in prefill — an opaque failure that cost a real
+/// debugging detour. This turns it into a descriptive
+/// [`RsError::ModelMismatch`] at open time.
+///
+/// Extracts the two robust signals from the manifest and hands the
+/// decision to [`check_variant_dims`] (the unit-tested half).
+fn probe_variant_match(wf: &WeightFile) -> Result<(), RsError> {
+    // Layer count: highest `model.layers.{N}.` index in the manifest,
+    // plus one. Every variant in `variants.rs` has a distinct
+    // `num_layers`, so this alone discriminates them.
+    let top_layer = wf
+        .iter()
+        .filter_map(|(name, _)| {
+            name.strip_prefix("model.layers.")?
+                .split('.')
+                .next()?
+                .parse::<usize>()
+                .ok()
+        })
+        .max();
+    // Hidden dim: the layer-0 `input_layernorm.weight` is a 1-D
+    // rms-norm vector of length `hidden_dim` (the product covers a
+    // `[1, hidden_dim]` storage variant).
+    let hidden_dim = wf
+        .tensor_info("model.layers.0.input_layernorm.weight")
+        .map(|info| info.shape.iter().product::<usize>());
+    check_variant_dims(top_layer, hidden_dim)
+}
+
+/// Decision half of [`probe_variant_match`]: compare the manifest's
+/// top layer index and hidden dim against [`VARIANT`]. Pure (no I/O)
+/// so it is unit-testable without a model on disk.
+///
+/// `top_layer` is the highest `model.layers.{N}` index (so layer
+/// *count* is `top_layer + 1`); `None` means the manifest carried no
+/// layer tensors at all. `hidden_dim` is the layer-0
+/// `input_layernorm.weight` length; `None` means that tensor was
+/// absent and the dim check is skipped.
+fn check_variant_dims(
+    top_layer: Option<usize>,
+    hidden_dim: Option<usize>,
+) -> Result<(), RsError> {
+    let mismatch = |detail: String| RsError::ModelMismatch {
+        expected: VARIANT.name,
+        detail,
+    };
+
+    match top_layer {
+        None => {
+            return Err(mismatch(
+                "manifest carries no `model.layers.*` tensors — not a \
+                 moeflux-converted model directory?"
+                    .to_string(),
+            ));
+        }
+        Some(top) if top + 1 != VARIANT.num_layers => {
+            return Err(mismatch(format!(
+                "weights have {} layers, this binary expects {}. \
+                 Rebuild with the matching `--features moeflux-model-…` \
+                 or point at the {} model directory.",
+                top + 1,
+                VARIANT.num_layers,
+                VARIANT.name,
+            )));
+        }
+        Some(_) => {}
+    }
+
+    // Belt-and-suspenders for any future variants that happen to
+    // share a `num_layers`.
+    if let Some(found) = hidden_dim {
+        if found != VARIANT.hidden_dim {
+            return Err(mismatch(format!(
+                "weights have hidden_dim {}, this binary expects {} \
+                 ({}). Rebuild with the matching \
+                 `--features moeflux-model-…`.",
+                found, VARIANT.hidden_dim, VARIANT.name,
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 impl RsCtx<MetalBackend> {
     /// Open a model. Argument order matches [`crate::imp::Ctx::open`].
     ///
@@ -343,6 +434,7 @@ impl RsCtx<MetalBackend> {
     ) -> Result<Self, RsError> {
         let wf = WeightFile::open(weights, manifest)
             .map_err(|_| RsError::InitFailed)?;
+        probe_variant_match(&wf)?;
         let experts = ExpertFiles::open(experts_dir)
             .map_err(|_| RsError::InitFailed)?;
         let layer_states = alloc_layer_states();
@@ -2790,4 +2882,72 @@ pub enum RsError {
         /// Bytes the snapshot requires.
         need: usize,
     },
+    /// The opened weights don't match the model this binary was built
+    /// for. A moeflux binary is feature-gated to one model
+    /// (`moeflux-model-*` → compile-time [`VARIANT`]); pointing it at
+    /// another model's weights otherwise loads cleanly and then
+    /// panics deep in prefill. Detected by [`probe_variant_match`] at
+    /// [`RsCtx::open`].
+    #[error("model mismatch: binary built for {expected} — {detail}")]
+    ModelMismatch {
+        /// `VARIANT.name` — the model this binary was compiled for.
+        expected: &'static str,
+        /// What was found in the weights, and how to fix it.
+        detail: String,
+    },
+}
+
+#[cfg(test)]
+mod variant_guard_tests {
+    use super::{check_variant_dims, RsError, VARIANT};
+
+    /// The dims this binary was actually built for pass cleanly.
+    #[test]
+    fn matching_dims_ok() {
+        let top = VARIANT.num_layers - 1;
+        assert!(
+            check_variant_dims(Some(top), Some(VARIANT.hidden_dim)).is_ok()
+        );
+    }
+
+    /// A manifest with no `model.layers.*` tensors is rejected.
+    #[test]
+    fn no_layer_tensors_rejected() {
+        assert!(matches!(
+            check_variant_dims(None, None),
+            Err(RsError::ModelMismatch { .. })
+        ));
+    }
+
+    /// Wrong layer count is rejected — guards the `top + 1` off-by-one.
+    #[test]
+    fn wrong_layer_count_rejected() {
+        // `top == num_layers` means count `num_layers + 1` — a mismatch.
+        assert!(matches!(
+            check_variant_dims(
+                Some(VARIANT.num_layers),
+                Some(VARIANT.hidden_dim),
+            ),
+            Err(RsError::ModelMismatch { .. })
+        ));
+    }
+
+    /// Right layer count but wrong hidden dim is rejected.
+    #[test]
+    fn wrong_hidden_dim_rejected() {
+        assert!(matches!(
+            check_variant_dims(
+                Some(VARIANT.num_layers - 1),
+                Some(VARIANT.hidden_dim + 1),
+            ),
+            Err(RsError::ModelMismatch { .. })
+        ));
+    }
+
+    /// An absent `input_layernorm.weight` skips the hidden-dim check
+    /// rather than failing — layer count alone still discriminates.
+    #[test]
+    fn absent_hidden_dim_tensor_skips_check() {
+        assert!(check_variant_dims(Some(VARIANT.num_layers - 1), None).is_ok());
+    }
 }
