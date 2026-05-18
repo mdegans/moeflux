@@ -429,6 +429,248 @@ pub fn gated_delta_recurrence_supplied(
     Ok(())
 }
 
+/// Chunkwise-parallel reformulation of
+/// [`gated_delta_recurrence_supplied`].
+///
+/// The per-token delta-rule recurrence is
+/// `S_t = g_t·S_{t-1} + u_t·k_tᵀ` with
+/// `u_t = β_t·(v_t − g_t·S_{t-1}·k_t)` and readout `out_t = S_t·q_t`.
+/// Run token-by-token it is a sequential scan — the wall in moeflux
+/// prefill. This function instead splits the `n_tokens` sequence into
+/// chunks of `chunk_size` and, within each chunk, expresses the
+/// recurrence as matmuls plus one lower-triangular solve. Only the
+/// chunk-to-chunk state carry stays sequential (`n / chunk_size`
+/// steps instead of `n`).
+///
+/// Algebra (per v-head, per chunk; local token index `l ∈ 0..C`,
+/// incoming state `S_0`). With cumulative log-decay
+/// `L_l = Σ_{j≤l} ln g_j`, `γ_l = exp(L_l)`, and decay ratio
+/// `Γ_{l,i} = exp(L_l − L_i) ∈ (0,1]` for `i ≤ l`:
+///
+/// ```text
+/// A_{l,i} = β_l·Γ_{l,i}·(k_i·k_l)          (strictly lower, i < l)
+/// B_l     = β_l·v_l − β_l·γ_l·(S_0·k_l)
+/// (I + A)·U = B                            (forward substitution)
+/// out_l   = γ_l·(S_0·q_l) + Σ_{i≤l} Γ_{l,i}·(k_i·q_l)·U_i
+/// S_C     = γ_{C-1}·S_0 + Σ_i Γ_{C-1,i}·U_i·k_iᵀ
+/// ```
+///
+/// This is the CPU reference for the eventual Metal chunkwise kernel.
+/// It is algebraically equal to the per-token oracle (and diff-tested
+/// against it); it is written for legibility, not speed — the GPU
+/// port carries the speed.
+///
+/// ## Layout
+/// - `g_decay`, `beta_gate`: `[n_tokens · v_heads]`, token-major.
+/// - `q`, `k`: `[n_tokens · k_heads · key_dim]`, token-major.
+/// - `v`: `[n_tokens · v_heads · value_dim]`, token-major.
+/// - `ssm_state`: `[v_heads · value_dim · key_dim]` — `S[vh][vi][ki]`,
+///   in/out, carried across the whole call.
+/// - `out_values`: `[n_tokens · v_heads · value_dim]`, token-major.
+///
+/// `g_decay` is `exp(…)` and therefore strictly positive, so the
+/// log-space cumulative decay never sees `ln(0)`.
+#[allow(clippy::too_many_arguments)]
+pub fn gated_delta_chunkwise(
+    g_decay: &[f32],
+    beta_gate: &[f32],
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    n_tokens: usize,
+    chunk_size: usize,
+    v_heads: usize,
+    k_heads: usize,
+    key_dim: usize,
+    value_dim: usize,
+    ssm_state: &mut [f32],
+    out_values: &mut [f32],
+) -> Result<(), LinearAttnError> {
+    if v_heads == 0
+        || k_heads == 0
+        || key_dim == 0
+        || value_dim == 0
+        || chunk_size == 0
+    {
+        return Err(LinearAttnError::ZeroDim);
+    }
+    if v_heads % k_heads != 0 {
+        return Err(LinearAttnError::InputLen {
+            got: v_heads,
+            expected: k_heads,
+        });
+    }
+    let key_total = k_heads * key_dim;
+    let value_total = v_heads * value_dim;
+    for (got, expected) in [
+        (g_decay.len(), n_tokens * v_heads),
+        (beta_gate.len(), n_tokens * v_heads),
+        (q.len(), n_tokens * key_total),
+        (k.len(), n_tokens * key_total),
+        (v.len(), n_tokens * value_total),
+        (out_values.len(), n_tokens * value_total),
+    ] {
+        if got != expected {
+            return Err(LinearAttnError::InputLen { got, expected });
+        }
+    }
+    if ssm_state.len() != v_heads * value_dim * key_dim {
+        return Err(LinearAttnError::InputLen {
+            got: ssm_state.len(),
+            expected: v_heads * value_dim * key_dim,
+        });
+    }
+    if n_tokens == 0 {
+        return Ok(());
+    }
+
+    let dot = |a: &[f32], b: &[f32]| -> f32 {
+        let mut s = 0.0f32;
+        for i in 0..a.len() {
+            s = a[i].mul_add(b[i], s);
+        }
+        s
+    };
+
+    let k_heads_per_v = v_heads / k_heads;
+    let head_state_stride = value_dim * key_dim;
+
+    for vh in 0..v_heads {
+        let kh = vh / k_heads_per_v;
+        let s_off = vh * head_state_stride;
+
+        let mut chunk_start = 0usize;
+        while chunk_start < n_tokens {
+            let c = (n_tokens - chunk_start).min(chunk_size);
+
+            // Gather this chunk's per-token inputs for head (vh, kh)
+            // into chunk-local buffers, plus the cumulative log-decay.
+            let mut kc = vec![0.0f32; c * key_dim];
+            let mut qc = vec![0.0f32; c * key_dim];
+            let mut vc = vec![0.0f32; c * value_dim];
+            let mut log_decay = vec![0.0f32; c];
+            let mut beta = vec![0.0f32; c];
+            let mut acc = 0.0f32;
+            for l in 0..c {
+                let t = chunk_start + l;
+                let kq_lo = t * key_total + kh * key_dim;
+                kc[l * key_dim..(l + 1) * key_dim]
+                    .copy_from_slice(&k[kq_lo..kq_lo + key_dim]);
+                qc[l * key_dim..(l + 1) * key_dim]
+                    .copy_from_slice(&q[kq_lo..kq_lo + key_dim]);
+                let v_lo = t * value_total + vh * value_dim;
+                vc[l * value_dim..(l + 1) * value_dim]
+                    .copy_from_slice(&v[v_lo..v_lo + value_dim]);
+                acc += g_decay[t * v_heads + vh].ln();
+                log_decay[l] = acc;
+                beta[l] = beta_gate[t * v_heads + vh];
+            }
+            let gamma_at = |l: usize| log_decay[l].exp();
+            // Γ_{l,i} = exp(L_l − L_i), for i ≤ l (bounded in (0,1]).
+            let decay_ratio =
+                |l: usize, i: usize| (log_decay[l] - log_decay[i]).exp();
+            let krow = |l: usize| &kc[l * key_dim..(l + 1) * key_dim];
+            let qrow = |l: usize| &qc[l * key_dim..(l + 1) * key_dim];
+
+            // Snapshot the incoming state — every chunk-internal read
+            // uses S_0; the new state is written only at the end.
+            let s0 = ssm_state[s_off..s_off + head_state_stride].to_vec();
+            // (S_0·x)[vi] = Σ_ki S_0[vi][ki]·x[ki].
+            let s0_apply = |x: &[f32], out: &mut [f32]| {
+                for vi in 0..value_dim {
+                    out[vi] =
+                        dot(&s0[vi * key_dim..(vi + 1) * key_dim], x);
+                }
+            };
+
+            // A: strictly-lower-triangular c×c.
+            let mut a = vec![0.0f32; c * c];
+            for l in 0..c {
+                for i in 0..l {
+                    a[l * c + i] = beta[l]
+                        * decay_ratio(l, i)
+                        * dot(krow(i), krow(l));
+                }
+            }
+
+            // RHS B_l = β_l·v_l − β_l·γ_l·(S_0·k_l), into `u`.
+            let mut u = vec![0.0f32; c * value_dim];
+            let mut scratch = vec![0.0f32; value_dim];
+            for l in 0..c {
+                s0_apply(krow(l), &mut scratch);
+                let gl = gamma_at(l);
+                let row = &mut u[l * value_dim..(l + 1) * value_dim];
+                for vi in 0..value_dim {
+                    row[vi] = beta[l] * vc[l * value_dim + vi]
+                        - beta[l] * gl * scratch[vi];
+                }
+            }
+            // Forward substitution: U_l −= Σ_{i<l} A_{l,i}·U_i.
+            for l in 0..c {
+                for i in 0..l {
+                    let coef = a[l * c + i];
+                    if coef == 0.0 {
+                        continue;
+                    }
+                    let (lo, hi) = u.split_at_mut(l * value_dim);
+                    let ui = &lo[i * value_dim..(i + 1) * value_dim];
+                    let ul = &mut hi[..value_dim];
+                    for vi in 0..value_dim {
+                        ul[vi] -= coef * ui[vi];
+                    }
+                }
+            }
+
+            // Outputs: out_l = γ_l·(S_0·q_l)
+            //                  + Σ_{i≤l} Γ_{l,i}·(k_i·q_l)·U_i.
+            for l in 0..c {
+                let t = chunk_start + l;
+                s0_apply(qrow(l), &mut scratch);
+                let gl = gamma_at(l);
+                let o_lo = t * value_total + vh * value_dim;
+                let out_l = &mut out_values[o_lo..o_lo + value_dim];
+                for vi in 0..value_dim {
+                    out_l[vi] = gl * scratch[vi];
+                }
+                for i in 0..=l {
+                    let coef =
+                        decay_ratio(l, i) * dot(krow(i), qrow(l));
+                    let ui = &u[i * value_dim..(i + 1) * value_dim];
+                    for vi in 0..value_dim {
+                        out_l[vi] = coef.mul_add(ui[vi], out_l[vi]);
+                    }
+                }
+            }
+
+            // New state: S_C = γ_{C-1}·S_0 + Σ_i Γ_{C-1,i}·U_i·k_iᵀ.
+            let last = c - 1;
+            let g_last = gamma_at(last);
+            let new_state =
+                &mut ssm_state[s_off..s_off + head_state_stride];
+            for (dst, src) in new_state.iter_mut().zip(s0.iter()) {
+                *dst = g_last * src;
+            }
+            for i in 0..c {
+                let ratio = decay_ratio(last, i);
+                let ki = krow(i);
+                let ui = &u[i * value_dim..(i + 1) * value_dim];
+                for vi in 0..value_dim {
+                    let coef = ratio * ui[vi];
+                    let row =
+                        &mut new_state[vi * key_dim..(vi + 1) * key_dim];
+                    for (rk, &kk) in row.iter_mut().zip(ki.iter()) {
+                        *rk = coef.mul_add(kk, *rk);
+                    }
+                }
+            }
+
+            chunk_start += c;
+        }
+    }
+
+    Ok(())
+}
+
 /// Compute the linear-attn 1c step element-wise per v-head:
 ///
 /// ```text
@@ -535,5 +777,155 @@ mod tests {
         silu_inplace(&mut x);
         // silu(10) ≈ 10 / (1 + e^-10) ≈ 10 * (1 - tiny)
         assert!((x[0] - 10.0).abs() < 1e-3);
+    }
+
+    /// LCG → f32 in `[-1, 1)`. Deterministic; seed per call site.
+    fn lcg_unit(state: &mut u64) -> f32 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let raw = ((*state >> 40) as f32) / ((1u32 << 24) as f32);
+        2.0 * raw - 1.0
+    }
+
+    fn cosine(a: &[f32], b: &[f32]) -> f32 {
+        let mut dot = 0.0f64;
+        let mut na = 0.0f64;
+        let mut nb = 0.0f64;
+        for (&x, &y) in a.iter().zip(b.iter()) {
+            dot += x as f64 * y as f64;
+            na += x as f64 * x as f64;
+            nb += y as f64 * y as f64;
+        }
+        if na == 0.0 && nb == 0.0 {
+            return 1.0;
+        }
+        (dot / (na.sqrt() * nb.sqrt())) as f32
+    }
+
+    fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+        a.iter()
+            .zip(b.iter())
+            .map(|(&x, &y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    /// The chunkwise reformulation must reproduce the sequential
+    /// per-token recurrence — Phase 1's load-bearing math gate. If
+    /// this fails, the chunkwise algebra is wrong; catch it here, in
+    /// pure Rust, before any Metal kernel work.
+    ///
+    /// Small head dims keep the test fast; the algebra is
+    /// dimension-agnostic so this fully exercises it. `key_dim ≠
+    /// value_dim` and `k_heads_per_v = 4` catch index/head-sharing
+    /// bugs. The grid spans `n < C`, exact and ragged final chunks,
+    /// and the across-chunk state carry.
+    #[test]
+    fn gated_delta_chunkwise_matches_per_token() {
+        let v_heads = 8usize;
+        let k_heads = 2usize;
+        let key_dim = 16usize;
+        let value_dim = 12usize;
+        let key_total = k_heads * key_dim;
+        let value_total = v_heads * value_dim;
+        let state_floats = v_heads * value_dim * key_dim;
+
+        for &n_tokens in &[1usize, 7, 64, 65, 200] {
+            // Inputs (shared by both paths). Ranges mirror the
+            // existing per-token diff test's generators.
+            let mut rng = 0x5DEECE66Du64 ^ (n_tokens as u64);
+            let g_decay: Vec<f32> = (0..n_tokens * v_heads)
+                .map(|_| 0.9 + lcg_unit(&mut rng) * 0.05)
+                .collect();
+            let beta_gate: Vec<f32> = (0..n_tokens * v_heads)
+                .map(|_| 0.5 + lcg_unit(&mut rng) * 0.2)
+                .collect();
+            let q: Vec<f32> = (0..n_tokens * key_total)
+                .map(|_| lcg_unit(&mut rng) * 0.5)
+                .collect();
+            let k: Vec<f32> = (0..n_tokens * key_total)
+                .map(|_| lcg_unit(&mut rng) * 0.5)
+                .collect();
+            let v: Vec<f32> = (0..n_tokens * value_total)
+                .map(|_| lcg_unit(&mut rng) * 0.5)
+                .collect();
+            let initial_state: Vec<f32> = (0..state_floats)
+                .map(|_| lcg_unit(&mut rng) * 0.01)
+                .collect();
+
+            // Oracle: the sequential per-token recurrence.
+            let mut oracle_state = initial_state.clone();
+            let mut oracle_out = vec![0.0f32; n_tokens * value_total];
+            for t in 0..n_tokens {
+                let mut out_t = vec![0.0f32; value_total];
+                gated_delta_recurrence_supplied(
+                    &g_decay[t * v_heads..(t + 1) * v_heads],
+                    &beta_gate[t * v_heads..(t + 1) * v_heads],
+                    &q[t * key_total..(t + 1) * key_total],
+                    &k[t * key_total..(t + 1) * key_total],
+                    &v[t * value_total..(t + 1) * value_total],
+                    v_heads,
+                    k_heads,
+                    key_dim,
+                    value_dim,
+                    &mut oracle_state,
+                    &mut out_t,
+                )
+                .expect("per-token oracle");
+                oracle_out[t * value_total..(t + 1) * value_total]
+                    .copy_from_slice(&out_t);
+            }
+
+            for &chunk_size in &[16usize, 64] {
+                let mut cw_state = initial_state.clone();
+                let mut cw_out = vec![0.0f32; n_tokens * value_total];
+                gated_delta_chunkwise(
+                    &g_decay,
+                    &beta_gate,
+                    &q,
+                    &k,
+                    &v,
+                    n_tokens,
+                    chunk_size,
+                    v_heads,
+                    k_heads,
+                    key_dim,
+                    value_dim,
+                    &mut cw_state,
+                    &mut cw_out,
+                )
+                .expect("chunkwise");
+
+                let cos_out = cosine(&oracle_out, &cw_out);
+                let cos_state = cosine(&oracle_state, &cw_state);
+                let mad_out = max_abs_diff(&oracle_out, &cw_out);
+                let mad_state =
+                    max_abs_diff(&oracle_state, &cw_state);
+                eprintln!(
+                    "[chunkwise] n={n_tokens} C={chunk_size}: \
+                     out cos={cos_out:.9} max_abs={mad_out:.3e}; \
+                     state cos={cos_state:.9} max_abs={mad_state:.3e}"
+                );
+                assert!(
+                    cos_out >= 0.9999,
+                    "n={n_tokens} C={chunk_size}: output cos={cos_out}"
+                );
+                assert!(
+                    cos_state >= 0.9999,
+                    "n={n_tokens} C={chunk_size}: state cos={cos_state}"
+                );
+                // Inputs are small (|out| ~ 1e-2 scale); a tight
+                // absolute bound also catches a systematic offset
+                // that cosine alone would miss.
+                assert!(
+                    mad_out < 1e-4,
+                    "n={n_tokens} C={chunk_size}: output max_abs={mad_out}"
+                );
+                assert!(
+                    mad_state < 1e-4,
+                    "n={n_tokens} C={chunk_size}: state max_abs={mad_state}"
+                );
+            }
+        }
     }
 }
