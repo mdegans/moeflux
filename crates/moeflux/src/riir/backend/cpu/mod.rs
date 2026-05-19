@@ -891,6 +891,18 @@ impl Backend for CpuBackend {
                 let mut o = self.write_f32(*out);
                 swiglu_fused_cpu(&g, &u, &mut o);
             }
+            Op::SigmoidGateNTokens { x, gate, .. } => {
+                // In-place: x[i] *= sigmoid(gate[i]). Element-wise, so
+                // `dim`/`n_tokens` need not be named — the whole buffer
+                // is one flat region.
+                let gate_buf = self.read_f32(*gate);
+                let mut x_buf = self.write_f32(*x);
+                for (xv, gv) in
+                    x_buf.iter_mut().zip(gate_buf.iter())
+                {
+                    *xv *= 1.0f32 / (1.0f32 + (-*gv).exp());
+                }
+            }
             Op::SdpaCausalTiled {
                 q,
                 k,

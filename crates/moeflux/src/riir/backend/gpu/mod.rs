@@ -461,6 +461,7 @@ pub struct MetalBackend {
     rope_n_pso: ComputePipelineState,
     swiglu_fused_batched_pso: ComputePipelineState,
     swiglu_fused_pso: ComputePipelineState,
+    sigmoid_gate_pso: ComputePipelineState,
     moe_combine_residual_n_pso: ComputePipelineState,
     moe_bucket_accumulate_pso: ComputePipelineState,
     /// When set (env `MOEFLUX_PROFILE_PER_OP`), [`Backend::execute`]
@@ -497,6 +498,7 @@ impl MetalBackend {
         let swiglu_fused_batched_pso =
             metal.pipeline("swiglu_fused_batched")?.clone();
         let swiglu_fused_pso = metal.pipeline("swiglu_fused")?.clone();
+        let sigmoid_gate_pso = metal.pipeline("sigmoid_gate")?.clone();
         let moe_combine_residual_n_pso =
             metal.pipeline("moe_combine_residual_n_tokens")?.clone();
         let moe_bucket_accumulate_pso =
@@ -517,6 +519,7 @@ impl MetalBackend {
             rope_n_pso,
             swiglu_fused_batched_pso,
             swiglu_fused_pso,
+            sigmoid_gate_pso,
             moe_combine_residual_n_pso,
             moe_bucket_accumulate_pso,
             profile_per_op: std::env::var_os("MOEFLUX_PROFILE_PER_OP")
@@ -762,6 +765,28 @@ impl Backend for MetalBackend {
                 enc.set_bytes(3, 4, (&dim as *const u32).cast());
                 enc.set_bytes(4, 4, (&k_one as *const u32).cast());
                 let num_tgs = (*total + 255) / 256;
+                enc.dispatch_thread_groups(
+                    MTLSize::new(num_tgs as NSUInteger, 1, 1),
+                    MTLSize::new(256, 1, 1),
+                );
+                enc.end_encoding();
+            }
+            Op::SigmoidGateNTokens {
+                x,
+                gate,
+                dim,
+                n_tokens,
+                ..
+            } => {
+                // Element-wise — the `sigmoid_gate` kernel is flat over
+                // its `dim` arg, so pass `dim * n_tokens` as one count.
+                let total = *dim * *n_tokens;
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&self.sigmoid_gate_pso);
+                enc.set_buffer(0, Some(self.pool.handle(*x)), 0);
+                enc.set_buffer(1, Some(self.pool.handle(*gate)), 0);
+                enc.set_bytes(2, 4, (&total as *const u32).cast());
+                let num_tgs = (total + 255) / 256;
                 enc.dispatch_thread_groups(
                     MTLSize::new(num_tgs as NSUInteger, 1, 1),
                     MTLSize::new(256, 1, 1),

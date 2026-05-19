@@ -306,11 +306,10 @@ pub trait Backend {
 /// ## What is *not* in this enum
 ///
 /// MLA variants (`MlaQPrime4Bit`, `MlaSdpaTileAccumulate`,
-/// `MlaSdpaTileFinalize`) and full-attn-GPU variants
-/// (`RopeApplyNTokens`, `KvCacheAppendNTokens`,
-/// `SigmoidGateNTokens`) are reserved for future sessions when
-/// their producers are rewritten. Don't add unused variants —
-/// each one expands the `encode_op` match arms in every backend.
+/// `MlaSdpaTileFinalize`) and the full-attn-GPU `KvCacheAppendNTokens`
+/// are reserved for future sessions when their producers are
+/// rewritten. Don't add unused variants — each one expands the
+/// `encode_op` match arms in every backend.
 #[derive(Debug)]
 pub enum Op {
     /// Fused RMS-norm with bf16 weight over `[n_tokens, dim]`.
@@ -437,6 +436,19 @@ pub enum Op {
         kv_start: u32,
         kv_len_total: u32,
         softmax_scale: f32,
+    },
+
+    /// Per-token sigmoid gate, in-place: `x[t,i] *= sigmoid(gate[t,i])`
+    /// over `[n_tokens, dim]`. Element-wise — `dim` and `n_tokens` are
+    /// kept for clarity but the encoder collapses them into one flat
+    /// dispatch of `dim * n_tokens` threads. Used for the full-attn
+    /// per-head query gate (`attn_out *= sigmoid(q_gate)`).
+    SigmoidGateNTokens {
+        label: &'static str,
+        x: BufId,
+        gate: BufId,
+        dim: u32,
+        n_tokens: u32,
     },
 
     /// MoE softmax + top-K selection. Reads `[n_tokens, n_experts]`
@@ -617,6 +629,7 @@ impl Op {
             Op::MatvecNTokens { label, .. } => label,
             Op::SwigluFusedBatched { label, .. } => label,
             Op::SdpaCausalTiled { label, .. } => label,
+            Op::SigmoidGateNTokens { label, .. } => label,
             Op::MoeSoftmaxTopK { label, .. } => label,
             Op::MoeNormalizeWeights { label, .. } => label,
             Op::MoeBatchedPermuteFuse { label, .. } => label,
@@ -642,6 +655,7 @@ impl Op {
             Op::MatvecNTokens { .. } => "MatvecNTokens",
             Op::SwigluFusedBatched { .. } => "SwigluFusedBatched",
             Op::SdpaCausalTiled { .. } => "SdpaCausalTiled",
+            Op::SigmoidGateNTokens { .. } => "SigmoidGateNTokens",
             Op::MoeSoftmaxTopK { .. } => "MoeSoftmaxTopK",
             Op::MoeNormalizeWeights { .. } => "MoeNormalizeWeights",
             Op::MoeBatchedPermuteFuse { .. } => "MoeBatchedPermuteFuse",
@@ -671,6 +685,7 @@ impl Op {
             Op::MatvecNTokens { input, .. } => vec![*input],
             Op::SwigluFusedBatched { gate, up, .. } => vec![*gate, *up],
             Op::SdpaCausalTiled { q, k, v, .. } => vec![*q, *k, *v],
+            Op::SigmoidGateNTokens { x, gate, .. } => vec![*x, *gate],
             Op::MoeSoftmaxTopK { logits, .. } => vec![*logits],
             Op::MoeNormalizeWeights { weights, .. } => vec![*weights],
             Op::MoeBatchedPermuteFuse {
@@ -733,6 +748,7 @@ impl Op {
             Op::MatvecNTokens { output, .. } => vec![*output],
             Op::SwigluFusedBatched { out, .. } => vec![*out],
             Op::SdpaCausalTiled { attn_out, .. } => vec![*attn_out],
+            Op::SigmoidGateNTokens { x, .. } => vec![*x], // in-place
             Op::MoeSoftmaxTopK {
                 indices_out,
                 weights_out,
@@ -890,6 +906,13 @@ mod tests {
             kv_start: 0,
             kv_len_total: 8,
             softmax_scale: 0.088_388_35,
+        });
+        g.push(Op::SigmoidGateNTokens {
+            label: "sigmoid_gate",
+            x: buf(15),
+            gate: buf(16),
+            dim: 1024,
+            n_tokens: 8,
         });
         g.push(Op::MoeSoftmaxTopK {
             label: "moe_topk",

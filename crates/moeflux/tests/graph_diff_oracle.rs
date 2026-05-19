@@ -537,6 +537,108 @@ fn check_sdpa_causal_tiled(heads_per_kv: u32) {
 }
 
 // ============================================================================
+// Test: SigmoidGateNTokens through both backends (prefill arc, phase 1b)
+// ============================================================================
+
+#[test]
+#[ignore = "long-running GPU test"]
+fn graph_metal_matches_cpu_sigmoid_gate_n_tokens() {
+    let n_tokens: u32 = 8;
+    let dim: u32 = 256 * 16; // full-attn q_dim
+    let total = (n_tokens * dim) as usize;
+
+    let mut rng = Rng::new(0x516_0A7E);
+    let x_data: Vec<f32> =
+        (0..total).map(|_| rng.next_f32_unit()).collect();
+    let gate_data: Vec<f32> =
+        (0..total).map(|_| rng.next_f32_unit()).collect();
+
+    // CPU path
+    let mut cpu_wf = dummy_weight_file("sigmoid_gate_cpu");
+    let mut cpu = CpuBackend::new(cpu_wf.take());
+    let cpu_x = cpu.pool_mut().alloc(total * 4, "x", false).unwrap();
+    let cpu_gate =
+        cpu.pool_mut().alloc(total * 4, "gate", false).unwrap();
+    cpu.pool_mut().upload(cpu_x, bytes_of_f32(&x_data)).unwrap();
+    cpu.pool_mut()
+        .upload(cpu_gate, bytes_of_f32(&gate_data))
+        .unwrap();
+    let mut g_cpu = Graph::new();
+    g_cpu.push(Op::SigmoidGateNTokens {
+        label: "test_sigmoid_gate",
+        x: cpu_x,
+        gate: cpu_gate,
+        dim,
+        n_tokens,
+    });
+    cpu.execute(&g_cpu, "diff_oracle").unwrap();
+    let mut cpu_out_bytes = vec![0u8; total * 4];
+    cpu.pool().download(cpu_x, &mut cpu_out_bytes).unwrap();
+    let cpu_out_f32 = f32_of_bytes(&cpu_out_bytes);
+
+    // GPU path
+    let mut gpu_wf = dummy_weight_file("sigmoid_gate_gpu");
+    let metal_ctx = MetalContext::new().expect("MetalContext::new");
+    let wf_ref = gpu_wf.wf.as_ref().unwrap();
+    let wf_buf = MtlWeightBuf::wrap(wf_ref, metal_ctx.device());
+    let _ = gpu_wf.take();
+    let mut gpu =
+        MetalBackend::new(metal_ctx, wf_buf).expect("MetalBackend::new");
+    let gpu_x = gpu.pool_mut().alloc(total * 4, "x", false).unwrap();
+    let gpu_gate =
+        gpu.pool_mut().alloc(total * 4, "gate", false).unwrap();
+    gpu.pool_mut().upload(gpu_x, bytes_of_f32(&x_data)).unwrap();
+    gpu.pool_mut()
+        .upload(gpu_gate, bytes_of_f32(&gate_data))
+        .unwrap();
+    let mut g_gpu = Graph::new();
+    g_gpu.push(Op::SigmoidGateNTokens {
+        label: "test_sigmoid_gate",
+        x: gpu_x,
+        gate: gpu_gate,
+        dim,
+        n_tokens,
+    });
+    gpu.execute(&g_gpu, "diff_oracle").unwrap();
+    let mut gpu_out_bytes = vec![0u8; total * 4];
+    gpu.pool().download(gpu_x, &mut gpu_out_bytes).unwrap();
+    let gpu_out_f32 = f32_of_bytes(&gpu_out_bytes);
+
+    let cos = cosine_sim(&cpu_out_f32, &gpu_out_f32);
+    let max_abs = cpu_out_f32
+        .iter()
+        .zip(gpu_out_f32.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+
+    // Guard: the gate actually scaled x — sigmoid ∈ (0,1) so every
+    // output differs from the input. Catches a no-op (gate ignored).
+    let vs_x = cpu_out_f32
+        .iter()
+        .zip(x_data.iter())
+        .map(|(o, i)| (o - i).abs())
+        .fold(0.0f32, f32::max);
+
+    eprintln!(
+        "[s15-p1b sigmoid_gate_n_tokens] N={} dim={}: cos={:.9}, \
+         max_abs={:.3e}, vs_x={:.3e}",
+        n_tokens, dim, cos, max_abs, vs_x
+    );
+    assert!(
+        cos >= COSINE_FLOOR,
+        "cosine {} below floor {} (max_abs={})",
+        cos,
+        COSINE_FLOOR,
+        max_abs
+    );
+    assert!(
+        vs_x > 0.01,
+        "sigmoid gate appears to be a no-op (vs_x={})",
+        vs_x
+    );
+}
+
+// ============================================================================
 // Test: SwigluFusedBatched through both backends
 // ============================================================================
 
