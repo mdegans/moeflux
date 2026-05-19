@@ -31,12 +31,13 @@ use crate::riir::backend::gpu::gpu_matvec::{
 };
 use crate::riir::moe::gpu_moe_router::MoeRouterPipelines;
 use crate::riir::backend::gpu::gpu_norm::{
-    encode_residual_add_n_tokens_into, encode_rms_norm_bf16_fused_n_tokens,
-    encode_rope_n_tokens_into, RmsNormBf16FusedNTokensPipeline,
-    RmsNormBf16Pipelines,
+    encode_embed_gather_4bit_into, encode_residual_add_n_tokens_into,
+    encode_rms_norm_bf16_fused_n_tokens, encode_rope_n_tokens_into,
+    RmsNormBf16FusedNTokensPipeline, RmsNormBf16Pipelines,
 };
 use crate::riir::backend::gpu::metal::{MetalContext, MetalError, MtlBuffer};
 use crate::riir::io::mtl_weight_buf::MtlWeightBuf;
+use crate::riir::variants::GROUP_SIZE;
 use moeflux_metal::{QmmCall, QuantWeights, SdpaCall};
 
 /// Metal buffer pool. Storage is `Vec<Buffer>` indexed *indirectly*
@@ -467,6 +468,7 @@ pub struct MetalBackend {
     kv_cache_append_pso: ComputePipelineState,
     moe_combine_residual_n_pso: ComputePipelineState,
     moe_bucket_accumulate_pso: ComputePipelineState,
+    embed_gather_4bit_pso: ComputePipelineState,
     /// When set (env `MOEFLUX_PROFILE_PER_OP`), [`Backend::execute`]
     /// commits each op as its own labeled cmdbuf so `prefill_profile`
     /// reports a per-op breakdown instead of one figure per graph.
@@ -511,6 +513,8 @@ impl MetalBackend {
             metal.pipeline("moe_combine_residual_n_tokens")?.clone();
         let moe_bucket_accumulate_pso =
             metal.pipeline("moe_bucket_accumulate")?.clone();
+        let embed_gather_4bit_pso =
+            metal.pipeline("embed_gather_4bit")?.clone();
 
         let device = metal.device().clone();
         Ok(Self {
@@ -533,6 +537,7 @@ impl MetalBackend {
             kv_cache_append_pso,
             moe_combine_residual_n_pso,
             moe_bucket_accumulate_pso,
+            embed_gather_4bit_pso,
             profile_per_op: std::env::var_os("MOEFLUX_PROFILE_PER_OP")
                 .is_some(),
             moe_gather: std::env::var("MOEFLUX_MOE_GATHER")
@@ -962,6 +967,28 @@ impl Backend for MetalBackend {
             Op::LmHead { .. } => {
                 todo!(
                     "LmHead encode_op: needs a persistent workspace BufId in Op shape for the intermediate (post-final-norm) hidden bytes; defer to S7-7 producer wire-up where the orchestrator can allocate it"
+                );
+            }
+            Op::EmbedGatherNTokens {
+                token_ids,
+                weight,
+                hidden_out,
+                hidden_dim,
+                n_tokens,
+                ..
+            } => {
+                encode_embed_gather_4bit_into(
+                    cmd,
+                    &self.embed_gather_4bit_pso,
+                    self.wf_buf.buffer(),
+                    weight.w_off,
+                    weight.s_off,
+                    weight.b_off,
+                    self.pool.handle(*token_ids),
+                    self.pool.handle(*hidden_out),
+                    *n_tokens,
+                    *hidden_dim,
+                    GROUP_SIZE as u32,
                 );
             }
             Op::RmsNormQkNTokens {

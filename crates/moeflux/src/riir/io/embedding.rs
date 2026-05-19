@@ -76,8 +76,6 @@ pub fn embed_lookup(
 
     let num_groups = hidden_dim / GROUP_SIZE;
     let packed_cols = hidden_dim / 8;
-    let group_size = GROUP_SIZE;
-    let packed_per_group = group_size / 8;
 
     let w_bytes = tensor_or_missing(wf, WEIGHT_NAME)?;
     let s_bytes = tensor_or_missing(wf, SCALES_NAME)?;
@@ -87,13 +85,40 @@ pub fn embed_lookup(
     expect_shape(wf, SCALES_NAME, &[vocab_size, num_groups])?;
     expect_shape(wf, BIASES_NAME, &[vocab_size, num_groups])?;
 
+    embed_lookup_at(w_bytes, s_bytes, b_bytes, token_id, out);
+    Ok(())
+}
+
+/// Dequantize one embedding row into `out` — the VARIANT-agnostic
+/// core of [`embed_lookup`].
+///
+/// `weight` / `scales` / `biases` are the three embedding tensors,
+/// each sliced from offset 0 and covering at least row `token_id`.
+/// `hidden_dim` is taken from `out.len()`; the group count derives
+/// from [`GROUP_SIZE`]. Unlike [`embed_lookup`] there is no manifest,
+/// no `VARIANT` shape check and no vocab bound — the caller (the
+/// `Op::EmbedGatherNTokens` backend arms) guarantees the slices are
+/// long enough. Bit-exact arithmetic, same as [`embed_lookup`].
+pub fn embed_lookup_at(
+    weight: &[u8],
+    scales: &[u8],
+    biases: &[u8],
+    token_id: i32,
+    out: &mut [f32],
+) {
+    let hidden_dim = out.len();
+    let num_groups = hidden_dim / GROUP_SIZE;
+    let packed_cols = hidden_dim / 8;
+    let group_size = GROUP_SIZE;
+    let packed_per_group = group_size / 8;
+
     let token = token_id as usize;
     let w_row_off = token * packed_cols * 4;
     let s_row_off = token * num_groups * 2;
     let b_row_off = token * num_groups * 2;
-    let w_row = &w_bytes[w_row_off..w_row_off + packed_cols * 4];
-    let s_row = &s_bytes[s_row_off..s_row_off + num_groups * 2];
-    let b_row = &b_bytes[b_row_off..b_row_off + num_groups * 2];
+    let w_row = &weight[w_row_off..w_row_off + packed_cols * 4];
+    let s_row = &scales[s_row_off..s_row_off + num_groups * 2];
+    let b_row = &biases[b_row_off..b_row_off + num_groups * 2];
 
     for g in 0..num_groups {
         let scale = bf16_to_f32(read_u16_le(s_row, g));
@@ -107,8 +132,6 @@ pub fn embed_lookup(
             }
         }
     }
-
-    Ok(())
 }
 
 fn tensor_or_missing<'a>(

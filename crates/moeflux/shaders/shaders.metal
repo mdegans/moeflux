@@ -3292,3 +3292,55 @@ kernel void kv_cache_append_n_tokens(
     k_cache[dst] = k_src[tid];
     v_cache[dst] = v_src[tid];
 }
+
+
+// ============================================================================
+// Kernel: 4-bit token-embedding gather
+// ============================================================================
+// GPU port of `io::embedding::embed_lookup`. For each token `t`, reads
+// row `token_ids[t]` of the 4-bit affine-packed embedding tensor and
+// dequantizes `hidden_dim` channels into `out[t]`.
+//
+// Layout (matches embedding.rs / extract_weights.py):
+//   - W_packed: U32, [vocab, hidden_dim/8], 8 nibbles/word, little-
+//     endian nibble order (nibble 0 = bits 0..4).
+//   - scales/biases: BF16, [vocab, hidden_dim/group_size].
+//
+//   out[t,d] = nibble(d) * scale(token, d/group_size) + bias(...)
+//
+// Mirrors embed_lookup's `nibble * scale + bias`; Metal FMA contraction
+// means it matches the CPU oracle to cosine ~1.0, not bit-exact.
+//
+// Dispatch: one thread per (token, channel), flat —
+//   threadgroups = ceil(n_tokens * hidden_dim / 256), threads = 256.
+
+kernel void embed_gather_4bit(
+    device const uint32_t* W_packed   [[buffer(0)]],  // [vocab, hidden_dim/8]
+    device const uint16_t* scales     [[buffer(1)]],  // [vocab, hidden_dim/group_size]
+    device const uint16_t* biases     [[buffer(2)]],  // [vocab, hidden_dim/group_size]
+    device const int*      token_ids  [[buffer(3)]],  // [n_tokens]
+    device float*          out        [[buffer(4)]],  // [n_tokens, hidden_dim]
+    constant uint&         n_tokens   [[buffer(5)]],
+    constant uint&         hidden_dim [[buffer(6)]],
+    constant uint&         group_size [[buffer(7)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    uint total = n_tokens * hidden_dim;
+    if (tid >= total) return;
+
+    uint t     = tid / hidden_dim;
+    uint d     = tid % hidden_dim;
+    uint token = uint(token_ids[t]);
+
+    uint num_groups  = hidden_dim / group_size;
+    uint packed_cols = hidden_dim / 8;
+
+    uint  g     = d / group_size;
+    float scale = bf16_to_f32(scales[token * num_groups + g]);
+    float bias  = bf16_to_f32(biases[token * num_groups + g]);
+
+    uint32_t packed = W_packed[token * packed_cols + (d >> 3)];
+    uint     nibble = (packed >> ((d & 7u) * 4u)) & 0xFu;
+
+    out[tid] = float(nibble) * scale + bias;
+}

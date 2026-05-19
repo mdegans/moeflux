@@ -663,6 +663,25 @@ pub enum Op {
         last_token_row: u32,
         logits_out: BufId,
     },
+
+    /// Batched 4-bit token-embedding gather. For each of `n_tokens`
+    /// tokens, reads row `token_ids[t]` of the affine-packed embedding
+    /// weight and dequantizes `hidden_dim` f32 channels into
+    /// `hidden_out` (`[n_tokens, hidden_dim]`). GPU port of
+    /// `io::embedding::embed_lookup` — that function is the CPU oracle.
+    ///
+    /// `token_ids` is an `[n_tokens]` `i32` buffer. `weight` carries
+    /// the offsets of `model.embed_tokens.{weight,scales,biases}`; the
+    /// Metal arm indexes the shared weight buffer by those offsets,
+    /// the CPU arm resolves the same bytes via `WeightFile::bytes_at`.
+    EmbedGatherNTokens {
+        label: &'static str,
+        token_ids: BufId,
+        weight: WeightRef,
+        hidden_out: BufId,
+        hidden_dim: u32,
+        n_tokens: u32,
+    },
 }
 
 impl Op {
@@ -691,6 +710,7 @@ impl Op {
             Op::GatedDeltaNetChunkwise { label, .. } => label,
             Op::GatedRmsNormNTokens { label, .. } => label,
             Op::LmHead { label, .. } => label,
+            Op::EmbedGatherNTokens { label, .. } => label,
         }
     }
 
@@ -720,6 +740,7 @@ impl Op {
             Op::GatedDeltaNetChunkwise { .. } => "GatedDeltaNetChunkwise",
             Op::GatedRmsNormNTokens { .. } => "GatedRmsNormNTokens",
             Op::LmHead { .. } => "LmHead",
+            Op::EmbedGatherNTokens { .. } => "EmbedGatherNTokens",
         }
     }
 
@@ -792,6 +813,7 @@ impl Op {
             } => vec![*state, *conv_out, *g_decay, *beta_gate],
             Op::GatedRmsNormNTokens { values, z, .. } => vec![*values, *z],
             Op::LmHead { hidden, .. } => vec![*hidden],
+            Op::EmbedGatherNTokens { token_ids, .. } => vec![*token_ids],
         }
     }
 
@@ -844,6 +866,7 @@ impl Op {
             Op::GatedDeltaNetChunkwise { state, output, .. } => vec![*state, *output], // state is RMW
             Op::GatedRmsNormNTokens { output, .. } => vec![*output],
             Op::LmHead { logits_out, .. } => vec![*logits_out],
+            Op::EmbedGatherNTokens { hidden_out, .. } => vec![*hidden_out],
         }
     }
 }

@@ -20,7 +20,7 @@ use crate::riir::backend::cpu::cpu_matvec::{
 use crate::riir::backend::cpu::cpu_ops::{
     cpu_sigmoid_scalar, residual_add_n_tokens_cpu, rope_n_tokens_cpu,
 };
-use crate::riir::io::embedding::bf16_to_f32;
+use crate::riir::io::embedding::{bf16_to_f32, embed_lookup_at};
 use crate::riir::attn::linear_attn::{
     compute_decay_beta_cpu, conv1d_step, gated_delta_chunkwise,
     gated_delta_recurrence_supplied,
@@ -1420,6 +1420,58 @@ impl Backend for CpuBackend {
                     vocab_size,
                     &mut logits_buf,
                 );
+            }
+            Op::EmbedGatherNTokens {
+                token_ids,
+                weight,
+                hidden_out,
+                hidden_dim,
+                n_tokens,
+                ..
+            } => {
+                // Oracle for the GPU `embed_gather_4bit` kernel. Reads
+                // one embedding row per token via `WeightFile::bytes_at`
+                // at the `weight` offsets (symmetric with the Metal arm)
+                // and dequantizes through the bit-exact `embed_lookup_at`.
+                let hidden_dim = *hidden_dim as usize;
+                let n_tokens = *n_tokens as usize;
+                let packed_cols = hidden_dim / 8;
+                let num_groups = hidden_dim / GROUP_SIZE;
+                let w_row_bytes = packed_cols * 4;
+                let sb_row_bytes = num_groups * 2;
+                let ids = self.read_i32(*token_ids);
+                let mut out = self.write_f32(*hidden_out);
+                for t in 0..n_tokens {
+                    let row = ids[t].max(0) as u64;
+                    let w_row = self
+                        .wf
+                        .bytes_at(
+                            weight.w_off + row * w_row_bytes as u64,
+                            w_row_bytes,
+                        )
+                        .expect("embed weight row out of mmap");
+                    let s_row = self
+                        .wf
+                        .bytes_at(
+                            weight.s_off + row * sb_row_bytes as u64,
+                            sb_row_bytes,
+                        )
+                        .expect("embed scales row out of mmap");
+                    let b_row = self
+                        .wf
+                        .bytes_at(
+                            weight.b_off + row * sb_row_bytes as u64,
+                            sb_row_bytes,
+                        )
+                        .expect("embed biases row out of mmap");
+                    embed_lookup_at(
+                        w_row,
+                        s_row,
+                        b_row,
+                        0,
+                        &mut out[t * hidden_dim..(t + 1) * hidden_dim],
+                    );
+                }
             }
         }
     }

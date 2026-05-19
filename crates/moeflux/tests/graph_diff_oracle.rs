@@ -33,7 +33,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use moeflux::riir::backend::{
-    Backend, BufferPool, CpuBackend, Graph, MetalBackend, Op,
+    Backend, BufferPool, CpuBackend, Graph, MetalBackend, Op, WeightRef,
 };
 use moeflux::riir::MetalContext;
 use moeflux::riir::MtlWeightBuf;
@@ -2406,5 +2406,151 @@ fn check_gated_delta_chunkwise(n_tokens: u32) {
     assert!(
         cos_state >= COSINE_FLOOR,
         "state cosine {cos_state} max_abs={max_abs_state}"
+    );
+}
+
+// ============================================================================
+// Test: EmbedGatherNTokens through both backends (prefill arc, phase 4)
+// ============================================================================
+// Oracle is `io::embedding::embed_lookup` (bit-exact vs the C path);
+// the GPU `embed_gather_4bit` kernel matches it to cosine ~1.0 (Metal
+// FMA contraction on `nibble * scale + bias`).
+
+#[test]
+#[ignore = "long-running GPU test"]
+fn graph_metal_matches_cpu_embed_gather() {
+    // GROUP_SIZE = 64; hidden_dim must be a multiple of 64 and of 8.
+    let hidden_dim: u32 = 128;
+    let vocab: usize = 32;
+    let n_tokens: u32 = 8;
+    let group_size: usize = 64;
+
+    let packed_cols = hidden_dim as usize / 8; // u32 words per row
+    let num_groups = hidden_dim as usize / group_size;
+    let out_len = (n_tokens * hidden_dim) as usize;
+
+    let mut rng = Rng::new(0x_E3B_ED);
+
+    // 4-bit packed embedding weight: [vocab, packed_cols] u32, random.
+    let mut weight_bytes = vec![0u8; vocab * packed_cols * 4];
+    for chunk in weight_bytes.chunks_exact_mut(4) {
+        chunk.copy_from_slice(&(rng.next_u64() as u32).to_le_bytes());
+    }
+    // bf16 scales / biases: [vocab, num_groups], modest magnitudes so
+    // the dequant stays finite.
+    let make_bf16 = |rng: &mut Rng, n: usize, span: f32, off: f32| {
+        let mut v = vec![0u8; n * 2];
+        for c in v.chunks_exact_mut(2) {
+            let f = rng.next_f32_unit() * span + off;
+            c.copy_from_slice(&((f.to_bits() >> 16) as u16).to_le_bytes());
+        }
+        v
+    };
+    let scales_bytes = make_bf16(&mut rng, vocab * num_groups, 0.05, 0.01);
+    let biases_bytes = make_bf16(&mut rng, vocab * num_groups, 0.2, -0.1);
+
+    // token ids in [0, vocab).
+    let token_ids: Vec<i32> = (0..n_tokens)
+        .map(|_| (rng.next_u64() as usize % vocab) as i32)
+        .collect();
+    let token_id_bytes: Vec<u8> =
+        token_ids.iter().flat_map(|t| t.to_le_bytes()).collect();
+
+    let tensors: &[(&str, &str, i32, Vec<usize>, Vec<u8>)] = &[
+        (
+            "model.embed_tokens.weight",
+            "U32",
+            4,
+            vec![vocab, packed_cols],
+            weight_bytes.clone(),
+        ),
+        (
+            "model.embed_tokens.scales",
+            "BF16",
+            0,
+            vec![vocab, num_groups],
+            scales_bytes.clone(),
+        ),
+        (
+            "model.embed_tokens.biases",
+            "BF16",
+            0,
+            vec![vocab, num_groups],
+            biases_bytes.clone(),
+        ),
+    ];
+
+    // CPU path
+    let mut cpu_wf = SyntheticWf::build("embed_gather_cpu", tensors);
+    let (w_off, s_off, b_off) = {
+        let wf = cpu_wf.wf.as_ref().unwrap();
+        (
+            wf.tensor_info("model.embed_tokens.weight").unwrap().offset as u64,
+            wf.tensor_info("model.embed_tokens.scales").unwrap().offset as u64,
+            wf.tensor_info("model.embed_tokens.biases").unwrap().offset as u64,
+        )
+    };
+    let weight = WeightRef { w_off, s_off, b_off, bits: 4 };
+    let build = |token_ids, hidden_out| Op::EmbedGatherNTokens {
+        label: "test_embed_gather",
+        token_ids,
+        weight,
+        hidden_out,
+        hidden_dim,
+        n_tokens,
+    };
+
+    let mut cpu = CpuBackend::new(cpu_wf.take());
+    let cpu_ids =
+        cpu.pool_mut().alloc(n_tokens as usize * 4, "ids", false).unwrap();
+    let cpu_out = cpu.pool_mut().alloc(out_len * 4, "out", false).unwrap();
+    cpu.pool_mut().upload(cpu_ids, &token_id_bytes).unwrap();
+    let mut g_cpu = Graph::new();
+    g_cpu.push(build(cpu_ids, cpu_out));
+    cpu.execute(&g_cpu, "diff_oracle").unwrap();
+    let mut cpu_out_bytes = vec![0u8; out_len * 4];
+    cpu.pool().download(cpu_out, &mut cpu_out_bytes).unwrap();
+    let cpu_out_f32 = f32_of_bytes(&cpu_out_bytes);
+
+    // GPU path — identical fixture, so identical manifest offsets.
+    let mut gpu_wf = SyntheticWf::build("embed_gather_gpu", tensors);
+    let metal_ctx = MetalContext::new().expect("MetalContext::new");
+    let wf_ref = gpu_wf.wf.as_ref().unwrap();
+    let wf_buf = MtlWeightBuf::wrap(wf_ref, metal_ctx.device());
+    let _ = gpu_wf.take();
+    let mut gpu =
+        MetalBackend::new(metal_ctx, wf_buf).expect("MetalBackend::new");
+    let gpu_ids =
+        gpu.pool_mut().alloc(n_tokens as usize * 4, "ids", false).unwrap();
+    let gpu_out = gpu.pool_mut().alloc(out_len * 4, "out", false).unwrap();
+    gpu.pool_mut().upload(gpu_ids, &token_id_bytes).unwrap();
+    let mut g_gpu = Graph::new();
+    g_gpu.push(build(gpu_ids, gpu_out));
+    gpu.execute(&g_gpu, "diff_oracle").unwrap();
+    let mut gpu_out_bytes = vec![0u8; out_len * 4];
+    gpu.pool().download(gpu_out, &mut gpu_out_bytes).unwrap();
+    let gpu_out_f32 = f32_of_bytes(&gpu_out_bytes);
+
+    let cos = cosine_sim(&cpu_out_f32, &gpu_out_f32);
+    let max_abs = cpu_out_f32
+        .iter()
+        .zip(gpu_out_f32.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    // Guard: a real dequant happened (not an all-zero buffer).
+    let nonzero = cpu_out_f32.iter().any(|&x| x != 0.0);
+
+    eprintln!(
+        "[phase4 embed_gather] N={} hidden_dim={} vocab={}: \
+         cos={:.9}, max_abs={:.3e}",
+        n_tokens, hidden_dim, vocab, cos, max_abs
+    );
+    assert!(nonzero, "embed gather produced an all-zero buffer");
+    assert!(
+        cos >= COSINE_FLOOR,
+        "cosine {} below floor {} (max_abs={})",
+        cos,
+        COSINE_FLOOR,
+        max_abs
     );
 }

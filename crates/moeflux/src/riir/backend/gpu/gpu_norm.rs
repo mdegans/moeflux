@@ -311,6 +311,45 @@ pub fn encode_rope_n_tokens_into(
     enc.end_encoding();
 }
 
+/// Encode a batched 4-bit token-embedding gather — see the
+/// `embed_gather_4bit` kernel in shaders.metal. For each of `n_tokens`
+/// tokens, row `token_ids[t]` of the affine-packed embedding tensor is
+/// dequantized into `out` (`[n_tokens, hidden_dim]`). `w_buf` is the
+/// shared [`MtlWeightBuf`] buffer; `w_off` / `s_off` / `b_off` are the
+/// byte offsets of `model.embed_tokens.{weight,scales,biases}`.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_embed_gather_4bit_into(
+    cmdbuf: &CommandBufferRef,
+    pipeline: &ComputePipelineState,
+    w_buf: &Buffer,
+    w_off: u64,
+    s_off: u64,
+    b_off: u64,
+    token_ids: &Buffer,
+    out: &Buffer,
+    n_tokens: u32,
+    hidden_dim: u32,
+    group_size: u32,
+) {
+    let total = n_tokens * hidden_dim;
+    let enc = cmdbuf.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(pipeline);
+    enc.set_buffer(0, Some(w_buf), w_off as NSUInteger);
+    enc.set_buffer(1, Some(w_buf), s_off as NSUInteger);
+    enc.set_buffer(2, Some(w_buf), b_off as NSUInteger);
+    enc.set_buffer(3, Some(token_ids), 0);
+    enc.set_buffer(4, Some(out), 0);
+    enc.set_bytes(5, 4, (&n_tokens as *const u32).cast());
+    enc.set_bytes(6, 4, (&hidden_dim as *const u32).cast());
+    enc.set_bytes(7, 4, (&group_size as *const u32).cast());
+    let num_tgs = (total + 255) / 256;
+    enc.dispatch_thread_groups(
+        MTLSize::new(num_tgs as NSUInteger, 1, 1),
+        MTLSize::new(256, 1, 1),
+    );
+    enc.end_encoding();
+}
+
 /// Encode a GPU-side buffer-to-buffer memcpy via Metal's blit encoder.
 /// `dim` floats from `src` → `dst`. Used by the orchestrator's GPU
 /// residual stream (Phase 5) to snapshot `hidden → residual` at the
