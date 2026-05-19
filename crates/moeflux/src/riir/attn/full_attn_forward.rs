@@ -46,7 +46,7 @@ use metal::NSUInteger;
 
 use crate::riir::moe::expert_forward::MoeBuffers;
 use crate::riir::backend::{
-    Backend, BufId, BufferPool, MetalBackend, MetalBufferPool,
+    Backend, BufId, BufferPool, MetalBufferPool,
 };
 use crate::riir::io::expert_io::ExpertFiles;
 use crate::riir::io::layer_weight_cache::LayerWeightCache;
@@ -638,8 +638,8 @@ pub(in crate::riir) fn full_attn_layer_forward(
 /// synchronously per bucket; `prefetch` is the decode-only (N=1)
 /// state machine, threaded through to the MoE block.
 #[allow(clippy::too_many_arguments)]
-pub(in crate::riir) fn batched_full_attn_layer_forward(
-    backend: &mut MetalBackend,
+pub(in crate::riir) fn batched_full_attn_layer_forward<B>(
+    backend: &mut B,
     wf: &WeightFile,
     layer_cache: &LayerWeightCache,
     layer_idx: usize,
@@ -663,7 +663,12 @@ pub(in crate::riir) fn batched_full_attn_layer_forward(
     // (boundary buffers + `graph2` working set).
     scratch: &FullAttnGraphScratch,
     moe: &MoeGraphScratch,
-) -> Result<(), LayerForwardError> {
+) -> Result<(), LayerForwardError>
+where
+    B: Backend,
+    LayerForwardError: From<B::Error>,
+    LayerForwardError: From<<B::Pool as BufferPool>::Error>,
+{
     use crate::riir::moe::expert_forward::MAX_K;
     use crate::riir::backend::{Graph, Op, WeightRef};
 
