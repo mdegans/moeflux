@@ -26,6 +26,7 @@
  */
 
 #include <metal_stdlib>
+#include <metal_simdgroup_matrix>
 using namespace metal;
 
 // ============================================================================
@@ -1763,6 +1764,7 @@ kernel void gated_delta_net_step(
 // is identical to `gated_delta_net_step`.
 
 #define CW_C 16          // inner chunk length C
+#define CW_STRIP 16      // Phase-6 GEMM column-strip width
 
 kernel void gated_delta_net_chunkwise(
     device float *state,             // [num_v_heads * 128 * 128] persistent
@@ -1789,6 +1791,9 @@ kernel void gated_delta_net_chunkwise(
     threadgroup float kqg[CW_C * CW_C];    // Gamma*(k.q)         (1 KB)
     threadgroup float log_decay[CW_C];
     threadgroup float beta_s[CW_C];
+    // Phase-6 delta-strip staging, laid out [D = 128, CW_STRIP].
+    // Reused each strip; total threadgroup memory now ~26.8 KB of 32 KB.
+    threadgroup float sdc[CW_C * 128];
 
     for (uint chunk_start = 0; chunk_start < n_tokens;
          chunk_start += CW_C) {
@@ -1889,22 +1894,77 @@ kernel void gated_delta_net_chunkwise(
 
         // --- Phase 6: new state  S_C = gamma_{c-1} S_0
         //     + sum_i Gamma_{c-1,i} U_i k_i^T ---
+        // As a GEMM: delta[D,D] = RUᵀ[D,C] @ kc[C,D], with
+        //   RU[i,vi] = exp(L_{c-1} - L_i) * U[i,vi].
+        // The 128 threads act as 4 simdgroups (sg = vi/32) that
+        // cooperatively tile the matmul; the gamma·S0 + delta epilogue
+        // stays per-vi scalar (precision-sensitive). delta is too large
+        // for threadgroup memory ([D,D] = 64 KB), so it is produced one
+        // [D,CW_STRIP] column strip at a time into `sdc`.
         if (c > 0) {
             uint last = c - 1;
             float g_last = precise::exp(log_decay[last]);
-            // Hoist the per-i decay ratio and this column's U_i out of
-            // the ki loop — both are ki-invariant.
-            float ru[CW_C];
+            uint sg = vi / 32;   // simdgroup index (1-D threadgroup)
+
+            // (a) Overwrite the (now-dead) U matrix in place with RU,
+            //     and zero-fill ragged rows c..CW_C of both contraction
+            //     operands — simdgroup_load always reads a full 8x8
+            //     tile, and 0 * NaN = NaN, so a stale row must be
+            //     cleared in *both* RU and kc, not just one.
             for (uint i = 0; i < c; i++) {
-                ru[i] = precise::exp(log_decay[last] - log_decay[i])
-                        * Umat[i * 128 + vi];
+                Umat[i * 128 + vi] *=
+                    precise::exp(log_decay[last] - log_decay[i]);
             }
-            for (uint ki = 0; ki < 128; ki++) {
-                float s = g_last * state[state_base + ki];
-                for (uint i = 0; i < c; i++) {
-                    s += ru[i] * kc[i * 128 + ki];
+            for (uint i = c; i < CW_C; i++) {
+                Umat[i * 128 + vi] = 0.0f;
+                kc[i * 128 + vi] = 0.0f;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // (b)+(c) per column strip: cooperative matmul -> sdc,
+            //     then per-vi scalar  state = g_last*S0 + delta.
+            for (uint cs = 0; cs < 128; cs += CW_STRIP) {
+                // Output tiles of this [D,CW_STRIP] strip: (D/8) row
+                // tiles x (CW_STRIP/8) col tiles, split across the 4
+                // simdgroups.
+                uint col_tiles = CW_STRIP / 8;
+                uint n_tiles = (128 / 8) * col_tiles;
+                for (uint ti = sg; ti < n_tiles; ti += 4) {
+                    uint rt = ti / col_tiles;
+                    uint ct = ti % col_tiles;
+                    simdgroup_matrix<float, 8, 8> dacc;
+                    // Contraction over C = CW_C (CW_C/8 tiles of 8).
+                    for (uint kt = 0; kt < CW_C / 8; kt++) {
+                        simdgroup_matrix<float, 8, 8> a, b;
+                        // a = RUᵀ tile: RU[C,D] block loaded transposed.
+                        simdgroup_load(a, &Umat[kt * 8 * 128 + rt * 8],
+                                       128, ulong2(0, 0),
+                                       /*transpose=*/true);
+                        // b = kc tile: kc[C,D] block, no transpose.
+                        simdgroup_load(b,
+                                       &kc[kt * 8 * 128 + cs + ct * 8],
+                                       128);
+                        if (kt == 0) {
+                            simdgroup_multiply(dacc, a, b);
+                        } else {
+                            simdgroup_multiply_accumulate(dacc, a, b,
+                                                          dacc);
+                        }
+                    }
+                    simdgroup_store(dacc,
+                                    &sdc[rt * 8 * CW_STRIP + ct * 8],
+                                    CW_STRIP);
                 }
-                state[state_base + ki] = s;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                // (c) epilogue: thread vi owns state row vi.
+                for (uint j = 0; j < CW_STRIP; j++) {
+                    uint ki = cs + j;
+                    state[state_base + ki] =
+                        g_last * state[state_base + ki]
+                        + sdc[vi * CW_STRIP + j];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
