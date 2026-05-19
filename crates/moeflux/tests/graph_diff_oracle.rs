@@ -765,6 +765,123 @@ fn graph_metal_matches_cpu_split_q_gate() {
 }
 
 // ============================================================================
+// Test: RmsNormPerHeadNTokens through both backends (prefill arc, phase 1d)
+// ============================================================================
+
+#[test]
+#[ignore = "long-running GPU test"]
+fn graph_metal_matches_cpu_rms_norm_per_head_n_tokens() {
+    // One Op covers full-attn q_norm (num_attn_heads) and k_norm
+    // (num_kv_heads) — exercise both head counts against the same
+    // head_dim-long weight.
+    check_rms_norm_per_head(16);
+    check_rms_norm_per_head(8);
+}
+
+fn check_rms_norm_per_head(num_heads: u32) {
+    let n_tokens: u32 = 8;
+    let head_dim: u32 = 256;
+    let total = (n_tokens * num_heads * head_dim) as usize;
+
+    let mut rng = Rng::new(0x12_4D ^ num_heads as u64);
+    let x_data: Vec<f32> =
+        (0..total).map(|_| rng.next_f32_unit()).collect();
+    // bf16 weight, head_dim long, ~1.0 (avoid NaN/inf exponents).
+    let mut weight_bytes = vec![0u8; head_dim as usize * 2];
+    for chunk in weight_bytes.chunks_exact_mut(2) {
+        let w = rng.next_f32_unit() * 0.25 + 1.0;
+        let bits = (w.to_bits() >> 16) as u16;
+        chunk.copy_from_slice(&bits.to_le_bytes());
+    }
+    let tensors: &[(&str, &str, i32, Vec<usize>, Vec<u8>)] = &[(
+        "q_norm.weight",
+        "BF16",
+        0,
+        vec![head_dim as usize],
+        weight_bytes.clone(),
+    )];
+
+    let build = |x| Op::RmsNormPerHeadNTokens {
+        label: "test_rms_per_head",
+        x,
+        weight_off: 0,
+        num_heads,
+        head_dim,
+        n_tokens,
+        eps: 1e-6,
+    };
+
+    // CPU path
+    let mut cpu_wf =
+        SyntheticWf::build("rms_norm_per_head_cpu", tensors);
+    let weight_off = {
+        let wf = cpu_wf.wf.as_ref().unwrap();
+        wf.tensor_info("q_norm.weight").unwrap().offset as u64
+    };
+    assert_eq!(weight_off, 0, "test assumes the weight is at offset 0");
+    let mut cpu = CpuBackend::new(cpu_wf.take());
+    let cpu_x = cpu.pool_mut().alloc(total * 4, "x", false).unwrap();
+    cpu.pool_mut().upload(cpu_x, bytes_of_f32(&x_data)).unwrap();
+    let mut g_cpu = Graph::new();
+    g_cpu.push(build(cpu_x));
+    cpu.execute(&g_cpu, "diff_oracle").unwrap();
+    let mut cpu_out_bytes = vec![0u8; total * 4];
+    cpu.pool().download(cpu_x, &mut cpu_out_bytes).unwrap();
+    let cpu_out_f32 = f32_of_bytes(&cpu_out_bytes);
+
+    // GPU path
+    let mut gpu_wf =
+        SyntheticWf::build("rms_norm_per_head_gpu", tensors);
+    let metal_ctx = MetalContext::new().expect("MetalContext::new");
+    let wf_ref = gpu_wf.wf.as_ref().unwrap();
+    let wf_buf = MtlWeightBuf::wrap(wf_ref, metal_ctx.device());
+    let _ = gpu_wf.take();
+    let mut gpu =
+        MetalBackend::new(metal_ctx, wf_buf).expect("MetalBackend::new");
+    let gpu_x = gpu.pool_mut().alloc(total * 4, "x", false).unwrap();
+    gpu.pool_mut().upload(gpu_x, bytes_of_f32(&x_data)).unwrap();
+    let mut g_gpu = Graph::new();
+    g_gpu.push(build(gpu_x));
+    gpu.execute(&g_gpu, "diff_oracle").unwrap();
+    let mut gpu_out_bytes = vec![0u8; total * 4];
+    gpu.pool().download(gpu_x, &mut gpu_out_bytes).unwrap();
+    let gpu_out_f32 = f32_of_bytes(&gpu_out_bytes);
+
+    let cos = cosine_sim(&cpu_out_f32, &gpu_out_f32);
+    let max_abs = cpu_out_f32
+        .iter()
+        .zip(gpu_out_f32.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+
+    // Guard: the norm actually changed x (not a no-op weight read).
+    let vs_x = cpu_out_f32
+        .iter()
+        .zip(x_data.iter())
+        .map(|(o, i)| (o - i).abs())
+        .fold(0.0f32, f32::max);
+
+    eprintln!(
+        "[s15-p1d rms_norm_per_head] N={} heads={} head_dim={}: \
+         cos={:.9}, max_abs={:.3e}, vs_x={:.3e}",
+        n_tokens, num_heads, head_dim, cos, max_abs, vs_x
+    );
+    assert!(
+        cos >= COSINE_FLOOR,
+        "cosine {} below floor {} (max_abs={}, num_heads={})",
+        cos,
+        COSINE_FLOOR,
+        max_abs,
+        num_heads,
+    );
+    assert!(
+        vs_x > 0.01,
+        "per-head rms-norm appears to be a no-op (vs_x={})",
+        vs_x
+    );
+}
+
+// ============================================================================
 // Test: SwigluFusedBatched through both backends
 // ============================================================================
 

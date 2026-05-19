@@ -349,6 +349,24 @@ pub enum Op {
         n_tokens: u32,
     },
 
+    /// Weighted per-head RMS norm, in-place over `[n_tokens,
+    /// num_heads*head_dim]`. Each `(token, head)` `head_dim`-slice is
+    /// independently RMS-normalized and scaled by a shared learned
+    /// bf16 weight of length `head_dim` (`weight_off` into the weight
+    /// file). Used for full-attn's per-head `q_norm` / `k_norm` — one
+    /// Op pushed once per buffer (q and k live in separate buffers,
+    /// so unlike [`Op::RmsNormQkNTokens`] they can't fuse into one
+    /// dispatch). Diff oracle: `attn::rms_norm::rms_norm_per_head_cpu`.
+    RmsNormPerHeadNTokens {
+        label: &'static str,
+        x: BufId,
+        weight_off: u64,
+        num_heads: u32,
+        head_dim: u32,
+        n_tokens: u32,
+        eps: f32,
+    },
+
     /// Vanilla RoPE over an `[n_tokens, num_heads, head_dim]` stack,
     /// in-place. Rotates the first `rotary_dim` channels of each head
     /// (GPT-NeoX half-split layout); token `t`'s absolute position is
@@ -647,6 +665,7 @@ impl Op {
             Op::SdpaCausalTiled { label, .. } => label,
             Op::SigmoidGateNTokens { label, .. } => label,
             Op::SplitQGate { label, .. } => label,
+            Op::RmsNormPerHeadNTokens { label, .. } => label,
             Op::MoeSoftmaxTopK { label, .. } => label,
             Op::MoeNormalizeWeights { label, .. } => label,
             Op::MoeBatchedPermuteFuse { label, .. } => label,
@@ -674,6 +693,7 @@ impl Op {
             Op::SdpaCausalTiled { .. } => "SdpaCausalTiled",
             Op::SigmoidGateNTokens { .. } => "SigmoidGateNTokens",
             Op::SplitQGate { .. } => "SplitQGate",
+            Op::RmsNormPerHeadNTokens { .. } => "RmsNormPerHeadNTokens",
             Op::MoeSoftmaxTopK { .. } => "MoeSoftmaxTopK",
             Op::MoeNormalizeWeights { .. } => "MoeNormalizeWeights",
             Op::MoeBatchedPermuteFuse { .. } => "MoeBatchedPermuteFuse",
@@ -705,6 +725,7 @@ impl Op {
             Op::SdpaCausalTiled { q, k, v, .. } => vec![*q, *k, *v],
             Op::SigmoidGateNTokens { x, gate, .. } => vec![*x, *gate],
             Op::SplitQGate { q_proj, .. } => vec![*q_proj],
+            Op::RmsNormPerHeadNTokens { x, .. } => vec![*x],
             Op::MoeSoftmaxTopK { logits, .. } => vec![*logits],
             Op::MoeNormalizeWeights { weights, .. } => vec![*weights],
             Op::MoeBatchedPermuteFuse {
@@ -771,6 +792,7 @@ impl Op {
             Op::SplitQGate {
                 q_out, gate_out, ..
             } => vec![*q_out, *gate_out],
+            Op::RmsNormPerHeadNTokens { x, .. } => vec![*x], // in-place
             Op::MoeSoftmaxTopK {
                 indices_out,
                 weights_out,
@@ -944,6 +966,15 @@ mod tests {
             num_heads: 16,
             head_dim: 128,
             n_tokens: 8,
+        });
+        g.push(Op::RmsNormPerHeadNTokens {
+            label: "rms_norm_per_head",
+            x: buf(43),
+            weight_off: 0,
+            num_heads: 16,
+            head_dim: 128,
+            n_tokens: 8,
+            eps: 1e-6,
         });
         g.push(Op::MoeSoftmaxTopK {
             label: "moe_topk",

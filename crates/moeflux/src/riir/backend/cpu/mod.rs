@@ -419,6 +419,43 @@ fn rms_norm_bf16_n_tokens_cpu(
     }
 }
 
+/// Weighted per-head RMS norm, in-place, batched over `n_tokens`.
+/// `x` is `[n_tokens, num_heads, head_dim]`; each `(token, head)`
+/// `head_dim`-slice is normalized and scaled by the shared bf16
+/// weight. Diff oracle for `Op::RmsNormPerHeadNTokens`; matches
+/// `attn::rms_norm::rms_norm_per_head_cpu` per `(token, head)`.
+fn rms_norm_per_head_n_tokens_cpu(
+    x: &mut [f32],
+    weight_bf16: &[u8],
+    num_heads: usize,
+    head_dim: usize,
+    n_tokens: usize,
+    eps: f32,
+) {
+    debug_assert_eq!(x.len(), n_tokens * num_heads * head_dim);
+    debug_assert!(weight_bf16.len() >= head_dim * 2);
+    for t in 0..n_tokens {
+        for h in 0..num_heads {
+            let base = (t * num_heads + h) * head_dim;
+            let xh = &mut x[base..base + head_dim];
+            let mut sum_sq = 0.0f32;
+            for &xi in xh.iter() {
+                sum_sq += xi * xi;
+            }
+            let inv_rms =
+                1.0f32 / (sum_sq / head_dim as f32 + eps).sqrt();
+            for i in 0..head_dim {
+                let w_bits = u16::from_le_bytes([
+                    weight_bf16[i * 2],
+                    weight_bf16[i * 2 + 1],
+                ]);
+                let w = bf16_to_f32(w_bits);
+                xh[i] = xh[i] * inv_rms * w;
+            }
+        }
+    }
+}
+
 fn rms_norm_qk_n_tokens_cpu(
     x_inout: &mut [f32],
     num_k_heads: usize,
@@ -827,6 +864,30 @@ impl Backend for CpuBackend {
                 let b_buf = self.read_f32(*b);
                 let mut out_buf = self.write_f32(*out);
                 residual_add_n_tokens_cpu(&a_buf, &b_buf, &mut out_buf);
+            }
+            Op::RmsNormPerHeadNTokens {
+                x,
+                weight_off,
+                num_heads,
+                head_dim,
+                n_tokens,
+                eps,
+                ..
+            } => {
+                let head_dim = *head_dim as usize;
+                let weight_bytes = self
+                    .wf
+                    .bytes_at(*weight_off, head_dim * 2)
+                    .expect("weight_off out of mmap");
+                let mut x_buf = self.write_f32(*x);
+                rms_norm_per_head_n_tokens_cpu(
+                    &mut x_buf,
+                    weight_bytes,
+                    *num_heads as usize,
+                    head_dim,
+                    *n_tokens as usize,
+                    *eps,
+                );
             }
             Op::RopeNTokens {
                 x,

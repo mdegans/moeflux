@@ -3193,3 +3193,72 @@ kernel void split_q_gate(
     q_out[dst]    = q_proj[src_base + c];
     gate_out[dst] = q_proj[src_base + head_dim + c];
 }
+
+
+// ============================================================================
+// Kernel: Weighted per-head RMS norm, batched over N tokens
+// ============================================================================
+// In-place per-head RMS normalize with a learned bf16 weight:
+//   xh = xh * rsqrt(sum_sq/head_dim + eps) * bf16_to_f32(w[i])
+// `x` is `[n_tokens, num_heads, head_dim]`; each (token, head) slice is
+// normalized independently. The `head_dim`-long weight is shared across all
+// heads and tokens. Diff oracle: `attn::rms_norm::rms_norm_per_head_cpu`.
+//
+// Unlike `rms_norm_qk` (weight-free, q/k regions in one buffer, the linear-
+// attn shape), full-attn's q_norm/k_norm are learned tensors and q/k live in
+// separate buffers — hence this distinct kernel, invoked once per buffer.
+//
+// Dispatch:
+//   threadgroups = (num_heads, n_tokens, 1)
+//   threads      = (tg_size, 1, 1)        // 256 is the sweet spot
+
+kernel void rms_norm_per_head_n_tokens(
+    device float*          x         [[buffer(0)]],   // [n_tokens, num_heads, head_dim] in-place
+    device const uint16_t* weight    [[buffer(1)]],   // [head_dim] bf16
+    constant uint&         num_heads [[buffer(2)]],
+    constant uint&         head_dim  [[buffer(3)]],
+    constant float&        eps       [[buffer(4)]],
+    uint3 tgid3   [[threadgroup_position_in_grid]],   // (head, token)
+    uint3 lid3    [[thread_position_in_threadgroup]],
+    uint3 tgsz3   [[threads_per_threadgroup]]
+) {
+    // Metal requires every position-attributed parameter to share one
+    // vector width; the dispatch is 2D over threadgroups, 1D within.
+    uint head    = tgid3.x;
+    uint token   = tgid3.y;
+    uint lid     = lid3.x;
+    uint tg_size = tgsz3.x;
+    device float* xh = x + (token * num_heads + head) * head_dim;
+
+    uint simd_lane       = lid % 32;
+    uint simd_group      = lid / 32;
+    uint num_simd_groups = (tg_size + 31) / 32;
+
+    // Phase 1: parallel sum-of-squares reduction.
+    threadgroup float shared[32];
+    float acc = 0.0f;
+    for (uint i = lid; i < head_dim; i += tg_size) {
+        float v = xh[i];
+        acc += v * v;
+    }
+    float sm = simd_sum(acc);
+    if (simd_lane == 0) shared[simd_group] = sm;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float total = 0.0f;
+    if (simd_group == 0 && simd_lane < num_simd_groups) {
+        total = simd_sum(shared[simd_lane]);
+    }
+    threadgroup float bc_inv_rms;
+    if (lid == 0) {
+        bc_inv_rms = rsqrt(total / float(head_dim) + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_rms = bc_inv_rms;
+
+    // Phase 2: apply the learned weight.
+    for (uint i = lid; i < head_dim; i += tg_size) {
+        float w = bf16_to_f32(weight[i]);
+        xh[i] = xh[i] * inv_rms * w;
+    }
+}

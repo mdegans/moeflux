@@ -97,6 +97,7 @@ pub const ALL_KERNELS: &[&str] = &[
     "rms_norm_apply",
     "rms_norm_apply_bf16",
     "rms_norm_bf16_fused_n_tokens",
+    "rms_norm_per_head_n_tokens",
     "rms_norm_qk",
     "rms_norm_sum_sq",
     "rope_n_tokens",

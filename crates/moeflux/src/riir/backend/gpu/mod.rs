@@ -463,6 +463,7 @@ pub struct MetalBackend {
     swiglu_fused_pso: ComputePipelineState,
     sigmoid_gate_pso: ComputePipelineState,
     split_q_gate_pso: ComputePipelineState,
+    rms_norm_per_head_pso: ComputePipelineState,
     moe_combine_residual_n_pso: ComputePipelineState,
     moe_bucket_accumulate_pso: ComputePipelineState,
     /// When set (env `MOEFLUX_PROFILE_PER_OP`), [`Backend::execute`]
@@ -501,6 +502,8 @@ impl MetalBackend {
         let swiglu_fused_pso = metal.pipeline("swiglu_fused")?.clone();
         let sigmoid_gate_pso = metal.pipeline("sigmoid_gate")?.clone();
         let split_q_gate_pso = metal.pipeline("split_q_gate")?.clone();
+        let rms_norm_per_head_pso =
+            metal.pipeline("rms_norm_per_head_n_tokens")?.clone();
         let moe_combine_residual_n_pso =
             metal.pipeline("moe_combine_residual_n_tokens")?.clone();
         let moe_bucket_accumulate_pso =
@@ -523,6 +526,7 @@ impl MetalBackend {
             swiglu_fused_pso,
             sigmoid_gate_pso,
             split_q_gate_pso,
+            rms_norm_per_head_pso,
             moe_combine_residual_n_pso,
             moe_bucket_accumulate_pso,
             profile_per_op: std::env::var_os("MOEFLUX_PROFILE_PER_OP")
@@ -820,6 +824,41 @@ impl Backend for MetalBackend {
                 let num_tgs = (total + 255) / 256;
                 enc.dispatch_thread_groups(
                     MTLSize::new(num_tgs as NSUInteger, 1, 1),
+                    MTLSize::new(256, 1, 1),
+                );
+                enc.end_encoding();
+            }
+            Op::RmsNormPerHeadNTokens {
+                x,
+                weight_off,
+                num_heads,
+                head_dim,
+                n_tokens,
+                eps,
+                ..
+            } => {
+                let nh = *num_heads;
+                let hd = *head_dim;
+                let eps_v = *eps;
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(
+                    &self.rms_norm_per_head_pso,
+                );
+                enc.set_buffer(0, Some(self.pool.handle(*x)), 0);
+                enc.set_buffer(
+                    1,
+                    Some(self.wf_buf.buffer()),
+                    *weight_off as NSUInteger,
+                );
+                enc.set_bytes(2, 4, (&nh as *const u32).cast());
+                enc.set_bytes(3, 4, (&hd as *const u32).cast());
+                enc.set_bytes(4, 4, (&eps_v as *const f32).cast());
+                enc.dispatch_thread_groups(
+                    MTLSize::new(
+                        nh as NSUInteger,
+                        *n_tokens as NSUInteger,
+                        1,
+                    ),
                     MTLSize::new(256, 1, 1),
                 );
                 enc.end_encoding();
