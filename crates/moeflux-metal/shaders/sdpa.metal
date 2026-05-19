@@ -13,9 +13,11 @@
 //
 // Residency (the point of the rewrite — both Q and K/V read from global
 // exactly once):
-//   - The Q tile is register-resident for the threadgroup's lifetime.
-//     Simdgroup g owns rows [g*FA_RPS, (g+1)*FA_RPS); each lane holds 8 of
-//     a row's 256 head_dim values (lane, lane+32, ..., lane+224).
+//   - The Q tile is register-resident for the threadgroup's lifetime, as a
+//     steel `MMATile` (simdgroup-matrix fragment layout). Simdgroup g owns
+//     rows [g*FA_RPS, (g+1)*FA_RPS); it is staged once through `kv_stage`
+//     before the KV loop (device `MMATile::load_safe` is unusable — a
+//     steel-header bug corrupts multi-column-frag tiles).
 //   - Each KV block is staged once into threadgroup `kv_stage` and reused
 //     across the whole query tile (K, then time-multiplexed for V).
 //   - The output accumulator is register-resident, same lane partition.
@@ -23,9 +25,10 @@
 // head_dim is fixed to FA_HD=256 (a3b); the threadgroup arrays are sized
 // at compile time. The encoder asserts head_dim == 256.
 //
-// Diff target: per-token cosine >= 0.9999 vs sdpa_cpu. Follow-up levers
-// (own arcs): simdgroup_matrix QK^T/AV; GQA-fold (one TG per (q_tile,kv_h),
-// K/V block reused across the 8 shared query-heads).
+// Diff target: per-token cosine >= 0.9999 vs sdpa_cpu. Phase 2 (QK^T) is a
+// steel `MMATile` simdgroup-matrix GEMM. Follow-up levers (own arcs):
+// simdgroup_matrix P·V; GQA-fold (one TG per (q_tile,kv_h), K/V block
+// reused across the 8 shared query-heads).
 
 constant uint FA_BR      = 64;   // query tile
 constant uint FA_BC      = 16;   // KV block
@@ -35,6 +38,7 @@ constant uint FA_SIMDS   = FA_THREADS / 32;   // 8
 constant uint FA_RPS     = FA_BR / FA_SIMDS;  // rows per simdgroup
 constant uint FA_VPL     = FA_HD / 32;        // values per lane = 8
 constant uint FA_TPR     = FA_THREADS / FA_BR; // Phase-3 threads per row
+constant uint FA_KTILES  = FA_HD / 8;          // 8-deep head_dim ktiles = 32
 
 kernel void attn_sdpa_causal_flash(
     device const float* Q             [[buffer(0)]],  // [M, num_heads, head_dim]
@@ -67,18 +71,12 @@ kernel void attn_sdpa_causal_flash(
     threadgroup float row_l   [FA_BR];          // running denom per row
     threadgroup float row_corr[FA_BR];          // exp(m_old - m_new) this block
 
-    // Q tile + O accumulator, register-resident. qreg[ri][k] / acc[ri][k]
-    // is row (q0 + simd_id*FA_RPS + ri), head_dim index (lane + k*32).
-    float qreg[FA_RPS][FA_VPL];
-    float acc [FA_RPS][FA_VPL];
+    // O accumulator, register-resident. acc[ri][k] is row
+    // (q0 + simd_id*FA_RPS + ri), head_dim index (lane + k*32).
+    float acc[FA_RPS][FA_VPL];
     for (uint ri = 0; ri < FA_RPS; ++ri) {
-        uint trow = simd_id * FA_RPS + ri;          // tile-local row
-        uint grow = q0 + trow;                       // global query token
-        device const float* qsrc =
-            Q + ((size_t)grow * num_heads + h) * FA_HD;
         for (uint k = 0; k < FA_VPL; ++k) {
-            qreg[ri][k] = (trow < br_valid) ? qsrc[lane + k * 32] : 0.0f;
-            acc[ri][k]  = 0.0f;
+            acc[ri][k] = 0.0f;
         }
     }
 
@@ -87,6 +85,40 @@ kernel void attn_sdpa_causal_flash(
         row_l[r] = 0.0f;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // -- Q tile -> register-resident MMATile `A` (the QK^T GEMM operand). --
+    //
+    // Steel `MMATile` loads/stores expect the caller to pre-offset the
+    // pointer by the lane's simdgroup-matrix fragment coordinate `co`
+    // (the `BlockMMA`-constructor idiom): co.y = frag row, co.x = frag col.
+    //
+    // `A` is [FA_RPS x FA_HD] for this simdgroup = 1 row-frag, FA_KTILES
+    // col-frags. The device `MMATile::load_safe` cannot load it (steel
+    // `BaseMMAFrag::load_safe` uses off_x where off_y belongs, corrupting
+    // any >1-column-frag tile), and the full Q tile is 64 KB — too large
+    // for threadgroup memory. So stage Q through `kv_stage` in FA_BR/FA_BC
+    // rounds of FA_BC rows; simdgroup g loads its FA_RPS rows in round
+    // g/2. One-time, before the KV loop; `kv_stage` is free afterwards.
+    using Frag  = mlx::steel::BaseMMAFrag<float, 8, 8>;
+    using QTile = mlx::steel::MMATile<float, 1, FA_KTILES>;
+    short2 co = Frag::get_coord(lane);
+    QTile A;
+    for (uint r = 0; r < FA_BR / FA_BC; ++r) {
+        for (uint idx = lid; idx < FA_BC * FA_HD; idx += FA_THREADS) {
+            uint c = idx / FA_HD, d = idx % FA_HD;   // local row, head_dim
+            uint trow = r * FA_BC + c;               // tile-local query row
+            kv_stage[idx] = (trow < br_valid)
+                ? Q[((size_t)(q0 + trow) * num_heads + h) * FA_HD + d]
+                : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_id / 2 == r) {
+            uint local_row0 = (simd_id - 2 * r) * FA_RPS;   // 0 or FA_RPS
+            A.load<float, 1, 1, FA_HD, 1>(
+                kv_stage + local_row0 * FA_HD + co.y * FA_HD + co.x);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
 
     // Causal extent: query (q0 + r) attends to KV [0, start_pos+q0+r+1).
     uint kv_max_last  = start_pos + q0 + br_valid;  // exclusive, last row
@@ -105,27 +137,38 @@ kernel void attn_sdpa_causal_flash(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // -- Phase 2: QK^T — simdgroup-cooperative dot, simd_sum reduce --
-        for (uint ri = 0; ri < FA_RPS; ++ri) {
-            uint trow = simd_id * FA_RPS + ri;
-            for (uint c = 0; c < FA_BC; ++c) {
-                float partial = 0.0f;
-                for (uint k = 0; k < FA_VPL; ++k) {
-                    partial = fma(qreg[ri][k],
-                                  kv_stage[c * FA_HD + lane + k * 32],
-                                  partial);
-                }
-                float dot = simd_sum(partial);
-                if (lane == 0) {
-                    uint kv_pos = c0 + c;
-                    bool masked = (c >= bc_valid) ||
-                        (needs_mask &&
-                         kv_pos >= start_pos + q0 + trow + 1);
-                    scores[trow * FA_BC + c] =
-                        masked ? -INFINITY : dot * softmax_scale;
-                }
+        // -- Phase 2: QK^T = A·Kᵀ as a steel MMATile simdgroup-matrix GEMM.
+        //    K is streamed transposed from `kv_stage` one 8-deep ktile at
+        //    a time (B-row = head_dim, B-col = kv pos => str_x=1,
+        //    str_y=FA_HD). `C` is [FA_RPS x FA_BC] for this simdgroup,
+        //    re-zeroed by the MMATile ctor each KV block. --
+        mlx::steel::MMATile<float, 1, 2> C;
+        for (uint k = 0; k < FA_KTILES; ++k) {
+            mlx::steel::MMATile<float, 1, 2> Bk;
+            Bk.load<float, 1, 1, 1, FA_HD>(
+                kv_stage + k * 8 + co.y + co.x * FA_HD);
+            for (uint n = 0; n < 2; ++n) {
+                Frag::mma(C.frag_at(0, n), A.frag_at(0, k),
+                          Bk.frag_at(0, n), C.frag_at(0, n));
             }
         }
+        // Scale + causal mask, fused into the score frags before the store
+        // (no extra barrier). Lane `co`, frag `n` owns the score cells at
+        // trow = simd_id*FA_RPS + co.y, c = n*8 + co.x + e for e in {0,1}.
+        for (uint n = 0; n < 2; ++n) {
+            uint trow = simd_id * FA_RPS + co.y;
+            for (uint e = 0; e < 2; ++e) {
+                uint c      = n * 8 + co.x + e;
+                uint kv_pos = c0 + c;
+                bool masked = (c >= bc_valid) ||
+                    (needs_mask && kv_pos >= start_pos + q0 + trow + 1);
+                C.frag_at(0, n)[e] = masked
+                    ? -INFINITY
+                    : C.frag_at(0, n)[e] * softmax_scale;
+            }
+        }
+        C.store<float, 1, 1, FA_BC, 1>(
+            scores + simd_id * FA_RPS * FA_BC + co.y * FA_BC + co.x);
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // -- Phase 3: per-row online-softmax update. FA_TPR threads

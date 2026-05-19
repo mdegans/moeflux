@@ -723,7 +723,7 @@ fn sdpa_causal_flash_m512_square_causal() {
 }
 
 /// M=1500, start_pos=4096 — deep chunk (kv_len > M), and 1500 is not a
-/// multiple of FA_BR=32 so the last tile is partial (`br_valid < FA_BR`).
+/// multiple of FA_BR=64 so the last tile is partial (`br_valid < FA_BR`).
 #[test]
 #[ignore = "long-running GPU test"]
 fn sdpa_causal_flash_m1500_deep_chunk() {
