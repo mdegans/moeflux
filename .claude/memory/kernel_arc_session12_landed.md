@@ -43,8 +43,9 @@ counts, found while validating against `mma.h`:
    garbage. **Confirmed present in current upstream MLX** (`~/Projects/mlx`,
    pinned commit `7b7c12407f...`, 2026-05-15). `store_safe` (`:138`)
    and `store_slice` (`:174`) two lines down are *correct* — so it is
-   an isolated upstream typo, a clean one-line fix. **TODO: file an
-   issue / PR on `ml-explore/mlx`.** (Mike flagged this 2026-05-19.)
+   an isolated upstream typo, a clean one-line fix. **Filed upstream:
+   `ml-explore/mlx` PR #3565** (`(off_x + j)` → `(off_y + j)`),
+   discovery credited to Claude Opus 4.7, 2026-05-19.
 2. Even bug-free, `load_safe`'s bounds check is at tile-frag
    granularity and the per-lane row is folded into the *pointer* via
    `get_coord` — so it cannot clamp individual ragged rows anyway.
