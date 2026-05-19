@@ -3159,3 +3159,37 @@ kernel void moe_normalize_weights(
         w[lid] = w[lid] * inv;
     }
 }
+
+
+// ============================================================================
+// Kernel: SplitQGate — deinterleave q_proj into q + gate stacks
+// ============================================================================
+// q_proj is laid out per head as `[q_h (head_dim) | gate_h (head_dim)]` —
+// stride `2*head_dim` per head, `num_heads` heads per token. Deinterleave it
+// into two contiguous `[n_tokens, num_heads, head_dim]` stacks. One thread per
+// (token, head, channel). Mirrors the CPU loop at `full_attn_forward.rs`
+// (the per-token q/gate split).
+//
+// Dispatch: flat over `n_tokens * num_heads * head_dim`.
+
+kernel void split_q_gate(
+    device const float* q_proj    [[buffer(0)]],  // [n_tokens, num_heads, 2*head_dim]
+    device float*       q_out     [[buffer(1)]],  // [n_tokens, num_heads, head_dim]
+    device float*       gate_out  [[buffer(2)]],  // [n_tokens, num_heads, head_dim]
+    constant uint&      num_heads [[buffer(3)]],
+    constant uint&      head_dim  [[buffer(4)]],
+    constant uint&      n_tokens  [[buffer(5)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    uint total = n_tokens * num_heads * head_dim;
+    if (tid >= total) return;
+
+    uint c     = tid % head_dim;
+    uint head  = (tid / head_dim) % num_heads;
+    uint token = tid / (head_dim * num_heads);
+
+    uint src_base = token * num_heads * 2 * head_dim + head * 2 * head_dim;
+    uint dst      = token * num_heads * head_dim + head * head_dim + c;
+    q_out[dst]    = q_proj[src_base + c];
+    gate_out[dst] = q_proj[src_base + head_dim + c];
+}

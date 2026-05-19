@@ -367,6 +367,22 @@ pub enum Op {
         start_pos: i32,
     },
 
+    /// Deinterleave a fused q-projection into separate q + gate
+    /// stacks. `q_proj` is `[n_tokens, num_heads, 2*head_dim]` — each
+    /// head laid out `[q (head_dim) | gate (head_dim)]`. Writes
+    /// `q_out` and `gate_out`, both `[n_tokens, num_heads*head_dim]`
+    /// contiguous. Full-attn's `q_proj` carries the per-head query
+    /// gate interleaved with the query; this splits them apart.
+    SplitQGate {
+        label: &'static str,
+        q_proj: BufId,
+        q_out: BufId,
+        gate_out: BufId,
+        num_heads: u32,
+        head_dim: u32,
+        n_tokens: u32,
+    },
+
     /// Residual add over `[n_tokens, dim]`: `out = a + b`.
     ResidualAddNTokens {
         label: &'static str,
@@ -630,6 +646,7 @@ impl Op {
             Op::SwigluFusedBatched { label, .. } => label,
             Op::SdpaCausalTiled { label, .. } => label,
             Op::SigmoidGateNTokens { label, .. } => label,
+            Op::SplitQGate { label, .. } => label,
             Op::MoeSoftmaxTopK { label, .. } => label,
             Op::MoeNormalizeWeights { label, .. } => label,
             Op::MoeBatchedPermuteFuse { label, .. } => label,
@@ -656,6 +673,7 @@ impl Op {
             Op::SwigluFusedBatched { .. } => "SwigluFusedBatched",
             Op::SdpaCausalTiled { .. } => "SdpaCausalTiled",
             Op::SigmoidGateNTokens { .. } => "SigmoidGateNTokens",
+            Op::SplitQGate { .. } => "SplitQGate",
             Op::MoeSoftmaxTopK { .. } => "MoeSoftmaxTopK",
             Op::MoeNormalizeWeights { .. } => "MoeNormalizeWeights",
             Op::MoeBatchedPermuteFuse { .. } => "MoeBatchedPermuteFuse",
@@ -686,6 +704,7 @@ impl Op {
             Op::SwigluFusedBatched { gate, up, .. } => vec![*gate, *up],
             Op::SdpaCausalTiled { q, k, v, .. } => vec![*q, *k, *v],
             Op::SigmoidGateNTokens { x, gate, .. } => vec![*x, *gate],
+            Op::SplitQGate { q_proj, .. } => vec![*q_proj],
             Op::MoeSoftmaxTopK { logits, .. } => vec![*logits],
             Op::MoeNormalizeWeights { weights, .. } => vec![*weights],
             Op::MoeBatchedPermuteFuse {
@@ -749,6 +768,9 @@ impl Op {
             Op::SwigluFusedBatched { out, .. } => vec![*out],
             Op::SdpaCausalTiled { attn_out, .. } => vec![*attn_out],
             Op::SigmoidGateNTokens { x, .. } => vec![*x], // in-place
+            Op::SplitQGate {
+                q_out, gate_out, ..
+            } => vec![*q_out, *gate_out],
             Op::MoeSoftmaxTopK {
                 indices_out,
                 weights_out,
@@ -912,6 +934,15 @@ mod tests {
             x: buf(15),
             gate: buf(16),
             dim: 1024,
+            n_tokens: 8,
+        });
+        g.push(Op::SplitQGate {
+            label: "split_q_gate",
+            q_proj: buf(40),
+            q_out: buf(41),
+            gate_out: buf(42),
+            num_heads: 16,
+            head_dim: 128,
             n_tokens: 8,
         });
         g.push(Op::MoeSoftmaxTopK {

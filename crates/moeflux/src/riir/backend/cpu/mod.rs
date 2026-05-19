@@ -519,6 +519,31 @@ fn swiglu_fused_cpu(gate: &[f32], up: &[f32], out: &mut [f32]) {
     }
 }
 
+/// Deinterleave a fused q-projection into separate q + gate stacks.
+/// `q_proj` is `[n_tokens, num_heads, 2*head_dim]` — each head laid
+/// out `[q | gate]`. Diff oracle for `Op::SplitQGate`; mirrors the
+/// per-token split loop in `full_attn_forward.rs`.
+fn split_q_gate_cpu(
+    q_proj: &[f32],
+    q_out: &mut [f32],
+    gate_out: &mut [f32],
+    num_heads: usize,
+    head_dim: usize,
+    n_tokens: usize,
+) {
+    for t in 0..n_tokens {
+        for h in 0..num_heads {
+            let src = t * num_heads * 2 * head_dim + h * 2 * head_dim;
+            let dst = t * num_heads * head_dim + h * head_dim;
+            q_out[dst..dst + head_dim]
+                .copy_from_slice(&q_proj[src..src + head_dim]);
+            gate_out[dst..dst + head_dim].copy_from_slice(
+                &q_proj[src + head_dim..src + 2 * head_dim],
+            );
+        }
+    }
+}
+
 fn moe_softmax_topk_cpu(
     logits: &[f32],
     indices_out: &mut [i32],
@@ -902,6 +927,27 @@ impl Backend for CpuBackend {
                 {
                     *xv *= 1.0f32 / (1.0f32 + (-*gv).exp());
                 }
+            }
+            Op::SplitQGate {
+                q_proj,
+                q_out,
+                gate_out,
+                num_heads,
+                head_dim,
+                n_tokens,
+                ..
+            } => {
+                let q_proj_buf = self.read_f32(*q_proj);
+                let mut q_out_buf = self.write_f32(*q_out);
+                let mut gate_out_buf = self.write_f32(*gate_out);
+                split_q_gate_cpu(
+                    &q_proj_buf,
+                    &mut q_out_buf,
+                    &mut gate_out_buf,
+                    *num_heads as usize,
+                    *head_dim as usize,
+                    *n_tokens as usize,
+                );
             }
             Op::SdpaCausalTiled {
                 q,

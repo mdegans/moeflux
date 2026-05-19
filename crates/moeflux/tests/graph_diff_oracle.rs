@@ -639,6 +639,132 @@ fn graph_metal_matches_cpu_sigmoid_gate_n_tokens() {
 }
 
 // ============================================================================
+// Test: SplitQGate through both backends (prefill arc, phase 1c)
+// ============================================================================
+
+#[test]
+#[ignore = "long-running GPU test"]
+fn graph_metal_matches_cpu_split_q_gate() {
+    let n_tokens: u32 = 8;
+    let num_heads: u32 = 16;
+    let head_dim: u32 = 256;
+    let q_proj_total =
+        (n_tokens * num_heads * 2 * head_dim) as usize;
+    let out_total = (n_tokens * num_heads * head_dim) as usize;
+
+    let mut rng = Rng::new(0x59_6A7E);
+    let q_proj_data: Vec<f32> =
+        (0..q_proj_total).map(|_| rng.next_f32_unit()).collect();
+
+    let build = |qp, qo, go| Op::SplitQGate {
+        label: "test_split_q_gate",
+        q_proj: qp,
+        q_out: qo,
+        gate_out: go,
+        num_heads,
+        head_dim,
+        n_tokens,
+    };
+
+    // CPU path
+    let mut cpu_wf = dummy_weight_file("split_q_gate_cpu");
+    let mut cpu = CpuBackend::new(cpu_wf.take());
+    let cpu_qp = cpu
+        .pool_mut()
+        .alloc(q_proj_total * 4, "q_proj", false)
+        .unwrap();
+    let cpu_qo =
+        cpu.pool_mut().alloc(out_total * 4, "q_out", false).unwrap();
+    let cpu_go = cpu
+        .pool_mut()
+        .alloc(out_total * 4, "gate_out", false)
+        .unwrap();
+    cpu.pool_mut()
+        .upload(cpu_qp, bytes_of_f32(&q_proj_data))
+        .unwrap();
+    let mut g_cpu = Graph::new();
+    g_cpu.push(build(cpu_qp, cpu_qo, cpu_go));
+    cpu.execute(&g_cpu, "diff_oracle").unwrap();
+    let mut cpu_qo_bytes = vec![0u8; out_total * 4];
+    let mut cpu_go_bytes = vec![0u8; out_total * 4];
+    cpu.pool().download(cpu_qo, &mut cpu_qo_bytes).unwrap();
+    cpu.pool().download(cpu_go, &mut cpu_go_bytes).unwrap();
+    let cpu_qo_f32 = f32_of_bytes(&cpu_qo_bytes);
+    let cpu_go_f32 = f32_of_bytes(&cpu_go_bytes);
+
+    // GPU path
+    let mut gpu_wf = dummy_weight_file("split_q_gate_gpu");
+    let metal_ctx = MetalContext::new().expect("MetalContext::new");
+    let wf_ref = gpu_wf.wf.as_ref().unwrap();
+    let wf_buf = MtlWeightBuf::wrap(wf_ref, metal_ctx.device());
+    let _ = gpu_wf.take();
+    let mut gpu =
+        MetalBackend::new(metal_ctx, wf_buf).expect("MetalBackend::new");
+    let gpu_qp = gpu
+        .pool_mut()
+        .alloc(q_proj_total * 4, "q_proj", false)
+        .unwrap();
+    let gpu_qo =
+        gpu.pool_mut().alloc(out_total * 4, "q_out", false).unwrap();
+    let gpu_go = gpu
+        .pool_mut()
+        .alloc(out_total * 4, "gate_out", false)
+        .unwrap();
+    gpu.pool_mut()
+        .upload(gpu_qp, bytes_of_f32(&q_proj_data))
+        .unwrap();
+    let mut g_gpu = Graph::new();
+    g_gpu.push(build(gpu_qp, gpu_qo, gpu_go));
+    gpu.execute(&g_gpu, "diff_oracle").unwrap();
+    let mut gpu_qo_bytes = vec![0u8; out_total * 4];
+    let mut gpu_go_bytes = vec![0u8; out_total * 4];
+    gpu.pool().download(gpu_qo, &mut gpu_qo_bytes).unwrap();
+    gpu.pool().download(gpu_go, &mut gpu_go_bytes).unwrap();
+    let gpu_qo_f32 = f32_of_bytes(&gpu_qo_bytes);
+    let gpu_go_f32 = f32_of_bytes(&gpu_go_bytes);
+
+    // Deinterleave is a pure copy — require bit-exact, not just cosine.
+    let q_max_abs = cpu_qo_f32
+        .iter()
+        .zip(gpu_qo_f32.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let g_max_abs = cpu_go_f32
+        .iter()
+        .zip(gpu_go_f32.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+
+    // Guard: q_out and gate_out are distinct halves — a stride bug
+    // that copied the same half twice would make them equal.
+    let qg_diff = cpu_qo_f32
+        .iter()
+        .zip(cpu_go_f32.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+
+    eprintln!(
+        "[s15-p1c split_q_gate] N={} heads={} head_dim={}: \
+         q_max_abs={:.3e}, g_max_abs={:.3e}, qg_diff={:.3e}",
+        n_tokens, num_heads, head_dim, q_max_abs, g_max_abs, qg_diff
+    );
+    assert_eq!(
+        q_max_abs, 0.0,
+        "q_out differs CPU vs GPU — split_q_gate is a pure copy"
+    );
+    assert_eq!(
+        g_max_abs, 0.0,
+        "gate_out differs CPU vs GPU — split_q_gate is a pure copy"
+    );
+    assert!(
+        qg_diff > 0.01,
+        "q_out == gate_out (qg_diff={}) — stride bug copying the \
+         same half twice",
+        qg_diff
+    );
+}
+
+// ============================================================================
 // Test: SwigluFusedBatched through both backends
 // ============================================================================
 

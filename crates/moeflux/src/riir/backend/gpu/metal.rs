@@ -101,6 +101,7 @@ pub const ALL_KERNELS: &[&str] = &[
     "rms_norm_sum_sq",
     "rope_n_tokens",
     "sigmoid_gate",
+    "split_q_gate",
     "swiglu_fused",
     "swiglu_fused_batched",
     "swiglu_fused_vec4",
