@@ -27,49 +27,184 @@ use metal::{Buffer, Device, MTLResourceOptions, NSUInteger};
 
 use crate::riir::variants::{Variant, MAX_SEQ_LEN, VARIANT};
 
-/// Full-attention key/value cache for one layer. Allocated to
-/// [`MAX_SEQ_LEN`] capacity up front; `len` tracks the occupied prefix.
+/// Full-attention key/value cache for one layer. **GPU-resident**:
+/// `k_cache` and `v_cache` are `MTLResourceStorageModeShared` Metal
+/// buffers of shape `[MAX_SEQ_LEN, num_kv_heads * head_dim]` row-major
+/// f32. Shared storage means the CPU full-attn path reads/writes the
+/// same bytes via `contents()` while the GPU SDPA path reads them
+/// directly — no host mirror, no per-layer re-upload (the prefill
+/// arc's Phase 0: the prior `Box<[f32]>` host cache forced a
+/// `MtlBuffer::with_data` of the whole growing prefix every layer).
 ///
-/// Layout matches the C `KVCache`: `k_cache` and `v_cache` are
-/// `[max_seq, num_kv_heads * head_dim]` row-major float arrays. Rust
-/// uses `Box<[f32]>` instead of `float *` — same bytes, lifetime-bound.
+/// Buffers are `Option`-wrapped for lazy allocation: `LayerState`s are
+/// constructed at `Ctx::open` before the Metal device exists;
+/// [`Self::ensure_buffers`] populates them on first eval. macOS
+/// lazy-commits the virtual reservation, so untouched rows cost no
+/// physical RAM (see the [`MlaKvCacheGpu::ensure_buffers`] note).
 #[derive(Debug)]
 pub struct KvCache {
-    pub k_cache: Box<[f32]>,
-    pub v_cache: Box<[f32]>,
+    /// `[MAX_SEQ_LEN, num_kv_heads * head_dim]` row-major f32.
+    /// `None` until [`Self::ensure_buffers`] runs on first eval.
+    pub k_cache: Option<Buffer>,
+    pub v_cache: Option<Buffer>,
     pub len: i32,
 }
 
 impl KvCache {
-    /// Allocate a zeroed cache sized for the active variant. Routes
-    /// through `vec![0.0; n]` so the system allocator uses
-    /// `alloc_zeroed`/`calloc` and gets lazy-committed pages on macOS
-    /// for the multi-GB virtual reservation.
+    /// Construct an empty cache without GPU buffers. Buffers are
+    /// allocated lazily by [`Self::ensure_buffers`] once a Metal
+    /// device is available.
     pub fn new() -> Self {
-        let entries = MAX_SEQ_LEN * VARIANT.num_kv_heads * VARIANT.head_dim;
         Self {
-            k_cache: vec![0.0f32; entries].into_boxed_slice(),
-            v_cache: vec![0.0f32; entries].into_boxed_slice(),
+            k_cache: None,
+            v_cache: None,
             len: 0,
         }
     }
 
-    /// Reset to positions `[0, new_len)`. No-op if already shorter.
-    /// Zeros the `[new_len, old_len)` window so stale K/V doesn't bleed
-    /// into later decodes — mirrors `kv_cache_truncate` at infer.m:2243.
+    /// Allocate the shared-storage Metal buffers if not already
+    /// present. Idempotent. Sized `MAX_SEQ_LEN * num_kv_heads *
+    /// head_dim` f32 per side — virtual reservations until pages are
+    /// touched; no explicit zeroing, `StorageModeShared` pages are
+    /// zero-filled on first touch by the Mach VM (see
+    /// `MlaKvCacheGpu::ensure_buffers`).
+    pub fn ensure_buffers(&mut self, device: &Device) {
+        let entries =
+            MAX_SEQ_LEN * VARIANT.num_kv_heads * VARIANT.head_dim;
+        let bytes =
+            (entries * std::mem::size_of::<f32>()) as NSUInteger;
+        if self.k_cache.is_none() {
+            self.k_cache = Some(device.new_buffer(
+                bytes,
+                MTLResourceOptions::StorageModeShared,
+            ));
+        }
+        if self.v_cache.is_none() {
+            self.v_cache = Some(device.new_buffer(
+                bytes,
+                MTLResourceOptions::StorageModeShared,
+            ));
+        }
+    }
+
+    /// Reset to positions `[0, new_len)`. No-op if already shorter or
+    /// the buffers don't exist yet. Zeros the `[new_len, old_len)`
+    /// window so stale K/V doesn't bleed into later decodes — mirrors
+    /// `kv_cache_truncate` at infer.m:2243.
     pub fn truncate(&mut self, new_len: i32) {
         if new_len < 0 || new_len > self.len {
             return;
         }
         let old_len = self.len;
-        let stride = VARIANT.num_kv_heads * VARIANT.head_dim;
         if new_len < old_len {
-            let start = (new_len as usize) * stride;
-            let end = (old_len as usize) * stride;
-            self.k_cache[start..end].fill(0.0);
-            self.v_cache[start..end].fill(0.0);
+            let stride_bytes = VARIANT.num_kv_heads
+                * VARIANT.head_dim
+                * std::mem::size_of::<f32>();
+            let start = (new_len as usize) * stride_bytes;
+            let end = (old_len as usize) * stride_bytes;
+            for buf in [self.k_cache.as_ref(), self.v_cache.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                // SAFETY: shared-storage buffer; truncate runs outside
+                // per-token forward (memory_clear / checkpoint
+                // restore), with no GPU work in flight.
+                unsafe {
+                    let p = buf.contents() as *mut u8;
+                    std::ptr::write_bytes(p.add(start), 0, end - start);
+                }
+            }
         }
         self.len = new_len;
+    }
+
+    /// Host-readable slice over the populated prefix of the K cache
+    /// (`[0, len) × num_kv_heads*head_dim` floats).
+    ///
+    /// # Safety
+    ///
+    /// Caller must guarantee no GPU work is reading or writing the
+    /// underlying buffer concurrently.
+    pub unsafe fn k_slice(&self, len: usize) -> &[f32] {
+        let buf = self
+            .k_cache
+            .as_ref()
+            .expect("k_slice called before ensure_buffers");
+        let n = len * VARIANT.num_kv_heads * VARIANT.head_dim;
+        // SAFETY: caller upholds the no-concurrent-GPU-work invariant.
+        unsafe {
+            std::slice::from_raw_parts(buf.contents() as *const f32, n)
+        }
+    }
+
+    /// Mutable counterpart to [`Self::k_slice`] over the row window
+    /// `[start_row, end_row) × num_kv_heads*head_dim`.
+    ///
+    /// # Safety
+    ///
+    /// See [`Self::k_slice`].
+    pub unsafe fn k_slice_mut(
+        &mut self,
+        start_row: usize,
+        end_row: usize,
+    ) -> &mut [f32] {
+        let buf = self
+            .k_cache
+            .as_ref()
+            .expect("k_slice_mut called before ensure_buffers");
+        let stride = VARIANT.num_kv_heads * VARIANT.head_dim;
+        // SAFETY: caller upholds the no-concurrent-GPU-work invariant.
+        unsafe {
+            let p =
+                (buf.contents() as *mut f32).add(start_row * stride);
+            std::slice::from_raw_parts_mut(
+                p,
+                (end_row - start_row) * stride,
+            )
+        }
+    }
+
+    /// Host-readable slice over the populated prefix of the V cache.
+    ///
+    /// # Safety
+    ///
+    /// See [`Self::k_slice`].
+    pub unsafe fn v_slice(&self, len: usize) -> &[f32] {
+        let buf = self
+            .v_cache
+            .as_ref()
+            .expect("v_slice called before ensure_buffers");
+        let n = len * VARIANT.num_kv_heads * VARIANT.head_dim;
+        // SAFETY: caller upholds the no-concurrent-GPU-work invariant.
+        unsafe {
+            std::slice::from_raw_parts(buf.contents() as *const f32, n)
+        }
+    }
+
+    /// Mutable counterpart to [`Self::v_slice`].
+    ///
+    /// # Safety
+    ///
+    /// See [`Self::k_slice`].
+    pub unsafe fn v_slice_mut(
+        &mut self,
+        start_row: usize,
+        end_row: usize,
+    ) -> &mut [f32] {
+        let buf = self
+            .v_cache
+            .as_ref()
+            .expect("v_slice_mut called before ensure_buffers");
+        let stride = VARIANT.num_kv_heads * VARIANT.head_dim;
+        // SAFETY: caller upholds the no-concurrent-GPU-work invariant.
+        unsafe {
+            let p =
+                (buf.contents() as *mut f32).add(start_row * stride);
+            std::slice::from_raw_parts_mut(
+                p,
+                (end_row - start_row) * stride,
+            )
+        }
     }
 }
 

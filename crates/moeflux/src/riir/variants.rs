@@ -363,10 +363,14 @@ pub const ROPE_THETA: f32 = 10_000_000.0;
 #[cfg(feature = "model-cogito-v2-671b")]
 pub const ROPE_THETA: f32 = 10_000.0;
 
-// --- KV cache / runtime limits (architecture-wide) ----------------
+// --- KV cache / runtime limits -----------------------------------
 
-/// Maximum sequence length the architecture supports. Mirrors
-/// `MAX_SEQ_LEN` in `model_variant.h`.
+/// Maximum sequence length the KV cache buffers and the overflow
+/// checks size against. Both Qwen variants are 262,144 native and
+/// YaRN-extensible to ~1.01M (`rope_type: yarn`, `factor: 4.0`); 1M
+/// is the common ceiling. Shared-storage KV buffers lazy-commit, so
+/// the ceiling costs no physical RAM until rows are touched —
+/// no per-variant value is needed.
 pub const MAX_SEQ_LEN: usize = 1_048_576;
 /// GPU-resident KV window — KV positions beyond this swap to host.
 pub const GPU_KV_SEQ: usize = 8192;

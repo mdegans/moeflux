@@ -94,6 +94,10 @@ pub(in crate::riir) fn full_attn_pre_moe_layer_forward(
         *gpu;
     let v = VARIANT;
 
+    // Phase 0 (prefill arc): the KV cache is GPU-resident. Allocate
+    // its shared-storage buffers on first eval; idempotent thereafter.
+    kv_state.ensure_buffers(metal.device());
+
     // Reject linear-attn layers up front. Mirror the symmetric guard
     // in `linear_attn_layer_forward`.
     if v.layer_kind(layer_idx) != crate::riir::variants::LayerKind::FullAttn {
@@ -277,10 +281,17 @@ pub(in crate::riir) fn full_attn_pre_moe_layer_forward(
             tensor: "kv cache overflow",
         });
     }
-    let row_start = cache_pos * kv_dim;
-    let row_end = row_start + kv_dim;
-    kv_state.k_cache[row_start..row_end].copy_from_slice(&k_host);
-    kv_state.v_cache[row_start..row_end].copy_from_slice(&v_host);
+    // SAFETY: shared-storage KV buffers; this CPU append runs before
+    // any GPU dispatch reads the cache this layer (CMD1 above
+    // committed and waited; CMD2 is built below).
+    unsafe {
+        kv_state
+            .k_slice_mut(cache_pos, cache_pos + 1)
+            .copy_from_slice(&k_host);
+        kv_state
+            .v_slice_mut(cache_pos, cache_pos + 1)
+            .copy_from_slice(&v_host);
+    }
     kv_state.len += 1;
 
     // GPU mirror of host KV — feeds the GPU SDPA fast path when the
@@ -296,6 +307,7 @@ pub(in crate::riir) fn full_attn_pre_moe_layer_forward(
             // yet this layer; previous dispatch's CMD2 commit-wait
             // happened in last layer's `complete_deferred_experts_into`
             // drain at the top of this layer's eval call).
+            let row_start = cache_pos * kv_dim;
             unsafe {
                 let k_dst = buffer_pool.handle(buffers.gpu_kv_k[fa_idx]).contents() as *mut f32;
                 let v_dst = buffer_pool.handle(buffers.gpu_kv_v[fa_idx]).contents() as *mut f32;
@@ -348,14 +360,22 @@ pub(in crate::riir) fn full_attn_pre_moe_layer_forward(
     } else {
         // CPU SDPA fallback. Slice the caches to the occupied prefix
         // and stage the result into batch_out[6] for o_proj.
-        let kv_total = (kv_len as usize) * kv_dim;
         let mut attn_out = vec![0.0f32; q_dim];
+        // SAFETY: shared-storage KV buffers; CPU SDPA fallback runs
+        // with no GPU work in flight on the cache (CMD1 committed and
+        // waited above; CMD2 not yet built).
+        let (k_prefix, v_prefix) = unsafe {
+            (
+                kv_state.k_slice(kv_len as usize),
+                kv_state.v_slice(kv_len as usize),
+            )
+        };
         sdpa_cpu(
             kv_len,
             &q_host,
             &q_gate_host,
-            &kv_state.k_cache[..kv_total],
-            &kv_state.v_cache[..kv_total],
+            k_prefix,
+            v_prefix,
             &mut attn_out,
         )?;
 
@@ -527,6 +547,10 @@ pub(in crate::riir) fn batched_full_attn_layer_forward(
     let v = VARIANT;
     debug_assert!(k_active <= MAX_K);
 
+    // Phase 0 (prefill arc): the KV cache is GPU-resident. Allocate
+    // its shared-storage buffers on first eval; idempotent thereafter.
+    kv_state.ensure_buffers(metal.device());
+
     let hidden_dim = v.hidden_dim;
     let q_dim = v.num_attn_heads * v.head_dim;
     let kv_dim = v.num_kv_heads * v.head_dim;
@@ -695,10 +719,17 @@ pub(in crate::riir) fn batched_full_attn_layer_forward(
         )?;
         apply_rotary_emb(pos, &mut q_host, &mut k_host)?;
         let cache_pos = (kv_start as usize) + t;
-        let row_start = cache_pos * kv_dim;
-        let row_end = row_start + kv_dim;
-        kv_state.k_cache[row_start..row_end].copy_from_slice(&k_host);
-        kv_state.v_cache[row_start..row_end].copy_from_slice(&v_host);
+        // SAFETY: shared-storage KV buffers; this CPU append precedes
+        // Phase 2's SDPA cmdbuf (built only after the whole token
+        // loop) — no GPU work in flight on the cache.
+        unsafe {
+            kv_state
+                .k_slice_mut(cache_pos, cache_pos + 1)
+                .copy_from_slice(&k_host);
+            kv_state
+                .v_slice_mut(cache_pos, cache_pos + 1)
+                .copy_from_slice(&v_host);
+        }
         q_stack[t * q_dim..(t + 1) * q_dim].copy_from_slice(&q_host);
         q_gate_stack[t * q_dim..(t + 1) * q_dim]
             .copy_from_slice(&q_gate_host);
@@ -709,16 +740,19 @@ pub(in crate::riir) fn batched_full_attn_layer_forward(
     //    the (now-extended) kv state. ──────────────────────────────
     let device = metal.device().clone();
     let kv_len_total = kv_state.len as u32;
-    let kv_floats = (kv_len_total as usize) * kv_dim;
     let q_buf = MtlBuffer::<f32>::with_data(&device, &q_stack);
-    let k_gpu = MtlBuffer::<f32>::with_data(
-        &device,
-        &kv_state.k_cache[..kv_floats],
-    );
-    let v_gpu = MtlBuffer::<f32>::with_data(
-        &device,
-        &kv_state.v_cache[..kv_floats],
-    );
+    // Phase 0 (prefill arc): SDPA reads the GPU-resident KV buffers
+    // directly — no per-layer `with_data` re-upload of the entire
+    // growing prefix. `kv_len_total` bounds the SDPA read to the
+    // occupied rows; the buffer itself is `MAX_SEQ_LEN`-capacity.
+    let k_gpu = kv_state
+        .k_cache
+        .as_ref()
+        .expect("ensure_buffers ran at fn entry");
+    let v_gpu = kv_state
+        .v_cache
+        .as_ref()
+        .expect("ensure_buffers ran at fn entry");
     let attn_out_buf =
         MtlBuffer::<f32>::with_len(&device, n_tokens * q_dim);
 
@@ -735,8 +769,8 @@ pub(in crate::riir) fn batched_full_attn_layer_forward(
         cmdbuf,
         &SdpaCall {
             q: q_buf.buffer(),
-            k_cache: k_gpu.buffer(),
-            v_cache: v_gpu.buffer(),
+            k_cache: k_gpu,
+            v_cache: v_gpu,
             out: attn_out_buf.buffer(),
             n_tokens: n_tokens as u32,
             num_heads: v.num_attn_heads as u32,
