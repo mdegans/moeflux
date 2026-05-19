@@ -681,7 +681,7 @@ impl Backend for MetalBackend {
                 if weight.bits == 4 {
                     // 4-bit: MLX's tiled quantized GEMM (~12x the old
                     // dequant_matvec_4bit matvec at prefill shapes).
-                    self.metal.qmm().encode_qmm_t(
+                    self.metal.kernels().encode(
                         cmd,
                         &QmmCall {
                             weights: QuantWeights {
@@ -877,7 +877,7 @@ impl Backend for MetalBackend {
                 crate::riir::moe::expert_forward::encode_moe_batched_permute_fuse(
                     cmd,
                     &self.matvec_pipes,
-                    self.metal.qmm(),
+                    self.metal.kernels(),
                     &self.swiglu_fused_pso,
                     &self.moe_bucket_accumulate_pso,
                     self.pool.handle(*expert_base),

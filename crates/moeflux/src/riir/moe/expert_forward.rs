@@ -50,7 +50,7 @@ use metal::{
     NSUInteger,
 };
 
-use moeflux_metal::{GatherQmmCall, QmmKernels, QuantWeights};
+use moeflux_metal::{GatherQmmCall, Kernels, QuantWeights};
 
 use crate::riir::backend::{BufId, BufferPool, MetalBufferPool};
 use crate::riir::backend::gpu::gpu_matvec::{encode_matvec_n_tokens, MatvecPipelines};
@@ -1278,7 +1278,7 @@ fn encode_swiglu_into_buf(
 pub fn encode_moe_batched_permute_fuse(
     cmdbuf: &CommandBufferRef,
     matvec: &MatvecPipelines,
-    qmm: &QmmKernels,
+    kernels: &Kernels,
     swiglu: &ComputePipelineState,
     bucket_accumulate: &ComputePipelineState,
     expert_base: &Buffer,
@@ -1300,7 +1300,7 @@ pub fn encode_moe_batched_permute_fuse(
     debug_assert_eq!(expert_slots.len(), buckets.expert_ids.len());
     if gather {
         encode_moe_gather(
-            cmdbuf, qmm, swiglu, bucket_accumulate, expert_base,
+            cmdbuf, kernels, swiglu, bucket_accumulate, expert_base,
             expert_stride, expert_indices, bucket_input, bucket_gate,
             bucket_up, bucket_act, bucket_out, bucket_token_idx,
             bucket_weights, out_sum, buckets, v,
@@ -1389,7 +1389,7 @@ fn encode_bucket_scatter(
 #[allow(clippy::too_many_arguments)]
 fn encode_moe_gather(
     cmdbuf: &CommandBufferRef,
-    qmm: &QmmKernels,
+    kernels: &Kernels,
     swiglu: &ComputePipelineState,
     bucket_accumulate: &ComputePipelineState,
     expert_base: &Buffer,
@@ -1421,7 +1421,7 @@ fn encode_moe_gather(
     // block; the kernel reaches expert e via `e * stride_w/stride_s`.
     let gather = |w_off: u64, s_off: u64, b_off: u64, input: &Buffer,
                   output: &Buffer, in_dim: u32, out_dim: u32| {
-        qmm.encode_gather_qmm_rhs(
+        kernels.encode(
             cmdbuf,
             &GatherQmmCall {
                 weights: QuantWeights {

@@ -36,7 +36,7 @@ use moeflux::riir::attn::gpu_attn::{
 use moeflux::riir::backend::gpu::gpu_matvec::{
     encode_matvec_n_tokens, MatvecPipelines,
 };
-use moeflux_metal::{QmmCall, QmmKernels, QuantWeights};
+use moeflux_metal::{QmmCall, Kernels, QuantWeights};
 use moeflux::riir::variants::VARIANT;
 use moeflux::riir::MetalContext;
 
@@ -297,8 +297,8 @@ fn bench_sdpa(metal: &mut MetalContext) {
 fn bench_matvec(metal: &mut MetalContext) {
     let pipes =
         MatvecPipelines::fetch(metal).expect("fetch MatvecPipelines");
-    let qmm = QmmKernels::new(metal.device())
-        .expect("build moeflux-metal QmmKernels");
+    let kernels = Kernels::new(metal.device())
+        .expect("build moeflux-metal Kernels");
 
     eprintln!("\n[matvec-4bit]  v3 matvec vs qmm_t (MLX)");
 
@@ -345,7 +345,7 @@ fn bench_matvec(metal: &mut MetalContext) {
                 &encode,
             );
             let encode_qmm = |cmd: &CommandBufferRef| {
-                qmm.encode_qmm_t(
+                kernels.encode(
                     cmd,
                     &QmmCall {
                         weights: QuantWeights {

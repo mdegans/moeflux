@@ -36,7 +36,7 @@ pub use metal::{
     MTLResourceOptions, NSUInteger,
 };
 
-use moeflux_metal::QmmKernels;
+use moeflux_metal::Kernels;
 
 /// Errors from the Metal backend.
 #[derive(Debug, thiserror::Error)]
@@ -135,10 +135,10 @@ pub struct MetalContext {
     /// helper can take `&self` — contention is irrelevant (one
     /// lock per cmdbuf, dwarfed by the wait itself).
     cmdbuf_stats: Mutex<HashMap<&'static str, CmdbufStat>>,
-    /// MLX quantized-GEMM kernels (`qmm_t` + the gathered MoE variant).
-    /// Compiled once here so every consumer — the `Op` executor and the
-    /// direct attn-forward callers alike — shares one compiled library.
-    qmm: QmmKernels,
+    /// The compiled `moeflux-metal` kernels. Built once here so every
+    /// consumer — the `Op` executor and the direct attn-forward callers
+    /// alike — shares one compiled library.
+    kernels: Kernels,
 }
 
 impl MetalContext {
@@ -158,7 +158,7 @@ impl MetalContext {
             .new_library_with_source(SHADER_SOURCE, &options)
             .map_err(MetalError::LibraryCompile)?;
 
-        let qmm = QmmKernels::new(&device)
+        let kernels = Kernels::new(&device)
             .map_err(|e| MetalError::MlxKernels(e.to_string()))?;
 
         Ok(Self {
@@ -167,7 +167,7 @@ impl MetalContext {
             library,
             pipelines: HashMap::new(),
             cmdbuf_stats: Mutex::new(HashMap::new()),
-            qmm,
+            kernels,
         })
     }
 
@@ -182,11 +182,10 @@ impl MetalContext {
         &self.queue
     }
 
-    /// The MLX quantized-GEMM kernels (`qmm_t` + gathered MoE variant),
-    /// compiled once in [`Self::new`]. Shared by the `Op` executor and
-    /// the direct attn-forward callers.
-    pub fn qmm(&self) -> &QmmKernels {
-        &self.qmm
+    /// The compiled `moeflux-metal` kernels, built once in [`Self::new`].
+    /// Shared by the `Op` executor and the direct attn-forward callers.
+    pub fn kernels(&self) -> &Kernels {
+        &self.kernels
     }
 
     /// Clone the command-queue handle. `metal::CommandQueue` is an

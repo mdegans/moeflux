@@ -1,4 +1,4 @@
-//! P4 diff gate: `encode_qmm_t` output vs a self-contained CPU reference.
+//! P4 diff gate: `QmmCall` encoding output vs a self-contained CPU reference.
 //!
 //! The CPU reference dequantizes the 4-bit affine weights and runs the
 //! matmul in f64-free f32 — the same arithmetic the kernel performs, in a
@@ -9,7 +9,7 @@
 #![cfg(target_os = "macos")]
 
 use metal::{Device, MTLResourceOptions};
-use moeflux_metal::{QmmCall, QmmKernels, QuantWeights};
+use moeflux_metal::{QmmCall, Kernels, QuantWeights};
 
 const COSINE_FLOOR: f32 = 0.9999;
 
@@ -141,7 +141,7 @@ fn run_case(in_dim: u32, out_dim: u32, n_tokens: u32, seed: u64) {
 
     // --- GPU ---
     let device = Device::system_default().expect("no Metal device");
-    let kernels = QmmKernels::new(&device).expect("build moeflux-metal kernels");
+    let kernels = Kernels::new(&device).expect("build moeflux-metal kernels");
 
     // One buffer: [packed u32][scales u16][biases u16], as moeflux's
     // weight file lays them out.
@@ -184,7 +184,7 @@ fn run_case(in_dim: u32, out_dim: u32, n_tokens: u32, seed: u64) {
 
     let queue = device.new_command_queue();
     let cmd = queue.new_command_buffer();
-    kernels.encode_qmm_t(
+    kernels.encode(
         cmd,
         &QmmCall {
             weights: QuantWeights {

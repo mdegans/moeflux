@@ -1,4 +1,4 @@
-//! P7 diff gate: `encode_gather_qmm_rhs` output vs a self-contained CPU
+//! P7 diff gate: `GatherQmmCall` encoding output vs a self-contained CPU
 //! reference.
 //!
 //! The gather kernel does the MoE expert matmul: all experts' 4-bit affine
@@ -16,7 +16,7 @@
 #![cfg(target_os = "macos")]
 
 use metal::{Device, MTLResourceOptions};
-use moeflux_metal::{GatherQmmCall, QmmKernels, QuantWeights};
+use moeflux_metal::{GatherQmmCall, Kernels, QuantWeights};
 
 const COSINE_FLOOR: f32 = 0.9999;
 
@@ -190,7 +190,7 @@ fn run_gather_case(
 
     // --- GPU ---
     let device = Device::system_default().expect("no Metal device");
-    let kernels = QmmKernels::new(&device).expect("build moeflux-metal kernels");
+    let kernels = Kernels::new(&device).expect("build moeflux-metal kernels");
 
     // One expert block: [packed u32][scales u16][biases u16] — moeflux's
     // weight-file layout. All experts contiguous at uniform `block_bytes`
@@ -245,7 +245,7 @@ fn run_gather_case(
 
     let queue = device.new_command_queue();
     let cmd = queue.new_command_buffer();
-    kernels.encode_gather_qmm_rhs(
+    kernels.encode(
         cmd,
         &GatherQmmCall {
             weights: QuantWeights {

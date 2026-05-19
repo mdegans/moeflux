@@ -4,10 +4,10 @@
 #![cfg(target_os = "macos")]
 
 use metal::Device;
-use moeflux_metal::QmmKernels;
+use moeflux_metal::Kernels;
 
 #[test]
 fn qmm_kernels_build() {
     let device = Device::system_default().expect("no Metal device");
-    QmmKernels::new(&device).expect("build moeflux-metal kernels");
+    Kernels::new(&device).expect("build moeflux-metal kernels");
 }

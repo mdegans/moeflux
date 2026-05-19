@@ -25,7 +25,7 @@
 //! the same device.
 
 use metal::{Buffer, CommandBufferRef, MTLSize, NSUInteger};
-use moeflux_metal::{QmmCall, QmmKernels, QuantWeights};
+use moeflux_metal::{QmmCall, Kernels, QuantWeights};
 
 use super::encoder::pipeline_bundle;
 use crate::riir::io::mtl_weight_buf::MtlWeightBuf;
@@ -215,7 +215,7 @@ pub fn encode_matvec_n_tokens(
 #[allow(clippy::too_many_arguments)]
 pub fn encode_dense_matmul_n_tokens(
     cmdbuf: &CommandBufferRef,
-    qmm: &QmmKernels,
+    kernels: &Kernels,
     pipes: &MatvecPipelines,
     w_buf: &Buffer,
     w_off: u64,
@@ -234,7 +234,7 @@ pub fn encode_dense_matmul_n_tokens(
         return;
     }
     if bits == 4 {
-        qmm.encode_qmm_t(
+        kernels.encode(
             cmdbuf,
             &QmmCall {
                 weights: QuantWeights {

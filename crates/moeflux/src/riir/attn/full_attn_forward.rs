@@ -599,7 +599,7 @@ pub(in crate::riir) fn batched_full_attn_layer_forward(
         );
         encode_dense_matmul_n_tokens(
             cmdbuf,
-            metal.qmm(),
+            metal.kernels(),
             &mv,
             wf_buf.buffer(),
             attn.q_proj_w,
@@ -616,7 +616,7 @@ pub(in crate::riir) fn batched_full_attn_layer_forward(
         );
         encode_dense_matmul_n_tokens(
             cmdbuf,
-            metal.qmm(),
+            metal.kernels(),
             &mv,
             wf_buf.buffer(),
             attn.k_proj_w,
@@ -633,7 +633,7 @@ pub(in crate::riir) fn batched_full_attn_layer_forward(
         );
         encode_dense_matmul_n_tokens(
             cmdbuf,
-            metal.qmm(),
+            metal.kernels(),
             &mv,
             wf_buf.buffer(),
             attn.v_proj_w,
@@ -797,7 +797,7 @@ pub(in crate::riir) fn batched_full_attn_layer_forward(
         let cmdbuf = queue.new_command_buffer();
         encode_dense_matmul_n_tokens(
             cmdbuf,
-            metal.qmm(),
+            metal.kernels(),
             &mv,
             wf_buf.buffer(),
             attn.o_proj_w,
@@ -834,7 +834,7 @@ pub(in crate::riir) fn batched_full_attn_layer_forward(
         );
         encode_dense_matmul_n_tokens(
             cmdbuf,
-            metal.qmm(),
+            metal.kernels(),
             &mv,
             wf_buf.buffer(),
             layer_cache.gate.w,
@@ -851,7 +851,7 @@ pub(in crate::riir) fn batched_full_attn_layer_forward(
         );
         encode_dense_matmul_n_tokens(
             cmdbuf,
-            metal.qmm(),
+            metal.kernels(),
             &mv,
             wf_buf.buffer(),
             layer_cache.shared.seg_w,
@@ -946,7 +946,7 @@ pub(in crate::riir) fn batched_full_attn_layer_forward(
     let cmdbuf = queue.new_command_buffer();
     encode_dense_matmul_n_tokens(
         cmdbuf,
-        metal.qmm(),
+        metal.kernels(),
         &mv,
         wf_buf.buffer(),
         shared_gate_w,
@@ -963,7 +963,7 @@ pub(in crate::riir) fn batched_full_attn_layer_forward(
     );
     encode_dense_matmul_n_tokens(
         cmdbuf,
-        metal.qmm(),
+        metal.kernels(),
         &mv,
         wf_buf.buffer(),
         shared_up_w,
@@ -997,7 +997,7 @@ pub(in crate::riir) fn batched_full_attn_layer_forward(
     }
     encode_dense_matmul_n_tokens(
         cmdbuf,
-        metal.qmm(),
+        metal.kernels(),
         &mv,
         wf_buf.buffer(),
         shared_down_w,
@@ -1190,7 +1190,7 @@ pub(in crate::riir) fn batched_full_attn_layer_forward(
     encode_moe_batched_permute_fuse(
         cmdbuf,
         &matvec,
-        metal.qmm(),
+        metal.kernels(),
         &swiglu,
         &bucket_accumulate,
         expert_base,

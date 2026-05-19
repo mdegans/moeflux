@@ -948,7 +948,7 @@ fn moe_permute_fuse_n_tokens_matches_tokenwise() {
         encode_moe_batched_permute_fuse(
             cmdbuf,
             &matvec_pipes,
-            metal.qmm(),
+            metal.kernels(),
             &swiglu,
             &bucket_accumulate,
             expert_base.buffer(),
