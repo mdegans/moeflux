@@ -2059,8 +2059,9 @@ pub(in crate::riir) fn batched_linear_attn_layer_forward<B>(
     // `prefetch.dispatch` for this layer and wants the bucket-vs-
     // prediction set match + record_outcome / record_actual. Only
     // enabled by `step_internal_batched_gqa` at N == 1 (decode
-    // re-routed eval_token shape) and only in pread mode.
-    mut prefetch: Option<PrefetchEnv<'_>>,
+    // re-routed eval_token shape) and only in pread mode. Moved into
+    // `moe_block_forward` unchanged.
+    prefetch: Option<PrefetchEnv<'_>>,
     // S10b-1a-ii (session 11): hidden in/out are pool BufIds. The
     // orchestrator owns the alternating double-buffer pair and passes
     // ids per layer; this producer resolves to `&metal::Buffer` via
@@ -2081,7 +2082,6 @@ where
     LayerForwardError: From<<B::Pool as BufferPool>::Error>,
 {
     use crate::riir::moe::expert_forward::MAX_K;
-    use crate::riir::moe::moe_router::build_expert_buckets;
 
     // S10b-1b (session 11): no parts_mut destructure here — Phase 2's
     // graph build owns its own pool borrow inside an inner scope, then
@@ -2174,7 +2174,6 @@ where
         ),
     );
 
-    let f32_sz_u = std::mem::size_of::<f32>();
     let value_dim = Variant::LINEAR_VALUE_DIM as u32;
     let k_heads_per_v =
         (v.linear_num_v_heads / v.linear_num_k_heads) as u32;
@@ -2410,14 +2409,6 @@ where
         g
     };
 
-    // S10b-2: boundary BufIds are scratch fields — named here for the
-    // imperative MoE block (1f-1h) + host readback below.
-    let h_mid_id = moe.h_mid;
-    let h_post_id = moe.h_post;
-    let shared_gate_id = moe.shared_gate;
-    let routing_indices_id = moe.routing_indices;
-    let routing_weights_id = moe.routing_weights;
-
     // S10b-2 Phase 4: on the first call, lifetime-color graph1's
     // transient BufIds (and pin them). Topology is layer- and
     // step-invariant, so one pass holds for the whole run. graph2 has
@@ -2429,6 +2420,67 @@ where
     // Submit + wait. Single cmdbuf, single commit (the S7-1a fusion
     // is preserved by `MetalBackend::execute`'s default loop body).
     backend.execute(&graph, "graph_linear_attn")?;
+
+    // Prefill-arc Phase 3b: host readback → CPU bucket build → expert
+    // staging → graph2 are the shared `moe_block_forward`, driven
+    // identically by the full-attn producer.
+    moe_block_forward(
+        backend,
+        moe,
+        wf,
+        layer_cache,
+        layer_idx,
+        n_tokens,
+        k_active,
+        expert_files,
+        moe_buffers,
+        prefetch,
+        hidden_out_id,
+    )
+}
+
+/// Run the shared MoE block — the tail half of every batched layer
+/// forward, after the attention `graph1` has produced its outputs into
+/// the [`MoeGraphScratch`] boundary buffers (`h_mid`, `h_post`,
+/// `shared_gate`, `routing_indices`, `routing_weights`).
+///
+/// Identical for linear-attn and full-attn layers: host-reads the
+/// router output, builds the expert buckets on the CPU, stages expert
+/// weights (pread) or points at the mmap layer, then runs `graph2` —
+/// shared FFN + MoE permute-fuse + combine into `hidden_out_id`. The
+/// `graph2` `commit_plan` is gated by `moe.commit_planned` (its
+/// topology is identical regardless of which attention kind produced
+/// the inputs, so one pass holds for the whole run).
+pub(in crate::riir) fn moe_block_forward<B>(
+    backend: &mut B,
+    moe: &MoeGraphScratch,
+    wf: &WeightFile,
+    layer_cache: &LayerWeightCache,
+    layer_idx: usize,
+    n_tokens: usize,
+    k_active: usize,
+    expert_files: &ExpertFiles,
+    moe_buffers: &mut crate::riir::moe::expert_forward::MoeBuffers,
+    mut prefetch: Option<PrefetchEnv<'_>>,
+    hidden_out_id: crate::riir::backend::BufId,
+) -> Result<(), LayerForwardError>
+where
+    B: Backend,
+    LayerForwardError: From<B::Error>,
+    LayerForwardError: From<<B::Pool as BufferPool>::Error>,
+{
+    use crate::riir::backend::{Graph, Op, WeightRef};
+    use crate::riir::moe::moe_router::build_expert_buckets;
+
+    let v = VARIANT;
+    let hidden_dim = v.hidden_dim;
+    let f32_sz_u = std::mem::size_of::<f32>();
+    // Boundary BufIds produced by the attention `graph1`.
+    let h_mid_id = moe.h_mid;
+    let h_post_id = moe.h_post;
+    let shared_gate_id = moe.shared_gate;
+    let routing_indices_id = moe.routing_indices;
+    let routing_weights_id = moe.routing_weights;
 
     // Host readback at the graph1 → MoE-graph split: h_post (for the
     // bucket_input gather) + routing indices/weights (for
@@ -2607,7 +2659,7 @@ where
     let graph2 = {
         let mut g = Graph::new();
         g.push(Op::MatvecNTokens {
-            label: "linear_attn.shared_gate_proj",
+            label: "moe.shared_gate_proj",
             weight: WeightRef {
                 w_off: layer_cache.shared.gate_w,
                 s_off: layer_cache.shared.gate_s,
@@ -2623,7 +2675,7 @@ where
             n_tokens: n_tokens as u32,
         });
         g.push(Op::MatvecNTokens {
-            label: "linear_attn.shared_up_proj",
+            label: "moe.shared_up_proj",
             weight: WeightRef {
                 w_off: layer_cache.shared.up_w,
                 s_off: layer_cache.shared.up_s,
@@ -2639,14 +2691,14 @@ where
             n_tokens: n_tokens as u32,
         });
         g.push(Op::SwigluFusedBatched {
-            label: "linear_attn.shared_swiglu",
+            label: "moe.shared_swiglu",
             gate: moe.shared_ffn_gate,
             up: moe.shared_up,
             out: moe.shared_act,
             total: (n_tokens * v.shared_intermediate) as u32,
         });
         g.push(Op::MatvecNTokens {
-            label: "linear_attn.shared_down_proj",
+            label: "moe.shared_down_proj",
             weight: WeightRef {
                 w_off: layer_cache.shared.down_w,
                 s_off: layer_cache.shared.down_s,
@@ -2662,12 +2714,12 @@ where
             n_tokens: n_tokens as u32,
         });
         g.push(Op::ZeroBuffer {
-            label: "linear_attn.moe_out_sum_zero",
+            label: "moe.out_sum_zero",
             buf: moe.out_sum,
             n_bytes: (n_tokens * hidden_dim * f32_sz_u) as u32,
         });
         g.push(Op::MoeBatchedPermuteFuse {
-            label: "linear_attn.moe_permute_fuse",
+            label: "moe.permute_fuse",
             expert_base: expert_base_id,
             expert_stride: v.expert_size_4bit() as u64,
             expert_indices: moe.expert_indices,
@@ -2683,7 +2735,7 @@ where
             buckets,
         });
         g.push(Op::MoeCombineResidualNTokens {
-            label: "linear_attn.moe_combine",
+            label: "moe.combine",
             h_mid: h_mid_id,
             moe_sum: moe.out_sum,
             shared_out: moe.shared_down,
