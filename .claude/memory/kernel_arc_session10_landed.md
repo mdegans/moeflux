@@ -63,18 +63,19 @@ Work is correctness-gated but uncommitted pending Mike's call at the
 checkpoint (session 9 precedent: commit on correctness, bench
 confirms after). One commit, `shaders.metal` only.
 
-## Next — session 11 (fork, decide post-bench)
+## Next — session 11: SDPA → simdgroup_matrix
 
-See `kernel_arc_session11_plan.md`. Two candidates:
-1. **Tier 2 — `s0q`** (Phase 5 GEMM1). Needs staging `q` (+8 KB) →
-   over the 32 KB cap → cascades into `sdc` 8→4 KB → Phase-6 strip
-   16→8 + re-verify. Its own plan-mode pass. Alternative: a
-   producer-side `conv_out` pad of CW_C tokens kills the cascade
-   (q loads direct from device) but relaxes "shaders.metal only".
-2. **Pivot to MoE GEMMs.** `moe_permute_fuse` profiled at a
-   magnitude comparable to `gated_delta_net_step` (session 9:
-   ~17–20 ms/commit) — likely the bigger fish now that linear-attn's
-   matmul story is nearly closed.
+The post-Tier-1 per-op profile (run at the close of session 10)
+**refuted the Tier-2-vs-MoE fork**. At production prefill shape
+(`profile_8192`), full-attention `batched_sdpa_causal_flash` is
+**33.2% of wall and O(n²)** — 2.4× the whole MoE chunk, and it only
+grows with context. `attn_sdpa_causal_flash` does QK^T and P·V with
+scalar `fma`+`simd_sum`, not `simdgroup_matrix` — the kernel's own
+header comment names it as the follow-up lever.
+
+Full detailed plan: `kernel_arc_session11_plan.md` (GPU capture
+first → QK^T GEMM → P·V GEMM → GQA-fold). Tier-2 `s0q` parked; MoE
+GEMMs → session 12.
 
 Also queued: delete `GatedDeltaNetStepNTokens` (per-token Op +
 kernel + arms) once a clean post-reboot bench confirms chunkwise
