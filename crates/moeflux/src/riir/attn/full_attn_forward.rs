@@ -58,7 +58,7 @@ use crate::riir::backend::gpu::gpu_matvec::encode_dense_matmul_n_tokens;
 use crate::riir::attn::linear_attn_forward::{
     bits_of, full_attn_layer_idx_for, moe_dispatch_per_token,
     post_attention_pre_moe, read_buffer_to_vec, GpuAttnEncodeArgs,
-    LayerForwardError, OProj, PostAttnIntermediates,
+    LayerForwardError, MoeGraphScratch, OProj, PostAttnIntermediates,
 };
 use crate::riir::backend::gpu::metal::MetalContext;
 use crate::riir::attn::rms_norm::rms_norm_per_head_cpu;
@@ -67,29 +67,27 @@ use crate::riir::attn::sdpa::sdpa_cpu;
 use crate::riir::snapshot::state::KvCache;
 use crate::riir::variants::VARIANT;
 
-/// Run-lifetime scratch for the batched full-attn graph (`graph1`).
+/// Run-lifetime scratch for the batched full-attn `graph1`.
 ///
 /// The full-attn counterpart of
-/// [`crate::riir::attn::linear_attn_forward::BatchedGraphScratch`]:
-/// every buffer allocated once at `BATCHED_CHUNK_SIZE` width, the
-/// `*NTokens` Ops stride by the real `n_tokens` and the max-chunk
-/// tail is simply unused. Two classes, per the `commit_plan`
-/// contract:
+/// [`crate::riir::attn::linear_attn_forward::LinearAttnGraphScratch`]:
+/// holds only the full-attn-specific intra-`graph1` transients plus the
+/// precomputed RoPE frequency table. Every buffer allocated once at
+/// `BATCHED_CHUNK_SIZE` width; the `*NTokens` Ops stride by the real
+/// `n_tokens` and the max-chunk tail is simply unused.
 ///
 /// - **Intra-graph1 transients** (`normed` … `gate_logits`):
 ///   `persistent = false`. The first producer call `commit_plan`s the
 ///   graph, which lifetime-colors them down to a small physical set.
-/// - **Graph1 → MoE-block boundary** (`h_mid` … `routing_weights`):
-///   `persistent = true` — written in graph1, read by the (still
-///   imperative) MoE block and the host readback; never aliased.
+/// - `inv_freq` is the precomputed vanilla-RoPE frequency table — a
+///   read-only graph input, `persistent = true`, uploaded once at
+///   construction.
 ///
-/// `inv_freq` is the precomputed vanilla-RoPE frequency table — a
-/// read-only graph input, uploaded once at construction.
-///
-/// The hidden double-buffer is *not* owned here: the orchestrator's
-/// [`BatchedGraphScratch`](crate::riir::attn::linear_attn_forward::BatchedGraphScratch)
-/// `hidden_a`/`hidden_b` are run-lifetime and shared; full-attn
-/// receives them as `hidden_in_id` / `hidden_out_id`.
+/// The graph1→MoE boundary buffers live in the shared
+/// [`MoeGraphScratch`](crate::riir::attn::linear_attn_forward::MoeGraphScratch);
+/// the hidden double-buffer in
+/// [`HiddenDoubleBuffer`](crate::riir::attn::linear_attn_forward::HiddenDoubleBuffer).
+/// Both are orchestrator-owned and passed in per layer.
 pub struct FullAttnGraphScratch {
     // Intra-graph1 transients (colorable).
     pub normed: BufId,
@@ -101,26 +99,20 @@ pub struct FullAttnGraphScratch {
     pub attn_out_stack: BufId,
     pub o_proj_stack: BufId,
     pub gate_logits: BufId,
-    // Graph1 → MoE-block boundary (persistent, never aliased).
-    pub h_mid: BufId,
-    pub h_post: BufId,
-    pub shared_gate: BufId,
-    pub routing_indices: BufId,
-    pub routing_weights: BufId,
     /// Precomputed vanilla-RoPE `inv_freq` table — persistent,
     /// read-only, uploaded once at construction.
     pub inv_freq: BufId,
-    /// One-time `commit_plan` latch — cleared at construction, set by
-    /// the first producer call. See `BatchedGraphScratch`.
+    /// One-time `commit_plan` latch for `graph1` — cleared at
+    /// construction, set by the first producer call. The MoE `graph2`
+    /// has its own latch on `MoeGraphScratch`.
     pub commit_planned: std::cell::Cell<bool>,
 }
 
 impl FullAttnGraphScratch {
-    /// Allocate every batched-graph scratch buffer at max chunk width
-    /// and upload the RoPE frequency table. Intra-graph transients are
-    /// `persistent = false` (the first producer call `commit_plan`s +
-    /// pins them); the boundary buffers + `inv_freq` are
-    /// `persistent = true`.
+    /// Allocate the `graph1` transients at max chunk width and upload
+    /// the RoPE frequency table. The transients are `persistent =
+    /// false` (the first producer call `commit_plan`s + pins them);
+    /// `inv_freq` is `persistent = true`.
     pub fn new(pool: &mut MetalBufferPool) -> Self {
         let v = VARIANT;
         let chunk = crate::riir::BATCHED_CHUNK_SIZE;
@@ -128,7 +120,6 @@ impl FullAttnGraphScratch {
         let hidden = v.hidden_dim;
         let q_dim = v.num_attn_heads * v.head_dim;
         let kv_dim = v.num_kv_heads * v.head_dim;
-        let max_k = crate::riir::moe::expert_forward::MAX_K;
 
         // Colorable transients first (`persistent = false`), in their
         // own `&mut pool` scope so it ends before the persistent pass.
@@ -170,28 +161,12 @@ impl FullAttnGraphScratch {
             })
             .collect();
 
-        let (
-            h_mid,
-            h_post,
-            shared_gate,
-            routing_indices,
-            routing_weights,
-            inv_freq,
-        ) = {
-            let mut p = |bytes: usize, label: &'static str| {
-                pool.alloc(bytes, label, true)
-                    .expect("FullAttnGraphScratch::new pool alloc")
-            };
-            let chk = |elems: usize| chunk * elems * f32_sz;
-            (
-                p(chk(hidden), "fags.h_mid"),
-                p(chk(hidden), "fags.h_post"),
-                p(chk(1), "fags.shared_gate"),
-                p(chk(max_k), "fags.routing_indices"),
-                p(chk(max_k), "fags.routing_weights"),
-                p(half * f32_sz, "fags.inv_freq"),
-            )
-        };
+        // `inv_freq` is the sole persistent buffer — allocated last so
+        // the highest BufId index is `persistent = true`, keeping the
+        // transients above safe under `reset_transient`.
+        let inv_freq = pool
+            .alloc(half * f32_sz, "fags.inv_freq", true)
+            .expect("FullAttnGraphScratch::new pool alloc");
         pool.upload(inv_freq, unsafe {
             std::slice::from_raw_parts(
                 inv_freq_host.as_ptr() as *const u8,
@@ -210,11 +185,6 @@ impl FullAttnGraphScratch {
             attn_out_stack,
             o_proj_stack,
             gate_logits,
-            h_mid,
-            h_post,
-            shared_gate,
-            routing_indices,
-            routing_weights,
             inv_freq,
             commit_planned: std::cell::Cell::new(false),
         }
@@ -687,9 +657,12 @@ pub(in crate::riir) fn batched_full_attn_layer_forward(
     // double-buffer BufIds, swapped between layers.
     hidden_in_id: BufId,
     hidden_out_id: BufId,
-    // Run-lifetime scratch for graph1, allocated once at max chunk
-    // width by `ensure_linear_resources`.
+    // Run-lifetime scratch, allocated once at max chunk width by
+    // `ensure_linear_resources`. `scratch` holds the full-attn
+    // `graph1` transients; `moe` is the shared MoE-block scratch
+    // (boundary buffers + `graph2` working set).
     scratch: &FullAttnGraphScratch,
+    moe: &MoeGraphScratch,
 ) -> Result<(), LayerForwardError> {
     use crate::riir::moe::expert_forward::{
         encode_moe_batched_permute_fuse, encode_moe_combine_residual_n_tokens,
@@ -926,15 +899,15 @@ pub(in crate::riir) fn batched_full_attn_layer_forward(
             label: "full_attn.residual_add",
             a: scratch.o_proj_stack,
             b: hidden_in_id,
-            out: scratch.h_mid,
+            out: moe.h_mid,
             n_tokens: n,
             dim: hidden_dim as u32,
         });
         g.push(Op::RmsNormBf16NTokens {
             label: "full_attn.post_attn_norm",
-            x: scratch.h_mid,
+            x: moe.h_mid,
             weight_off: layer_cache.post_attention_layernorm_w,
-            out: scratch.h_post,
+            out: moe.h_post,
             dim: hidden_dim as u32,
             n_tokens: n,
             eps,
@@ -947,7 +920,7 @@ pub(in crate::riir) fn batched_full_attn_layer_forward(
                 b_off: layer_cache.gate.b,
                 bits: gate_bits,
             },
-            input: scratch.h_post,
+            input: moe.h_post,
             input_off: 0,
             output: scratch.gate_logits,
             output_off: 0,
@@ -963,9 +936,9 @@ pub(in crate::riir) fn batched_full_attn_layer_forward(
                 b_off: layer_cache.shared.seg_b,
                 bits: seg_bits,
             },
-            input: scratch.h_post,
+            input: moe.h_post,
             input_off: 0,
-            output: scratch.shared_gate,
+            output: moe.shared_gate,
             output_off: 0,
             in_dim: hidden_dim as u32,
             out_dim: 1,
@@ -974,15 +947,15 @@ pub(in crate::riir) fn batched_full_attn_layer_forward(
         g.push(Op::MoeSoftmaxTopK {
             label: "full_attn.router_softmax_topk",
             logits: scratch.gate_logits,
-            indices_out: scratch.routing_indices,
-            weights_out: scratch.routing_weights,
+            indices_out: moe.routing_indices,
+            weights_out: moe.routing_weights,
             n_tokens: n,
             n_experts: v.num_experts as u32,
             k: k_active as u32,
         });
         g.push(Op::MoeNormalizeWeights {
             label: "full_attn.router_normalize",
-            weights: scratch.routing_weights,
+            weights: moe.routing_weights,
             n_tokens: n,
             k: k_active as u32,
         });
@@ -1008,19 +981,19 @@ pub(in crate::riir) fn batched_full_attn_layer_forward(
     let mut all_routing_weights = vec![0.0f32; n_tokens * k_active];
     {
         let pool = backend.pool();
-        pool.download(scratch.h_post, unsafe {
+        pool.download(moe.h_post, unsafe {
             std::slice::from_raw_parts_mut(
                 h_post_stack.as_mut_ptr() as *mut u8,
                 n_tokens * hidden_dim * std::mem::size_of::<f32>(),
             )
         })?;
-        pool.download(scratch.routing_indices, unsafe {
+        pool.download(moe.routing_indices, unsafe {
             std::slice::from_raw_parts_mut(
                 all_routing_indices.as_mut_ptr() as *mut u8,
                 n_tokens * k_active * std::mem::size_of::<i32>(),
             )
         })?;
-        pool.download(scratch.routing_weights, unsafe {
+        pool.download(moe.routing_weights, unsafe {
             std::slice::from_raw_parts_mut(
                 all_routing_weights.as_mut_ptr() as *mut u8,
                 n_tokens * k_active * std::mem::size_of::<f32>(),
@@ -1035,9 +1008,9 @@ pub(in crate::riir) fn batched_full_attn_layer_forward(
     let (metal, wf_buf, buffer_pool) = backend.parts_mut();
     let device = metal.device().clone();
     let mv = MatvecPipelines::fetch(metal)?;
-    let h_post_gpu = buffer_pool.handle(scratch.h_post);
-    let h_mid_gpu = buffer_pool.handle(scratch.h_mid);
-    let shared_gate_gpu = buffer_pool.handle(scratch.shared_gate);
+    let h_post_gpu = buffer_pool.handle(moe.h_post);
+    let h_mid_gpu = buffer_pool.handle(moe.h_mid);
+    let shared_gate_gpu = buffer_pool.handle(moe.shared_gate);
     let hidden_out_gpu = buffer_pool.handle(hidden_out_id);
 
     // ── Phase 3d: batched shared FFN (gate matvec, up matvec,

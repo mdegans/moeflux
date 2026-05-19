@@ -179,25 +179,20 @@ pub struct LayerForwardBuffers {
 /// Backwards-compat alias for the original 4c name.
 pub type LinearAttnBuffers = LayerForwardBuffers;
 
-/// Run-lifetime scratch BufIds for the batched linear-attn graph
-/// (S10b-2). Allocated once, sized at `BATCHED_CHUNK_SIZE` token
-/// width; every step and every layer reuses these ids. A smaller
-/// chunk (or a decode step at `n_tokens = 1`) processes only a
-/// prefix — the `*NTokens` Ops stride by the real `n_tokens`.
+/// Run-lifetime scratch BufIds for the batched linear-attn `graph1`
+/// (S10b-2 / prefill-arc Phase 3). Allocated once, sized at
+/// `BATCHED_CHUNK_SIZE` token width; every step and every layer reuses
+/// these ids. A smaller chunk (or a decode step at `n_tokens = 1`)
+/// processes only a prefix — the `*NTokens` Ops stride by the real
+/// `n_tokens`.
 ///
-/// All buffers are allocated `persistent = true` so the per-step
-/// `reset_transient()` leaves them intact. Two classes for the
-/// S10b-2 Phase-4 `commit_plan` pass:
-/// - **Intra-graph1 transients** (`normed` … `gate_logits`): written
-///   and last-read inside the pre-MoE graph. Phase 4 temporarily
-///   flips them to `persistent = false`, runs `commit_plan` to
-///   lifetime-color them down to a small physical set, then re-pins
-///   them to `persistent = true`.
-/// - **Graph1→graph2 boundary buffers** (`h_mid` … `hidden_b`):
-///   written in graph1, read in the MoE block / next layer. Stay
-///   `persistent = true` throughout — never aliased, so they safely
-///   bridge the CPU-readback split and the cross-layer double-buffer.
-pub struct BatchedGraphScratch {
+/// Holds *only* the linear-attn-specific intra-`graph1` transients.
+/// The graph1→MoE boundary + the MoE block's working set live in the
+/// shared [`MoeGraphScratch`]; the cross-layer hidden double-buffer in
+/// [`HiddenDoubleBuffer`]. All allocated `persistent = false` — the
+/// first producer call `commit_plan`s, which lifetime-colors them down
+/// to a small physical set and pins them for the run.
+pub struct LinearAttnGraphScratch {
     // Intra-graph1 transients (colorable).
     pub normed: BufId,
     pub qkv_stack: BufId,
@@ -211,22 +206,106 @@ pub struct BatchedGraphScratch {
     pub value_out_stack: BufId,
     pub o_proj_stack: BufId,
     pub gate_logits: BufId,
-    // Graph1→graph2 boundary (persistent, never aliased).
+    /// One-time latch: cleared at construction, set by the first
+    /// producer call after it `commit_plan`s `graph1`. Gates the
+    /// lifetime-coloring pass to run exactly once per run. The MoE
+    /// `graph2` has its own latch on [`MoeGraphScratch`].
+    pub commit_planned: std::cell::Cell<bool>,
+}
+
+impl LinearAttnGraphScratch {
+    /// Allocate the `graph1` transients at max chunk width, all
+    /// `persistent = false` (the first producer call `commit_plan`s +
+    /// pins them).
+    pub fn new(pool: &mut MetalBufferPool) -> Self {
+        let v = VARIANT;
+        let chunk = crate::riir::BATCHED_CHUNK_SIZE;
+        let f32_sz = std::mem::size_of::<f32>();
+        let hidden = v.hidden_dim;
+        let conv = v.linear_conv_dim();
+        let total_value = v.linear_total_value();
+        let num_v = v.linear_num_v_heads;
+        let delta_out = num_v * Variant::LINEAR_VALUE_DIM;
+        let mut c = |elems: usize, label: &'static str| {
+            pool.alloc(chunk * elems * f32_sz, label, false)
+                .expect("LinearAttnGraphScratch::new pool alloc")
+        };
+        Self {
+            normed: c(hidden, "lags.normed"),
+            qkv_stack: c(conv, "lags.qkv_stack"),
+            z_stack: c(total_value, "lags.z_stack"),
+            beta_stack: c(num_v, "lags.beta_stack"),
+            alpha_stack: c(num_v, "lags.alpha_stack"),
+            conv_out_stack: c(conv, "lags.conv_out_stack"),
+            g_decay_stack: c(num_v, "lags.g_decay_stack"),
+            beta_gate_stack: c(num_v, "lags.beta_gate_stack"),
+            delta_out_stack: c(delta_out, "lags.delta_out_stack"),
+            value_out_stack: c(total_value, "lags.value_out_stack"),
+            o_proj_stack: c(hidden, "lags.o_proj_stack"),
+            gate_logits: c(v.num_experts, "lags.gate_logits"),
+            commit_planned: std::cell::Cell::new(false),
+        }
+    }
+}
+
+/// Cross-layer hidden double-buffer — run-lifetime, orchestrator-owned.
+/// Each layer reads `hidden_in` and writes `hidden_out`; the
+/// orchestrator swaps the pair between layers. Lifted out of the
+/// per-layer scratch (prefill-arc Phase 3) so the attention scratch
+/// structs hold only per-layer state, not run-level orchestrator state.
+pub struct HiddenDoubleBuffer {
+    pub hidden_a: BufId,
+    pub hidden_b: BufId,
+}
+
+impl HiddenDoubleBuffer {
+    /// Allocate the alternating hidden pair at max chunk width, both
+    /// `persistent = true` (never aliased — they bridge layers).
+    pub fn new(pool: &mut MetalBufferPool) -> Self {
+        let v = VARIANT;
+        let chunk = crate::riir::BATCHED_CHUNK_SIZE;
+        let bytes = chunk * v.hidden_dim * std::mem::size_of::<f32>();
+        let mut p = |label: &'static str| {
+            pool.alloc(bytes, label, true)
+                .expect("HiddenDoubleBuffer::new pool alloc")
+        };
+        Self {
+            hidden_a: p("hdb.hidden_a"),
+            hidden_b: p("hdb.hidden_b"),
+        }
+    }
+}
+
+/// Run-lifetime scratch for the shared MoE block (`graph2`) — the
+/// graph1→MoE boundary buffers plus the shared-FFN + permute-fuse
+/// working set. One instance, owned by the orchestrator, reused by
+/// every layer's MoE block regardless of attention kind (layers run
+/// sequentially — no aliasing hazard). Both attention producers
+/// receive it as `&MoeGraphScratch` (prefill-arc Phase 3).
+///
+/// Two `commit_plan` classes:
+/// - **graph1→MoE boundary** (`h_mid` … `routing_weights`): written by
+///   the attention `graph1`, read by the MoE block. `persistent = true`
+///   — never aliased.
+/// - **MoE working set** (`shared_ffn_gate` … `expert_indices`):
+///   `shared_ffn_gate` … `out_sum` are colorable transients
+///   (`persistent = false`); the host-uploaded inputs (`bucket_input`,
+///   `bucket_token_idx`, `bucket_weights`, `expert_base`,
+///   `expert_indices`) are `persistent = true`.
+pub struct MoeGraphScratch {
+    // Graph1→MoE boundary (persistent, never aliased).
     pub h_mid: BufId,
     pub h_post: BufId,
     pub shared_gate: BufId,
     pub routing_indices: BufId,
     pub routing_weights: BufId,
-    // Cross-layer hidden double-buffer (orchestrator swaps per layer).
-    pub hidden_a: BufId,
-    pub hidden_b: BufId,
-    // MoE block (graph2) — shared FFN intermediates.
+    // Shared FFN intermediates (colorable transients).
     pub shared_ffn_gate: BufId,
     pub shared_up: BufId,
     pub shared_act: BufId,
     pub shared_down: BufId,
-    // MoE block (graph2) — bucket-flat scratch. Sized for
-    // `BATCHED_CHUNK_SIZE * k_active` assignments.
+    // Bucket-flat scratch. Sized for `BATCHED_CHUNK_SIZE * k_active`
+    // assignments.
     pub bucket_input: BufId,
     pub bucket_gate: BufId,
     pub bucket_up: BufId,
@@ -248,20 +327,20 @@ pub struct BatchedGraphScratch {
     /// k_active` wide — the gather kernel's `indices`. Filled per
     /// layer from `buckets`.
     pub expert_indices: BufId,
-    /// One-time latch: cleared at construction, set by the first
-    /// producer call after it `commit_plan`s graph1 + graph2. Gates
-    /// the lifetime-coloring pass to run exactly once per run.
+    /// One-time latch: cleared at construction, set by the first MoE
+    /// block call after it `commit_plan`s `graph2`. `graph2`'s
+    /// topology is identical regardless of which attention kind
+    /// produced its inputs, so one pass holds for the whole run.
     pub commit_planned: std::cell::Cell<bool>,
 }
 
-impl BatchedGraphScratch {
-    /// Allocate every batched-graph scratch buffer at max chunk
-    /// width. The intra-graph transients are `persistent = false`
-    /// (the first producer call `commit_plan`s + pins them); the
-    /// graph1→graph2 boundary buffers + uploaded inputs are
-    /// `persistent = true`. `k_active` sizes the bucket-flat MoE
-    /// buffers; `pread_mode` gates the per-expert weight blobs
-    /// (skipped in mmap mode).
+impl MoeGraphScratch {
+    /// Allocate the MoE-block scratch at max chunk width. The shared-
+    /// FFN intermediates are `persistent = false` (the first MoE block
+    /// call `commit_plan`s + pins them); the boundary buffers +
+    /// host-uploaded inputs are `persistent = true`. `k_active` sizes
+    /// the bucket-flat buffers; `pread_mode` gates the per-expert
+    /// weight staging blob (skipped in mmap mode).
     pub fn new(
         pool: &mut MetalBufferPool,
         k_active: usize,
@@ -271,31 +350,12 @@ impl BatchedGraphScratch {
         let chunk = crate::riir::BATCHED_CHUNK_SIZE;
         let f32_sz = std::mem::size_of::<f32>();
         let hidden = v.hidden_dim;
-        let conv = v.linear_conv_dim();
-        let total_value = v.linear_total_value();
-        let num_v = v.linear_num_v_heads;
-        let delta_out = num_v * Variant::LINEAR_VALUE_DIM;
         let shared_inter = v.shared_intermediate;
         let moe_inter = v.moe_intermediate;
-        // All colorable transients first (`persistent = false`), then
-        // all pinned buffers (`persistent = true`) — two passes so the
-        // two `&mut pool` closures never overlap. BufId order within
-        // the scratch set is irrelevant: `commit_plan` colors by
-        // topology and `reset_transient` keeps everything up to the
-        // last persistent BufId (all of these end up persistent).
+        // Colorable transients first (`persistent = false`), then
+        // pinned buffers (`persistent = true`) — two passes so the two
+        // `&mut pool` closures never overlap.
         let (
-            normed,
-            qkv_stack,
-            z_stack,
-            beta_stack,
-            alpha_stack,
-            conv_out_stack,
-            g_decay_stack,
-            beta_gate_stack,
-            delta_out_stack,
-            value_out_stack,
-            o_proj_stack,
-            gate_logits,
             shared_ffn_gate,
             shared_up,
             shared_act,
@@ -308,53 +368,38 @@ impl BatchedGraphScratch {
         ) = {
             let mut c = |elems: usize, label: &'static str| {
                 pool.alloc(chunk * elems * f32_sz, label, false)
-                    .expect("BatchedGraphScratch::new pool alloc")
+                    .expect("MoeGraphScratch::new pool alloc")
             };
             (
-                c(hidden, "bgs.normed"),
-                c(conv, "bgs.qkv_stack"),
-                c(total_value, "bgs.z_stack"),
-                c(num_v, "bgs.beta_stack"),
-                c(num_v, "bgs.alpha_stack"),
-                c(conv, "bgs.conv_out_stack"),
-                c(num_v, "bgs.g_decay_stack"),
-                c(num_v, "bgs.beta_gate_stack"),
-                c(delta_out, "bgs.delta_out_stack"),
-                c(total_value, "bgs.value_out_stack"),
-                c(hidden, "bgs.o_proj_stack"),
-                c(v.num_experts, "bgs.gate_logits"),
-                c(shared_inter, "bgs.shared_ffn_gate"),
-                c(shared_inter, "bgs.shared_up"),
-                c(shared_inter, "bgs.shared_act"),
-                c(hidden, "bgs.shared_down"),
-                c(k_active * moe_inter, "bgs.bucket_gate"),
-                c(k_active * moe_inter, "bgs.bucket_up"),
-                c(k_active * moe_inter, "bgs.bucket_act"),
-                c(k_active * hidden, "bgs.bucket_out"),
-                c(hidden, "bgs.out_sum"),
+                c(shared_inter, "mgs.shared_ffn_gate"),
+                c(shared_inter, "mgs.shared_up"),
+                c(shared_inter, "mgs.shared_act"),
+                c(hidden, "mgs.shared_down"),
+                c(k_active * moe_inter, "mgs.bucket_gate"),
+                c(k_active * moe_inter, "mgs.bucket_up"),
+                c(k_active * moe_inter, "mgs.bucket_act"),
+                c(k_active * hidden, "mgs.bucket_out"),
+                c(hidden, "mgs.out_sum"),
             )
         };
         let mut p = |bytes: usize, label: &'static str| {
             pool.alloc(bytes, label, true)
-                .expect("BatchedGraphScratch::new pool alloc")
+                .expect("MoeGraphScratch::new pool alloc")
         };
         let chk = |elems: usize| chunk * elems * f32_sz;
         // Bucket-flat buffers hold `chunk * k_active` assignments.
         let bkt = |per: usize| chunk * k_active * per * f32_sz;
-        let h_mid = p(chk(hidden), "bgs.h_mid");
-        let h_post = p(chk(hidden), "bgs.h_post");
-        let shared_gate = p(chk(1), "bgs.shared_gate");
-        let routing_indices =
-            p(chk(crate::riir::moe::expert_forward::MAX_K), "bgs.routing_indices");
-        let routing_weights =
-            p(chk(crate::riir::moe::expert_forward::MAX_K), "bgs.routing_weights");
-        let hidden_a = p(chk(hidden), "bgs.hidden_a");
-        let hidden_b = p(chk(hidden), "bgs.hidden_b");
-        let bucket_input = p(bkt(hidden), "bgs.bucket_input");
+        let max_k = crate::riir::moe::expert_forward::MAX_K;
+        let h_mid = p(chk(hidden), "mgs.h_mid");
+        let h_post = p(chk(hidden), "mgs.h_post");
+        let shared_gate = p(chk(1), "mgs.shared_gate");
+        let routing_indices = p(chk(max_k), "mgs.routing_indices");
+        let routing_weights = p(chk(max_k), "mgs.routing_weights");
+        let bucket_input = p(bkt(hidden), "mgs.bucket_input");
         let bucket_token_idx =
-            p(chunk * k_active * f32_sz, "bgs.bucket_token_idx");
+            p(chunk * k_active * f32_sz, "mgs.bucket_token_idx");
         let bucket_weights =
-            p(chunk * k_active * f32_sz, "bgs.bucket_weights");
+            p(chunk * k_active * f32_sz, "mgs.bucket_weights");
         // One staging buffer holding every expert's block at
         // `expert_size_4bit()` stride. Pread-only — mmap mode points
         // the gather GEMM straight at the layer mmap buffer. (Prefetch
@@ -362,32 +407,18 @@ impl BatchedGraphScratch {
         // always runs prefetch-disabled, so pread is the only IO mode
         // that needs a staging copy.)
         let expert_base = pread_mode.then(|| {
-            p(v.num_experts * v.expert_size_4bit(), "bgs.expert_base")
+            p(v.num_experts * v.expert_size_4bit(), "mgs.expert_base")
         });
         let expert_indices = p(
             chunk * k_active * std::mem::size_of::<u32>(),
-            "bgs.expert_indices",
+            "mgs.expert_indices",
         );
         Self {
-            normed,
-            qkv_stack,
-            z_stack,
-            beta_stack,
-            alpha_stack,
-            conv_out_stack,
-            g_decay_stack,
-            beta_gate_stack,
-            delta_out_stack,
-            value_out_stack,
-            o_proj_stack,
-            gate_logits,
             h_mid,
             h_post,
             shared_gate,
             routing_indices,
             routing_weights,
-            hidden_a,
-            hidden_b,
             shared_ffn_gate,
             shared_up,
             shared_act,
@@ -2038,8 +2069,11 @@ pub(in crate::riir) fn batched_linear_attn_layer_forward<B>(
     hidden_out_id: crate::riir::backend::BufId,
     // S10b-2: run-lifetime scratch BufIds for the batched graph,
     // allocated once at max chunk width. Replaces the per-layer
-    // `pool.alloc` of the pre-MoE transients.
-    scratch: &BatchedGraphScratch,
+    // `pool.alloc` of the pre-MoE transients. `scratch` holds the
+    // linear-attn `graph1` transients; `moe` is the shared MoE-block
+    // scratch (boundary buffers + `graph2` working set).
+    scratch: &LinearAttnGraphScratch,
+    moe: &MoeGraphScratch,
 ) -> Result<(), LayerForwardError>
 where
     B: Backend,
@@ -2154,8 +2188,9 @@ where
     let graph = {
         let mut g = Graph::new();
 
-        // S10b-2: transient + boundary BufIds come from the
-        // run-lifetime `BatchedGraphScratch` (allocated once at max
+        // S10b-2: transient BufIds come from the run-lifetime
+        // `LinearAttnGraphScratch`; the graph1→MoE boundary BufIds from
+        // the shared `MoeGraphScratch` (both allocated once at max
         // chunk width) instead of a fresh per-layer `pool.alloc`.
         // Same local names so the Op pushes below are unchanged; the
         // `*NTokens` Ops stride by the real `n_tokens` and the
@@ -2172,11 +2207,11 @@ where
         let value_out_stack_id = scratch.value_out_stack;
         let o_proj_stack_id = scratch.o_proj_stack;
         let gate_logits_id = scratch.gate_logits;
-        let h_mid_id = scratch.h_mid;
-        let h_post_id = scratch.h_post;
-        let shared_gate_id = scratch.shared_gate;
-        let routing_indices_id = scratch.routing_indices;
-        let routing_weights_id = scratch.routing_weights;
+        let h_mid_id = moe.h_mid;
+        let h_post_id = moe.h_post;
+        let shared_gate_id = moe.shared_gate;
+        let routing_indices_id = moe.routing_indices;
+        let routing_weights_id = moe.routing_weights;
 
         // Phase 1a — input rms_norm.
         g.push(Op::RmsNormBf16NTokens {
@@ -2377,17 +2412,19 @@ where
 
     // S10b-2: boundary BufIds are scratch fields — named here for the
     // imperative MoE block (1f-1h) + host readback below.
-    let h_mid_id = scratch.h_mid;
-    let h_post_id = scratch.h_post;
-    let shared_gate_id = scratch.shared_gate;
-    let routing_indices_id = scratch.routing_indices;
-    let routing_weights_id = scratch.routing_weights;
+    let h_mid_id = moe.h_mid;
+    let h_post_id = moe.h_post;
+    let shared_gate_id = moe.shared_gate;
+    let routing_indices_id = moe.routing_indices;
+    let routing_weights_id = moe.routing_weights;
 
     // S10b-2 Phase 4: on the first call, lifetime-color graph1's
     // transient BufIds (and pin them). Topology is layer- and
-    // step-invariant, so one pass holds for the whole run.
+    // step-invariant, so one pass holds for the whole run. graph2 has
+    // its own latch on `moe` (prefill-arc Phase 3 split the latches).
     if !scratch.commit_planned.get() {
         backend.pool_mut().commit_plan(&graph);
+        scratch.commit_planned.set(true);
     }
     // Submit + wait. Single cmdbuf, single commit (the S7-1a fusion
     // is preserved by `MetalBackend::execute`'s default loop body).
@@ -2486,7 +2523,7 @@ where
                 .0
         } else {
             let base_id =
-                scratch.expert_base.expect("pread mode has expert_base");
+                moe.expert_base.expect("pread mode has expert_base");
             let expert_size = v.expert_size_4bit();
             let mut blob_scratch = vec![0u8; expert_size];
             let pool = backend.pool_mut();
@@ -2538,25 +2575,25 @@ where
     }
     {
         let pool = backend.pool_mut();
-        pool.upload(scratch.bucket_input, unsafe {
+        pool.upload(moe.bucket_input, unsafe {
             std::slice::from_raw_parts(
                 bucket_input_host.as_ptr() as *const u8,
                 total_assignments * hidden_dim * f32_sz_u,
             )
         })?;
-        pool.upload(scratch.bucket_token_idx, unsafe {
+        pool.upload(moe.bucket_token_idx, unsafe {
             std::slice::from_raw_parts(
                 buckets.token_idx.as_ptr() as *const u8,
                 total_assignments * std::mem::size_of::<i32>(),
             )
         })?;
-        pool.upload(scratch.bucket_weights, unsafe {
+        pool.upload(moe.bucket_weights, unsafe {
             std::slice::from_raw_parts(
                 buckets.weights.as_ptr() as *const u8,
                 total_assignments * f32_sz_u,
             )
         })?;
-        pool.upload(scratch.expert_indices, unsafe {
+        pool.upload(moe.expert_indices, unsafe {
             std::slice::from_raw_parts(
                 expert_indices_host.as_ptr() as *const u8,
                 total_assignments * std::mem::size_of::<u32>(),
@@ -2579,7 +2616,7 @@ where
             },
             input: h_post_id,
             input_off: 0,
-            output: scratch.shared_ffn_gate,
+            output: moe.shared_ffn_gate,
             output_off: 0,
             in_dim: hidden_dim as u32,
             out_dim: v.shared_intermediate as u32,
@@ -2595,7 +2632,7 @@ where
             },
             input: h_post_id,
             input_off: 0,
-            output: scratch.shared_up,
+            output: moe.shared_up,
             output_off: 0,
             in_dim: hidden_dim as u32,
             out_dim: v.shared_intermediate as u32,
@@ -2603,9 +2640,9 @@ where
         });
         g.push(Op::SwigluFusedBatched {
             label: "linear_attn.shared_swiglu",
-            gate: scratch.shared_ffn_gate,
-            up: scratch.shared_up,
-            out: scratch.shared_act,
+            gate: moe.shared_ffn_gate,
+            up: moe.shared_up,
+            out: moe.shared_act,
             total: (n_tokens * v.shared_intermediate) as u32,
         });
         g.push(Op::MatvecNTokens {
@@ -2616,9 +2653,9 @@ where
                 b_off: layer_cache.shared.down_b,
                 bits: s_down_bits,
             },
-            input: scratch.shared_act,
+            input: moe.shared_act,
             input_off: 0,
-            output: scratch.shared_down,
+            output: moe.shared_down,
             output_off: 0,
             in_dim: v.shared_intermediate as u32,
             out_dim: hidden_dim as u32,
@@ -2626,30 +2663,30 @@ where
         });
         g.push(Op::ZeroBuffer {
             label: "linear_attn.moe_out_sum_zero",
-            buf: scratch.out_sum,
+            buf: moe.out_sum,
             n_bytes: (n_tokens * hidden_dim * f32_sz_u) as u32,
         });
         g.push(Op::MoeBatchedPermuteFuse {
             label: "linear_attn.moe_permute_fuse",
             expert_base: expert_base_id,
             expert_stride: v.expert_size_4bit() as u64,
-            expert_indices: scratch.expert_indices,
+            expert_indices: moe.expert_indices,
             expert_slots,
-            bucket_input: scratch.bucket_input,
-            bucket_gate: scratch.bucket_gate,
-            bucket_up: scratch.bucket_up,
-            bucket_act: scratch.bucket_act,
-            bucket_out: scratch.bucket_out,
-            bucket_token_idx: scratch.bucket_token_idx,
-            bucket_weights: scratch.bucket_weights,
-            out_sum: scratch.out_sum,
+            bucket_input: moe.bucket_input,
+            bucket_gate: moe.bucket_gate,
+            bucket_up: moe.bucket_up,
+            bucket_act: moe.bucket_act,
+            bucket_out: moe.bucket_out,
+            bucket_token_idx: moe.bucket_token_idx,
+            bucket_weights: moe.bucket_weights,
+            out_sum: moe.out_sum,
             buckets,
         });
         g.push(Op::MoeCombineResidualNTokens {
             label: "linear_attn.moe_combine",
             h_mid: h_mid_id,
-            moe_sum: scratch.out_sum,
-            shared_out: scratch.shared_down,
+            moe_sum: moe.out_sum,
+            shared_out: moe.shared_down,
             shared_gate: shared_gate_id,
             hidden_out: hidden_out_id,
             n_tokens: n_tokens as u32,
@@ -2659,9 +2696,9 @@ where
     };
     // S10b-2 Phase 4: color graph2's transients on the first call,
     // then latch — `commit_plan` runs exactly once per run.
-    if !scratch.commit_planned.get() {
+    if !moe.commit_planned.get() {
         backend.pool_mut().commit_plan(&graph2);
-        scratch.commit_planned.set(true);
+        moe.commit_planned.set(true);
     }
     backend.execute(&graph2, "graph_moe")?;
 

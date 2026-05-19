@@ -233,15 +233,26 @@ pub struct RsCtx<B: Backend = MetalBackend> {
     /// Lazily-built persistent buffer set for the linear-attn forward.
     linear_buffers: Option<LinearAttnBuffers>,
     /// S10b-2: run-lifetime scratch BufIds for the batched linear-attn
-    /// graph (allocated once at max chunk width, reused every step /
+    /// `graph1` (allocated once at max chunk width, reused every step /
     /// layer). Built by [`Self::ensure_linear_resources`].
-    batched_graph_scratch: Option<attn::linear_attn_forward::BatchedGraphScratch>,
+    linear_attn_graph_scratch:
+        Option<attn::linear_attn_forward::LinearAttnGraphScratch>,
     /// Prefill arc Phase 2 — run-lifetime scratch for the batched
     /// full-attn `graph1` (allocated once at max chunk width). Built
     /// by [`Self::ensure_linear_resources`] alongside
-    /// `batched_graph_scratch`.
+    /// `linear_attn_graph_scratch`.
     full_attn_graph_scratch:
         Option<attn::full_attn_forward::FullAttnGraphScratch>,
+    /// Prefill arc Phase 3 — shared run-lifetime scratch for the MoE
+    /// block (`graph2`): graph1→MoE boundary buffers + the shared-FFN /
+    /// permute-fuse working set. One instance, reused by every layer's
+    /// MoE block regardless of attention kind.
+    moe_graph_scratch: Option<attn::linear_attn_forward::MoeGraphScratch>,
+    /// Prefill arc Phase 3 — the cross-layer hidden double-buffer,
+    /// lifted out of the per-layer attention scratch so it is owned at
+    /// run scope. The orchestrator swaps the pair between layers.
+    hidden_double_buffer:
+        Option<attn::linear_attn_forward::HiddenDoubleBuffer>,
     /// Slice 4e — pending deferred-experts state. Originally a
     /// single `Option<DeferredState>` (one in-flight K-expert dispatch
     /// at a time); slice 5d-9 widened it to a depth-2
@@ -460,8 +471,10 @@ impl RsCtx<MetalBackend> {
             k_active,
             layer_caches: None,
             linear_buffers: None,
-            batched_graph_scratch: None,
+            linear_attn_graph_scratch: None,
             full_attn_graph_scratch: None,
+            moe_graph_scratch: None,
+            hidden_double_buffer: None,
             deferred: DeferredRing::new(),
             lm_head_gpu: None,
             io_pool,
@@ -1419,15 +1432,18 @@ impl RsCtx<MetalBackend> {
                 self.backend.as_mut().expect("just-set").pool_mut();
             self.linear_buffers = Some(LinearAttnBuffers::new(pool));
         }
-        if self.batched_graph_scratch.is_none() {
-            let k_active = self.k_active;
-            let pread =
-                self.experts.mode() == io::expert_io::ExpertIoMode::Pread;
+        // Construction order matters: `LinearAttnGraphScratch` is
+        // all-transient (`persistent = false`); the structs after it
+        // (`full_attn_graph_scratch`, `moe_graph_scratch`,
+        // `hidden_double_buffer`, `moe_buffers`) all end on a
+        // persistent alloc, so the highest pool BufId stays persistent
+        // and `reset_transient` keeps the transients above it.
+        if self.linear_attn_graph_scratch.is_none() {
             let pool =
                 self.backend.as_mut().expect("just-set").pool_mut();
-            self.batched_graph_scratch = Some(
-                attn::linear_attn_forward::BatchedGraphScratch::new(
-                    pool, k_active, pread,
+            self.linear_attn_graph_scratch = Some(
+                attn::linear_attn_forward::LinearAttnGraphScratch::new(
+                    pool,
                 ),
             );
         }
@@ -1436,6 +1452,25 @@ impl RsCtx<MetalBackend> {
                 self.backend.as_mut().expect("just-set").pool_mut();
             self.full_attn_graph_scratch = Some(
                 attn::full_attn_forward::FullAttnGraphScratch::new(pool),
+            );
+        }
+        if self.moe_graph_scratch.is_none() {
+            let k_active = self.k_active;
+            let pread =
+                self.experts.mode() == io::expert_io::ExpertIoMode::Pread;
+            let pool =
+                self.backend.as_mut().expect("just-set").pool_mut();
+            self.moe_graph_scratch = Some(
+                attn::linear_attn_forward::MoeGraphScratch::new(
+                    pool, k_active, pread,
+                ),
+            );
+        }
+        if self.hidden_double_buffer.is_none() {
+            let pool =
+                self.backend.as_mut().expect("just-set").pool_mut();
+            self.hidden_double_buffer = Some(
+                attn::linear_attn_forward::HiddenDoubleBuffer::new(pool),
             );
         }
         if self.moe_buffers.is_none() {
@@ -1647,8 +1682,10 @@ impl RsCtx<MetalBackend> {
             layer_states,
             layer_caches,
             linear_buffers,
-            batched_graph_scratch,
+            linear_attn_graph_scratch,
             full_attn_graph_scratch,
+            moe_graph_scratch,
+            hidden_double_buffer,
             deferred,
             lm_head_gpu,
             io_pool,
@@ -1665,10 +1702,16 @@ impl RsCtx<MetalBackend> {
             layer_caches.as_ref().expect("ensure_linear_resources");
         let linear_buffers =
             linear_buffers.as_mut().expect("ensure_linear_resources");
-        let batched_graph_scratch = batched_graph_scratch
+        let linear_attn_graph_scratch = linear_attn_graph_scratch
             .as_ref()
             .expect("ensure_linear_resources");
         let full_attn_graph_scratch = full_attn_graph_scratch
+            .as_ref()
+            .expect("ensure_linear_resources");
+        let moe_graph_scratch = moe_graph_scratch
+            .as_ref()
+            .expect("ensure_linear_resources");
+        let hidden_double_buffer = hidden_double_buffer
             .as_ref()
             .expect("ensure_linear_resources");
         let moe_buffers =
@@ -1719,7 +1762,7 @@ impl RsCtx<MetalBackend> {
         // tail is unused for n < BATCHED_CHUNK_SIZE).
         let hidden_bytes = n * hidden_dim * std::mem::size_of::<f32>();
         let (mut hidden_a_id, mut hidden_b_id) =
-            (batched_graph_scratch.hidden_a, batched_graph_scratch.hidden_b);
+            (hidden_double_buffer.hidden_a, hidden_double_buffer.hidden_b);
         {
             let pool = backend.pool_mut();
             let stack_bytes: &[u8] = unsafe {
@@ -1786,6 +1829,7 @@ impl RsCtx<MetalBackend> {
                     hidden_a_id,
                     hidden_b_id,
                     full_attn_graph_scratch,
+                    moe_graph_scratch,
                 )
                 .map_err(|_| RsError::EvalFailed)?;
             } else {
@@ -1824,7 +1868,8 @@ impl RsCtx<MetalBackend> {
                     prefetch_env,
                     hidden_a_id,
                     hidden_b_id,
-                    batched_graph_scratch,
+                    linear_attn_graph_scratch,
+                    moe_graph_scratch,
                 )
                 .map_err(|_| RsError::EvalFailed)?;
             }
