@@ -350,6 +350,24 @@ pub enum Op {
         n_tokens: u32,
     },
 
+    /// Vanilla RoPE over an `[n_tokens, num_heads, head_dim]` stack,
+    /// in-place. Rotates the first `rotary_dim` channels of each head
+    /// (GPT-NeoX half-split layout); token `t`'s absolute position is
+    /// `start_pos + t`. `inv_freq` is a precomputed `rotary_dim/2`-
+    /// length frequency table — the kernel is agnostic to vanilla vs
+    /// YaRN-rescaled, so a future `factor` knob only touches the
+    /// table, never this Op. Diff oracle: `attn::rope::apply_rotary_emb`.
+    RopeNTokens {
+        label: &'static str,
+        x: BufId,
+        inv_freq: BufId,
+        n_tokens: u32,
+        num_heads: u32,
+        head_dim: u32,
+        rotary_dim: u32,
+        start_pos: i32,
+    },
+
     /// Residual add over `[n_tokens, dim]`: `out = a + b`.
     ResidualAddNTokens {
         label: &'static str,
@@ -593,6 +611,7 @@ impl Op {
         match self {
             Op::RmsNormBf16NTokens { label, .. } => label,
             Op::RmsNormQkNTokens { label, .. } => label,
+            Op::RopeNTokens { label, .. } => label,
             Op::ResidualAddNTokens { label, .. } => label,
             Op::ZeroBuffer { label, .. } => label,
             Op::MatvecNTokens { label, .. } => label,
@@ -617,6 +636,7 @@ impl Op {
         match self {
             Op::RmsNormBf16NTokens { .. } => "RmsNormBf16NTokens",
             Op::RmsNormQkNTokens { .. } => "RmsNormQkNTokens",
+            Op::RopeNTokens { .. } => "RopeNTokens",
             Op::ResidualAddNTokens { .. } => "ResidualAddNTokens",
             Op::ZeroBuffer { .. } => "ZeroBuffer",
             Op::MatvecNTokens { .. } => "MatvecNTokens",
@@ -645,6 +665,7 @@ impl Op {
         match self {
             Op::RmsNormBf16NTokens { x, .. } => vec![*x],
             Op::RmsNormQkNTokens { x, .. } => vec![*x],
+            Op::RopeNTokens { x, inv_freq, .. } => vec![*x, *inv_freq],
             Op::ResidualAddNTokens { a, b, .. } => vec![*a, *b],
             Op::ZeroBuffer { .. } => vec![],
             Op::MatvecNTokens { input, .. } => vec![*input],
@@ -714,6 +735,7 @@ impl Op {
         match self {
             Op::RmsNormBf16NTokens { out, .. } => vec![*out],
             Op::RmsNormQkNTokens { x, .. } => vec![*x], // in-place
+            Op::RopeNTokens { x, .. } => vec![*x], // in-place
             Op::ResidualAddNTokens { out, .. } => vec![*out],
             Op::ZeroBuffer { buf, .. } => vec![*buf],
             Op::MatvecNTokens { output, .. } => vec![*output],

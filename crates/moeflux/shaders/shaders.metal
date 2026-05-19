@@ -2951,6 +2951,59 @@ kernel void residual_add_n_tokens(
 
 
 // ============================================================================
+// Kernel: RoPE (rotary position embedding) batched over N tokens
+// ============================================================================
+// Vanilla RoPE in the GPT-NeoX (half-split) layout, batched across an
+// `[n_tokens, num_heads, head_dim]` stack. Rotates the first `rotary_dim`
+// channels of each head; channels [rotary_dim, head_dim) are left
+// untouched (partial rotary). Token `t`'s absolute position is
+// `start_pos + t`.
+//
+// `inv_freq` is a precomputed `rotary_dim/2`-length table — vanilla
+// `1/theta^(2i/rotary_dim)` or a YaRN-rescaled table; the kernel is
+// agnostic to which (the table is the runtime-tunable seam — see the
+// `factor` discussion on Op::RopeNTokens). Mirrors the CPU reference
+// `apply_rotary_emb` (attn/rope.rs). In-place.
+//
+// `precise::cos`/`sin`: RoPE angles reach the thousands, where
+// fast-math cos/sin drift ~3e-4 (see yarn_rope_apply's note above).
+//
+// Dispatch:
+//   one thread per (token, head, i), i in [0, rotary_dim/2)
+//   threadgroups = (ceil(n_tokens * num_heads * (rotary_dim/2) / 256), 1, 1)
+//   threads      = (256, 1, 1)
+
+kernel void rope_n_tokens(
+    device float*        x          [[buffer(0)]],   // [n_tokens, num_heads, head_dim], in-place
+    device const float*  inv_freq   [[buffer(1)]],   // [rotary_dim/2]
+    constant uint&       n_tokens   [[buffer(2)]],
+    constant uint&       num_heads  [[buffer(3)]],
+    constant uint&       head_dim   [[buffer(4)]],
+    constant uint&       rotary_dim [[buffer(5)]],
+    constant int&        start_pos  [[buffer(6)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    uint half_rd = rotary_dim / 2;
+    uint total   = n_tokens * num_heads * half_rd;
+    if (tid >= total) return;
+
+    uint i     = tid % half_rd;
+    uint head  = (tid / half_rd) % num_heads;
+    uint token = tid / (half_rd * num_heads);
+
+    float angle = float(start_pos + int(token)) * inv_freq[i];
+    float cos_a = metal::precise::cos(angle);
+    float sin_a = metal::precise::sin(angle);
+
+    uint  base = token * num_heads * head_dim + head * head_dim + i;
+    float x0   = x[base];
+    float x1   = x[base + half_rd];
+    x[base]           = x0 * cos_a - x1 * sin_a;
+    x[base + half_rd] = x0 * sin_a + x1 * cos_a;
+}
+
+
+// ============================================================================
 // Kernel: MoE softmax + selection-sort top-K
 // ============================================================================
 // Per-token GPU port of `moe_router_cpu`'s softmax → top-K. One threadgroup

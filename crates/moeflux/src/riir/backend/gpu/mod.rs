@@ -32,7 +32,8 @@ use crate::riir::backend::gpu::gpu_matvec::{
 use crate::riir::moe::gpu_moe_router::MoeRouterPipelines;
 use crate::riir::backend::gpu::gpu_norm::{
     encode_residual_add_n_tokens_into, encode_rms_norm_bf16_fused_n_tokens,
-    RmsNormBf16FusedNTokensPipeline, RmsNormBf16Pipelines,
+    encode_rope_n_tokens_into, RmsNormBf16FusedNTokensPipeline,
+    RmsNormBf16Pipelines,
 };
 use crate::riir::backend::gpu::metal::{MetalContext, MetalError, MtlBuffer};
 use crate::riir::io::mtl_weight_buf::MtlWeightBuf;
@@ -457,6 +458,7 @@ pub struct MetalBackend {
     #[allow(dead_code)]
     linear_attn_pipes: LinearAttnPipelines,
     residual_add_n_pso: ComputePipelineState,
+    rope_n_pso: ComputePipelineState,
     swiglu_fused_batched_pso: ComputePipelineState,
     swiglu_fused_pso: ComputePipelineState,
     moe_combine_residual_n_pso: ComputePipelineState,
@@ -491,6 +493,7 @@ impl MetalBackend {
         let linear_attn_pipes = LinearAttnPipelines::fetch(&mut metal)?;
         let residual_add_n_pso =
             metal.pipeline("residual_add_n_tokens")?.clone();
+        let rope_n_pso = metal.pipeline("rope_n_tokens")?.clone();
         let swiglu_fused_batched_pso =
             metal.pipeline("swiglu_fused_batched")?.clone();
         let swiglu_fused_pso = metal.pipeline("swiglu_fused")?.clone();
@@ -511,6 +514,7 @@ impl MetalBackend {
             router_pipes,
             linear_attn_pipes,
             residual_add_n_pso,
+            rope_n_pso,
             swiglu_fused_batched_pso,
             swiglu_fused_pso,
             moe_combine_residual_n_pso,
@@ -651,6 +655,28 @@ impl Backend for MetalBackend {
                     self.pool.handle(*out),
                     *n_tokens,
                     *dim,
+                );
+            }
+            Op::RopeNTokens {
+                x,
+                inv_freq,
+                n_tokens,
+                num_heads,
+                head_dim,
+                rotary_dim,
+                start_pos,
+                ..
+            } => {
+                encode_rope_n_tokens_into(
+                    cmd,
+                    &self.rope_n_pso,
+                    self.pool.handle(*x),
+                    self.pool.handle(*inv_freq),
+                    *n_tokens,
+                    *num_heads,
+                    *head_dim,
+                    *rotary_dim,
+                    *start_pos,
                 );
             }
             Op::ZeroBuffer { buf, n_bytes, .. } => {

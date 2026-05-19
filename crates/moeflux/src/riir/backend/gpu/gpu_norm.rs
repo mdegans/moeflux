@@ -276,6 +276,41 @@ pub fn encode_residual_add_n_tokens_into(
     enc.end_encoding();
 }
 
+/// Encode in-place vanilla RoPE over an `[n_tokens, num_heads,
+/// head_dim]` stack — see the `rope_n_tokens` kernel in
+/// shaders.metal. One thread per `(token, head, i)` with
+/// `i ∈ [0, rotary_dim/2)`; `inv_freq` is the precomputed
+/// `rotary_dim/2`-length frequency table.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_rope_n_tokens_into(
+    cmdbuf: &CommandBufferRef,
+    pipeline: &ComputePipelineState,
+    x: &Buffer,
+    inv_freq: &Buffer,
+    n_tokens: u32,
+    num_heads: u32,
+    head_dim: u32,
+    rotary_dim: u32,
+    start_pos: i32,
+) {
+    let total = n_tokens * num_heads * (rotary_dim / 2);
+    let enc = cmdbuf.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(pipeline);
+    enc.set_buffer(0, Some(x), 0);
+    enc.set_buffer(1, Some(inv_freq), 0);
+    enc.set_bytes(2, 4, (&n_tokens as *const u32).cast());
+    enc.set_bytes(3, 4, (&num_heads as *const u32).cast());
+    enc.set_bytes(4, 4, (&head_dim as *const u32).cast());
+    enc.set_bytes(5, 4, (&rotary_dim as *const u32).cast());
+    enc.set_bytes(6, 4, (&start_pos as *const i32).cast());
+    let num_tgs = (total + 255) / 256;
+    enc.dispatch_thread_groups(
+        MTLSize::new(num_tgs as NSUInteger, 1, 1),
+        MTLSize::new(256, 1, 1),
+    );
+    enc.end_encoding();
+}
+
 /// Encode a GPU-side buffer-to-buffer memcpy via Metal's blit encoder.
 /// `dim` floats from `src` → `dst`. Used by the orchestrator's GPU
 /// residual stream (Phase 5) to snapshot `hidden → residual` at the

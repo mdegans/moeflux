@@ -99,6 +99,7 @@ pub const ALL_KERNELS: &[&str] = &[
     "rms_norm_bf16_fused_n_tokens",
     "rms_norm_qk",
     "rms_norm_sum_sq",
+    "rope_n_tokens",
     "sigmoid_gate",
     "swiglu_fused",
     "swiglu_fused_batched",

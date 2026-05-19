@@ -257,6 +257,164 @@ fn graph_metal_matches_cpu_residual_add() {
 }
 
 // ============================================================================
+// Test: RopeNTokens through both backends
+// ============================================================================
+
+#[test]
+#[ignore = "long-running GPU test"]
+fn graph_metal_matches_cpu_rope_n_tokens() {
+    // a3b attention shape; partial rotary = head_dim / 4.
+    let n_tokens: u32 = 8;
+    let num_heads: u32 = 16;
+    let head_dim: u32 = 256;
+    let rotary_dim: u32 = 64;
+    let half = (rotary_dim / 2) as usize;
+    // start_pos large enough that pos*inv_freq drives angles into the
+    // thousands — the regime where fast-math cos/sin drift and the
+    // kernel's `precise::cos`/`sin` earn their keep.
+    let start_pos: i32 = 4000;
+    let total = (n_tokens * num_heads * head_dim) as usize;
+
+    let mut rng = Rng::new(0xA3B_C0DE);
+    let x_data: Vec<f32> =
+        (0..total).map(|_| rng.next_f32_unit()).collect();
+
+    // Vanilla RoPE frequency table: inv_freq[i] = 1/theta^(2i/rotary_dim).
+    // theta = variants::ROPE_THETA for the a3b variant (1e7).
+    let theta = 10_000_000.0f32;
+    let inv_freq: Vec<f32> = (0..half)
+        .map(|i| 1.0 / theta.powf((2 * i) as f32 / rotary_dim as f32))
+        .collect();
+
+    // CPU path
+    let mut cpu_wf = dummy_weight_file("rope_cpu");
+    let mut cpu = CpuBackend::new(cpu_wf.take());
+    let cpu_x = cpu.pool_mut().alloc(total * 4, "x", false).unwrap();
+    let cpu_freq =
+        cpu.pool_mut().alloc(half * 4, "inv_freq", false).unwrap();
+    cpu.pool_mut().upload(cpu_x, bytes_of_f32(&x_data)).unwrap();
+    cpu.pool_mut()
+        .upload(cpu_freq, bytes_of_f32(&inv_freq))
+        .unwrap();
+    let mut g_cpu = Graph::new();
+    g_cpu.push(Op::RopeNTokens {
+        label: "test_rope",
+        x: cpu_x,
+        inv_freq: cpu_freq,
+        n_tokens,
+        num_heads,
+        head_dim,
+        rotary_dim,
+        start_pos,
+    });
+    cpu.execute(&g_cpu, "diff_oracle").unwrap();
+    let mut cpu_out_bytes = vec![0u8; total * 4];
+    cpu.pool().download(cpu_x, &mut cpu_out_bytes).unwrap();
+    let cpu_out_f32 = f32_of_bytes(&cpu_out_bytes);
+
+    // GPU path
+    let mut gpu_wf = dummy_weight_file("rope_gpu");
+    let metal_ctx = MetalContext::new().expect("MetalContext::new");
+    let wf_ref = gpu_wf.wf.as_ref().unwrap();
+    let wf_buf = MtlWeightBuf::wrap(wf_ref, metal_ctx.device());
+    let _ = gpu_wf.take();
+    let mut gpu =
+        MetalBackend::new(metal_ctx, wf_buf).expect("MetalBackend::new");
+    let gpu_x = gpu.pool_mut().alloc(total * 4, "x", false).unwrap();
+    let gpu_freq =
+        gpu.pool_mut().alloc(half * 4, "inv_freq", false).unwrap();
+    gpu.pool_mut().upload(gpu_x, bytes_of_f32(&x_data)).unwrap();
+    gpu.pool_mut()
+        .upload(gpu_freq, bytes_of_f32(&inv_freq))
+        .unwrap();
+    let mut g_gpu = Graph::new();
+    g_gpu.push(Op::RopeNTokens {
+        label: "test_rope",
+        x: gpu_x,
+        inv_freq: gpu_freq,
+        n_tokens,
+        num_heads,
+        head_dim,
+        rotary_dim,
+        start_pos,
+    });
+    gpu.execute(&g_gpu, "diff_oracle").unwrap();
+    let mut gpu_out_bytes = vec![0u8; total * 4];
+    gpu.pool().download(gpu_x, &mut gpu_out_bytes).unwrap();
+    let gpu_out_f32 = f32_of_bytes(&gpu_out_bytes);
+
+    // Primary check: CPU arm vs GPU kernel.
+    let cos = cosine_sim(&cpu_out_f32, &gpu_out_f32);
+    let max_abs = cpu_out_f32
+        .iter()
+        .zip(gpu_out_f32.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+
+    // Guard 1: the Op actually rotated something — at start_pos=4000
+    // the rotated channels change by O(1). Catches a no-op bug that a
+    // CPU-vs-GPU-only cosine would miss (two no-ops still match).
+    let rotated_delta = cpu_out_f32
+        .iter()
+        .zip(x_data.iter())
+        .map(|(o, i)| (o - i).abs())
+        .fold(0.0f32, f32::max);
+
+    // Guard 2: partial rotary — channels [rotary_dim, head_dim) of
+    // every head are never touched, so they must stay bit-exact
+    // equal to the input on both backends. Catches a head_dim vs
+    // rotary_dim stride bug.
+    let mut tail_max_diff = 0.0f32;
+    for t in 0..n_tokens as usize {
+        for h in 0..num_heads as usize {
+            let base = t * num_heads as usize * head_dim as usize
+                + h * head_dim as usize;
+            for c in rotary_dim as usize..head_dim as usize {
+                let d_cpu =
+                    (cpu_out_f32[base + c] - x_data[base + c]).abs();
+                let d_gpu =
+                    (gpu_out_f32[base + c] - x_data[base + c]).abs();
+                tail_max_diff = tail_max_diff.max(d_cpu).max(d_gpu);
+            }
+        }
+    }
+
+    eprintln!(
+        "[s14-p1 rope_n_tokens] N={} heads={} head_dim={} rotary={} \
+         start_pos={}: cos={:.9}, max_abs={:.3e}, \
+         rotated_delta={:.3e}, tail_max_diff={:.3e}",
+        n_tokens,
+        num_heads,
+        head_dim,
+        rotary_dim,
+        start_pos,
+        cos,
+        max_abs,
+        rotated_delta,
+        tail_max_diff
+    );
+    assert!(
+        cos >= COSINE_FLOOR,
+        "cosine {} below floor {} (max_abs={})",
+        cos,
+        COSINE_FLOOR,
+        max_abs
+    );
+    assert!(
+        rotated_delta > 0.01,
+        "RoPE appears to be a no-op (rotated_delta={}) — the Op did \
+         not change the rotated channels",
+        rotated_delta
+    );
+    assert_eq!(
+        tail_max_diff, 0.0,
+        "non-rotated tail channels [{}, {}) were modified — partial \
+         rotary stride bug",
+        rotary_dim, head_dim
+    );
+}
+
+// ============================================================================
 // Test: SwigluFusedBatched through both backends
 // ============================================================================
 

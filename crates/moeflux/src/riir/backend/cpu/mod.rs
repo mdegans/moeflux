@@ -17,7 +17,9 @@ use std::cell::{Ref, RefCell, RefMut};
 use crate::riir::backend::cpu::cpu_matvec::{
     dequant_matvec_4bit_cpu, dequant_matvec_8bit_v3_cpu,
 };
-use crate::riir::backend::cpu::cpu_ops::{cpu_sigmoid_scalar, residual_add_n_tokens_cpu};
+use crate::riir::backend::cpu::cpu_ops::{
+    cpu_sigmoid_scalar, residual_add_n_tokens_cpu, rope_n_tokens_cpu,
+};
 use crate::riir::io::embedding::bf16_to_f32;
 use crate::riir::attn::linear_attn::{
     compute_decay_beta_cpu, conv1d_step, gated_delta_chunkwise,
@@ -800,6 +802,28 @@ impl Backend for CpuBackend {
                 let b_buf = self.read_f32(*b);
                 let mut out_buf = self.write_f32(*out);
                 residual_add_n_tokens_cpu(&a_buf, &b_buf, &mut out_buf);
+            }
+            Op::RopeNTokens {
+                x,
+                inv_freq,
+                n_tokens,
+                num_heads,
+                head_dim,
+                rotary_dim,
+                start_pos,
+                ..
+            } => {
+                let freq = self.read_f32(*inv_freq);
+                let mut x_buf = self.write_f32(*x);
+                rope_n_tokens_cpu(
+                    &mut x_buf,
+                    &freq,
+                    *n_tokens as usize,
+                    *num_heads as usize,
+                    *head_dim as usize,
+                    *rotary_dim as usize,
+                    *start_pos,
+                );
             }
             Op::ZeroBuffer { buf, n_bytes, .. } => {
                 let mut b = self.write_bytes(*buf);

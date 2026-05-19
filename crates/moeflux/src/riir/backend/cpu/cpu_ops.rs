@@ -37,6 +37,45 @@ pub fn residual_add_n_tokens_cpu(a: &[f32], b: &[f32], out: &mut [f32]) {
     }
 }
 
+/// Vanilla RoPE over an `[n_tokens, num_heads, head_dim]` stack,
+/// in-place — CPU oracle for the `rope_n_tokens` Metal kernel
+/// ([`crate::riir::backend::Op::RopeNTokens`]). Rotates the first
+/// `rotary_dim` channels of each head (GPT-NeoX half-split:
+/// `x[i]` paired with `x[i + rotary_dim/2]`); channels
+/// `[rotary_dim, head_dim)` are untouched. Token `t`'s absolute
+/// position is `start_pos + t`. `inv_freq` is the precomputed
+/// `rotary_dim/2`-length frequency table. Same rotation as
+/// `attn::rope::apply_rotary_emb`.
+#[allow(clippy::too_many_arguments)]
+pub fn rope_n_tokens_cpu(
+    x: &mut [f32],
+    inv_freq: &[f32],
+    n_tokens: usize,
+    num_heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    start_pos: i32,
+) {
+    let half = rotary_dim / 2;
+    debug_assert_eq!(inv_freq.len(), half);
+    debug_assert_eq!(x.len(), n_tokens * num_heads * head_dim);
+    for token in 0..n_tokens {
+        let pos = (start_pos + token as i32) as f32;
+        for head in 0..num_heads {
+            let base = token * num_heads * head_dim + head * head_dim;
+            for i in 0..half {
+                let angle = pos * inv_freq[i];
+                let cos_a = angle.cos();
+                let sin_a = angle.sin();
+                let x0 = x[base + i];
+                let x1 = x[base + i + half];
+                x[base + i] = x0 * cos_a - x1 * sin_a;
+                x[base + i + half] = x0 * sin_a + x1 * cos_a;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
