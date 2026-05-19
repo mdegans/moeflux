@@ -2,62 +2,76 @@
 
 Continues `kernel_arc_session9_landed.md`. Session 9 proved the
 chunkwise kernel's matmul phases are compute-bound (Phase 6: 1.85–2.2×
-from `simdgroup_matrix`). Session 10 applies the same lever to the
-remaining scalar-matmul phases. **Gets a plan-mode formalization pass
-next session** per `feedback_design_before_execute` — this memo is the
-plan-of-record sketch.
+from `simdgroup_matrix`). Session 10 applies the same lever to phases
+3 and 5. **Design pass done at the close of session 9** (this memo
+reflects the resolved decomposition); a short plan-mode confirmation
+opens session 10, then execute.
 
-## Scope
+## Decomposition — a free tier and a costly tier
 
-Rewrite phases 3 and 5 of `gated_delta_net_chunkwise` (`shaders.metal`)
-to cooperative `simdgroup_matrix<float,8,8>`. Phase 2 optional, last.
-Same discipline as session 9: **one kernel, one phase at a time**, Op /
-backends / producer / CPU oracle unchanged, untouched phases stay
-scalar so the diff oracle isolates each change. f32 v1.
+The chunk index `l` is an **output row** of every phase-3/5 GEMM; the
+contraction runs over `d` (D=128) or `i` (C=16). So a ragged `l` row
+only corrupts an *unused* output row — it does **not** poison the
+contraction. Zero-fill is only needed where a ragged row sits on the
+**contraction** axis (the `0*NaN=NaN` trap).
 
-## The GEMMs (per head, per chunk; C=CW_C=16, D=128)
+### Tier 1 — Phase 3 + Phase 5 GEMM2 (no new staging, no budget cost)
 
-`S0` = `state` device buffer, `[D,D]` row-major per head. We want
-`sum_d state[vi,d]·x[l,d] = (x @ S0ᵀ)[l,vi]` → load `x` as operand a,
-`S0` **transposed** as operand b.
+Do this first. Same discipline as session 9: one phase at a time,
+untouched phases stay scalar, per-phase diff-oracle gate.
 
 - **Phase 3** — `s0k[C,D] = kc[C,D] @ S0ᵀ[D,D]`, contraction D=128
-  (16 tiles of 8). Output `[16,128]` = 8 KB → reuse the `sdc` buffer
-  (already `CW_C*128`). Epilogue `U_l = beta_l·v_l - beta_l·gamma_l·s0k`
-  stays per-`vi` scalar.
-- **Phase 5** — two GEMMs:
-  1. `s0q[C,D] = qc[C,D] @ S0ᵀ[D,D]`, contraction D=128. `qc` is read
-     from `conv_out` (q-region) — may need staging into tg memory
-     first (kc is staged; q currently is not). Decide in plan mode:
-     stage q, or `simdgroup_load` direct from the device `conv_out`
-     with the right stride/offset.
-  2. `kqg[C,C] @ U[C,D] → [C,D]`, contraction C=16. `kqg` already
-     carries the `i≤l` triangular mask from Phase 2 (dense matmul OK).
-  Output `[C,D]` reuses `sdc`. Epilogue: `out = gamma_l·s0q + (kqg@U)`.
+  (16 tiles of 8). Output `[C=16,D=128]` → reuse `sdc`. Operands:
+  `a` = `kc` (already tg-staged, stride 128); `b` = `state` device
+  buffer loaded **transposed** (S0 is `[vi,d]` row-major at
+  `head*128*128`, stride 128 → transpose gives `[d,vi]`). Epilogue
+  `U_l = beta_l v_l - beta_l gamma_l s0k` stays per-`vi` scalar.
+  **No zero-fill** (raggedness is on the output `l` axis only).
+  Big win expected — D=128 contraction was fully scalar.
+- **Phase 5 GEMM2** — `kqg[C,C] @ U[C,D] → [C,D]`, contraction C=16
+  (2 tiles). `a` = `kqg` (tg, stride CW_C); `b` = `Umat` (tg, stride
+  128). `kqg` already carries the `i≤l` mask from Phase 2 (dense
+  matmul OK; `kqg` ragged entries are already 0).
+  **Fix:** zero-fill `Umat` rows `c..CW_C` before the GEMM —
+  contraction is over `i`, and `kqg(0)*U(NaN)=NaN`. Phase 3/4 only
+  write `l<c`.
+  **New barrier:** one after Phase 4, before Phase 5 GEMM2 — the GEMM
+  reads `Umat` cross-thread (all columns); today phases 4→5 have no
+  barrier because the scalar code reads only its own `vi` column.
 
-These contractions (D=128) are **8× longer** than Phase 6's (C=16),
-so the wins may be larger still.
+### Tier 2 — Phase 5 GEMM1 (`s0q`) — staging cascade, deferred
+
+`s0q[C,D] = qc[C,D] @ S0ᵀ[D,D]`, contraction D=128. `q` is **not**
+tg-staged (read direct from `conv_out`). A `simdgroup_load` of a
+ragged `q` tile reads `conv_out` **out of bounds** — worst case
+decode (n=1) overreads 7 tokens ≈ 86 KB past the buffer; a real
+fault risk. Clamping doesn't save `n_tokens<8`.
+
+Fix requires staging `q` (+8 KB tg) → total 34.75 KB **over** the
+32 KB cap → forces `sdc` 8 KB→4 KB → forces Phase 6 strip 16→8 and
+phase-3/5 output stripped 64-wide. Re-verify Phase 6.
+
+**Decision:** Tier 2 is its own plan-mode pass (session 11), or a
+Tier-1 follow-on only if session 10 has the energy. Alternative worth
+weighing then: a producer-side `conv_out` pad of `CW_C` tokens
+(relaxes "shaders.metal only", but kills the whole cascade — q can
+then load direct from device). Phase 2 (`[16,16]` QK matmul) is also
+deferred — smallest output, optional per the original session-9 plan.
 
 ## Carry-overs from session 9
 
 - `sg = vi/32` local (no kernel attribute).
-- **Ragged zero-fill** is the #1 risk again: zero rows `c..CW_C` of
-  every tg operand before each matmul. `kc` is already zeroed by
-  Phase 6's prologue *after* Phase 5 runs — Phase 3/5 run *before*
-  Phase 6, so they need their own zero-fill of `kc`/`qc`/`Umat`
-  ragged rows. `kqg` ragged entries are already 0 (Phase 2 writes 0
-  for `l≥c`). Diff oracle n=1/n=4 catches a miss.
-- tg budget: `sdc` (8 KB) already allocated; phases 3/5 outputs
-  `[C,128]` reuse it. If q-staging is added that is +8 KB → total
-  ~34.8 KB **over** the 32 KB cap → must alias q-staging over a dead
-  buffer (Amat/kqg are alive through Phase 5; Umat is the RHS).
-  Resolve in plan mode — likely `simdgroup_load` q direct from device.
+- `sdc` (8 KB) already allocated — Tier 1 reuses it for the
+  `[C,128]` phase-3/5 GEMM outputs (different shape, different time
+  than Phase 6's `[128,16]` use; one buffer, time-shared).
+- tg budget after Tier 1: unchanged at 26.75 KB / 32 KB.
 
 ## Verification
 
 Per phase: smoke + `graph_metal_matches_cpu_gated_delta_chunkwise`
 (cos ≥ 0.9999, n ∈ {1,4,16,64} incl. g=0). Final: `diff_oracle`
-canary 12/12 + post-reboot `bench.py --model a3b -n 3` A/B.
+canary 12/12 + **post-reboot** `bench.py --model a3b -n 3` A/B vs the
+session-9 (Phase-6-only) baseline.
 
 ## After session 10
 
