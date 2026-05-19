@@ -87,21 +87,39 @@ Phase-1 kernel lands its diff test before being wired. Phase 5:
 
 ## Progress
 
-- **Phase 0 — DONE** (`caa44fa`). `KvCache` GPU-resident
-  (`Option<Buffer>` shared-storage, lazy `ensure_buffers`,
-  `k_slice`/`v_slice`); batched SDPA reads it directly, per-layer
-  KV re-upload gone; `state_save`/`state_load` go through the shared
-  buffer. Canary: batched_diff_oracle 23/23, diff_oracle 12/12,
-  checkpoint_restore 7/7.
-- **Phase 1 — IN PROGRESS.**
-  - item 1 RoPE — **DONE** (`82e4a52`). `Op::RopeNTokens` +
-    `rope_n_tokens` kernel (table-driven, factor-agnostic) + diff
-    test. graph_diff_oracle 13/13.
-  - item 2 sigmoid-gate — **TODO.** NOTE: a `sigmoid_gate` kernel
-    already exists in `ALL_KERNELS` — check it before writing new;
-    item 2 may only need an n-tokens variant + Op.
-  - item 3 Q-split / deinterleave — TODO.
-  - item 4 embedding gather — TODO.
-- Phases 2–5 — not started.
+- **Phase 0 — DONE** (`caa44fa`). KV cache GPU-resident; batched SDPA
+  reads it directly, per-layer re-upload gone.
+- **Phase 0b — DONE** (session 15, `2cd4b46`). `KvCache` reworked from
+  raw `Option<Buffer>` to pool `BufId`s — `register_borrowed` (not
+  `pool.alloc`, which would zero-fill multi-GB). Registered eagerly in
+  `ensure_linear_resources`. `truncate` zero-window dropped (overwrite-
+  before-read). Canary 4/4 suites green.
+- **Phase 1 — DONE** (session 15). All Ops for graph1 landed
+  diff-test-first; graph_diff_oracle 17/17:
+  - item 1 RoPE — `Op::RopeNTokens` (`82e4a52`, session 14).
+  - 1a SDPA — `Op::SdpaCausalTiled` Metal arm wired to the `SdpaCall`
+    flash kernel; the 3 vestigial accumulator fields trimmed
+    (`01b8434`).
+  - 1b `Op::SigmoidGateNTokens` (`34e7581`) — reuses the existing
+    `sigmoid_gate` kernel flat.
+  - 1c `Op::SplitQGate` (`3e833ae`) — new `split_q_gate` kernel.
+  - 1d `Op::RmsNormPerHeadNTokens` (`f9d3309`) — new weighted per-head
+    rms-norm kernel. `RmsNormQkNTokens` could NOT be reused (it is
+    weight-free; full-attn q_norm/k_norm are learned bf16 tensors).
+  - 1e `Op::KvCacheAppendNTokens` (`3e62813`) — new compute kernel.
+  - **Embedding-gather (orig. item 4) moved to Phase 4** — its only
+    consumer is the orchestrator; building it now would be unused.
+- **Phase 2 — DONE** (session 15, `d3b342b`). `FullAttnGraphScratch` +
+  `batched_full_attn_layer_forward` pre-MoE half rewritten as one
+  19-Op `Graph`. Signature now mirrors the linear-attn branch
+  (`&mut MetalBackend` + BufIds + scratch). MoE block still imperative,
+  rewired onto the graph1 boundary BufIds. Canary: batched_diff_oracle
+  23/23, diff_oracle 12/12, checkpoint_restore 7/7.
 
-Next session: resume at Phase 1 item 2.
+- Phases 3–5 — not started. **Next session resumes at Phase 3**
+  (graph2: MoE block — shared FFN + permute-fuse + combine — as a
+  second Graph, mirroring linear-attn's graph2; then the producer
+  goes generic `<B: Backend>`). Then Phase 4 (orchestrator cleanup +
+  GPU embedding gather + GPU final norm via the `LmHead` Op — its
+  Metal arm is still `todo!()`), Phase 5 (measure: reprofile + bench
+  post-reboot).
