@@ -236,6 +236,12 @@ pub struct RsCtx<B: Backend = MetalBackend> {
     /// graph (allocated once at max chunk width, reused every step /
     /// layer). Built by [`Self::ensure_linear_resources`].
     batched_graph_scratch: Option<attn::linear_attn_forward::BatchedGraphScratch>,
+    /// Prefill arc Phase 2 — run-lifetime scratch for the batched
+    /// full-attn `graph1` (allocated once at max chunk width). Built
+    /// by [`Self::ensure_linear_resources`] alongside
+    /// `batched_graph_scratch`.
+    full_attn_graph_scratch:
+        Option<attn::full_attn_forward::FullAttnGraphScratch>,
     /// Slice 4e — pending deferred-experts state. Originally a
     /// single `Option<DeferredState>` (one in-flight K-expert dispatch
     /// at a time); slice 5d-9 widened it to a depth-2
@@ -455,6 +461,7 @@ impl RsCtx<MetalBackend> {
             layer_caches: None,
             linear_buffers: None,
             batched_graph_scratch: None,
+            full_attn_graph_scratch: None,
             deferred: DeferredRing::new(),
             lm_head_gpu: None,
             io_pool,
@@ -1424,6 +1431,13 @@ impl RsCtx<MetalBackend> {
                 ),
             );
         }
+        if self.full_attn_graph_scratch.is_none() {
+            let pool =
+                self.backend.as_mut().expect("just-set").pool_mut();
+            self.full_attn_graph_scratch = Some(
+                attn::full_attn_forward::FullAttnGraphScratch::new(pool),
+            );
+        }
         if self.moe_buffers.is_none() {
             let pool =
                 self.backend.as_mut().expect("just-set").pool_mut();
@@ -1634,6 +1648,7 @@ impl RsCtx<MetalBackend> {
             layer_caches,
             linear_buffers,
             batched_graph_scratch,
+            full_attn_graph_scratch,
             deferred,
             lm_head_gpu,
             io_pool,
@@ -1651,6 +1666,9 @@ impl RsCtx<MetalBackend> {
         let linear_buffers =
             linear_buffers.as_mut().expect("ensure_linear_resources");
         let batched_graph_scratch = batched_graph_scratch
+            .as_ref()
+            .expect("ensure_linear_resources");
+        let full_attn_graph_scratch = full_attn_graph_scratch
             .as_ref()
             .expect("ensure_linear_resources");
         let moe_buffers =
@@ -1749,19 +1767,14 @@ impl RsCtx<MetalBackend> {
                 == variants::LayerKind::FullAttn;
             if is_full {
                 let kv_state = full_kv_mut(layer_states, layer_idx)?;
-                // S10b-1a-ii: parts_mut local to the full-attn
-                // branch; the borrow ends with the call.
-                let (metal, wf_buf, pool) = backend.parts_mut();
-                let layer_ctx = backend::gpu::gpu_ctx::GpuLayerCtx {
-                    wf,
-                    wf_buf,
-                    layer_cache: &layer_caches[layer_idx],
-                    buffers: linear_buffers,
-                    buffer_pool: pool,
-                };
+                // Prefill arc Phase 2: full-attn now mirrors the
+                // linear-attn branch — `&mut backend` + BufIds +
+                // graph scratch; the producer resolves parts via
+                // `parts_mut` internally.
                 batched_full_attn_layer_forward(
-                    metal,
-                    &layer_ctx,
+                    backend,
+                    wf,
+                    &layer_caches[layer_idx],
                     layer_idx,
                     start_pos,
                     n,
@@ -1770,8 +1783,9 @@ impl RsCtx<MetalBackend> {
                     &mut *moe_buffers,
                     kv_state,
                     prefetch_env,
-                    pool.handle(hidden_a_id),
-                    pool.handle(hidden_b_id),
+                    hidden_a_id,
+                    hidden_b_id,
+                    full_attn_graph_scratch,
                 )
                 .map_err(|_| RsError::EvalFailed)?;
             } else {

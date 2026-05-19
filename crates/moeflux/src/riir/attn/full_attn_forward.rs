@@ -45,9 +45,12 @@
 use metal::{Buffer, NSUInteger};
 
 use crate::riir::moe::expert_forward::MoeBuffers;
-use crate::riir::backend::BufferPool;
+use crate::riir::backend::{
+    Backend, BufId, BufferPool, MetalBackend, MetalBufferPool,
+};
 use crate::riir::io::expert_io::ExpertFiles;
-use moeflux_metal::SdpaCall;
+use crate::riir::io::layer_weight_cache::LayerWeightCache;
+use crate::riir::io::weight_file::WeightFile;
 use crate::riir::backend::gpu::gpu_matvec::{encode_matvec, MatvecPipelines, MatvecSpec};
 use crate::riir::backend::gpu::gpu_norm::{encode_rms_norm_bf16_into, RmsNormBf16Pipelines};
 use crate::riir::backend::gpu::gpu_ctx::GpuLayerCtx;
@@ -63,6 +66,160 @@ use crate::riir::attn::rope::apply_rotary_emb;
 use crate::riir::attn::sdpa::sdpa_cpu;
 use crate::riir::snapshot::state::KvCache;
 use crate::riir::variants::VARIANT;
+
+/// Run-lifetime scratch for the batched full-attn graph (`graph1`).
+///
+/// The full-attn counterpart of
+/// [`crate::riir::attn::linear_attn_forward::BatchedGraphScratch`]:
+/// every buffer allocated once at `BATCHED_CHUNK_SIZE` width, the
+/// `*NTokens` Ops stride by the real `n_tokens` and the max-chunk
+/// tail is simply unused. Two classes, per the `commit_plan`
+/// contract:
+///
+/// - **Intra-graph1 transients** (`normed` … `gate_logits`):
+///   `persistent = false`. The first producer call `commit_plan`s the
+///   graph, which lifetime-colors them down to a small physical set.
+/// - **Graph1 → MoE-block boundary** (`h_mid` … `routing_weights`):
+///   `persistent = true` — written in graph1, read by the (still
+///   imperative) MoE block and the host readback; never aliased.
+///
+/// `inv_freq` is the precomputed vanilla-RoPE frequency table — a
+/// read-only graph input, uploaded once at construction.
+///
+/// The hidden double-buffer is *not* owned here: the orchestrator's
+/// [`BatchedGraphScratch`](crate::riir::attn::linear_attn_forward::BatchedGraphScratch)
+/// `hidden_a`/`hidden_b` are run-lifetime and shared; full-attn
+/// receives them as `hidden_in_id` / `hidden_out_id`.
+pub struct FullAttnGraphScratch {
+    // Intra-graph1 transients (colorable).
+    pub normed: BufId,
+    pub q_proj_stack: BufId,
+    pub k_proj_stack: BufId,
+    pub v_proj_stack: BufId,
+    pub q_stack: BufId,
+    pub q_gate_stack: BufId,
+    pub attn_out_stack: BufId,
+    pub o_proj_stack: BufId,
+    pub gate_logits: BufId,
+    // Graph1 → MoE-block boundary (persistent, never aliased).
+    pub h_mid: BufId,
+    pub h_post: BufId,
+    pub shared_gate: BufId,
+    pub routing_indices: BufId,
+    pub routing_weights: BufId,
+    /// Precomputed vanilla-RoPE `inv_freq` table — persistent,
+    /// read-only, uploaded once at construction.
+    pub inv_freq: BufId,
+    /// One-time `commit_plan` latch — cleared at construction, set by
+    /// the first producer call. See `BatchedGraphScratch`.
+    pub commit_planned: std::cell::Cell<bool>,
+}
+
+impl FullAttnGraphScratch {
+    /// Allocate every batched-graph scratch buffer at max chunk width
+    /// and upload the RoPE frequency table. Intra-graph transients are
+    /// `persistent = false` (the first producer call `commit_plan`s +
+    /// pins them); the boundary buffers + `inv_freq` are
+    /// `persistent = true`.
+    pub fn new(pool: &mut MetalBufferPool) -> Self {
+        let v = VARIANT;
+        let chunk = crate::riir::BATCHED_CHUNK_SIZE;
+        let f32_sz = std::mem::size_of::<f32>();
+        let hidden = v.hidden_dim;
+        let q_dim = v.num_attn_heads * v.head_dim;
+        let kv_dim = v.num_kv_heads * v.head_dim;
+        let max_k = crate::riir::moe::expert_forward::MAX_K;
+
+        // Colorable transients first (`persistent = false`), in their
+        // own `&mut pool` scope so it ends before the persistent pass.
+        let (
+            normed,
+            q_proj_stack,
+            k_proj_stack,
+            v_proj_stack,
+            q_stack,
+            q_gate_stack,
+            attn_out_stack,
+            o_proj_stack,
+            gate_logits,
+        ) = {
+            let mut c = |elems: usize, label: &'static str| {
+                pool.alloc(chunk * elems * f32_sz, label, false)
+                    .expect("FullAttnGraphScratch::new pool alloc")
+            };
+            (
+                c(hidden, "fags.normed"),
+                c(q_dim * 2, "fags.q_proj_stack"),
+                c(kv_dim, "fags.k_proj_stack"),
+                c(kv_dim, "fags.v_proj_stack"),
+                c(q_dim, "fags.q_stack"),
+                c(q_dim, "fags.q_gate_stack"),
+                c(q_dim, "fags.attn_out_stack"),
+                c(hidden, "fags.o_proj_stack"),
+                c(v.num_experts, "fags.gate_logits"),
+            )
+        };
+
+        // RoPE frequency table: inv_freq[i] = 1 / theta^(2i/rotary_dim).
+        let rotary_dim = v.rotary_dim();
+        let half = rotary_dim / 2;
+        let theta = crate::riir::variants::ROPE_THETA;
+        let inv_freq_host: Vec<f32> = (0..half)
+            .map(|i| {
+                1.0f32 / theta.powf((2 * i) as f32 / rotary_dim as f32)
+            })
+            .collect();
+
+        let (
+            h_mid,
+            h_post,
+            shared_gate,
+            routing_indices,
+            routing_weights,
+            inv_freq,
+        ) = {
+            let mut p = |bytes: usize, label: &'static str| {
+                pool.alloc(bytes, label, true)
+                    .expect("FullAttnGraphScratch::new pool alloc")
+            };
+            let chk = |elems: usize| chunk * elems * f32_sz;
+            (
+                p(chk(hidden), "fags.h_mid"),
+                p(chk(hidden), "fags.h_post"),
+                p(chk(1), "fags.shared_gate"),
+                p(chk(max_k), "fags.routing_indices"),
+                p(chk(max_k), "fags.routing_weights"),
+                p(half * f32_sz, "fags.inv_freq"),
+            )
+        };
+        pool.upload(inv_freq, unsafe {
+            std::slice::from_raw_parts(
+                inv_freq_host.as_ptr() as *const u8,
+                half * f32_sz,
+            )
+        })
+        .expect("FullAttnGraphScratch::new inv_freq upload");
+
+        Self {
+            normed,
+            q_proj_stack,
+            k_proj_stack,
+            v_proj_stack,
+            q_stack,
+            q_gate_stack,
+            attn_out_stack,
+            o_proj_stack,
+            gate_logits,
+            h_mid,
+            h_post,
+            shared_gate,
+            routing_indices,
+            routing_weights,
+            inv_freq,
+            commit_planned: std::cell::Cell::new(false),
+        }
+    }
+}
 
 /// Run one full-attention layer's forward pass — the pre-MoE half.
 ///
@@ -491,31 +648,30 @@ pub(in crate::riir) fn full_attn_layer_forward(
 
 /// Batched full-attention layer forward for chunked prefill.
 ///
-/// Runs the per-token pre-MoE forward in a loop (steps 1-14 of the
-/// Phase B plan), capturing per-token intermediates and the GPU
-/// outputs (`h_mid`, `h_post`, `shared_out`) to host stacks. Then
-/// builds the joint N×k_active expert-bucket CSR and runs
-/// [`crate::riir::moe::expert_forward::encode_moe_batched_permute_fuse`] once
-/// for the whole chunk — one expert blob read per non-empty bucket
-/// instead of K reads per token. The per-token combine
-/// (h_mid + moe_sum + sigmoid(shared_gate) * shared_out) runs on
-/// CPU; B4 batches it via a GPU kernel.
+/// The pre-MoE half — input norm, Q/K/V projections, the per-head
+/// Q/gate split, per-head Q/K norm, RoPE, KV-cache append, SDPA, the
+/// sigmoid query gate, O-projection, the post-attention residual +
+/// norm, and the MoE router — is expressed as one [`Graph`] of typed
+/// [`Op`]s and submitted via `backend.execute` in a single cmdbuf
+/// (`commit_plan`'d once per run). Structurally identical to
+/// [`batched_linear_attn_layer_forward`](crate::riir::attn::linear_attn_forward::batched_linear_attn_layer_forward)'s
+/// `graph1`.
 ///
-/// **B1 sub-step:** steps 1-14 per-token, step 16 (MoE permute-fuse)
-/// batched. Sub-steps B2-B4 progressively batch SDPA, projections,
-/// shared FFN, and combine.
+/// The MoE block (shared FFN + expert permute-fuse + combine) is still
+/// imperative — graph-ifying it is the next slice.
 ///
-/// Pre: `hidden_in[t*hidden_dim..(t+1)*hidden_dim]` holds token t's
-/// input hidden state. Post: `hidden_out[t*hidden_dim..]` holds the
-/// post-combine hidden state. `kv_state.len` advances by `n_tokens`.
+/// Pre: `hidden_in_id` holds token `t`'s input hidden state at
+/// `[t*hidden_dim..]`. Post: `hidden_out_id` holds the post-combine
+/// hidden state; `kv_state.len` advances by `n_tokens`.
 ///
-/// **No deferred dispatch, no prefetch.** The batched path reads
-/// expert blobs synchronously per bucket; the per-token prefetch
-/// state machine is decode-only after Phase H.
+/// **No deferred dispatch.** The batched path reads expert blobs
+/// synchronously per bucket; `prefetch` is the decode-only (N=1)
+/// state machine, threaded through to the MoE block.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::riir) fn batched_full_attn_layer_forward(
-    metal: &mut MetalContext,
-    gpu: &GpuLayerCtx<'_>,
+    backend: &mut MetalBackend,
+    wf: &WeightFile,
+    layer_cache: &LayerWeightCache,
     layer_idx: usize,
     start_pos: i32,
     n_tokens: usize,
@@ -527,40 +683,43 @@ pub(in crate::riir) fn batched_full_attn_layer_forward(
     // prefetch for this layer. See `batched_linear_attn_layer_forward`
     // for the semantic.
     mut prefetch: Option<crate::riir::attn::linear_attn_forward::PrefetchEnv<'_>>,
-    // S7-2 (session 6): hidden_in / hidden_out live on GPU. The
-    // orchestrator double-buffers two MtlBuffers and swaps between
-    // layers, eliminating the inter-layer host bounce. Layer body
-    // reads `hidden_in_buf` for embedding/residual + writes
-    // `hidden_out_buf` via the GPU combine kernel.
-    hidden_in_buf: &metal::Buffer,
-    hidden_out_buf: &metal::Buffer,
+    // S7-2: hidden_in / hidden_out are the orchestrator's run-lifetime
+    // double-buffer BufIds, swapped between layers.
+    hidden_in_id: BufId,
+    hidden_out_id: BufId,
+    // Run-lifetime scratch for graph1, allocated once at max chunk
+    // width by `ensure_linear_resources`.
+    scratch: &FullAttnGraphScratch,
 ) -> Result<(), LayerForwardError> {
     use crate::riir::moe::expert_forward::{
         encode_moe_batched_permute_fuse, encode_moe_combine_residual_n_tokens,
         MAX_K,
     };
     use crate::riir::backend::gpu::metal::MtlBuffer;
+    use crate::riir::backend::{Graph, Op, WeightRef};
     use crate::riir::moe::moe_router::build_expert_buckets;
 
-    let GpuLayerCtx { wf, wf_buf, layer_cache, buffers: _, buffer_pool } =
-        *gpu;
     let v = VARIANT;
     debug_assert!(k_active <= MAX_K);
-
-    // Phase 0b (prefill arc): the KV cache is GPU-resident, registered
-    // into the pool by `ensure_linear_resources` before any forward
-    // runs — no per-layer alloc here.
 
     let hidden_dim = v.hidden_dim;
     let q_dim = v.num_attn_heads * v.head_dim;
     let kv_dim = v.num_kv_heads * v.head_dim;
+    let q_proj_dim = q_dim * 2;
+    let num_attn_heads = v.num_attn_heads as u32;
+    let num_kv_heads = v.num_kv_heads as u32;
+    let head_dim = v.head_dim as u32;
+    let rotary_dim = v.rotary_dim() as u32;
+    let eps = crate::riir::variants::RMS_NORM_EPS;
 
-    // S7-2: h_mid + shared_gate stay on GPU (consumed by GPU combine).
-    // h_post_stack is still read back so the per-token bucket_input
-    // gather (`bucket_input_host[assignment_idx]`) can index into it.
-    let mut h_post_stack = vec![0.0f32; n_tokens * hidden_dim];
-    let all_routing_indices: Vec<i32>;
-    let all_routing_weights: Vec<f32>;
+    // Phase 0b (prefill arc): the KV cache is GPU-resident, registered
+    // into the pool by `ensure_linear_resources`.
+    let k_cache_id = kv_state
+        .k_id
+        .expect("kv cache registered by ensure_linear_resources");
+    let v_cache_id = kv_state
+        .v_id
+        .expect("kv cache registered by ensure_linear_resources");
 
     let kv_start = kv_state.len;
     if (kv_start as usize) + n_tokens > crate::riir::variants::MAX_SEQ_LEN {
@@ -569,12 +728,15 @@ pub(in crate::riir) fn batched_full_attn_layer_forward(
             tensor: "kv cache overflow",
         });
     }
+
     let attn = layer_cache.attn.full().ok_or(
         LayerForwardError::MissingTensor {
             layer: layer_idx,
-            tensor: "full_attn weights (B3 batched path)",
+            tensor: "full_attn weights (batched graph path)",
         },
     )?;
+
+    // Per-tensor bit widths for the projection / router matvecs.
     let q_bits = bits_of(
         wf,
         &format!("model.layers.{layer_idx}.self_attn.q_proj.weight"),
@@ -591,344 +753,292 @@ pub(in crate::riir) fn batched_full_attn_layer_forward(
         wf,
         &format!("model.layers.{layer_idx}.self_attn.o_proj.weight"),
     );
-    let q_proj_dim = q_dim * 2;
-    let device = metal.device().clone();
-    let mv = MatvecPipelines::fetch(metal)?;
-    let rms_pipes = RmsNormBf16Pipelines::fetch(metal)?;
-
-    // ── Phase 1a+1b: fused input rms_norm + Q/K/V projections. ───
-    // No host bounce between normed_buf and the Q/K/V matvecs, so
-    // both phases share one cmdbuf. S7-1a fusion.
-    let rms_n_pipe =
-        crate::riir::backend::gpu::gpu_norm::RmsNormBf16FusedNTokensPipeline::fetch(metal)?;
-    // hidden_in_buf comes from the orchestrator's double-buffer (S7-2).
-    let normed_buf = MtlBuffer::<f32>::with_len(&device, n_tokens * hidden_dim);
-    let q_proj_buf =
-        MtlBuffer::<f32>::with_len(&device, n_tokens * q_proj_dim);
-    let k_proj_buf = MtlBuffer::<f32>::with_len(&device, n_tokens * kv_dim);
-    let v_proj_buf = MtlBuffer::<f32>::with_len(&device, n_tokens * kv_dim);
-    {
-        let queue = metal.queue_clone();
-        let cmdbuf = queue.new_command_buffer();
-        crate::riir::backend::gpu::gpu_norm::encode_rms_norm_bf16_fused_n_tokens(
-            cmdbuf,
-            &rms_n_pipe,
-            hidden_in_buf,
-            wf_buf.buffer(),
-            layer_cache.input_layernorm_w,
-            normed_buf.buffer(),
-            hidden_dim as u32,
-            n_tokens as u32,
-            crate::riir::variants::RMS_NORM_EPS,
-        );
-        encode_dense_matmul_n_tokens(
-            cmdbuf,
-            metal.kernels(),
-            &mv,
-            wf_buf.buffer(),
-            attn.q_proj_w,
-            attn.q_proj_s,
-            attn.q_proj_b,
-            normed_buf.buffer(),
-            0,
-            q_proj_buf.buffer(),
-            0,
-            hidden_dim as u32,
-            q_proj_dim as u32,
-            n_tokens as u32,
-            q_bits,
-        );
-        encode_dense_matmul_n_tokens(
-            cmdbuf,
-            metal.kernels(),
-            &mv,
-            wf_buf.buffer(),
-            attn.k_proj_w,
-            attn.k_proj_s,
-            attn.k_proj_b,
-            normed_buf.buffer(),
-            0,
-            k_proj_buf.buffer(),
-            0,
-            hidden_dim as u32,
-            kv_dim as u32,
-            n_tokens as u32,
-            k_bits,
-        );
-        encode_dense_matmul_n_tokens(
-            cmdbuf,
-            metal.kernels(),
-            &mv,
-            wf_buf.buffer(),
-            attn.v_proj_w,
-            attn.v_proj_s,
-            attn.v_proj_b,
-            normed_buf.buffer(),
-            0,
-            v_proj_buf.buffer(),
-            0,
-            hidden_dim as u32,
-            kv_dim as u32,
-            n_tokens as u32,
-            v_bits,
-        );
-        metal.commit_and_wait_labeled(cmdbuf, "batched_rms_norm_qkv_proj");
-    }
-    let _ = &rms_pipes;
-    let q_proj_stack = q_proj_buf.to_vec();
-    let k_stack = k_proj_buf.to_vec();
-    let v_stack = v_proj_buf.to_vec();
-
-    // ── Phase 1c: per-token Q split + per-head Q/K norm + RoPE +
-    //    KV append into kv_state. ─────────────────────────────────
-    let mut q_stack = vec![0.0f32; n_tokens * q_dim];
-    let mut q_gate_stack = vec![0.0f32; n_tokens * q_dim];
-    for t in 0..n_tokens {
-        let pos = start_pos + t as i32;
-        let q_proj_t = &q_proj_stack
-            [t * q_proj_dim..(t + 1) * q_proj_dim];
-        let mut q_host = vec![0.0f32; q_dim];
-        let mut q_gate_host = vec![0.0f32; q_dim];
-        let mut k_host =
-            k_stack[t * kv_dim..(t + 1) * kv_dim].to_vec();
-        let v_host =
-            v_stack[t * kv_dim..(t + 1) * kv_dim].to_vec();
-        for h in 0..v.num_attn_heads {
-            let src_off = h * (2 * v.head_dim);
-            let dst_off = h * v.head_dim;
-            q_host[dst_off..dst_off + v.head_dim].copy_from_slice(
-                &q_proj_t[src_off..src_off + v.head_dim],
-            );
-            q_gate_host[dst_off..dst_off + v.head_dim].copy_from_slice(
-                &q_proj_t[src_off + v.head_dim..src_off + 2 * v.head_dim],
-            );
-        }
-        rms_norm_per_head_cpu(
-            wf,
-            &format!("model.layers.{layer_idx}.self_attn.q_norm.weight"),
-            v.num_attn_heads,
-            v.head_dim,
-            &mut q_host,
-        )?;
-        rms_norm_per_head_cpu(
-            wf,
-            &format!("model.layers.{layer_idx}.self_attn.k_norm.weight"),
-            v.num_kv_heads,
-            v.head_dim,
-            &mut k_host,
-        )?;
-        apply_rotary_emb(pos, &mut q_host, &mut k_host)?;
-        let cache_pos = (kv_start as usize) + t;
-        // SAFETY: shared-storage KV buffers; this CPU append precedes
-        // Phase 2's SDPA cmdbuf (built only after the whole token
-        // loop) — no GPU work in flight on the cache.
-        unsafe {
-            kv_state
-                .k_slice_mut(buffer_pool, cache_pos, cache_pos + 1)
-                .copy_from_slice(&k_host);
-            kv_state
-                .v_slice_mut(buffer_pool, cache_pos, cache_pos + 1)
-                .copy_from_slice(&v_host);
-        }
-        q_stack[t * q_dim..(t + 1) * q_dim].copy_from_slice(&q_host);
-        q_gate_stack[t * q_dim..(t + 1) * q_dim]
-            .copy_from_slice(&q_gate_host);
-    }
-    kv_state.len += n_tokens as i32;
-
-    // ── Phase 2: batched tiled SDPA over the joint q stack against
-    //    the (now-extended) kv state. ──────────────────────────────
-    let device = metal.device().clone();
-    let kv_len_total = kv_state.len as u32;
-    let q_buf = MtlBuffer::<f32>::with_data(&device, &q_stack);
-    // Phase 0 (prefill arc): SDPA reads the GPU-resident KV buffers
-    // directly — no per-layer `with_data` re-upload of the entire
-    // growing prefix. `kv_len_total` bounds the SDPA read to the
-    // occupied rows; the buffer itself is `MAX_SEQ_LEN`-capacity.
-    let k_gpu = buffer_pool.handle(
-        kv_state
-            .k_id
-            .expect("kv cache registered by ensure_linear_resources"),
-    );
-    let v_gpu = buffer_pool.handle(
-        kv_state
-            .v_id
-            .expect("kv cache registered by ensure_linear_resources"),
-    );
-    let attn_out_buf =
-        MtlBuffer::<f32>::with_len(&device, n_tokens * q_dim);
-
-    let softmax_scale = 1.0f32 / (v.head_dim as f32).sqrt();
-    let heads_per_kv = (v.num_attn_heads / v.num_kv_heads) as u32;
-    // GQA-fold: when `heads_per_kv` is even, two query-heads share one
-    // threadgroup and stage each K/V block once (`attn_sdpa_causal_flash_gqa2`,
-    // ~1.3× over the unfolded kernel). Odd `heads_per_kv` (e.g. Cogito's
-    // heads_per_kv == 1) falls back to the unfolded kernel.
-    let fold = if heads_per_kv % 2 == 0 { 2 } else { 1 };
-    let queue = metal.queue_clone();
-    let cmdbuf = queue.new_command_buffer();
-    metal.kernels().encode(
-        cmdbuf,
-        &SdpaCall {
-            q: q_buf.buffer(),
-            k_cache: k_gpu,
-            v_cache: v_gpu,
-            out: attn_out_buf.buffer(),
-            n_tokens: n_tokens as u32,
-            num_heads: v.num_attn_heads as u32,
-            heads_per_kv,
-            head_dim: v.head_dim as u32,
-            kv_dim: kv_dim as u32,
-            start_pos: kv_start as u32,
-            kv_len: kv_len_total,
-            softmax_scale,
-            fold,
-        },
-    );
-    metal.commit_and_wait_labeled(cmdbuf, "batched_sdpa_causal_flash");
-    // Tiled SDPA output is gate-free (per session-2 Phase 3 design).
-    // Apply sigmoid_gate per token on host below.
-    let attn_out_stack = attn_out_buf.to_vec();
-
-    // ── Phase 3a: per-token sigmoid_gate (CPU) → attn_with_gate_stack ─
-    let mut attn_with_gate_stack = vec![0.0f32; n_tokens * q_dim];
-    for t in 0..n_tokens {
-        let q_gate = &q_gate_stack[t * q_dim..(t + 1) * q_dim];
-        let attn_raw = &attn_out_stack[t * q_dim..(t + 1) * q_dim];
-        let out_t = &mut attn_with_gate_stack[t * q_dim..(t + 1) * q_dim];
-        for i in 0..q_dim {
-            let sg = 1.0f32 / (1.0f32 + (-q_gate[i]).exp());
-            out_t[i] = sg * attn_raw[i];
-        }
-    }
-
-    // ── Phase 3b+3c: fused O projection + post-attn residual_add +
-    //    rms_norm + gate matvec + shared-gate matvec + GPU MoE router.
-    //    o_proj_buf is consumed only by the residual_add inside the
-    //    post-attn chain — no host bounce between them, so one cmdbuf
-    //    covers both. S7-1a fusion.
-    let attn_with_gate_buf =
-        MtlBuffer::<f32>::with_data(&device, &attn_with_gate_stack);
-    let o_proj_buf =
-        MtlBuffer::<f32>::with_len(&device, n_tokens * hidden_dim);
     let gate_bits =
         bits_of(wf, &format!("model.layers.{layer_idx}.mlp.gate.weight"));
     let seg_bits = bits_of(
         wf,
-        &format!(
-            "model.layers.{layer_idx}.mlp.shared_expert_gate.weight"
-        ),
+        &format!("model.layers.{layer_idx}.mlp.shared_expert_gate.weight"),
     );
-    let resid_add_n_pso = metal
-        .pipeline("residual_add_n_tokens")?
-        .clone();
-    let router_pipes =
-        crate::riir::moe::gpu_moe_router::MoeRouterPipelines::fetch(metal)?;
-    let h_mid_buf =
-        MtlBuffer::<f32>::with_len(&device, n_tokens * hidden_dim);
-    let h_post_buf =
-        MtlBuffer::<f32>::with_len(&device, n_tokens * hidden_dim);
-    let gate_logits_buf =
-        MtlBuffer::<f32>::with_len(&device, n_tokens * v.num_experts);
-    let shared_gate_buf = MtlBuffer::<f32>::with_len(&device, n_tokens);
-    let routing_indices_buf = MtlBuffer::<i32>::with_len(&device, n_tokens * k_active);
-    let routing_weights_buf =
-        MtlBuffer::<f32>::with_len(&device, n_tokens * k_active);
-    {
-        let queue = metal.queue_clone();
-        let cmdbuf = queue.new_command_buffer();
-        encode_dense_matmul_n_tokens(
-            cmdbuf,
-            metal.kernels(),
-            &mv,
-            wf_buf.buffer(),
-            attn.o_proj_w,
-            attn.o_proj_s,
-            attn.o_proj_b,
-            attn_with_gate_buf.buffer(),
-            0,
-            o_proj_buf.buffer(),
-            0,
-            q_dim as u32,
-            hidden_dim as u32,
-            n_tokens as u32,
-            o_bits,
-        );
-        crate::riir::backend::gpu::gpu_norm::encode_residual_add_n_tokens_into(
-            cmdbuf,
-            &resid_add_n_pso,
-            o_proj_buf.buffer(),
-            hidden_in_buf,
-            h_mid_buf.buffer(),
-            n_tokens as u32,
-            hidden_dim as u32,
-        );
-        crate::riir::backend::gpu::gpu_norm::encode_rms_norm_bf16_fused_n_tokens(
-            cmdbuf,
-            &rms_n_pipe,
-            h_mid_buf.buffer(),
-            wf_buf.buffer(),
-            layer_cache.post_attention_layernorm_w,
-            h_post_buf.buffer(),
-            hidden_dim as u32,
-            n_tokens as u32,
-            crate::riir::variants::RMS_NORM_EPS,
-        );
-        encode_dense_matmul_n_tokens(
-            cmdbuf,
-            metal.kernels(),
-            &mv,
-            wf_buf.buffer(),
-            layer_cache.gate.w,
-            layer_cache.gate.s,
-            layer_cache.gate.b,
-            h_post_buf.buffer(),
-            0,
-            gate_logits_buf.buffer(),
-            0,
-            hidden_dim as u32,
-            v.num_experts as u32,
-            n_tokens as u32,
-            gate_bits,
-        );
-        encode_dense_matmul_n_tokens(
-            cmdbuf,
-            metal.kernels(),
-            &mv,
-            wf_buf.buffer(),
-            layer_cache.shared.seg_w,
-            layer_cache.shared.seg_s,
-            layer_cache.shared.seg_b,
-            h_post_buf.buffer(),
-            0,
-            shared_gate_buf.buffer(),
-            0,
-            hidden_dim as u32,
-            1,
-            n_tokens as u32,
-            seg_bits,
-        );
-        crate::riir::moe::gpu_moe_router::encode_moe_router(
-            cmdbuf,
-            &router_pipes,
-            gate_logits_buf.buffer(),
-            routing_indices_buf.buffer(),
-            routing_weights_buf.buffer(),
-            n_tokens as u32,
-            v.num_experts as u32,
-            k_active as u32,
-        );
-        metal.commit_and_wait_labeled(
-            cmdbuf,
-            "batched_oproj_post_attn_route",
-        );
+
+    let softmax_scale = 1.0f32 / (v.head_dim as f32).sqrt();
+    let heads_per_kv = num_attn_heads / num_kv_heads;
+    let n = n_tokens as u32;
+
+    // ── graph1: input norm → Q/K/V proj → split → per-head norm →
+    //    RoPE → KV append → SDPA → sigmoid gate → o_proj → residual →
+    //    post-norm → MoE router. One Graph, one commit_plan, one
+    //    cmdbuf — mirrors `batched_linear_attn_layer_forward`. ──────
+    let graph = {
+        let mut g = Graph::new();
+        g.push(Op::RmsNormBf16NTokens {
+            label: "full_attn.input_norm",
+            x: hidden_in_id,
+            weight_off: layer_cache.input_layernorm_w,
+            out: scratch.normed,
+            dim: hidden_dim as u32,
+            n_tokens: n,
+            eps,
+        });
+        g.push(Op::MatvecNTokens {
+            label: "full_attn.q_proj",
+            weight: WeightRef {
+                w_off: attn.q_proj_w,
+                s_off: attn.q_proj_s,
+                b_off: attn.q_proj_b,
+                bits: q_bits,
+            },
+            input: scratch.normed,
+            input_off: 0,
+            output: scratch.q_proj_stack,
+            output_off: 0,
+            in_dim: hidden_dim as u32,
+            out_dim: q_proj_dim as u32,
+            n_tokens: n,
+        });
+        g.push(Op::MatvecNTokens {
+            label: "full_attn.k_proj",
+            weight: WeightRef {
+                w_off: attn.k_proj_w,
+                s_off: attn.k_proj_s,
+                b_off: attn.k_proj_b,
+                bits: k_bits,
+            },
+            input: scratch.normed,
+            input_off: 0,
+            output: scratch.k_proj_stack,
+            output_off: 0,
+            in_dim: hidden_dim as u32,
+            out_dim: kv_dim as u32,
+            n_tokens: n,
+        });
+        g.push(Op::MatvecNTokens {
+            label: "full_attn.v_proj",
+            weight: WeightRef {
+                w_off: attn.v_proj_w,
+                s_off: attn.v_proj_s,
+                b_off: attn.v_proj_b,
+                bits: v_bits,
+            },
+            input: scratch.normed,
+            input_off: 0,
+            output: scratch.v_proj_stack,
+            output_off: 0,
+            in_dim: hidden_dim as u32,
+            out_dim: kv_dim as u32,
+            n_tokens: n,
+        });
+        g.push(Op::SplitQGate {
+            label: "full_attn.split_q_gate",
+            q_proj: scratch.q_proj_stack,
+            q_out: scratch.q_stack,
+            gate_out: scratch.q_gate_stack,
+            num_heads: num_attn_heads,
+            head_dim,
+            n_tokens: n,
+        });
+        g.push(Op::RmsNormPerHeadNTokens {
+            label: "full_attn.q_norm",
+            x: scratch.q_stack,
+            weight_off: attn.q_norm_w,
+            num_heads: num_attn_heads,
+            head_dim,
+            n_tokens: n,
+            eps,
+        });
+        g.push(Op::RmsNormPerHeadNTokens {
+            label: "full_attn.k_norm",
+            x: scratch.k_proj_stack,
+            weight_off: attn.k_norm_w,
+            num_heads: num_kv_heads,
+            head_dim,
+            n_tokens: n,
+            eps,
+        });
+        g.push(Op::RopeNTokens {
+            label: "full_attn.q_rope",
+            x: scratch.q_stack,
+            inv_freq: scratch.inv_freq,
+            n_tokens: n,
+            num_heads: num_attn_heads,
+            head_dim,
+            rotary_dim,
+            start_pos,
+        });
+        g.push(Op::RopeNTokens {
+            label: "full_attn.k_rope",
+            x: scratch.k_proj_stack,
+            inv_freq: scratch.inv_freq,
+            n_tokens: n,
+            num_heads: num_kv_heads,
+            head_dim,
+            rotary_dim,
+            start_pos,
+        });
+        g.push(Op::KvCacheAppendNTokens {
+            label: "full_attn.kv_append",
+            k_src: scratch.k_proj_stack,
+            v_src: scratch.v_proj_stack,
+            k_cache: k_cache_id,
+            v_cache: v_cache_id,
+            kv_dim: kv_dim as u32,
+            n_tokens: n,
+            kv_start: kv_start as u32,
+        });
+        g.push(Op::SdpaCausalTiled {
+            label: "full_attn.sdpa",
+            q: scratch.q_stack,
+            k: k_cache_id,
+            v: v_cache_id,
+            attn_out: scratch.attn_out_stack,
+            n_tokens: n,
+            num_heads: num_attn_heads,
+            heads_per_kv,
+            head_dim,
+            kv_dim: kv_dim as u32,
+            kv_start: kv_start as u32,
+            kv_len_total: kv_start as u32 + n,
+            softmax_scale,
+        });
+        g.push(Op::SigmoidGateNTokens {
+            label: "full_attn.sigmoid_gate",
+            x: scratch.attn_out_stack,
+            gate: scratch.q_gate_stack,
+            dim: q_dim as u32,
+            n_tokens: n,
+        });
+        g.push(Op::MatvecNTokens {
+            label: "full_attn.o_proj",
+            weight: WeightRef {
+                w_off: attn.o_proj_w,
+                s_off: attn.o_proj_s,
+                b_off: attn.o_proj_b,
+                bits: o_bits,
+            },
+            input: scratch.attn_out_stack,
+            input_off: 0,
+            output: scratch.o_proj_stack,
+            output_off: 0,
+            in_dim: q_dim as u32,
+            out_dim: hidden_dim as u32,
+            n_tokens: n,
+        });
+        g.push(Op::ResidualAddNTokens {
+            label: "full_attn.residual_add",
+            a: scratch.o_proj_stack,
+            b: hidden_in_id,
+            out: scratch.h_mid,
+            n_tokens: n,
+            dim: hidden_dim as u32,
+        });
+        g.push(Op::RmsNormBf16NTokens {
+            label: "full_attn.post_attn_norm",
+            x: scratch.h_mid,
+            weight_off: layer_cache.post_attention_layernorm_w,
+            out: scratch.h_post,
+            dim: hidden_dim as u32,
+            n_tokens: n,
+            eps,
+        });
+        g.push(Op::MatvecNTokens {
+            label: "full_attn.gate_router",
+            weight: WeightRef {
+                w_off: layer_cache.gate.w,
+                s_off: layer_cache.gate.s,
+                b_off: layer_cache.gate.b,
+                bits: gate_bits,
+            },
+            input: scratch.h_post,
+            input_off: 0,
+            output: scratch.gate_logits,
+            output_off: 0,
+            in_dim: hidden_dim as u32,
+            out_dim: v.num_experts as u32,
+            n_tokens: n,
+        });
+        g.push(Op::MatvecNTokens {
+            label: "full_attn.shared_gate",
+            weight: WeightRef {
+                w_off: layer_cache.shared.seg_w,
+                s_off: layer_cache.shared.seg_s,
+                b_off: layer_cache.shared.seg_b,
+                bits: seg_bits,
+            },
+            input: scratch.h_post,
+            input_off: 0,
+            output: scratch.shared_gate,
+            output_off: 0,
+            in_dim: hidden_dim as u32,
+            out_dim: 1,
+            n_tokens: n,
+        });
+        g.push(Op::MoeSoftmaxTopK {
+            label: "full_attn.router_softmax_topk",
+            logits: scratch.gate_logits,
+            indices_out: scratch.routing_indices,
+            weights_out: scratch.routing_weights,
+            n_tokens: n,
+            n_experts: v.num_experts as u32,
+            k: k_active as u32,
+        });
+        g.push(Op::MoeNormalizeWeights {
+            label: "full_attn.router_normalize",
+            weights: scratch.routing_weights,
+            n_tokens: n,
+            k: k_active as u32,
+        });
+        g
+    };
+
+    // First call lifetime-colors graph1's transients (topology is
+    // layer- and step-invariant); then latch.
+    if !scratch.commit_planned.get() {
+        backend.pool_mut().commit_plan(&graph);
+        scratch.commit_planned.set(true);
     }
-    // Bulk readback (S7-2): only h_post_stack (for bucket_input
-    // gather) and the small routing buffers — h_mid + shared_gate
-    // stay on GPU and feed directly into the GPU combine kernel.
-    h_post_stack.copy_from_slice(&h_post_buf.to_vec());
-    all_routing_indices = routing_indices_buf.to_vec();
-    all_routing_weights = routing_weights_buf.to_vec();
+    backend.execute(&graph, "graph_full_attn")?;
+    // The `KvCacheAppendNTokens` op extended the cache by `n_tokens`.
+    kv_state.len += n_tokens as i32;
+
+    // ── Host readback at the graph1 → MoE-block split: h_post (for
+    //    the bucket_input gather) + routing indices/weights (for
+    //    build_expert_buckets). h_mid / shared_gate stay GPU-resident
+    //    and feed the imperative MoE block directly. ───────────────
+    let mut h_post_stack = vec![0.0f32; n_tokens * hidden_dim];
+    let mut all_routing_indices = vec![0i32; n_tokens * k_active];
+    let mut all_routing_weights = vec![0.0f32; n_tokens * k_active];
+    {
+        let pool = backend.pool();
+        pool.download(scratch.h_post, unsafe {
+            std::slice::from_raw_parts_mut(
+                h_post_stack.as_mut_ptr() as *mut u8,
+                n_tokens * hidden_dim * std::mem::size_of::<f32>(),
+            )
+        })?;
+        pool.download(scratch.routing_indices, unsafe {
+            std::slice::from_raw_parts_mut(
+                all_routing_indices.as_mut_ptr() as *mut u8,
+                n_tokens * k_active * std::mem::size_of::<i32>(),
+            )
+        })?;
+        pool.download(scratch.routing_weights, unsafe {
+            std::slice::from_raw_parts_mut(
+                all_routing_weights.as_mut_ptr() as *mut u8,
+                n_tokens * k_active * std::mem::size_of::<f32>(),
+            )
+        })?;
+    }
+
+    // ── MoE block — still imperative (Phase 3 graph-ifies it). ───
+    // `parts_mut` after graph1 is done; the three boundary buffers
+    // (h_mid / shared_gate / hidden_out) are resolved from the pool
+    // and fed to the imperative encoders below.
+    let (metal, wf_buf, buffer_pool) = backend.parts_mut();
+    let device = metal.device().clone();
+    let mv = MatvecPipelines::fetch(metal)?;
+    let h_post_gpu = buffer_pool.handle(scratch.h_post);
+    let h_mid_gpu = buffer_pool.handle(scratch.h_mid);
+    let shared_gate_gpu = buffer_pool.handle(scratch.shared_gate);
+    let hidden_out_gpu = buffer_pool.handle(hidden_out_id);
 
     // ── Phase 3d: batched shared FFN (gate matvec, up matvec,
     //    flat-element-wise swiglu, down matvec) over h_post_stack. ─
@@ -959,12 +1069,10 @@ pub(in crate::riir) fn batched_full_attn_layer_forward(
     let shared_down_w = layer_cache.shared.down_w;
     let shared_down_s = layer_cache.shared.down_s;
     let shared_down_b = layer_cache.shared.down_b;
-    let h_post_buf =
-        MtlBuffer::<f32>::with_data(&device, &h_post_stack);
-    // Shared FFN's gate-proj output (NOT the per-token sigmoid scalar
-    // from Phase 3c — that's `shared_gate_buf` and is still in scope).
-    // Renamed from `shared_gate_buf` to `shared_ffn_gate_buf` so the
-    // GPU combine kernel below reads the right buffer.
+    // Shared FFN reads `h_post` straight from the graph1 scratch
+    // buffer (`h_post_gpu`) — no host re-upload. `shared_ffn_gate_buf`
+    // is the gate-proj *output*, distinct from the per-token sigmoid
+    // scalar `shared_gate` (a graph1 boundary buffer, `shared_gate_gpu`).
     let shared_ffn_gate_buf = MtlBuffer::<f32>::with_len(
         &device,
         n_tokens * v.shared_intermediate,
@@ -994,7 +1102,7 @@ pub(in crate::riir) fn batched_full_attn_layer_forward(
         shared_gate_w,
         shared_gate_s,
         shared_gate_b,
-        h_post_buf.buffer(),
+        h_post_gpu,
         0,
         shared_ffn_gate_buf.buffer(),
         0,
@@ -1011,7 +1119,7 @@ pub(in crate::riir) fn batched_full_attn_layer_forward(
         shared_up_w,
         shared_up_s,
         shared_up_b,
-        h_post_buf.buffer(),
+        h_post_gpu,
         0,
         shared_up_buf.buffer(),
         0,
@@ -1222,7 +1330,6 @@ pub(in crate::riir) fn batched_full_attn_layer_forward(
     let out_sum_zeros = vec![0.0f32; n_tokens * hidden_dim];
     let out_sum = MtlBuffer::<f32>::with_data(&device, &out_sum_zeros);
 
-    let matvec = MatvecPipelines::fetch(metal)?;
     let swiglu = metal.pipeline("swiglu_fused")?.clone();
     let bucket_accumulate =
         metal.pipeline("moe_bucket_accumulate")?.clone();
@@ -1231,7 +1338,7 @@ pub(in crate::riir) fn batched_full_attn_layer_forward(
     // setup, then 3e dispatches after them in the same buffer.
     encode_moe_batched_permute_fuse(
         cmdbuf,
-        &matvec,
+        &mv,
         metal.kernels(),
         &swiglu,
         &bucket_accumulate,
@@ -1262,11 +1369,11 @@ pub(in crate::riir) fn batched_full_attn_layer_forward(
     encode_moe_combine_residual_n_tokens(
         cmdbuf,
         &combine_pso,
-        h_mid_buf.buffer(),
+        h_mid_gpu,
         out_sum.buffer(),
         shared_down_buf.buffer(),
-        shared_gate_buf.buffer(),
-        hidden_out_buf,
+        shared_gate_gpu,
+        hidden_out_gpu,
         n_tokens as u32,
         hidden_dim as u32,
     );
