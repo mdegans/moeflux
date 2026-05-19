@@ -1701,7 +1701,6 @@ impl RsCtx<MetalBackend> {
             hidden_double_buffer,
             head_tail_scratch,
             deferred,
-            lm_head_gpu,
             io_pool,
             prefetch,
             ..
@@ -1733,8 +1732,6 @@ impl RsCtx<MetalBackend> {
             .expect("ensure_linear_resources");
         let moe_buffers =
             moe_buffers.as_mut().expect("ensure_linear_resources");
-        let lm_head_gpu =
-            lm_head_gpu.as_ref().expect("ensure_linear_resources");
         let io_pool: &rayon::ThreadPool = &*io_pool;
 
         // Drain any stale deferred state — neither batched path uses
@@ -1768,7 +1765,6 @@ impl RsCtx<MetalBackend> {
         // the alternating pair and swaps it between layers. The
         // embed gather writes a prefix (the max-chunk tail is unused
         // for n < BATCHED_CHUNK_SIZE).
-        let hidden_bytes = n * hidden_dim * std::mem::size_of::<f32>();
         let (mut hidden_a_id, mut hidden_b_id) =
             (hidden_double_buffer.hidden_a, hidden_double_buffer.hidden_b);
         // The `embed_gather_4bit` kernel does not range-check token
@@ -1912,40 +1908,71 @@ impl RsCtx<MetalBackend> {
             std::mem::swap(&mut hidden_a_id, &mut hidden_b_id);
         }
 
-        // Final norm + lm_head on the LAST token's hidden state.
-        // `hidden_a_id` now references the buffer that the final
-        // layer wrote (post-swap). Read the last token's row to host
-        // for the CPU rms_norm pass.
-        // S10b-1a-ii: re-borrow parts for the post-loop block.
-        let (metal, wf_buf, pool) = backend.parts_mut();
+        // Prefill arc Phase 4 — GPU final norm + lm_head. The layer
+        // loop's post-iteration swap leaves `hidden_a_id` on the
+        // buffer the last layer wrote; `hidden_b_id` is the *other*
+        // physical buffer — no layer reads it again, so it is free to
+        // norm into. (Use the post-loop local, never the struct
+        // field: under odd num_layers `hidden_double_buffer.hidden_b`
+        // aliases the final hidden state we still need to read.)
+        //
+        // `Op::LmHead`'s job is exactly RmsNorm + Matvec, and both
+        // are already wired — norm `hidden_a -> hidden_b`, then an
+        // lm_head matvec of the last token's row produces the logits.
         if let Some(logits) = logits_out {
-            let mut hidden_final_host = vec![0.0f32; n * hidden_dim];
-            let bytes_out: &mut [u8] = unsafe {
-                std::slice::from_raw_parts_mut(
-                    hidden_final_host.as_mut_ptr() as *mut u8,
-                    hidden_bytes,
-                )
+            let norm_off = wf
+                .tensor_info("model.norm.weight")
+                .map(|t| t.offset)
+                .ok_or(RsError::EvalFailed)?;
+            let lm_off = |name: &str| -> Result<u64, RsError> {
+                wf.tensor_info(name)
+                    .map(|t| t.offset)
+                    .ok_or(RsError::EvalFailed)
             };
-            pool.download(hidden_a_id, bytes_out)
-                .expect("pool download hidden_final");
-            let last_row = &hidden_final_host
-                [(n - 1) * hidden_dim..n * hidden_dim];
-            let mut hidden_normed = vec![0.0f32; hidden_dim];
-            rms_norm_cpu(
-                wf,
-                "model.norm.weight",
-                last_row,
-                &mut hidden_normed,
-            )
-            .map_err(|_| RsError::EvalFailed)?;
-            lm_head_gpu
-                .forward(metal, wf_buf, &hidden_normed, logits)
+            let lm_head_weight = WeightRef {
+                w_off: lm_off("lm_head.weight")?,
+                s_off: lm_off("lm_head.scales")?,
+                b_off: lm_off("lm_head.biases")?,
+                bits: 4,
+            };
+            let mut g_tail = Graph::new();
+            g_tail.push(Op::RmsNormBf16NTokens {
+                label: "final_norm",
+                x: hidden_a_id,
+                weight_off: norm_off,
+                out: hidden_b_id,
+                dim: hidden_dim as u32,
+                n_tokens: n as u32,
+                eps: variants::RMS_NORM_EPS,
+            });
+            g_tail.push(Op::MatvecNTokens {
+                label: "lm_head",
+                weight: lm_head_weight,
+                input: hidden_b_id,
+                input_off: ((n - 1)
+                    * hidden_dim
+                    * std::mem::size_of::<f32>())
+                    as u64,
+                output: head_tail_scratch.logits,
+                output_off: 0,
+                in_dim: hidden_dim as u32,
+                out_dim: v.vocab_size as u32,
+                n_tokens: 1,
+            });
+            backend
+                .execute(&g_tail, "graph_tail")
                 .map_err(|_| RsError::EvalFailed)?;
+            backend
+                .pool()
+                .download(
+                    head_tail_scratch.logits,
+                    bytemuck::cast_slice_mut(logits),
+                )
+                .expect("pool download logits");
         }
-        // Release the transient hidden BufIds so the pool doesn't
-        // grow unbounded across steps. Persistent BufIds (none yet
-        // at S7-6c-1) would survive this call.
-        pool.reset_transient();
+        // Release transient BufIds so the pool doesn't grow across
+        // steps. The head/tail graphs use only persistent BufIds.
+        backend.pool_mut().reset_transient();
         Ok(())
     }
 
