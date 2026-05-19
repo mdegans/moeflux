@@ -84,3 +84,24 @@ gather; GPU final rms_norm → existing `LmHead` Op. *In-arc.*
 Phase-1 kernel lands its diff test before being wired. Phase 5:
 `./profile.py --model a3b --prompt-file prefill_prompt_long.txt
 --max-tokens 1 --duration 180 --top 35` after reboot, vs session-13.
+
+## Progress
+
+- **Phase 0 — DONE** (`caa44fa`). `KvCache` GPU-resident
+  (`Option<Buffer>` shared-storage, lazy `ensure_buffers`,
+  `k_slice`/`v_slice`); batched SDPA reads it directly, per-layer
+  KV re-upload gone; `state_save`/`state_load` go through the shared
+  buffer. Canary: batched_diff_oracle 23/23, diff_oracle 12/12,
+  checkpoint_restore 7/7.
+- **Phase 1 — IN PROGRESS.**
+  - item 1 RoPE — **DONE** (`82e4a52`). `Op::RopeNTokens` +
+    `rope_n_tokens` kernel (table-driven, factor-agnostic) + diff
+    test. graph_diff_oracle 13/13.
+  - item 2 sigmoid-gate — **TODO.** NOTE: a `sigmoid_gate` kernel
+    already exists in `ALL_KERNELS` — check it before writing new;
+    item 2 may only need an n-tokens variant + Op.
+  - item 3 Q-split / deinterleave — TODO.
+  - item 4 embedding gather — TODO.
+- Phases 2–5 — not started.
+
+Next session: resume at Phase 1 item 2.
