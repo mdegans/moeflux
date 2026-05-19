@@ -724,6 +724,11 @@ pub(in crate::riir) fn batched_full_attn_layer_forward(
 
     let softmax_scale = 1.0f32 / (v.head_dim as f32).sqrt();
     let heads_per_kv = (v.num_attn_heads / v.num_kv_heads) as u32;
+    // GQA-fold: when `heads_per_kv` is even, two query-heads share one
+    // threadgroup and stage each K/V block once (`attn_sdpa_causal_flash_gqa2`,
+    // ~1.3× over the unfolded kernel). Odd `heads_per_kv` (e.g. Cogito's
+    // heads_per_kv == 1) falls back to the unfolded kernel.
+    let fold = if heads_per_kv % 2 == 0 { 2 } else { 1 };
     let queue = metal.queue_clone();
     let cmdbuf = queue.new_command_buffer();
     metal.kernels().encode(
@@ -741,6 +746,7 @@ pub(in crate::riir) fn batched_full_attn_layer_forward(
             start_pos: kv_start as u32,
             kv_len: kv_len_total,
             softmax_scale,
+            fold,
         },
     );
     metal.commit_and_wait_labeled(cmdbuf, "batched_sdpa_causal_flash");

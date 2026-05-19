@@ -98,6 +98,10 @@ const FC_ALIGN_K: NSUInteger = 202;
 
 /// The FA2 batched-prefill causal SDPA kernel (`sdpa.metal`).
 const SDPA: &str = "attn_sdpa_causal_flash";
+/// The GQA-folded SDPA kernel — one threadgroup per `(q_tile, head-pair)`,
+/// staging each K/V block once for both query-heads. Used when
+/// `SdpaCall::fold == 2`.
+const SDPA_GQA2: &str = "attn_sdpa_causal_flash_gqa2";
 /// SDPA query-tile size — must match `FA_BR` in `sdpa.metal`.
 const FA_BR: u32 = 64;
 /// SDPA threads per threadgroup — must match `FA_THREADS` in `sdpa.metal`.
@@ -277,6 +281,12 @@ pub struct SdpaCall<'a> {
     pub kv_len: u32,
     /// Softmax scale, typically `1 / sqrt(head_dim)`.
     pub softmax_scale: f32,
+    /// GQA-fold factor — query-heads folded into one threadgroup so each
+    /// K/V block is staged once and reused. `1` = unfolded
+    /// (`attn_sdpa_causal_flash`); `2` = the folded kernel
+    /// (`attn_sdpa_causal_flash_gqa2`). Must divide both `num_heads` and
+    /// `heads_per_kv`.
+    pub fold: u32,
 }
 
 /// A kernel invocation that encodes itself into a command buffer using
@@ -309,6 +319,8 @@ pub struct Kernels {
     gather: [ComputePipelineState; 8],
     /// FA2 batched-prefill causal SDPA (`attn_sdpa_causal_flash`).
     sdpa: ComputePipelineState,
+    /// GQA-folded SDPA (`attn_sdpa_causal_flash_gqa2`) — `SdpaCall::fold == 2`.
+    sdpa_gqa2: ComputePipelineState,
 }
 
 impl Kernels {
@@ -322,8 +334,13 @@ impl Kernels {
             .map_err(MlxError::Compile)?;
 
         let build = |name: &str| -> Result<ComputePipelineState, MlxError> {
+            // An empty `FunctionConstantValues` (not `None`): `sdpa.metal`
+            // declares the `ABLATE_*` function constants, and Metal then
+            // requires a specialized function even when every constant
+            // takes its `is_function_constant_defined` default. Harmless
+            // for the constant-free `qmm_t` kernels.
             let function = library
-                .get_function(name, None)
+                .get_function(name, Some(FunctionConstantValues::new()))
                 .map_err(|e| MlxError::Pipeline(name.to_string(), e))?;
             let pipeline = device
                 .new_compute_pipeline_state_with_function(&function)
@@ -393,6 +410,7 @@ impl Kernels {
             qmm_t_unaligned: build(QMM_T_UNALIGNED)?,
             gather,
             sdpa: build(SDPA)?,
+            sdpa_gqa2: build(SDPA_GQA2)?,
         })
     }
 
@@ -523,11 +541,29 @@ impl KernelCall for SdpaCall<'_> {
             "attn_sdpa_causal_flash is compiled for head_dim == 256"
         );
 
+        debug_assert!(
+            self.fold == 1 || self.fold == 2,
+            "SdpaCall::fold must be 1 or 2, got {}",
+            self.fold
+        );
+        debug_assert_eq!(
+            self.num_heads % self.fold,
+            0,
+            "fold must divide num_heads"
+        );
+
+        // GQA-fold: one threadgroup per (q_tile, head-group of `fold`
+        // query-heads). fold == 1 is the unfolded kernel.
+        let pso = if self.fold > 1 {
+            &kernels.sdpa_gqa2
+        } else {
+            &kernels.sdpa
+        };
         let num_q_tiles = self.n_tokens.div_ceil(FA_BR);
-        let total_tgs = num_q_tiles * self.num_heads;
+        let total_tgs = num_q_tiles * (self.num_heads / self.fold);
 
         let enc = cmdbuf.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&kernels.sdpa);
+        enc.set_compute_pipeline_state(pso);
         enc.set_buffer(0, Some(self.q), 0);
         enc.set_buffer(1, Some(self.k_cache), 0);
         enc.set_buffer(2, Some(self.v_cache), 0);

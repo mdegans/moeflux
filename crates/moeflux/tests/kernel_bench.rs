@@ -26,9 +26,14 @@
 
 #![cfg(target_os = "macos")]
 
+use std::ffi::c_void;
 use std::time::{Duration, Instant};
 
-use metal::{Buffer, CommandBufferRef, MTLResourceOptions, NSUInteger};
+use metal::{
+    Buffer, CommandBufferRef, CompileOptions, ComputePipelineState,
+    FunctionConstantValues, MTLDataType, MTLResourceOptions, MTLSize,
+    NSUInteger,
+};
 
 use moeflux::riir::backend::gpu::gpu_matvec::{
     encode_matvec_n_tokens, MatvecPipelines,
@@ -181,35 +186,291 @@ fn time_cmdbuf(
 
 /// Warm up (one untimed dispatch, absorbs shader-compile), probe a
 /// single dispatch to size `K`, then run `TRIALS` timed cmdbufs of K
-/// dispatches each. Returns `(k, ms_per_dispatch_median)`.
+/// dispatches each. Returns `(k, sorted per-dispatch ms)`.
+fn measure(
+    metal: &MetalContext,
+    encode: &dyn Fn(&CommandBufferRef),
+) -> (u32, Vec<f64>) {
+    let _ = time_cmdbuf(metal, 1, encode);
+    let probe = time_cmdbuf(metal, 1, encode).as_secs_f64() * 1e3;
+    let k = ((TARGET_MS / probe).round() as u32).clamp(1, MAX_K);
+    let mut per: Vec<f64> = (0..TRIALS)
+        .map(|_| time_cmdbuf(metal, k, encode).as_secs_f64() * 1e3 / k as f64)
+        .collect();
+    per.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    (k, per)
+}
+
+/// Median of a sorted trial vector.
+fn median(per: &[f64]) -> f64 {
+    per[per.len() / 2]
+}
+
+/// [`measure`] + print a GFLOP/s line.
 fn bench(
     metal: &MetalContext,
     label: &str,
     flops_per_dispatch: f64,
     encode: &dyn Fn(&CommandBufferRef),
 ) {
-    // Warm-up + single-dispatch probe.
-    let _ = time_cmdbuf(metal, 1, encode);
-    let probe = time_cmdbuf(metal, 1, encode).as_secs_f64() * 1e3;
-    let k = ((TARGET_MS / probe).round() as u32).clamp(1, MAX_K);
-
-    let mut per: Vec<f64> = (0..TRIALS)
-        .map(|_| {
-            let d = time_cmdbuf(metal, k, encode);
-            d.as_secs_f64() * 1e3 / k as f64
-        })
-        .collect();
-    per.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let median = per[per.len() / 2];
-    let gflops = flops_per_dispatch / (median * 1e6);
-
+    let (k, per) = measure(metal, encode);
+    let med = median(&per);
+    let gflops = flops_per_dispatch / (med * 1e6);
     eprintln!(
-        "  {label:<40} K={k:<3} {median:>10.3} ms  {gflops:>9.1} GFLOP/s  \
+        "  {label:<40} K={k:<3} {med:>10.3} ms  {gflops:>9.1} GFLOP/s  \
          (trials {:.3}/{:.3}/{:.3})",
         per[0],
-        per[per.len() / 2],
+        med,
         per[per.len() - 1],
     );
+}
+
+// ---------------------------------------------------------------------------
+// SDPA ablation — Phase 0 bound analysis (session 13).
+//
+// Builds `attn_sdpa_causal_flash` with the `ABLATE_*` phase-skip /
+// vec4-stage function constants (see `sdpa.metal`) and times each
+// variant. The dominant cost (staging / QK / softmax / P·V /
+// loop+barrier floor) falls out by difference: `A − skip(X) = cost(X)`.
+// ---------------------------------------------------------------------------
+
+/// SDPA query-tile size — must match `FA_BR` in `sdpa.metal`.
+const FA_BR: u32 = 64;
+/// SDPA threads per threadgroup — must match `FA_THREADS` in `sdpa.metal`.
+const FA_THREADS: u32 = 256;
+
+// `ABLATE_*` function-constant indices — must match `sdpa.metal`.
+const FC_SKIP_QK: NSUInteger = 100;
+const FC_SKIP_SOFTMAX: NSUInteger = 101;
+const FC_SKIP_PV: NSUInteger = 102;
+const FC_SKIP_STAGE: NSUInteger = 103;
+
+struct SdpaArgs<'a> {
+    q: &'a Buffer,
+    k: &'a Buffer,
+    v: &'a Buffer,
+    out: &'a Buffer,
+    n_tokens: u32,
+    num_heads: u32,
+    heads_per_kv: u32,
+    kv_dim: u32,
+    start_pos: u32,
+    kv_len: u32,
+    scale: f32,
+}
+
+/// Encode one SDPA dispatch with `pso` — mirrors `SdpaCall::encode`
+/// (moeflux-metal). `fold` is the GQA-fold factor: the grid is
+/// `num_q_tiles × num_heads / fold` (1 for the unfolded ablation PSOs).
+fn encode_sdpa(
+    cmd: &CommandBufferRef,
+    pso: &ComputePipelineState,
+    a: &SdpaArgs,
+    fold: u32,
+) {
+    let enc = cmd.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(pso);
+    enc.set_buffer(0, Some(a.q), 0);
+    enc.set_buffer(1, Some(a.k), 0);
+    enc.set_buffer(2, Some(a.v), 0);
+    enc.set_buffer(3, Some(a.out), 0);
+    enc.set_bytes(4, 4, (&a.n_tokens as *const u32).cast());
+    enc.set_bytes(5, 4, (&a.num_heads as *const u32).cast());
+    enc.set_bytes(6, 4, (&a.heads_per_kv as *const u32).cast());
+    enc.set_bytes(7, 4, (&a.kv_dim as *const u32).cast());
+    enc.set_bytes(8, 4, (&a.start_pos as *const u32).cast());
+    enc.set_bytes(9, 4, (&a.kv_len as *const u32).cast());
+    enc.set_bytes(10, 4, (&a.scale as *const f32).cast());
+    let total_tgs = a.n_tokens.div_ceil(FA_BR) * (a.num_heads / fold);
+    enc.dispatch_thread_groups(
+        MTLSize::new(total_tgs as NSUInteger, 1, 1),
+        MTLSize::new(FA_THREADS as NSUInteger, 1, 1),
+    );
+    enc.end_encoding();
+}
+
+/// One SDPA PSO under test: label, pipeline, GQA-fold factor.
+struct SdpaPso {
+    label: &'static str,
+    pso: ComputePipelineState,
+    fold: u32,
+}
+
+/// Build the SDPA PSOs from one compiled library: 6 unfolded ablation
+/// variants (fold 1) + the 3 GQA-folded kernels (fold 2/4/8).
+fn build_sdpa_psos(metal: &MetalContext) -> Vec<SdpaPso> {
+    let device = metal.device();
+    let library = device
+        .new_library_with_source(
+            &moeflux_metal::assemble_source(),
+            &CompileOptions::new(),
+        )
+        .expect("compile sdpa ablation library");
+    let build = |name: &str, flags: &[NSUInteger]| -> ComputePipelineState {
+        let fcv = FunctionConstantValues::new();
+        let set = true;
+        for &idx in flags {
+            fcv.set_constant_value_at_index(
+                &set as *const bool as *const c_void,
+                MTLDataType::Bool,
+                idx,
+            );
+        }
+        let function = library
+            .get_function(name, Some(fcv))
+            .unwrap_or_else(|e| panic!("get {name}: {e}"));
+        device
+            .new_compute_pipeline_state_with_function(&function)
+            .unwrap_or_else(|e| panic!("build {name} pso: {e}"))
+    };
+    const UNFOLDED: &str = "attn_sdpa_causal_flash";
+    let mk = |label, pso, fold| SdpaPso { label, pso, fold };
+    vec![
+        mk("A baseline", build(UNFOLDED, &[]), 1),
+        mk("B skip-QK", build(UNFOLDED, &[FC_SKIP_QK]), 1),
+        mk("C skip-softmax", build(UNFOLDED, &[FC_SKIP_SOFTMAX]), 1),
+        mk("D skip-PV", build(UNFOLDED, &[FC_SKIP_PV]), 1),
+        mk("E skip-stage", build(UNFOLDED, &[FC_SKIP_STAGE]), 1),
+        mk(
+            "F floor",
+            build(
+                UNFOLDED,
+                &[FC_SKIP_QK, FC_SKIP_SOFTMAX, FC_SKIP_PV, FC_SKIP_STAGE],
+            ),
+            1,
+        ),
+        mk("G gqa-fold G=2", build("attn_sdpa_causal_flash_gqa2", &[]), 2),
+        mk("H gqa-fold G=4", build("attn_sdpa_causal_flash_gqa4", &[]), 4),
+        mk("I gqa-fold G=8", build("attn_sdpa_causal_flash_gqa8", &[]), 8),
+    ]
+}
+
+fn bench_sdpa_ablation(metal: &mut MetalContext) {
+    let num_heads = VARIANT.num_attn_heads as u32;
+    let num_kv_heads = VARIANT.num_kv_heads as u32;
+    let head_dim = VARIANT.head_dim as u32;
+    let heads_per_kv = num_heads / num_kv_heads;
+    let kv_dim = num_kv_heads * head_dim;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    assert_eq!(head_dim, 256, "ablation kernel is compiled for head_dim 256");
+
+    let psos = build_sdpa_psos(metal);
+    eprintln!(
+        "\n[sdpa-ablation] heads={num_heads} kv_heads={num_kv_heads} \
+         heads_per_kv={heads_per_kv} head_dim={head_dim}"
+    );
+
+    let configs: &[(u32, u32)] =
+        &[(1536, 1536), (8192, 8192), (8192, 32768)];
+    let mut rng = XorShift64::new(0x5D_0A_0013);
+    for &(m, kv_len) in configs {
+        let start_pos = kv_len - m;
+        let q = rand_f32s(
+            &mut rng,
+            m as usize * num_heads as usize * head_dim as usize,
+        );
+        let k = rand_f32s(&mut rng, kv_len as usize * kv_dim as usize);
+        let v = rand_f32s(&mut rng, kv_len as usize * kv_dim as usize);
+        let q_buf = make_buf::<f32>(metal, q.len());
+        write_buf(&q_buf, &q);
+        let k_buf = make_buf::<f32>(metal, k.len());
+        write_buf(&k_buf, &k);
+        let v_buf = make_buf::<f32>(metal, v.len());
+        write_buf(&v_buf, &v);
+        let out_buf = make_buf::<f32>(
+            metal,
+            m as usize * num_heads as usize * head_dim as usize,
+        );
+        let args = SdpaArgs {
+            q: &q_buf,
+            k: &k_buf,
+            v: &v_buf,
+            out: &out_buf,
+            n_tokens: m,
+            num_heads,
+            heads_per_kv,
+            kv_dim,
+            start_pos,
+            kv_len,
+            scale,
+        };
+
+        eprintln!("  -- M={m} kv_len={kv_len} --");
+        let mut med = vec![f64::NAN; psos.len()];
+        for (i, p) in psos.iter().enumerate() {
+            // A folded PSO whose register footprint forces the
+            // threadgroup below FA_THREADS can't be dispatched at 256
+            // threads — that is the register-ceiling readout.
+            let max_tg = p.pso.max_total_threads_per_threadgroup();
+            if max_tg < FA_THREADS as NSUInteger {
+                eprintln!(
+                    "  {:<16} occupancy {max_tg}<{FA_THREADS} thr/TG \
+                     — register spill, skipped",
+                    p.label,
+                );
+                continue;
+            }
+            let encode = |cmd: &CommandBufferRef| {
+                encode_sdpa(cmd, &p.pso, &args, p.fold)
+            };
+            let (reps, per) = measure(metal, &encode);
+            med[i] = median(&per);
+            let occ = if p.fold > 1 {
+                format!("  [{max_tg} thr/TG]")
+            } else {
+                String::new()
+            };
+            eprintln!(
+                "  {:<16} K={reps:<3} {:>10.3} ms  \
+                 (trials {:.3}/{:.3}/{:.3}){occ}",
+                p.label,
+                med[i],
+                per[0],
+                med[i],
+                per[per.len() - 1],
+            );
+        }
+
+        // Attribution: A − skip(X) = cost of X.
+        let a = med[0];
+        let qk = a - med[1];
+        let sm = a - med[2];
+        let pv = a - med[3];
+        let stage = a - med[4];
+        let floor = med[5];
+        let sum = floor + qk + sm + pv + stage;
+        let pct = |x: f64| 100.0 * x / a;
+        eprintln!(
+            "  attribution (A = {a:.3} ms):\n\
+             \x20   staging  {stage:>9.3} ms  ({:>5.1}%)\n\
+             \x20   QK^T     {qk:>9.3} ms  ({:>5.1}%)\n\
+             \x20   softmax  {sm:>9.3} ms  ({:>5.1}%)\n\
+             \x20   P-V      {pv:>9.3} ms  ({:>5.1}%)\n\
+             \x20   floor    {floor:>9.3} ms  ({:>5.1}%)  (KV loop + barriers)\n\
+             \x20   sum {sum:.3} ms vs A {a:.3} ms  (residual {:.3} ms)",
+            pct(stage),
+            pct(qk),
+            pct(sm),
+            pct(pv),
+            pct(floor),
+            a - sum,
+        );
+        // GQA-fold (G/H/I) vs baseline A — the headline A/B.
+        eprintln!("  GQA-fold vs baseline A ({a:.3} ms):");
+        for (i, p) in psos.iter().enumerate().skip(6) {
+            if med[i].is_nan() {
+                eprintln!("    {:<16}  — skipped", p.label);
+            } else {
+                eprintln!(
+                    "    {:<16} {:>10.3} ms   {:.2}× speedup ({:+.1}%)",
+                    p.label,
+                    med[i],
+                    a / med[i],
+                    100.0 * (a - med[i]) / a,
+                );
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -286,6 +547,7 @@ fn bench_sdpa(metal: &mut MetalContext) {
                     start_pos,
                     kv_len,
                     softmax_scale: scale,
+                    fold: 1,
                 },
             );
         };
@@ -388,6 +650,7 @@ fn kernel_microbench() {
     let mut metal = MetalContext::new().expect("open Metal");
     eprintln!("=== moeflux kernel microbench (a3b shapes) ===");
     bench_sdpa(&mut metal);
+    bench_sdpa_ablation(&mut metal);
     bench_matvec(&mut metal);
     eprintln!("=== end microbench ===");
 }

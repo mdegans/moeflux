@@ -569,9 +569,10 @@ fn gate_off(q_dim: usize) -> Vec<f32> {
 // FlashAttention-2 causal SDPA — diff vs tokenwise sdpa_cpu oracle.
 // ---------------------------------------------------------------------------
 
-/// Dispatch `encode_sdpa_causal_flash` over freshly-written input buffers
-/// and read back `out`. No scratch buffers (the flash kernel keeps its
-/// running state threadgroup/register-resident).
+/// Dispatch the SDPA kernel over freshly-written input buffers and read
+/// back `out`. `fold` selects unfolded (1) vs the GQA-folded kernel (2)
+/// via the production `SdpaCall` path. No scratch buffers — the flash
+/// kernel keeps its running state threadgroup/register-resident.
 #[allow(clippy::too_many_arguments)]
 fn run_batched_sdpa_flash(
     metal: &mut MetalContext,
@@ -586,6 +587,7 @@ fn run_batched_sdpa_flash(
     start_pos: u32,
     kv_len: u32,
     scale: f32,
+    fold: u32,
 ) -> Vec<f32> {
     let out_total =
         n_tokens as usize * num_heads as usize * head_dim as usize;
@@ -615,6 +617,7 @@ fn run_batched_sdpa_flash(
             start_pos,
             kv_len,
             softmax_scale: scale,
+            fold,
         },
     );
     cmdbuf.commit();
@@ -627,7 +630,7 @@ fn run_batched_sdpa_flash(
 /// absolute position `start_pos` against a per-token `sdpa_cpu` oracle
 /// (each query `q` attends to `KV[0 .. start_pos+q+1]`). Per-token
 /// cosine must clear `COSINE_FLOOR`.
-fn flash_diff_tokenwise(n_tokens: u32, start_pos: u32, seed: u64) {
+fn flash_diff_tokenwise(n_tokens: u32, start_pos: u32, seed: u64, fold: u32) {
     let num_heads = VARIANT.num_attn_heads as u32;
     let num_kv_heads = VARIANT.num_kv_heads as u32;
     let head_dim = VARIANT.head_dim as u32;
@@ -666,9 +669,8 @@ fn flash_diff_tokenwise(n_tokens: u32, start_pos: u32, seed: u64) {
 
     let mut metal = MetalContext::new().expect("open Metal");
     let gpu = run_batched_sdpa_flash(
-        &mut metal, &q_data, &k_data, &v_data, n_tokens,
-        num_heads, heads_per_kv, head_dim, kv_dim, start_pos, kv_len,
-        scale,
+        &mut metal, &q_data, &k_data, &v_data, n_tokens, num_heads,
+        heads_per_kv, head_dim, kv_dim, start_pos, kv_len, scale, fold,
     );
 
     assert!(
@@ -681,14 +683,28 @@ fn flash_diff_tokenwise(n_tokens: u32, start_pos: u32, seed: u64) {
         let c = &cpu[q * q_dim..(q + 1) * q_dim];
         let cos = cosine_sim(g, c);
         worst = worst.min(cos);
+        if cos < COSINE_FLOOR {
+            let hd = head_dim as usize;
+            for h in 0..num_heads as usize {
+                let gh = &g[h * hd..(h + 1) * hd];
+                let ch = &c[h * hd..(h + 1) * hd];
+                let gn: f32 = gh.iter().map(|x| x * x).sum::<f32>().sqrt();
+                let cn: f32 = ch.iter().map(|x| x * x).sum::<f32>().sqrt();
+                eprintln!(
+                    "  token {q} head {h}: cos={:.6} |gpu|={gn:.4} \
+                     |cpu|={cn:.4}",
+                    cosine_sim(gh, ch),
+                );
+            }
+        }
         assert!(
             cos >= COSINE_FLOOR,
-            "flash N={n_tokens} start_pos={start_pos} token {q} \
-             cosine {cos} below floor {COSINE_FLOOR}"
+            "flash N={n_tokens} start_pos={start_pos} fold={fold} \
+             token {q} cosine {cos} below floor {COSINE_FLOOR}"
         );
     }
     eprintln!(
-        "flash N={n_tokens} start_pos={start_pos}: \
+        "flash N={n_tokens} start_pos={start_pos} fold={fold}: \
          worst per-token cosine = {worst:.9}"
     );
 }
@@ -697,21 +713,21 @@ fn flash_diff_tokenwise(n_tokens: u32, start_pos: u32, seed: u64) {
 #[test]
 #[ignore = "long-running GPU test"]
 fn sdpa_causal_flash_n1_single_block() {
-    flash_diff_tokenwise(1, 63, 0x5DA0_F1A5_0000_0001);
+    flash_diff_tokenwise(1, 63, 0x5DA0_F1A5_0000_0001, 1);
 }
 
 /// N=1, kv_len=5000 — many KV blocks, exercises the online merge.
 #[test]
 #[ignore = "long-running GPU test"]
 fn sdpa_causal_flash_n1_multi_block() {
-    flash_diff_tokenwise(1, 4999, 0x5DA0_F1A5_0000_0002);
+    flash_diff_tokenwise(1, 4999, 0x5DA0_F1A5_0000_0002, 1);
 }
 
 /// N=4, start_pos=4 — per-query causal cutoff across a small tile.
 #[test]
 #[ignore = "long-running GPU test"]
 fn sdpa_causal_flash_n4_tokenwise() {
-    flash_diff_tokenwise(4, 4, 0x5DA0_F1A5_0000_0003);
+    flash_diff_tokenwise(4, 4, 0x5DA0_F1A5_0000_0003, 1);
 }
 
 /// M=512, start_pos=0 — square causal: 16 query tiles, heavy causal
@@ -719,7 +735,7 @@ fn sdpa_causal_flash_n4_tokenwise() {
 #[test]
 #[ignore = "long-running GPU test"]
 fn sdpa_causal_flash_m512_square_causal() {
-    flash_diff_tokenwise(512, 0, 0x5DA0_F1A5_0000_0004);
+    flash_diff_tokenwise(512, 0, 0x5DA0_F1A5_0000_0004, 1);
 }
 
 /// M=1500, start_pos=4096 — deep chunk (kv_len > M), and 1500 is not a
@@ -727,7 +743,41 @@ fn sdpa_causal_flash_m512_square_causal() {
 #[test]
 #[ignore = "long-running GPU test"]
 fn sdpa_causal_flash_m1500_deep_chunk() {
-    flash_diff_tokenwise(1500, 4096, 0x5DA0_F1A5_0000_0005);
+    flash_diff_tokenwise(1500, 4096, 0x5DA0_F1A5_0000_0005, 1);
+}
+
+// GQA-folded kernel (`attn_sdpa_causal_flash_gqa2`, fold=2) — same five
+// shapes, diffed against the same per-token `sdpa_cpu` oracle. fold=2
+// divides a3b's heads_per_kv=8.
+
+#[test]
+#[ignore = "long-running GPU test"]
+fn sdpa_causal_flash_gqa2_n1_single_block() {
+    flash_diff_tokenwise(1, 63, 0x5DA0_F1A5_0000_0001, 2);
+}
+
+#[test]
+#[ignore = "long-running GPU test"]
+fn sdpa_causal_flash_gqa2_n1_multi_block() {
+    flash_diff_tokenwise(1, 4999, 0x5DA0_F1A5_0000_0002, 2);
+}
+
+#[test]
+#[ignore = "long-running GPU test"]
+fn sdpa_causal_flash_gqa2_n4_tokenwise() {
+    flash_diff_tokenwise(4, 4, 0x5DA0_F1A5_0000_0003, 2);
+}
+
+#[test]
+#[ignore = "long-running GPU test"]
+fn sdpa_causal_flash_gqa2_m512_square_causal() {
+    flash_diff_tokenwise(512, 0, 0x5DA0_F1A5_0000_0004, 2);
+}
+
+#[test]
+#[ignore = "long-running GPU test"]
+fn sdpa_causal_flash_gqa2_m1500_deep_chunk() {
+    flash_diff_tokenwise(1500, 4096, 0x5DA0_F1A5_0000_0005, 2);
 }
 
 // ---------------------------------------------------------------------------
