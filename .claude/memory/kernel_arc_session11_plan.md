@@ -104,27 +104,48 @@ replace a hand-rolled ~5%-of-peak matvec with MLX's tiled `qmm_t`.
   the vendored file — no new headers, no new attribution, no
   collision.
 - **Path B — vendor MLX's whole `steel/attn` flash-attention** —
-  rejected for our shape. It *is* a true single-pass flash-attn-2
-  with GQA + causal + (implicit, `qL_off = kL−qL`) start-offset, so
-  it fits the model class. But two concrete blockers:
-  1. **head_dim 256 is not instantiated.** MLX ships `steel/attn`
-     only for `BD ∈ {64,80,128}` (`steel_attention.metal:15-17`).
-     a3b is 256. The body is generic in `BD`, but at `BD=256`
-     threadgroup memory (~48 KB) blows the 32 KB cap → forces
-     `BQ=16` / f16 staging. We would be the *first* to tune
-     steel/attn at 256 — i.e. it would not be the battle-tested
-     kernel that is the whole argument for B.
+  rejected for our shape, but **on value-proposition grounds, not a
+  hard limit.** (Second-opinion verification 2026-05-19 — see note
+  below.) It *is* a true single-pass flash-attn-2 with GQA + causal
+  + (implicit, `qL_off = kL−qL`) start-offset, so it fits the model
+  class. The case against:
+  1. **`BD=256` is feasible but untuned.** MLX ships `steel/attn`
+     only for `BD ∈ {64,80,128}` (`steel_attention.metal:15-17`),
+     all at `BQ=32`. The body is generic in `BD`. The threadgroup-
+     memory formula is `BQ·(BD+pad) + max((BK+pad)·BD, BK·(BD+pad))`
+     — Q/K/V tiles only (S and O stay in registers, per FA-2). At
+     `BD=256`: default `BQ=32/BK=32` = **36.5 KB** (over the 32 KB
+     cap), but **`BQ=16/BK=32` = 28.25 KB — fits.** The earlier
+     "~48 KB" figure was wrong. So tgmem is NOT a blocker. The real
+     cost: `BQ=16` is a tile shape MLX has never instantiated for
+     any head_dim, and a `static_assert(TQ==1)` couples `BQ` to the
+     warp count — `BQ=16` also needs `WM=2`. We would be the *first*
+     to tune steel/attn at this shape, plus register pressure at
+     `BD=256` (2× the `BD=128` accumulator) is unverified. That
+     dissolves "battle-tested" — the whole argument for B.
   2. **`mma.h` name collision.** `steel/attn` needs a *different*
      `steel/attn/mma.h` (750 lines; adds `row_reduce`/`row_bin_op`)
      that redefines `MMATile` in the same `mlx::steel` namespace as
      the vendored `steel/gemm/mma.h`. `moeflux-mlx`'s flatten-into-
-     one-TU build (`assemble_source`) can't hold both without a
-     separate Metal library or a namespace rename — structural.
+     one-TU build (`assemble_source`) needs a `#pragma once` or a
+     namespace rename to `mlx::steel::attn` to hold both — real, but
+     a contained sed, not a structural blocker.
 
   Path B's upside (also gets MLX's `nax` tensor path + decode-side
-  `sdpa_vector` for free) is real; revisit only for a future model
-  with `BD ∈ {64,80,128}`. The `flash_diff_tokenwise` oracle bounds
-  the risk of the Path A swap.
+  `sdpa_vector` for free) is real, and it remains a viable **Path A
+  fallback at `BD=256`** (config `BQ=16/BK=32/WM=2`, 28.25 KB) if
+  the hand-rolled softmax underperforms — not just for future models
+  with `BD ∈ {64,80,128}`. It is a fair amount of work (vendor
+  `attn/*`, namespace surgery, tune an untested tile shape, profile
+  for spills). The `flash_diff_tokenwise` oracle validates either
+  path and bounds the risk of the Path A swap.
+
+  *2026-05-19 correction:* the original blocker #1 claimed `BD=256`
+  needs ~48 KB and is therefore dead. A follow-up agent read of the
+  upstream kernel + an M2 Max `maxThreadgroupMemoryLength` probe
+  (confirmed 32768 B, constant across apple7/8/9) found a sub-32 KB
+  config exists. Path A still wins — but for the "untuned shape /
+  unverified register pressure" reason, not a tgmem cap.
 
 ## Three design decisions — lock these in the opening conversation
 
