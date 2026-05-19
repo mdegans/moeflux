@@ -50,7 +50,7 @@ pub use attn::linear_attn::{
 // S7-6c: trait scope for `pool.alloc/handle/upload/download/reset_transient`
 // in `step_internal_batched_gqa`.
 use backend::BufferPool as _;
-use backend::{Backend, MetalBackend};
+use backend::{Backend, Graph, MetalBackend, Op, WeightRef};
 pub use io::lm_head::{lm_head_cpu, LmHeadError};
 pub use backend::gpu::metal::{
     CmdbufStat, MetalContext, MetalError, MtlBuffer,
@@ -253,6 +253,11 @@ pub struct RsCtx<B: Backend = MetalBackend> {
     /// run scope. The orchestrator swaps the pair between layers.
     hidden_double_buffer:
         Option<attn::linear_attn_forward::HiddenDoubleBuffer>,
+    /// Prefill arc Phase 4 — run-lifetime scratch for the orchestrator
+    /// head (GPU embedding gather) and tail (GPU final norm + lm_head).
+    /// Built by [`Self::ensure_linear_resources`].
+    head_tail_scratch:
+        Option<attn::linear_attn_forward::HeadTailScratch>,
     /// Slice 4e — pending deferred-experts state. Originally a
     /// single `Option<DeferredState>` (one in-flight K-expert dispatch
     /// at a time); slice 5d-9 widened it to a depth-2
@@ -475,6 +480,7 @@ impl RsCtx<MetalBackend> {
             full_attn_graph_scratch: None,
             moe_graph_scratch: None,
             hidden_double_buffer: None,
+            head_tail_scratch: None,
             deferred: DeferredRing::new(),
             lm_head_gpu: None,
             io_pool,
@@ -1473,6 +1479,13 @@ impl RsCtx<MetalBackend> {
                 attn::linear_attn_forward::HiddenDoubleBuffer::new(pool),
             );
         }
+        if self.head_tail_scratch.is_none() {
+            let pool =
+                self.backend.as_mut().expect("just-set").pool_mut();
+            self.head_tail_scratch = Some(
+                attn::linear_attn_forward::HeadTailScratch::new(pool),
+            );
+        }
         if self.moe_buffers.is_none() {
             let pool =
                 self.backend.as_mut().expect("just-set").pool_mut();
@@ -1686,6 +1699,7 @@ impl RsCtx<MetalBackend> {
             full_attn_graph_scratch,
             moe_graph_scratch,
             hidden_double_buffer,
+            head_tail_scratch,
             deferred,
             lm_head_gpu,
             io_pool,
@@ -1714,6 +1728,9 @@ impl RsCtx<MetalBackend> {
         let hidden_double_buffer = hidden_double_buffer
             .as_ref()
             .expect("ensure_linear_resources");
+        let head_tail_scratch = head_tail_scratch
+            .as_ref()
+            .expect("ensure_linear_resources");
         let moe_buffers =
             moe_buffers.as_mut().expect("ensure_linear_resources");
         let lm_head_gpu =
@@ -1740,40 +1757,54 @@ impl RsCtx<MetalBackend> {
             prefetch.drain();
         }
 
-        // S7-2: embed all tokens into a stacked host buffer, then
-        // upload to a GPU buffer once. Layer-forwards read/write GPU
-        // buffers directly; the orchestrator double-buffers
-        // hidden_a / hidden_b and swaps between layers. Eliminates the
-        // inter-layer host bounce that historically forced one
-        // commit_and_wait per layer just for hidden state marshaling.
-        let mut hidden_stack_host = vec![0.0f32; n * hidden_dim];
-        for (t, &tok) in tokens.iter().enumerate() {
-            io::embedding::embed_lookup(
-                wf,
-                tok,
-                &mut hidden_stack_host[t * hidden_dim..(t + 1) * hidden_dim],
-            )
-            .map_err(|_| RsError::EvalFailed)?;
-        }
-        // S10b-2: hidden_a / hidden_b are run-lifetime scratch BufIds
-        // (allocated once at max chunk width). The orchestrator owns
-        // the alternating pair and uploads this step's embeddings into
-        // hidden_a via a prefix upload (the scratch buffer's max-chunk
-        // tail is unused for n < BATCHED_CHUNK_SIZE).
+        // Prefill arc Phase 4 — GPU embedding gather. Upload the N
+        // token ids (N×4 bytes), then one `EmbedGatherNTokens` Op
+        // dequantizes each token's row of `model.embed_tokens.*`
+        // straight into `hidden_a` — no host stack, no n×hidden_dim
+        // upload. `io::embedding::embed_lookup` stays the CPU oracle.
+        //
+        // hidden_a / hidden_b are run-lifetime scratch BufIds
+        // (allocated once at max chunk width); the orchestrator owns
+        // the alternating pair and swaps it between layers. The
+        // embed gather writes a prefix (the max-chunk tail is unused
+        // for n < BATCHED_CHUNK_SIZE).
         let hidden_bytes = n * hidden_dim * std::mem::size_of::<f32>();
         let (mut hidden_a_id, mut hidden_b_id) =
             (hidden_double_buffer.hidden_a, hidden_double_buffer.hidden_b);
-        {
-            let pool = backend.pool_mut();
-            let stack_bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(
-                    hidden_stack_host.as_ptr() as *const u8,
-                    std::mem::size_of_val(&hidden_stack_host[..]),
-                )
-            };
-            pool.upload(hidden_a_id, stack_bytes)
-                .expect("pool upload hidden_a embeddings");
+        // The `embed_gather_4bit` kernel does not range-check token
+        // ids; the orchestrator does, before the upload.
+        for &tok in tokens {
+            if tok < 0 || tok as usize >= v.vocab_size {
+                return Err(RsError::EvalFailed);
+            }
         }
+        let embed_off = |name: &str| -> Result<u64, RsError> {
+            wf.tensor_info(name)
+                .map(|t| t.offset)
+                .ok_or(RsError::EvalFailed)
+        };
+        let embed_weight = WeightRef {
+            w_off: embed_off("model.embed_tokens.weight")?,
+            s_off: embed_off("model.embed_tokens.scales")?,
+            b_off: embed_off("model.embed_tokens.biases")?,
+            bits: 4,
+        };
+        backend
+            .pool_mut()
+            .upload(head_tail_scratch.token_ids, bytemuck::cast_slice(tokens))
+            .expect("pool upload token ids");
+        let mut g_head = Graph::new();
+        g_head.push(Op::EmbedGatherNTokens {
+            label: "embed_gather",
+            token_ids: head_tail_scratch.token_ids,
+            weight: embed_weight,
+            hidden_out: hidden_a_id,
+            hidden_dim: hidden_dim as u32,
+            n_tokens: n as u32,
+        });
+        backend
+            .execute(&g_head, "graph_head")
+            .map_err(|_| RsError::EvalFailed)?;
 
         for layer_idx in 0..v.num_layers {
             let prefetch_set = layer_idx % 2;

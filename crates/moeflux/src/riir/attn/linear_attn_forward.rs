@@ -276,6 +276,42 @@ impl HiddenDoubleBuffer {
     }
 }
 
+/// Run-lifetime scratch for the orchestrator's head and tail —
+/// owned at run scope, both BufIds `persistent = true`, allocated
+/// once by [`Self::new`] (prefill-arc Phase 4).
+///
+/// - `token_ids` — `[BATCHED_CHUNK_SIZE]` i32. The head uploads this
+///   step's token ids here for `Op::EmbedGatherNTokens`.
+/// - `logits` — `[vocab_size]` f32. The tail's lm-head matvec writes
+///   the final logits here, downloaded to the caller's slice.
+pub struct HeadTailScratch {
+    pub token_ids: BufId,
+    pub logits: BufId,
+}
+
+impl HeadTailScratch {
+    /// Allocate the token-id input and logits-output buffers.
+    pub fn new(pool: &mut MetalBufferPool) -> Self {
+        let v = VARIANT;
+        let chunk = crate::riir::BATCHED_CHUNK_SIZE;
+        let token_ids = pool
+            .alloc(
+                chunk * std::mem::size_of::<i32>(),
+                "hts.token_ids",
+                true,
+            )
+            .expect("HeadTailScratch::new token_ids alloc");
+        let logits = pool
+            .alloc(
+                v.vocab_size * std::mem::size_of::<f32>(),
+                "hts.logits",
+                true,
+            )
+            .expect("HeadTailScratch::new logits alloc");
+        Self { token_ids, logits }
+    }
+}
+
 /// Run-lifetime scratch for the shared MoE block (`graph2`) — the
 /// graph1→MoE boundary buffers plus the shared-FFN + permute-fuse
 /// working set. One instance, owned by the orchestrator, reused by
