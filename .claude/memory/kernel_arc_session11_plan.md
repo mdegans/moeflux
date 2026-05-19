@@ -92,21 +92,39 @@ Raw intrinsics become the fallback, not the default. This is the
 established house pattern — `moeflux-mlx` was created precisely to
 replace a hand-rolled ~5%-of-peak matvec with MLX's tiled `qmm_t`.
 
-For SDPA *as a whole kernel*, MLX also has `steel/attn/` — a real
-flash-attention — **not yet vendored**. MLX is checked out at
-`~/Projects/mlx`; Phase 0 reads `mlx/backend/metal/kernels/steel/
-attn/` and picks:
-- **Path A** — build our fused kernel on the vendored `mma.h`
-  `MMATile`. Moderate, known; keeps our online-softmax + masking +
-  GQA fusion intact.
-- **Path B** — vendor + adapt MLX's whole steel attention kernel.
-  Highest ceiling (Apple-tuned), unknown integration cost: our SDPA
-  is fused to our KV-cache layout / `start_pos` masking / GQA
-  `heads_per_kv`; MLX's kernel carries its own. Likely a layout-
-  adaptation swamp — but the source is right there, so assess, don't
-  guess.
-Lean A as the pragmatic pick, B as the upside if it adapts cleanly.
-The `flash_diff_tokenwise` oracle bounds the risk of either.
+**Path A vs Path B — DECIDED: Path A.** (Research agent read of MLX
+`steel/attn` at `~/Projects/mlx`, 2026-05-19.)
+
+- **Path A — build the QK^T / P·V matmuls on the already-vendored
+  `steel/gemm/mma.h` `MMATile`**, keeping moeflux's own online-
+  softmax / causal-mask / GQA loop. **CHOSEN.** Strictly additive:
+  swaps only Phase 2 and Phase 5, keeps the proven control logic and
+  the `sdpa_cpu` cosine oracle as the net. `MMATile`, `tile_matmad`,
+  `load_safe`, `store_safe`, `frag_at` are all confirmed present in
+  the vendored file — no new headers, no new attribution, no
+  collision.
+- **Path B — vendor MLX's whole `steel/attn` flash-attention** —
+  rejected for our shape. It *is* a true single-pass flash-attn-2
+  with GQA + causal + (implicit, `qL_off = kL−qL`) start-offset, so
+  it fits the model class. But two concrete blockers:
+  1. **head_dim 256 is not instantiated.** MLX ships `steel/attn`
+     only for `BD ∈ {64,80,128}` (`steel_attention.metal:15-17`).
+     a3b is 256. The body is generic in `BD`, but at `BD=256`
+     threadgroup memory (~48 KB) blows the 32 KB cap → forces
+     `BQ=16` / f16 staging. We would be the *first* to tune
+     steel/attn at 256 — i.e. it would not be the battle-tested
+     kernel that is the whole argument for B.
+  2. **`mma.h` name collision.** `steel/attn` needs a *different*
+     `steel/attn/mma.h` (750 lines; adds `row_reduce`/`row_bin_op`)
+     that redefines `MMATile` in the same `mlx::steel` namespace as
+     the vendored `steel/gemm/mma.h`. `moeflux-mlx`'s flatten-into-
+     one-TU build (`assemble_source`) can't hold both without a
+     separate Metal library or a namespace rename — structural.
+
+  Path B's upside (also gets MLX's `nax` tensor path + decode-side
+  `sdpa_vector` for free) is real; revisit only for a future model
+  with `BD ∈ {64,80,128}`. The `flash_diff_tokenwise` oracle bounds
+  the risk of the Path A swap.
 
 ## Three design decisions — lock these in the opening conversation
 
@@ -127,12 +145,13 @@ design pass on exactly these, then plan-mode, then execute.
    `MMATile::load_safe` clamps the load to `br_valid` — no pad, no
    re-stage. Only live if Phase 0 picks raw intrinsics; then (a).**
 2. **O-accumulator residency.** O[64,256]=64 KB across the KV loop
-   won't fit tg. Candidate: **O as register-resident
-   `simdgroup_matrix<float,8,8>` accumulators** (32 tiles/simdgroup =
-   64 floats/lane — identical footprint to today's `acc[8][8]`; this
-   is the FlashAttention-2-on-tensor-cores standard).
-   `simdgroup_multiply_accumulate` accumulates P·V in-register across
-   blocks. **Lean register-resident simdgroup_matrix.**
+   won't fit tg. Candidate: **O as a register-resident `MMATile`
+   accumulator** (same order of register pressure as today's
+   `acc[8][8]` — agent-confirmed; the FlashAttention-2-on-tensor-
+   cores standard). `tile_matmad` accumulates P·V in-register across
+   blocks. The current hand-rolled kernel already proves residency
+   works at FA_HD=256, so this is a perf-tuning risk, not a
+   "won't fit" risk. **Lean register-resident `MMATile`.**
 3. **Per-row `corr` rescale of O.** With O in simdgroup_matrix tiles,
    `O ← diag(corr)·O` each block = left-multiply each row-tile by an
    8×8 diagonal `corr` matrix (`simdgroup_multiply`). Candidates:
@@ -143,12 +162,12 @@ design pass on exactly these, then plan-mode, then execute.
 
 - **Phase 0 — GPU capture first.** Before any rewrite, Xcode GPU
   capture / occupancy read on `attn_sdpa_causal_flash` at the 8192
-  shape: is it compute-bound (→ simdgroup_matrix is the lever) or
-  memory-bound on K/V re-reads (→ GQA-fold is the lever)? This is
-  the session-12 plan-of-record's "GPU capture first" applied here,
-  and it orders Phases 1–3. Session 9's discipline: measure before
-  assuming the lever works. **Also in Phase 0:** read
-  `~/Projects/mlx/.../steel/attn/` and pick Path A vs B (above).
+  shape: is it compute-bound (→ the `MMATile` GEMM swap is the
+  lever) or memory-bound on K/V re-reads (→ GQA-fold is the lever)?
+  This is the session-12 plan-of-record's "GPU capture first"
+  applied here, and it orders Phases 1–3. Session 9's discipline:
+  measure before assuming the lever works. (The Path A/B question
+  is already settled — see "Build on MLX steel" above.)
 - **Phase 1 — QK^T → steel `MMATile` GEMM.** Highest-confidence win
   (removes the `simd_sum`). `shaders.metal`-only — `load_safe`
   handles the ragged tile. Gate: all 4 `flash_diff_tokenwise` tests.
