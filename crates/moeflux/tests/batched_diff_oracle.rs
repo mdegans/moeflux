@@ -24,9 +24,7 @@ use moeflux::riir::backend::cpu::cpu_matvec::{bf16_matvec_cpu, dequant_matvec_4b
 use moeflux::riir::moe::expert_forward::{
     encode_moe_batched_permute_fuse, gpu_expert_forward,
 };
-use moeflux::riir::attn::gpu_attn::{
-    encode_sdpa_causal_flash, FlashSdpaPipelines,
-};
+use moeflux_metal::SdpaCall;
 use moeflux::riir::backend::gpu::gpu_matvec::{
     encode_bf16_matmul_n_tokens, encode_matvec_n_tokens, BfMatvecPipelines,
     MatvecPipelines,
@@ -577,7 +575,6 @@ fn gate_off(q_dim: usize) -> Vec<f32> {
 #[allow(clippy::too_many_arguments)]
 fn run_batched_sdpa_flash(
     metal: &mut MetalContext,
-    pipes: &FlashSdpaPipelines,
     q_data: &[f32],
     k_data: &[f32],
     v_data: &[f32],
@@ -603,10 +600,22 @@ fn run_batched_sdpa_flash(
 
     let queue = metal.queue();
     let cmdbuf = queue.new_command_buffer();
-    encode_sdpa_causal_flash(
-        cmdbuf, pipes, &q_buf, &k_buf, &v_buf, &out_buf, n_tokens,
-        num_heads, heads_per_kv, head_dim, kv_dim, start_pos, kv_len,
-        scale,
+    metal.kernels().encode(
+        cmdbuf,
+        &SdpaCall {
+            q: &q_buf,
+            k_cache: &k_buf,
+            v_cache: &v_buf,
+            out: &out_buf,
+            n_tokens,
+            num_heads,
+            heads_per_kv,
+            head_dim,
+            kv_dim,
+            start_pos,
+            kv_len,
+            softmax_scale: scale,
+        },
     );
     cmdbuf.commit();
     cmdbuf.wait_until_completed();
@@ -656,10 +665,8 @@ fn flash_diff_tokenwise(n_tokens: u32, start_pos: u32, seed: u64) {
     }
 
     let mut metal = MetalContext::new().expect("open Metal");
-    let pipes = FlashSdpaPipelines::fetch(&mut metal)
-        .expect("fetch FlashSdpaPipelines");
     let gpu = run_batched_sdpa_flash(
-        &mut metal, &pipes, &q_data, &k_data, &v_data, n_tokens,
+        &mut metal, &q_data, &k_data, &v_data, n_tokens,
         num_heads, heads_per_kv, head_dim, kv_dim, start_pos, kv_len,
         scale,
     );

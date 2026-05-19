@@ -30,13 +30,10 @@ use std::time::{Duration, Instant};
 
 use metal::{Buffer, CommandBufferRef, MTLResourceOptions, NSUInteger};
 
-use moeflux::riir::attn::gpu_attn::{
-    encode_sdpa_causal_flash, FlashSdpaPipelines,
-};
 use moeflux::riir::backend::gpu::gpu_matvec::{
     encode_matvec_n_tokens, MatvecPipelines,
 };
-use moeflux_metal::{QmmCall, Kernels, QuantWeights};
+use moeflux_metal::{Kernels, QmmCall, QuantWeights, SdpaCall};
 use moeflux::riir::variants::VARIANT;
 use moeflux::riir::MetalContext;
 
@@ -228,8 +225,7 @@ fn sdpa_flops(m: u64, start_pos: u64, num_heads: u64, head_dim: u64) -> f64 {
 }
 
 fn bench_sdpa(metal: &mut MetalContext) {
-    let flash_pipes =
-        FlashSdpaPipelines::fetch(metal).expect("fetch FlashSdpaPipelines");
+    let kernels = metal.kernels().clone();
 
     let num_heads = VARIANT.num_attn_heads as u32;
     let num_kv_heads = VARIANT.num_kv_heads as u32;
@@ -275,10 +271,22 @@ fn bench_sdpa(metal: &mut MetalContext) {
             head_dim as u64,
         );
         let encode_flash = |cmd: &CommandBufferRef| {
-            encode_sdpa_causal_flash(
-                cmd, &flash_pipes, &q_buf, &k_buf, &v_buf, &out_buf, m,
-                num_heads, heads_per_kv, head_dim, kv_dim, start_pos,
-                kv_len, scale,
+            kernels.encode(
+                cmd,
+                &SdpaCall {
+                    q: &q_buf,
+                    k_cache: &k_buf,
+                    v_cache: &v_buf,
+                    out: &out_buf,
+                    n_tokens: m,
+                    num_heads,
+                    heads_per_kv,
+                    head_dim,
+                    kv_dim,
+                    start_pos,
+                    kv_len,
+                    softmax_scale: scale,
+                },
             );
         };
         bench(

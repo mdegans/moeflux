@@ -1,4 +1,4 @@
-//! MLX-derived Metal compute kernels for the moeflux inference stack.
+//! Metal compute kernels for the moeflux inference stack.
 //!
 //! This crate vendors a subset of [MLX](https://github.com/ml-explore/mlx)'s
 //! Metal kernel source — the **affine quantized GEMM** (`affine_qmm_t` and,
@@ -96,6 +96,13 @@ const FC_ALIGN_M: NSUInteger = 200;
 const FC_ALIGN_N: NSUInteger = 201;
 const FC_ALIGN_K: NSUInteger = 202;
 
+/// The FA2 batched-prefill causal SDPA kernel (`sdpa.metal`).
+const SDPA: &str = "attn_sdpa_causal_flash";
+/// SDPA query-tile size — must match `FA_BR` in `sdpa.metal`.
+const FA_BR: u32 = 64;
+/// SDPA threads per threadgroup — must match `FA_THREADS` in `sdpa.metal`.
+const FA_THREADS: u32 = 256;
+
 /// Vendored MLX headers + the moeflux-metal instantiation entry, embedded at
 /// build time. Order is the topological order of the files' `#include`
 /// DAG — dependencies before dependents — so concatenation with quoted
@@ -120,6 +127,9 @@ const SHADER_PARTS: &[&str] = &[
     include_str!("../shaders/quantized_utils.h"),
     include_str!("../shaders/quantized.h"),
     include_str!("../shaders/qmm.metal"),
+    // moeflux's own kernels — concatenated after the steel headers so
+    // they can build on `mlx::steel::MMATile`.
+    include_str!("../shaders/sdpa.metal"),
 ];
 
 /// Concatenate [`SHADER_PARTS`] into one Metal translation unit. Two kinds
@@ -232,6 +242,43 @@ pub struct GatherQmmCall<'a> {
     pub stride_s: u64,
 }
 
+/// One FlashAttention-2 batched-prefill causal SDPA dispatch.
+///
+/// `q` / `out` are `[n_tokens, num_heads, head_dim]` f32, contiguous;
+/// `k_cache` / `v_cache` are `[kv_len, kv_dim]` f32 with
+/// `kv_dim = num_kv_heads * head_dim`. Per-query causal mask: query `i`
+/// attends to `[0, start_pos + i + 1)`. Single dispatch, no scratch —
+/// the kernel keeps its online-softmax state threadgroup/register-
+/// resident. `head_dim` must equal 256 (the kernel's threadgroup arrays
+/// are sized at compile time around `FA_HD = 256`, a3b).
+#[derive(Clone, Copy)]
+pub struct SdpaCall<'a> {
+    /// Query tensor — `[n_tokens, num_heads, head_dim]` f32.
+    pub q: &'a BufferRef,
+    /// Key cache — `[kv_len, kv_dim]` f32.
+    pub k_cache: &'a BufferRef,
+    /// Value cache — `[kv_len, kv_dim]` f32.
+    pub v_cache: &'a BufferRef,
+    /// Output tensor — `[n_tokens, num_heads, head_dim]` f32, written.
+    pub out: &'a BufferRef,
+    /// `M` — number of query tokens.
+    pub n_tokens: u32,
+    /// Number of attention (query) heads.
+    pub num_heads: u32,
+    /// Query heads sharing one KV head (GQA fan-out).
+    pub heads_per_kv: u32,
+    /// Per-head dimension. Must be 256.
+    pub head_dim: u32,
+    /// `kv_dim = num_kv_heads * head_dim` — row stride of the KV caches.
+    pub kv_dim: u32,
+    /// Absolute position of query 0 — the causal-mask offset.
+    pub start_pos: u32,
+    /// Total KV length the caches hold.
+    pub kv_len: u32,
+    /// Softmax scale, typically `1 / sqrt(head_dim)`.
+    pub softmax_scale: f32,
+}
+
 /// A kernel invocation that encodes itself into a command buffer using
 /// the compiled [`Kernels`] pipelines.
 ///
@@ -246,9 +293,10 @@ pub trait KernelCall {
 
 /// The compiled Metal kernels, ready to dispatch.
 ///
-/// Construct once via [`Self::new`]; it compiles the vendored library and
-/// builds every pipeline up front, so [`Self::encode`] is infallible.
-/// Cheap to keep alive for a process; not cheap to rebuild.
+/// Construct once via [`Self::new`]; it compiles the library and builds
+/// every pipeline up front, so [`Self::encode`] is infallible. `Clone` is
+/// cheap — per-pipeline NSObject refcount bumps; rebuilding is not.
+#[derive(Clone)]
 pub struct Kernels {
     /// `aligned_N` variant — used when `out_dim % 32 == 0`.
     qmm_t_aligned: ComputePipelineState,
@@ -259,6 +307,8 @@ pub struct Kernels {
     /// up front so a [`GatherQmmCall`] dispatch picks the exact-fit PSO
     /// for any M/N/K without a bounds-unsafe fallback in release builds.
     gather: [ComputePipelineState; 8],
+    /// FA2 batched-prefill causal SDPA (`attn_sdpa_causal_flash`).
+    sdpa: ComputePipelineState,
 }
 
 impl Kernels {
@@ -342,6 +392,7 @@ impl Kernels {
             qmm_t_aligned: build(QMM_T_ALIGNED)?,
             qmm_t_unaligned: build(QMM_T_UNALIGNED)?,
             gather,
+            sdpa: build(SDPA)?,
         })
     }
 
@@ -454,6 +505,44 @@ impl KernelCall for GatherQmmCall<'_> {
             1,
         );
         enc.dispatch_thread_groups(grid, MTLSize::new(32, 2, 2));
+        enc.end_encoding();
+    }
+}
+
+/// Encode the FA2 batched-prefill causal SDPA ([`SdpaCall`]) into
+/// `cmdbuf`. One threadgroup per `(query tile, head)`; the kernel runs
+/// the whole online-softmax KV-block loop internally. Encoding cannot
+/// fail.
+impl KernelCall for SdpaCall<'_> {
+    fn encode(&self, kernels: &Kernels, cmdbuf: &CommandBufferRef) {
+        if self.n_tokens == 0 || self.kv_len == 0 {
+            return;
+        }
+        assert_eq!(
+            self.head_dim, 256,
+            "attn_sdpa_causal_flash is compiled for head_dim == 256"
+        );
+
+        let num_q_tiles = self.n_tokens.div_ceil(FA_BR);
+        let total_tgs = num_q_tiles * self.num_heads;
+
+        let enc = cmdbuf.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&kernels.sdpa);
+        enc.set_buffer(0, Some(self.q), 0);
+        enc.set_buffer(1, Some(self.k_cache), 0);
+        enc.set_buffer(2, Some(self.v_cache), 0);
+        enc.set_buffer(3, Some(self.out), 0);
+        enc.set_bytes(4, 4, (&self.n_tokens as *const u32).cast());
+        enc.set_bytes(5, 4, (&self.num_heads as *const u32).cast());
+        enc.set_bytes(6, 4, (&self.heads_per_kv as *const u32).cast());
+        enc.set_bytes(7, 4, (&self.kv_dim as *const u32).cast());
+        enc.set_bytes(8, 4, (&self.start_pos as *const u32).cast());
+        enc.set_bytes(9, 4, (&self.kv_len as *const u32).cast());
+        enc.set_bytes(10, 4, (&self.softmax_scale as *const f32).cast());
+        enc.dispatch_thread_groups(
+            MTLSize::new(total_tgs as NSUInteger, 1, 1),
+            MTLSize::new(FA_THREADS as NSUInteger, 1, 1),
+        );
         enc.end_encoding();
     }
 }

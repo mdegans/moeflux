@@ -37,8 +37,7 @@
 //! after slicing.
 
 use metal::{
-    Buffer, BufferRef, CommandBufferRef, ComputePipelineState, MTLSize,
-    NSUInteger,
+    BufferRef, CommandBufferRef, ComputePipelineState, MTLSize, NSUInteger,
 };
 
 use crate::riir::backend::gpu::encoder::pipeline_bundle;
@@ -408,83 +407,6 @@ pub fn gpu_sigmoid_gate(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// FlashAttention-2 causal SDPA — batched prefill.
-// ---------------------------------------------------------------------------
-
-/// Query-tile size of `attn_sdpa_causal_flash` (must match the shader's
-/// `FA_BR`). One threadgroup processes this many query tokens.
-pub const FA_BR: u32 = 64;
-/// Threads per `attn_sdpa_causal_flash` threadgroup (must match `FA_THREADS`).
-pub const FA_THREADS: u32 = 256;
-
-pipeline_bundle! {
-    /// Pipeline for the FA2-style batched-prefill causal SDPA kernel.
-    /// One threadgroup owns a tile of `FA_BR` query tokens and runs the
-    /// whole online-softmax KV-block loop internally, writing `out`
-    /// directly — no init/finalize dispatches, no global running-state
-    /// scratch.
-    pub struct FlashSdpaPipelines {
-        flash => "attn_sdpa_causal_flash",
-    }
-}
-
-/// Encode the FA2-style batched-prefill causal SDPA into `cmdbuf`.
-///
-/// Single dispatch, no scratch buffers:
-///  - `q [n_tokens, num_heads, head_dim]` f32, contiguous.
-///  - `k_cache` / `v_cache` `[kv_len, kv_dim]` f32, `kv_dim =
-///    num_kv_heads * head_dim`.
-///  - `out [n_tokens, num_heads, head_dim]` f32, written.
-///
-/// Per-query causal mask: query `i` attends to `[0, start_pos + i + 1)`.
-///
-/// `head_dim` must equal 256 — the kernel's threadgroup arrays are sized
-/// at compile time around `FA_HD = 256` (a3b). The encoder asserts this.
-#[allow(clippy::too_many_arguments)]
-pub fn encode_sdpa_causal_flash(
-    cmdbuf: &CommandBufferRef,
-    pipes: &FlashSdpaPipelines,
-    q: &Buffer,
-    k_cache: &Buffer,
-    v_cache: &Buffer,
-    out: &Buffer,
-    n_tokens: u32,
-    num_heads: u32,
-    heads_per_kv: u32,
-    head_dim: u32,
-    kv_dim: u32,
-    start_pos: u32,
-    kv_len: u32,
-    softmax_scale: f32,
-) {
-    if n_tokens == 0 || kv_len == 0 {
-        return;
-    }
-    assert_eq!(
-        head_dim, 256,
-        "attn_sdpa_causal_flash is compiled for head_dim == 256"
-    );
-
-    let num_q_tiles = n_tokens.div_ceil(FA_BR);
-    let total_tgs = num_q_tiles * num_heads;
-
-    let enc = cmdbuf.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipes.flash);
-    enc.set_buffer(0, Some(q), 0);
-    enc.set_buffer(1, Some(k_cache), 0);
-    enc.set_buffer(2, Some(v_cache), 0);
-    enc.set_buffer(3, Some(out), 0);
-    enc.set_bytes(4, 4, (&n_tokens as *const u32).cast());
-    enc.set_bytes(5, 4, (&num_heads as *const u32).cast());
-    enc.set_bytes(6, 4, (&heads_per_kv as *const u32).cast());
-    enc.set_bytes(7, 4, (&kv_dim as *const u32).cast());
-    enc.set_bytes(8, 4, (&start_pos as *const u32).cast());
-    enc.set_bytes(9, 4, (&kv_len as *const u32).cast());
-    enc.set_bytes(10, 4, (&softmax_scale as *const f32).cast());
-    enc.dispatch_thread_groups(
-        MTLSize::new(total_tgs as NSUInteger, 1, 1),
-        MTLSize::new(FA_THREADS as NSUInteger, 1, 1),
-    );
-    enc.end_encoding();
-}
+// FlashAttention-2 causal SDPA migrated to the `moeflux-metal` crate
+// (`moeflux_metal::SdpaCall` + `sdpa.metal`). Dispatch via
+// `metal.kernels().encode(cmdbuf, &SdpaCall { .. })`.

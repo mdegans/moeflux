@@ -25,7 +25,6 @@ use metal::{
     CommandBufferRef, ComputePipelineState, Device, MTLResourceOptions, NSUInteger,
 };
 
-use crate::riir::attn::gpu_attn::FlashSdpaPipelines;
 use crate::riir::attn::gpu_linear_attn::LinearAttnPipelines;
 use crate::riir::backend::gpu::gpu_matvec::{
     encode_matvec_n_tokens, BfMatvecPipelines, MatvecPipelines,
@@ -456,8 +455,6 @@ pub struct MetalBackend {
     rms_pipes: RmsNormBf16Pipelines,
     router_pipes: MoeRouterPipelines,
     #[allow(dead_code)]
-    sdpa_pipes: FlashSdpaPipelines,
-    #[allow(dead_code)]
     linear_attn_pipes: LinearAttnPipelines,
     residual_add_n_pso: ComputePipelineState,
     swiglu_fused_batched_pso: ComputePipelineState,
@@ -491,7 +488,6 @@ impl MetalBackend {
         let rms_n_pipe = RmsNormBf16FusedNTokensPipeline::fetch(&mut metal)?;
         let rms_pipes = RmsNormBf16Pipelines::fetch(&mut metal)?;
         let router_pipes = MoeRouterPipelines::fetch(&mut metal)?;
-        let sdpa_pipes = FlashSdpaPipelines::fetch(&mut metal)?;
         let linear_attn_pipes = LinearAttnPipelines::fetch(&mut metal)?;
         let residual_add_n_pso =
             metal.pipeline("residual_add_n_tokens")?.clone();
@@ -513,7 +509,6 @@ impl MetalBackend {
             rms_n_pipe,
             rms_pipes,
             router_pipes,
-            sdpa_pipes,
             linear_attn_pipes,
             residual_add_n_pso,
             swiglu_fused_batched_pso,
