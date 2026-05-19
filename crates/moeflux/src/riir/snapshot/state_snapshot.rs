@@ -284,21 +284,25 @@ pub fn state_save(
                     if len > 0 {
                         let bytes = (len as usize) * fa_stride;
                         let n = bytes / std::mem::size_of::<f32>();
-                        // Phase 0 (prefill arc): KV is GPU-resident —
-                        // read straight from the shared-storage
-                        // buffers (mirrors the MLA branch below).
-                        let k_buf = kv.k_cache.as_ref().ok_or(
+                        // Phase 0b (prefill arc): KV is GPU-resident
+                        // in the pool — resolve the BufId to its
+                        // shared-storage buffer and read straight from
+                        // it (mirrors the MLA branch below).
+                        let p = pool.ok_or(
                             StateSnapshotError::BuffersNotReady,
                         )?;
+                        let k_buf = p.handle(kv.k_id.ok_or(
+                            StateSnapshotError::BuffersNotReady,
+                        )?);
                         read_buffer_bytes_n_f32(
                             k_buf,
                             &mut buf[off..off + bytes],
                             n,
                         );
                         off += bytes;
-                        let v_buf = kv.v_cache.as_ref().ok_or(
+                        let v_buf = p.handle(kv.v_id.ok_or(
                             StateSnapshotError::BuffersNotReady,
-                        )?;
+                        )?);
                         read_buffer_bytes_n_f32(
                             v_buf,
                             &mut buf[off..off + bytes],
@@ -585,30 +589,31 @@ pub fn state_load(
                         });
                     }
                 };
-                // Phase 0 (prefill arc): KV is GPU-resident. Allocate
-                // the shared-storage buffers, then write the restored
-                // prefix straight into them. The `[len, MAX_SEQ_LEN)`
-                // tail is not zeroed — SDPA reads are bounded by `len`
-                // and every appended row is overwritten before it is
-                // read (mirrors the MLA branch + `MlaKvCacheGpu`).
-                kv.ensure_buffers(device);
+                // Phase 0b (prefill arc): KV is GPU-resident in the
+                // pool — registered by `ensure_linear_resources`,
+                // which `state_load` runs before reaching here. Write
+                // the restored prefix straight into the shared-storage
+                // buffers. The `[len, MAX_SEQ_LEN)` tail is not zeroed
+                // — SDPA reads are bounded by `len` and every appended
+                // row is overwritten before it is read (mirrors the
+                // MLA branch + `MlaKvCacheGpu`).
                 if len > 0 {
+                    let p = pool
+                        .ok_or(StateSnapshotError::BuffersNotReady)?;
                     let bytes = (len as usize) * fa_stride;
                     let n = bytes / std::mem::size_of::<f32>();
-                    let k_buf = kv
-                        .k_cache
-                        .as_ref()
-                        .expect("ensure_buffers just ran");
+                    let k_buf = p.handle(kv.k_id.ok_or(
+                        StateSnapshotError::BuffersNotReady,
+                    )?);
                     write_buffer_bytes_n_f32(
                         k_buf,
                         &buf[off..off + bytes],
                         n,
                     );
                     off += bytes;
-                    let v_buf = kv
-                        .v_cache
-                        .as_ref()
-                        .expect("ensure_buffers just ran");
+                    let v_buf = p.handle(kv.v_id.ok_or(
+                        StateSnapshotError::BuffersNotReady,
+                    )?);
                     write_buffer_bytes_n_f32(
                         v_buf,
                         &buf[off..off + bytes],
@@ -649,12 +654,12 @@ pub fn state_load(
                                 .contents()
                                 as *mut f32;
                             std::ptr::copy_nonoverlapping(
-                                kv.k_slice(mirror_len).as_ptr(),
+                                kv.k_slice(p, mirror_len).as_ptr(),
                                 k_dst,
                                 n,
                             );
                             std::ptr::copy_nonoverlapping(
-                                kv.v_slice(mirror_len).as_ptr(),
+                                kv.v_slice(p, mirror_len).as_ptr(),
                                 v_dst,
                                 n,
                             );

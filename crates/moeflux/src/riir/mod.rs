@@ -1379,6 +1379,27 @@ impl RsCtx<MetalBackend> {
                 self.backend.as_mut().expect("just-set").pool_mut();
             self.experts.attach_to_device(pool);
         }
+        // Prefill arc Phase 0b: register the GPU-resident KV cache for
+        // every full-attn (GQA) layer into the pool, once, up front.
+        // Eager — not lazy-per-eval — because `KvCache::ensure_buffers`
+        // needs `&mut pool`, available only here. Idempotent:
+        // `ensure_buffers` skips already-registered caches. MLA
+        // variants have no `FullAttn(KvCache)` layers, so the loop is
+        // empty for them.
+        {
+            let Self {
+                layer_states,
+                backend,
+                ..
+            } = self;
+            let pool =
+                backend.as_mut().expect("just-set").pool_mut();
+            for layer in layer_states.iter_mut() {
+                if let LayerState::FullAttn(kv) = layer {
+                    kv.ensure_buffers(pool);
+                }
+            }
+        }
         if self.layer_caches.is_none() {
             let wf_buf =
                 self.backend.as_ref().expect("just-set").weight_buf();
