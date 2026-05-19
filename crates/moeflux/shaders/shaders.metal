@@ -1852,18 +1852,53 @@ kernel void gated_delta_net_chunkwise(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // --- Phase 3: RHS  U_l = beta_l v_l - beta_l gamma_l (S_0.k_l) ---
-        // Thread vi owns column vi of U for the rest of the chunk.
+        // The S_0.k contraction is a GEMM  s0k[C,D] = kc[C,D] @ S_0ᵀ[D,D],
+        // contraction over d (D=128 — 16 full tiles, no raggedness). The
+        // chunk index l is an *output row*; a ragged l only corrupts an
+        // unused output row, so — unlike Phase 6, where raggedness sits on
+        // the contraction axis — no zero-fill is needed here.
+        //   a = kc   [C,D] tg-staged, stride 128, no transpose.
+        //   b = S_0ᵀ loaded transposed from the [vi,d] row-major device
+        //       `state` buffer (transpose gives [d,vi]).
+        // 4 simdgroups (sg = vi/32) tile the [C=16,D=128] output into sdc.
+        {
+            uint sg = vi / 32;
+            uint col_tiles = 128 / 8;               // D / 8 = 16
+            uint n_tiles = (CW_C / 8) * col_tiles;  // 2 * 16 = 32
+            for (uint ti = sg; ti < n_tiles; ti += 4) {
+                uint rt = ti / col_tiles;   // C row tile (0..1)
+                uint ct = ti % col_tiles;   // D col tile (0..15)
+                simdgroup_matrix<float, 8, 8> sacc;
+                for (uint kt = 0; kt < 128 / 8; kt++) {
+                    simdgroup_matrix<float, 8, 8> a, b;
+                    // a = kc tile [l = rt, d = kt].
+                    simdgroup_load(a, &kc[rt * 8 * 128 + kt * 8], 128);
+                    // b = S_0ᵀ tile [d = kt, vi = ct]: `state` is [vi,d]
+                    //     row-major (stride 128) — transpose to [d,vi].
+                    simdgroup_load(
+                        b,
+                        &state[head_id * 128 * 128 + ct * 8 * 128 + kt * 8],
+                        128, ulong2(0, 0), /*transpose=*/true);
+                    if (kt == 0) {
+                        simdgroup_multiply(sacc, a, b);
+                    } else {
+                        simdgroup_multiply_accumulate(sacc, a, b, sacc);
+                    }
+                }
+                simdgroup_store(sacc, &sdc[rt * 8 * 128 + ct * 8], 128);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Epilogue: thread vi owns column vi of U for the rest of the
+        // chunk. s0k[l,vi] now lives in sdc[l*128 + vi].
         for (uint l = 0; l < c; l++) {
             uint t = chunk_start + l;
-            float s0k = 0.0f;
-            for (uint d = 0; d < 128; d++) {
-                s0k += state[state_base + d] * kc[l * 128 + d];
-            }
             float v_l = conv_out[t * conv_per_token + 2 * key_total
                                  + head_id * 128 + vi];
             float gamma_l = precise::exp(log_decay[l]);
             Umat[l * 128 + vi] =
-                beta_s[l] * v_l - beta_s[l] * gamma_l * s0k;
+                beta_s[l] * v_l - beta_s[l] * gamma_l * sdc[l * 128 + vi];
         }
 
         // --- Phase 4: forward substitution (column vi is thread-private,
@@ -1878,6 +1913,47 @@ kernel void gated_delta_net_chunkwise(
 
         // --- Phase 5: output  out_l = gamma_l (S_0.q_l)
         //     + sum_{i<=l} Gamma_{l,i}(k_i.q_l) U_i ---
+        // The kqg.U term is a GEMM  kqg[C,C] @ U[C,D] -> [C,D],
+        // contraction over i (C=16). kqg already carries the i<=l mask
+        // from Phase 2, so the dense matmul is exact. But the contraction
+        // axis IS the ragged axis here: zero-fill U rows c..CW_C first —
+        // a stale (possibly uninitialized → NaN) U row would poison every
+        // output via 0*NaN. The S_0.q term (s0q) stays per-vi scalar
+        // (Tier 2 — q is not tg-staged).
+        for (uint i = c; i < CW_C; i++) {
+            Umat[i * 128 + vi] = 0.0f;
+        }
+        // Barrier: the GEMM reads U across all columns; until now phases
+        // 4->5 needed none (the scalar code read only its own vi column).
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            uint sg = vi / 32;
+            uint col_tiles = 128 / 8;               // D / 8 = 16
+            uint n_tiles = (CW_C / 8) * col_tiles;  // 2 * 16 = 32
+            for (uint ti = sg; ti < n_tiles; ti += 4) {
+                uint rt = ti / col_tiles;   // C row tile (0..1)
+                uint ct = ti % col_tiles;   // D col tile (0..15)
+                simdgroup_matrix<float, 8, 8> oacc;
+                // Contraction over i = C (CW_C/8 tiles of 8).
+                for (uint kt = 0; kt < CW_C / 8; kt++) {
+                    simdgroup_matrix<float, 8, 8> a, b;
+                    // a = kqg tile [l = rt, i = kt], stride CW_C.
+                    simdgroup_load(a, &kqg[rt * 8 * CW_C + kt * 8], CW_C);
+                    // b = U tile [i = kt, vi = ct], stride 128.
+                    simdgroup_load(b, &Umat[kt * 8 * 128 + ct * 8], 128);
+                    if (kt == 0) {
+                        simdgroup_multiply(oacc, a, b);
+                    } else {
+                        simdgroup_multiply_accumulate(oacc, a, b, oacc);
+                    }
+                }
+                simdgroup_store(oacc, &sdc[rt * 8 * 128 + ct * 8], 128);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Epilogue: thread vi owns output column vi. The kqg.U term is
+        // now in sdc[l*128 + vi]; s0q stays per-vi scalar.
         for (uint l = 0; l < c; l++) {
             uint t = chunk_start + l;
             uint q_base = t * conv_per_token + k_off;
@@ -1885,10 +1961,8 @@ kernel void gated_delta_net_chunkwise(
             for (uint d = 0; d < 128; d++) {
                 s0q += state[state_base + d] * conv_out[q_base + d];
             }
-            float out_val = precise::exp(log_decay[l]) * s0q;
-            for (uint i = 0; i <= l; i++) {
-                out_val += kqg[l * CW_C + i] * Umat[i * 128 + vi];
-            }
+            float out_val =
+                precise::exp(log_decay[l]) * s0q + sdc[l * 128 + vi];
             output[t * value_total + head_id * 128 + vi] = out_val;
         }
 
