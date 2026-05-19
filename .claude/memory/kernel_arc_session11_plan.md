@@ -76,6 +76,38 @@ Output O[64,256] = 8×32 = 256 tiles. **Lower-confidence than GEMM 1**
 throughput, not removing a `simd_sum`. Gate it on its own bench;
 keep GEMM 1 if GEMM 2 doesn't pay.
 
+## Build on MLX `steel` — not raw `simdgroup_matrix`
+
+`moeflux-mlx` already vendors `shaders/steel/gemm/{mma,loader,
+transforms}.h` (MLX, MIT, upstream commit pinned in `NOTICE`).
+`mma.h` gives `MMATile` — a register-blocked multi-fragment GEMM
+over `simdgroup_matrix` — plus **`load_safe` / `store_safe`**,
+bounds-checked tile loaders. Build QK^T/P·V on `MMATile`, not on raw
+`simdgroup_matrix<float,8,8>` intrinsics:
+- register-blocked tiling, better than a naive intrinsic loop;
+- `load_safe` clamps a tile load to a valid extent — which
+  **dissolves Design Decision #1** (no producer-side Q pad).
+
+Raw intrinsics become the fallback, not the default. This is the
+established house pattern — `moeflux-mlx` was created precisely to
+replace a hand-rolled ~5%-of-peak matvec with MLX's tiled `qmm_t`.
+
+For SDPA *as a whole kernel*, MLX also has `steel/attn/` — a real
+flash-attention — **not yet vendored**. MLX is checked out at
+`~/Projects/mlx`; Phase 0 reads `mlx/backend/metal/kernels/steel/
+attn/` and picks:
+- **Path A** — build our fused kernel on the vendored `mma.h`
+  `MMATile`. Moderate, known; keeps our online-softmax + masking +
+  GQA fusion intact.
+- **Path B** — vendor + adapt MLX's whole steel attention kernel.
+  Highest ceiling (Apple-tuned), unknown integration cost: our SDPA
+  is fused to our KV-cache layout / `start_pos` masking / GQA
+  `heads_per_kv`; MLX's kernel carries its own. Likely a layout-
+  adaptation swamp — but the source is right there, so assess, don't
+  guess.
+Lean A as the pragmatic pick, B as the upside if it adapts cleanly.
+The `flash_diff_tokenwise` oracle bounds the risk of either.
+
 ## Three design decisions — lock these in the opening conversation
 
 Per `feedback_design_before_execute`, session 11 opens with a short
@@ -91,7 +123,9 @@ design pass on exactly these, then plan-mode, then execute.
    cleanly; (b) re-stage a `[64,8]` Q ktile-strip into tg (2 KB,
    fits the 11 KB headroom), zero-filled for ragged rows, per ktile
    — shaders-only but re-stages 32× per KV block (Q is block-
-   invariant → wasteful). **Lean (a).**
+   invariant → wasteful). **Resolved by building on steel:
+   `MMATile::load_safe` clamps the load to `br_valid` — no pad, no
+   re-stage. Only live if Phase 0 picks raw intrinsics; then (a).**
 2. **O-accumulator residency.** O[64,256]=64 KB across the KV loop
    won't fit tg. Candidate: **O as register-resident
    `simdgroup_matrix<float,8,8>` accumulators** (32 tiles/simdgroup =
@@ -113,11 +147,12 @@ design pass on exactly these, then plan-mode, then execute.
   memory-bound on K/V re-reads (→ GQA-fold is the lever)? This is
   the session-12 plan-of-record's "GPU capture first" applied here,
   and it orders Phases 1–3. Session 9's discipline: measure before
-  assuming the lever works.
-- **Phase 1 — QK^T → simdgroup_matrix.** Highest-confidence win
-  (removes the `simd_sum`). `shaders.metal` + (likely) the 1-line Q
-  pad. Gate: all 4 `flash_diff_tokenwise` tests.
-- **Phase 2 — P·V → simdgroup_matrix** with register-resident O +
+  assuming the lever works. **Also in Phase 0:** read
+  `~/Projects/mlx/.../steel/attn/` and pick Path A vs B (above).
+- **Phase 1 — QK^T → steel `MMATile` GEMM.** Highest-confidence win
+  (removes the `simd_sum`). `shaders.metal`-only — `load_safe`
+  handles the ragged tile. Gate: all 4 `flash_diff_tokenwise` tests.
+- **Phase 2 — P·V → steel `MMATile`** with register-resident O +
   diag-`corr` rescale. `shaders.metal`-only. Gate: flash diff tests
   + its own per-op bench (keep only if it pays).
 - **Phase 3 — GQA-fold** (stretch; likely session 12). One
@@ -157,3 +192,6 @@ lever and Phase 3 jumps the queue. Either way the headline metric is
   wins and decode (n=1) doesn't regress — cheap, do it early.
 - Tier-2 `s0q` and MoE GEMMs (`moe_permute_fuse` ~8.6%,
   `moe_combine` ~4.5%) remain real but secondary — session 12.
+  Note: `moeflux-mlx` already vendors `affine_gather_qmm_rhs` (the
+  gathered MoE quantized GEMM) — session 12 may be mostly *wiring it
+  in*, not a hand-roll.
