@@ -86,10 +86,27 @@ the repro; capture state / run a subagent *before* rebooting next time.
 
 ## Net for the session / next
 
-SDPA's two big structural levers are now both measured: simdgroup-matrix
-(session 12, dead) and GQA-fold (1.3×, occupancy-bound, shipped). The
-kernel is 97% staging and latency-bound at 6% of peak — the remaining
-headroom is staging-latency (FA_BC tuning, async copy, prefetch) or
-accepting SDPA is near its structural floor and looking elsewhere in the
-~20× prefill gap to llama.cpp. Next session: decide that, or chase the
-staging-latency micro-levers.
+SDPA's two structural levers are both measured and closed: simdgroup-
+matrix (session 12, dead) and GQA-fold (1.3×, occupancy-bound, shipped).
+Two further leads were investigated late in the session and **both ruled
+out**:
+
+- **Metal async-copy** (a `cp.async` analog — register-free global→
+  threadgroup staging, which would have un-stuck the fold's occupancy
+  ceiling): the instruction exists (`air.simdgroup_async_copy_2d`) but
+  is *private/undocumented*. Using it = a reverse-engineered AIR
+  intrinsic, ABI-fragile across macOS updates. Not worth it.
+- **The `v3` matvec** (~700 GFLOP/s vs `qmm_t` ~9000 — a 13× microbench
+  gap): an Explore sweep confirmed the prefill hot path *already* routes
+  every significant 4-bit matmul through `qmm_t` / `GatherQmmCall`. Only
+  the LM head (last-token-only) and two tiny 8-bit router gates still
+  touch v3. Not a lever.
+
+So a fresh a3b prefill profile was run (`profile.py`, samply, 15.7k-token
+prompt) to actually locate the ~20× gap. **Verdict: prefill is CPU/
+memory-bound, not GPU-bound** — GPU-wait is 2.5%; the time is 41%
+memmove + 26% `pread` + CPU-side QK-norm/RoPE + per-layer Metal-buffer
+creation. Session 12's "GPU-bound" reading was the linear-attn path; the
+**full-attn path (`batched_full_attn_layer_forward`, 57% of prefill)
+never got the GPU migration.** Session 14 plan-of-record:
+[[prefill_arc_session14_plan]].
