@@ -16,7 +16,7 @@
 #![cfg(target_os = "macos")]
 
 use metal::{Device, MTLResourceOptions};
-use moeflux_mlx::{GatherQmmCall, QmmKernels, QuantWeights};
+use moeflux_metal::{GatherQmmCall, QmmKernels, QuantWeights};
 
 const COSINE_FLOOR: f32 = 0.9999;
 
@@ -190,7 +190,7 @@ fn run_gather_case(
 
     // --- GPU ---
     let device = Device::system_default().expect("no Metal device");
-    let kernels = QmmKernels::new(&device).expect("build moeflux-mlx kernels");
+    let kernels = QmmKernels::new(&device).expect("build moeflux-metal kernels");
 
     // One expert block: [packed u32][scales u16][biases u16] — moeflux's
     // weight-file layout. All experts contiguous at uniform `block_bytes`

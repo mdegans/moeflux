@@ -25,7 +25,7 @@
 //! the same device.
 
 use metal::{Buffer, CommandBufferRef, MTLSize, NSUInteger};
-use moeflux_mlx::{QmmCall, QmmKernels, QuantWeights};
+use moeflux_metal::{QmmCall, QmmKernels, QuantWeights};
 
 use super::encoder::pipeline_bundle;
 use crate::riir::io::mtl_weight_buf::MtlWeightBuf;
@@ -206,7 +206,7 @@ pub fn encode_matvec_n_tokens(
 /// routes 4-bit weights through MLX's tuned `qmm_t` GEMM (~65% of GPU
 /// peak vs the hand-rolled matvec's ~5%) and 8-bit through
 /// [`encode_matvec_n_tokens`]. The two paths are cosine-1.0 equivalent
-/// (the moeflux-mlx `qmm_t` diff gate). Use for dense projection /
+/// (the moeflux-metal `qmm_t` diff gate). Use for dense projection /
 /// shared-FFN matmuls reading the shared weight buffer; the **gathered**
 /// per-expert matmul has its own encoder in `expert_forward.rs`.
 ///

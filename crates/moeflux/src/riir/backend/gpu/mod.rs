@@ -37,7 +37,7 @@ use crate::riir::backend::gpu::gpu_norm::{
 };
 use crate::riir::backend::gpu::metal::{MetalContext, MetalError, MtlBuffer};
 use crate::riir::io::mtl_weight_buf::MtlWeightBuf;
-use moeflux_mlx::{QmmCall, QuantWeights};
+use moeflux_metal::{QmmCall, QuantWeights};
 
 /// Metal buffer pool. Storage is `Vec<Buffer>` indexed *indirectly*
 /// by `BufId` through `bufid_to_physical`. Pre-`commit_plan` the
@@ -701,7 +701,7 @@ impl Backend for MetalBackend {
                     );
                 } else {
                     // 8-bit (a3b mlp.gate / shared_expert_gate) stays on
-                    // the per-token dequant matvec — moeflux-mlx's qmm_t
+                    // the per-token dequant matvec — moeflux-metal's qmm_t
                     // is instantiated 4-bit only.
                     encode_matvec_n_tokens(
                         cmd,

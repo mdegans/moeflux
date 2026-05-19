@@ -16,7 +16,7 @@
 //! quantized matmul into a command buffer — infallible, hot-path-friendly:
 //!
 //! ```no_run
-//! # use moeflux_mlx::{QmmKernels, QmmCall, QuantWeights};
+//! # use moeflux_metal::{QmmKernels, QmmCall, QuantWeights};
 //! # fn go(device: &metal::DeviceRef, cmd: &metal::CommandBufferRef,
 //! #       wf: &metal::BufferRef, x: &metal::BufferRef, y: &metal::BufferRef) {
 //! let kernels = QmmKernels::new(device).expect("build MLX kernels");
@@ -36,7 +36,7 @@
 //! Copyright © 2023-2024 Apple Inc.). Every vendored file keeps its
 //! upstream copyright header; the small adaptations moeflux needs (notably
 //! a `ScaleT` template parameter so the quantized loader reads bf16
-//! scales while computing in f32) are marked inline as `moeflux-mlx`
+//! scales while computing in f32) are marked inline as `moeflux-metal`
 //! changes. See `NOTICE` for the upstream commit and details.
 //!
 //! ## How the library is built
@@ -60,7 +60,7 @@ use metal::{
 #[derive(Debug, thiserror::Error)]
 pub enum MlxError {
     /// `new_library_with_source` rejected the assembled Metal source.
-    #[error("compiling the moeflux-mlx Metal library: {0}")]
+    #[error("compiling the moeflux-metal Metal library: {0}")]
     Compile(String),
     /// A kernel function or pipeline could not be created.
     #[error("creating pipeline for kernel `{0}`: {1}")]
@@ -96,7 +96,7 @@ const FC_ALIGN_M: NSUInteger = 200;
 const FC_ALIGN_N: NSUInteger = 201;
 const FC_ALIGN_K: NSUInteger = 202;
 
-/// Vendored MLX headers + the moeflux-mlx instantiation entry, embedded at
+/// Vendored MLX headers + the moeflux-metal instantiation entry, embedded at
 /// build time. Order is the topological order of the files' `#include`
 /// DAG — dependencies before dependents — so concatenation with quoted
 /// includes stripped yields a well-formed translation unit.

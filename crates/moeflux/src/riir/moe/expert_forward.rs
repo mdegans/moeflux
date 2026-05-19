@@ -50,7 +50,7 @@ use metal::{
     NSUInteger,
 };
 
-use moeflux_mlx::{GatherQmmCall, QmmKernels, QuantWeights};
+use moeflux_metal::{GatherQmmCall, QmmKernels, QuantWeights};
 
 use crate::riir::backend::{BufId, BufferPool, MetalBufferPool};
 use crate::riir::backend::gpu::gpu_matvec::{encode_matvec_n_tokens, MatvecPipelines};

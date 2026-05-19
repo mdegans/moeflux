@@ -1,5 +1,5 @@
 [package]
-name          = "moeflux-mlx"
+name          = "moeflux-metal"
 description   = "MLX-derived Metal compute kernels for the moeflux inference stack — vendors Apple's MLX quantized-GEMM kernels (MIT) behind a thin Rust dispatch wrapper."
 version       = { workspace = true }
 edition       = { workspace = true }

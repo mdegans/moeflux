@@ -36,7 +36,7 @@ pub use metal::{
     MTLResourceOptions, NSUInteger,
 };
 
-use moeflux_mlx::QmmKernels;
+use moeflux_metal::QmmKernels;
 
 /// Errors from the Metal backend.
 #[derive(Debug, thiserror::Error)]
@@ -49,7 +49,7 @@ pub enum MetalError {
     FunctionNotFound { name: String },
     #[error("pipeline-state creation failed for '{name}': {err}")]
     PipelineCreate { name: String, err: String },
-    #[error("building the moeflux-mlx kernel library: {0}")]
+    #[error("building the moeflux-metal kernel library: {0}")]
     MlxKernels(String),
 }
 

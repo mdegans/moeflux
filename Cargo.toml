@@ -2,7 +2,7 @@
 resolver = "2"
 members = [
     "crates/moeflux",
-    "crates/moeflux-mlx",
+    "crates/moeflux-metal",
 ]
 
 [workspace.package]
