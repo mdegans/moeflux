@@ -653,17 +653,6 @@ pub enum Op {
         eps: f32,
     },
 
-    /// Final RMS norm + lm_head matvec for a single token row of
-    /// `hidden`. Used at chunk end to produce logits for the last
-    /// (or specified) token. `last_token_row` indexes into
-    /// `hidden`'s n_tokens dimension.
-    LmHead {
-        label: &'static str,
-        hidden: BufId,
-        last_token_row: u32,
-        logits_out: BufId,
-    },
-
     /// Batched 4-bit token-embedding gather. For each of `n_tokens`
     /// tokens, reads row `token_ids[t]` of the affine-packed embedding
     /// weight and dequantizes `hidden_dim` f32 channels into
@@ -709,7 +698,6 @@ impl Op {
             Op::GatedDeltaNetStepNTokens { label, .. } => label,
             Op::GatedDeltaNetChunkwise { label, .. } => label,
             Op::GatedRmsNormNTokens { label, .. } => label,
-            Op::LmHead { label, .. } => label,
             Op::EmbedGatherNTokens { label, .. } => label,
         }
     }
@@ -739,7 +727,6 @@ impl Op {
             Op::GatedDeltaNetStepNTokens { .. } => "GatedDeltaNetStepNTokens",
             Op::GatedDeltaNetChunkwise { .. } => "GatedDeltaNetChunkwise",
             Op::GatedRmsNormNTokens { .. } => "GatedRmsNormNTokens",
-            Op::LmHead { .. } => "LmHead",
             Op::EmbedGatherNTokens { .. } => "EmbedGatherNTokens",
         }
     }
@@ -812,7 +799,6 @@ impl Op {
                 ..
             } => vec![*state, *conv_out, *g_decay, *beta_gate],
             Op::GatedRmsNormNTokens { values, z, .. } => vec![*values, *z],
-            Op::LmHead { hidden, .. } => vec![*hidden],
             Op::EmbedGatherNTokens { token_ids, .. } => vec![*token_ids],
         }
     }
@@ -865,7 +851,6 @@ impl Op {
             Op::GatedDeltaNetStepNTokens { state, output, .. } => vec![*state, *output], // state is RMW
             Op::GatedDeltaNetChunkwise { state, output, .. } => vec![*state, *output], // state is RMW
             Op::GatedRmsNormNTokens { output, .. } => vec![*output],
-            Op::LmHead { logits_out, .. } => vec![*logits_out],
             Op::EmbedGatherNTokens { hidden_out, .. } => vec![*hidden_out],
         }
     }
@@ -1120,11 +1105,13 @@ mod tests {
             n_tokens: 8,
             eps: 1e-6,
         });
-        g.push(Op::LmHead {
-            label: "lm_head",
-            hidden: buf(50),
-            last_token_row: 7,
-            logits_out: buf(51),
+        g.push(Op::EmbedGatherNTokens {
+            label: "embed_gather",
+            token_ids: buf(50),
+            weight: WeightRef { w_off: 0, s_off: 0, b_off: 0, bits: 4 },
+            hidden_out: buf(51),
+            hidden_dim: 2048,
+            n_tokens: 8,
         });
         g
     }
@@ -1132,7 +1119,7 @@ mod tests {
     #[test]
     fn push_round_trips() {
         let g = one_of_each();
-        assert_eq!(g.len(), 15);
+        assert_eq!(g.len(), 19);
         assert!(!g.is_empty());
     }
 
@@ -1149,6 +1136,10 @@ mod tests {
                 "q_proj",
                 "ffn_swiglu",
                 "sdpa",
+                "sigmoid_gate",
+                "split_q_gate",
+                "rms_norm_per_head",
+                "kv_cache_append",
                 "moe_topk",
                 "moe_norm",
                 "moe_pf",
@@ -1157,7 +1148,7 @@ mod tests {
                 "decay_beta",
                 "delta_net",
                 "gated_rms",
-                "lm_head",
+                "embed_gather",
             ]
         );
     }
@@ -1173,8 +1164,8 @@ mod tests {
         // Spot-check the discriminant-aware naming.
         assert!(pairs.contains(&("RmsNormBf16NTokens", "rms_in")));
         assert!(pairs.contains(&("MoeBatchedPermuteFuse", "moe_pf")));
-        assert!(pairs.contains(&("LmHead", "lm_head")));
-        assert_eq!(pairs.len(), 15);
+        assert!(pairs.contains(&("EmbedGatherNTokens", "embed_gather")));
+        assert_eq!(pairs.len(), 19);
     }
 
     #[test]
@@ -1240,7 +1231,7 @@ mod tests {
         let g = one_of_each();
         let dump = g.dump();
         let line_count = dump.lines().count();
-        assert_eq!(line_count, 15);
+        assert_eq!(line_count, 19);
         // Spot-check formatting: each line has the variant name and label.
         assert!(dump.contains("RmsNormBf16NTokens"));
         assert!(dump.contains("rms_in"));

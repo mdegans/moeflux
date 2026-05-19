@@ -14,11 +14,11 @@
 //! the prefill arc (phase 1a) that covers ResidualAddNTokens,
 //! RmsNormBf16NTokens, MatvecNTokens (4-bit + 8-bit), SwigluFusedBatched,
 //! MoeSoftmaxTopK, MoeNormalizeWeights, MoeCombineResidualNTokens,
-//! RmsNormQkNTokens, RopeNTokens, the GatedDeltaNet family, and
-//! SdpaCausalTiled.
+//! RmsNormQkNTokens, RopeNTokens, the GatedDeltaNet family,
+//! SdpaCausalTiled, and EmbedGatherNTokens.
 //!
 //! Still un-tested here (wire in alongside their producers):
-//! MoeBatchedPermuteFuse and LmHead.
+//! MoeBatchedPermuteFuse.
 //!
 //! ## Synthetic weight file
 //!

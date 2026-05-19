@@ -6,10 +6,8 @@
 //! a `MetalEncodeCtx` that owns a `CommandBuffer`; `submit_and_wait`
 //! commits the cmdbuf and blocks.
 //!
-//! **S7-3 / S7-6b scope:** 13 of 15 `Op` variants are fully wired.
-//! `LmHead` (workspace BufId) and `SdpaCausalTiled` (kv_dim
-//! disambiguation) remain as `todo!()` and will wire alongside the
-//! full-attn producer rewrite in S7-7.
+//! **Scope:** every `Op` variant is wired to a Metal kernel — there
+//! are no `todo!()` arms left in `encode_op`.
 
 pub mod dense_mlp_gpu;
 pub mod encoder;
@@ -962,11 +960,6 @@ impl Backend for MetalBackend {
                     self.pool.handle(*hidden_out),
                     *n_tokens,
                     *dim,
-                );
-            }
-            Op::LmHead { .. } => {
-                todo!(
-                    "LmHead encode_op: needs a persistent workspace BufId in Op shape for the intermediate (post-final-norm) hidden bytes; defer to S7-7 producer wire-up where the orchestrator can allocate it"
                 );
             }
             Op::EmbedGatherNTokens {

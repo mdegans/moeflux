@@ -739,45 +739,6 @@ fn sdpa_causal_tiled_n_tokens_cpu(
     }
 }
 
-fn lm_head_cpu(
-    hidden: &[f32],
-    last_token_row: usize,
-    hidden_dim: usize,
-    final_norm_weight: &[u8],
-    lm_head_weight: &[u8],
-    vocab_size: usize,
-    logits_out: &mut [f32],
-) {
-    debug_assert_eq!(logits_out.len(), vocab_size);
-    // Final RMSNorm on the last_token_row of hidden.
-    let hr =
-        &hidden[last_token_row * hidden_dim..(last_token_row + 1) * hidden_dim];
-    let mut normed = vec![0.0f32; hidden_dim];
-    let mut sum_sq = 0.0f32;
-    for &v in hr.iter() {
-        sum_sq += v * v;
-    }
-    let inv_rms = 1.0f32 / (sum_sq / hidden_dim as f32 + 1e-6).sqrt();
-    for i in 0..hidden_dim {
-        let w_bits = u16::from_le_bytes([
-            final_norm_weight[i * 2],
-            final_norm_weight[i * 2 + 1],
-        ]);
-        let w = bf16_to_f32(w_bits);
-        normed[i] = hr[i] * inv_rms * w;
-    }
-    // lm_head matvec: BF16 weight, shape [vocab_size, hidden_dim].
-    let lm_w = bytes_as::<u16>(lm_head_weight);
-    for r in 0..vocab_size {
-        let mut acc = 0.0f32;
-        for c in 0..hidden_dim {
-            let w = bf16_to_f32(lm_w[r * hidden_dim + c]);
-            acc = w.mul_add(normed[c], acc);
-        }
-        logits_out[r] = acc;
-    }
-}
-
 // ----------------------------------------------------------------------------
 // CpuBackend::Backend impl
 // ----------------------------------------------------------------------------
@@ -1391,34 +1352,6 @@ impl Backend for CpuBackend {
                     value_dim,
                     *n_tokens as usize,
                     *eps,
-                );
-            }
-            Op::LmHead {
-                hidden,
-                last_token_row,
-                logits_out,
-                ..
-            } => {
-                let hidden_dim = VARIANT.hidden_dim;
-                let vocab_size = VARIANT.vocab_size;
-                let final_norm_bytes = self
-                    .wf
-                    .tensor_bytes("model.norm.weight")
-                    .expect("final norm tensor missing");
-                let lm_head_bytes = self
-                    .wf
-                    .tensor_bytes("lm_head.weight")
-                    .expect("lm_head tensor missing");
-                let hidden_buf = self.read_f32(*hidden);
-                let mut logits_buf = self.write_f32(*logits_out);
-                lm_head_cpu(
-                    &hidden_buf,
-                    *last_token_row as usize,
-                    hidden_dim,
-                    final_norm_bytes,
-                    lm_head_bytes,
-                    vocab_size,
-                    &mut logits_buf,
                 );
             }
             Op::EmbedGatherNTokens {
