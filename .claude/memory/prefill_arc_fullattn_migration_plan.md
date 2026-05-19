@@ -116,10 +116,36 @@ Phase-1 kernel lands its diff test before being wired. Phase 5:
   rewired onto the graph1 boundary BufIds. Canary: batched_diff_oracle
   23/23, diff_oracle 12/12, checkpoint_restore 7/7.
 
-- Phases 3–5 — not started. **Next session resumes at Phase 3**
-  (graph2: MoE block — shared FFN + permute-fuse + combine — as a
-  second Graph, mirroring linear-attn's graph2; then the producer
-  goes generic `<B: Backend>`). Then Phase 4 (orchestrator cleanup +
-  GPU embedding gather + GPU final norm via the `LmHead` Op — its
-  Metal arm is still `todo!()`), Phase 5 (measure: reprofile + bench
-  post-reboot).
+- **Phase 3 — DONE** (session 16, `9bdc488` `4a647d6` `5aef553`
+  `3c6f25b`). Done as 3 sub-phases — the design conversation upgraded
+  the plan from "copy linear-attn's graph2 into full-attn" to "extract
+  the MoE block once, shared":
+  - **3a** (`9bdc488`) — split `BatchedGraphScratch` into four structs:
+    `LinearAttnGraphScratch` (12 graph1 transients), `MoeGraphScratch`
+    (5 boundary + 14 MoE buffers, one shared instance), `HiddenDouble
+    Buffer` (run-level), trimmed `FullAttnGraphScratch`. Killed the
+    double-duty smell — neither attention scratch owns run-level state;
+    the orchestrator does. Commit latches split (each `graph1` + the
+    shared `graph2`).
+  - **3b/1** (`4a647d6`) — extracted `moe_block_forward<B: Backend>`:
+    host readback → CPU bucket build → expert staging → `graph2`.
+    Linear-attn routes through it. `graph2` Op labels `linear_attn.*`
+    → `moe.*`.
+  - **3b/2** (`5aef553`) — full-attn's ~390-line imperative MoE tail
+    deleted; calls the shared `moe_block_forward`. Full-attn's MoE
+    block is now graph-mode (one `graph2`, one cmdbuf), the pooled
+    `MoeGraphScratch` buffers replacing ~12 per-layer fresh allocs.
+  - **3c** (`3c6f25b`) — `batched_full_attn_layer_forward` generic
+    `<B: Backend>`. Both batched producers are now structurally
+    identical: one `graph1`, then shared `moe_block_forward`.
+  Canary green at every boundary (serialized — see
+  `future_work_diff_oracle_parallel_segv`). All 3 model variants
+  compile.
+
+- Phases 4–5 — not started. **Next session resumes at Phase 4**
+  (orchestrator cleanup in `mod.rs` + GPU embedding gather + GPU final
+  norm via the `LmHead` Op — its Metal arm is the last `todo!()`).
+  Phase 4 touches the orchestrator across several seams — give it its
+  own design / plan-mode pass (`feedback_design_before_execute`); the
+  one-line "O1–O7" sketch above is only a skeleton. Then Phase 5
+  (measure: reprofile vs session-13 + bench post-reboot).
