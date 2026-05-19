@@ -523,21 +523,6 @@ impl MoeBuffers {
     }
     // -------- &Buffer accessors via pool (imperative encoders) --------
 
-    /// One per-slot `data_prefetch[set][slot]` Metal buffer. Caller
-    /// guarantees the slot was the target of a completed
-    /// `prefetch.dispatch` (via `PrefetchState::wait_for`) before the
-    /// dispatch that reads from it.
-    pub(crate) fn data_prefetch_buffer<'p>(
-        &self,
-        pool: &'p MetalBufferPool,
-        set: usize,
-        slot: usize,
-    ) -> &'p metal::Buffer {
-        debug_assert!(set < 2);
-        debug_assert!(slot < MAX_K);
-        pool.handle(self.data_prefetch[set][slot])
-    }
-
     /// All per-slot data_synced buffers as disjoint `&mut [u8]` views
     /// for parallel pread. SAFETY: caller ensures no GPU dispatch is
     /// reading from any slot.

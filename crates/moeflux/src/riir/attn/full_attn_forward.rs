@@ -42,7 +42,7 @@
 //! Predicted observed: well under those — comparable to 4c's
 //! cosine ≈ 1.0, max_abs_diff ≈ 4.1e-8.
 
-use metal::{Buffer, NSUInteger};
+use metal::NSUInteger;
 
 use crate::riir::moe::expert_forward::MoeBuffers;
 use crate::riir::backend::{
@@ -54,11 +54,11 @@ use crate::riir::io::weight_file::WeightFile;
 use crate::riir::backend::gpu::gpu_matvec::{encode_matvec, MatvecPipelines, MatvecSpec};
 use crate::riir::backend::gpu::gpu_norm::{encode_rms_norm_bf16_into, RmsNormBf16Pipelines};
 use crate::riir::backend::gpu::gpu_ctx::GpuLayerCtx;
-use crate::riir::backend::gpu::gpu_matvec::encode_dense_matmul_n_tokens;
 use crate::riir::attn::linear_attn_forward::{
-    bits_of, full_attn_layer_idx_for, moe_dispatch_per_token,
-    post_attention_pre_moe, read_buffer_to_vec, GpuAttnEncodeArgs,
-    LayerForwardError, MoeGraphScratch, OProj, PostAttnIntermediates,
+    bits_of, full_attn_layer_idx_for, moe_block_forward,
+    moe_dispatch_per_token, post_attention_pre_moe, read_buffer_to_vec,
+    GpuAttnEncodeArgs, LayerForwardError, MoeGraphScratch, OProj,
+    PostAttnIntermediates,
 };
 use crate::riir::backend::gpu::metal::MetalContext;
 use crate::riir::attn::rms_norm::rms_norm_per_head_cpu;
@@ -652,7 +652,7 @@ pub(in crate::riir) fn batched_full_attn_layer_forward(
     // Session-5 Phase 3: prefetch env when caller has fired async
     // prefetch for this layer. See `batched_linear_attn_layer_forward`
     // for the semantic.
-    mut prefetch: Option<crate::riir::attn::linear_attn_forward::PrefetchEnv<'_>>,
+    prefetch: Option<crate::riir::attn::linear_attn_forward::PrefetchEnv<'_>>,
     // S7-2: hidden_in / hidden_out are the orchestrator's run-lifetime
     // double-buffer BufIds, swapped between layers.
     hidden_in_id: BufId,
@@ -664,13 +664,8 @@ pub(in crate::riir) fn batched_full_attn_layer_forward(
     scratch: &FullAttnGraphScratch,
     moe: &MoeGraphScratch,
 ) -> Result<(), LayerForwardError> {
-    use crate::riir::moe::expert_forward::{
-        encode_moe_batched_permute_fuse, encode_moe_combine_residual_n_tokens,
-        MAX_K,
-    };
-    use crate::riir::backend::gpu::metal::MtlBuffer;
+    use crate::riir::moe::expert_forward::MAX_K;
     use crate::riir::backend::{Graph, Op, WeightRef};
-    use crate::riir::moe::moe_router::build_expert_buckets;
 
     let v = VARIANT;
     debug_assert!(k_active <= MAX_K);
@@ -972,395 +967,20 @@ pub(in crate::riir) fn batched_full_attn_layer_forward(
     // The `KvCacheAppendNTokens` op extended the cache by `n_tokens`.
     kv_state.len += n_tokens as i32;
 
-    // ── Host readback at the graph1 → MoE-block split: h_post (for
-    //    the bucket_input gather) + routing indices/weights (for
-    //    build_expert_buckets). h_mid / shared_gate stay GPU-resident
-    //    and feed the imperative MoE block directly. ───────────────
-    let mut h_post_stack = vec![0.0f32; n_tokens * hidden_dim];
-    let mut all_routing_indices = vec![0i32; n_tokens * k_active];
-    let mut all_routing_weights = vec![0.0f32; n_tokens * k_active];
-    {
-        let pool = backend.pool();
-        pool.download(moe.h_post, unsafe {
-            std::slice::from_raw_parts_mut(
-                h_post_stack.as_mut_ptr() as *mut u8,
-                n_tokens * hidden_dim * std::mem::size_of::<f32>(),
-            )
-        })?;
-        pool.download(moe.routing_indices, unsafe {
-            std::slice::from_raw_parts_mut(
-                all_routing_indices.as_mut_ptr() as *mut u8,
-                n_tokens * k_active * std::mem::size_of::<i32>(),
-            )
-        })?;
-        pool.download(moe.routing_weights, unsafe {
-            std::slice::from_raw_parts_mut(
-                all_routing_weights.as_mut_ptr() as *mut u8,
-                n_tokens * k_active * std::mem::size_of::<f32>(),
-            )
-        })?;
-    }
-
-    // ── MoE block — still imperative (Phase 3 graph-ifies it). ───
-    // `parts_mut` after graph1 is done; the three boundary buffers
-    // (h_mid / shared_gate / hidden_out) are resolved from the pool
-    // and fed to the imperative encoders below.
-    let (metal, wf_buf, buffer_pool) = backend.parts_mut();
-    let device = metal.device().clone();
-    let mv = MatvecPipelines::fetch(metal)?;
-    let h_post_gpu = buffer_pool.handle(moe.h_post);
-    let h_mid_gpu = buffer_pool.handle(moe.h_mid);
-    let shared_gate_gpu = buffer_pool.handle(moe.shared_gate);
-    let hidden_out_gpu = buffer_pool.handle(hidden_out_id);
-
-    // ── Phase 3d: batched shared FFN (gate matvec, up matvec,
-    //    flat-element-wise swiglu, down matvec) over h_post_stack. ─
-    let s_gate_bits = bits_of(
+    // Prefill-arc Phase 3b: the MoE block — host readback, CPU
+    // bucket build, expert staging, graph2 — is the shared
+    // `moe_block_forward`, identical to the linear-attn path.
+    moe_block_forward(
+        backend,
+        moe,
         wf,
-        &format!(
-            "model.layers.{layer_idx}.mlp.shared_expert.gate_proj.weight"
-        ),
-    );
-    let s_up_bits = bits_of(
-        wf,
-        &format!(
-            "model.layers.{layer_idx}.mlp.shared_expert.up_proj.weight"
-        ),
-    );
-    let s_down_bits = bits_of(
-        wf,
-        &format!(
-            "model.layers.{layer_idx}.mlp.shared_expert.down_proj.weight"
-        ),
-    );
-    let shared_gate_w = layer_cache.shared.gate_w;
-    let shared_gate_s = layer_cache.shared.gate_s;
-    let shared_gate_b = layer_cache.shared.gate_b;
-    let shared_up_w = layer_cache.shared.up_w;
-    let shared_up_s = layer_cache.shared.up_s;
-    let shared_up_b = layer_cache.shared.up_b;
-    let shared_down_w = layer_cache.shared.down_w;
-    let shared_down_s = layer_cache.shared.down_s;
-    let shared_down_b = layer_cache.shared.down_b;
-    // Shared FFN reads `h_post` straight from the graph1 scratch
-    // buffer (`h_post_gpu`) — no host re-upload. `shared_ffn_gate_buf`
-    // is the gate-proj *output*, distinct from the per-token sigmoid
-    // scalar `shared_gate` (a graph1 boundary buffer, `shared_gate_gpu`).
-    let shared_ffn_gate_buf = MtlBuffer::<f32>::with_len(
-        &device,
-        n_tokens * v.shared_intermediate,
-    );
-    let shared_up_buf = MtlBuffer::<f32>::with_len(
-        &device,
-        n_tokens * v.shared_intermediate,
-    );
-    let shared_act_buf = MtlBuffer::<f32>::with_len(
-        &device,
-        n_tokens * v.shared_intermediate,
-    );
-    let shared_down_buf =
-        MtlBuffer::<f32>::with_len(&device, n_tokens * hidden_dim);
-    let swiglu_pso = metal.pipeline("swiglu_fused")?.clone();
-    // S7-1a fusion: one cmdbuf covers Phase 3d (shared FFN) AND
-    // Phase 3e (MoE permute-fuse). CPU bucket-build + bucket setup
-    // happen *between* encoding 3d and 3e; the GPU runs 3d while
-    // CPU prepares 3e's bucket inputs.
-    let queue = metal.queue_clone();
-    let cmdbuf = queue.new_command_buffer();
-    encode_dense_matmul_n_tokens(
-        cmdbuf,
-        metal.kernels(),
-        &mv,
-        wf_buf.buffer(),
-        shared_gate_w,
-        shared_gate_s,
-        shared_gate_b,
-        h_post_gpu,
-        0,
-        shared_ffn_gate_buf.buffer(),
-        0,
-        hidden_dim as u32,
-        v.shared_intermediate as u32,
-        n_tokens as u32,
-        s_gate_bits,
-    );
-    encode_dense_matmul_n_tokens(
-        cmdbuf,
-        metal.kernels(),
-        &mv,
-        wf_buf.buffer(),
-        shared_up_w,
-        shared_up_s,
-        shared_up_b,
-        h_post_gpu,
-        0,
-        shared_up_buf.buffer(),
-        0,
-        hidden_dim as u32,
-        v.shared_intermediate as u32,
-        n_tokens as u32,
-        s_up_bits,
-    );
-    // swiglu_fused is element-wise → flat dispatch over
-    // n_tokens * shared_intermediate.
-    {
-        let enc = cmdbuf.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&swiglu_pso);
-        enc.set_buffer(0, Some(shared_ffn_gate_buf.buffer()), 0);
-        enc.set_buffer(1, Some(shared_up_buf.buffer()), 0);
-        enc.set_buffer(2, Some(shared_act_buf.buffer()), 0);
-        let dim = (n_tokens * v.shared_intermediate) as u32;
-        enc.set_bytes(3, 4, (&dim as *const u32).cast());
-        let num_tgs = (dim + 255) / 256;
-        enc.dispatch_thread_groups(
-            metal::MTLSize::new(num_tgs as NSUInteger, 1, 1),
-            metal::MTLSize::new(256, 1, 1),
-        );
-        enc.end_encoding();
-    }
-    encode_dense_matmul_n_tokens(
-        cmdbuf,
-        metal.kernels(),
-        &mv,
-        wf_buf.buffer(),
-        shared_down_w,
-        shared_down_s,
-        shared_down_b,
-        shared_act_buf.buffer(),
-        0,
-        shared_down_buf.buffer(),
-        0,
-        v.shared_intermediate as u32,
-        hidden_dim as u32,
-        n_tokens as u32,
-        s_down_bits,
-    );
-    // 3d encoded — fall through to 3e CPU prep without committing.
-
-    let buckets = build_expert_buckets(
-        &all_routing_indices,
-        &all_routing_weights,
+        layer_cache,
+        layer_idx,
         n_tokens,
         k_active,
-        v.num_experts,
-    );
-
-    let device = metal.device().clone();
-    let total_assignments = buckets.token_idx.len();
-    debug_assert_eq!(total_assignments, n_tokens * k_active);
-
-    // Expert weight buffers — see `batched_linear_attn_layer_forward`
-    // for the three-source explanation (prefetch hit / mmap / pread).
-    let expert_size = v.expert_size_4bit();
-    let mode = expert_files.mode();
-    let num_buckets = buckets.expert_ids.len();
-    let mut bucket_prefetch_slot: Vec<Option<usize>> = vec![None; num_buckets];
-    let mut hit_count: u64 = 0;
-    if let Some(pe) = prefetch.as_mut() {
-        if let Some(status) = pe.prefetch.wait_for(layer_idx) {
-            for (bi, &expert_id) in buckets.expert_ids.iter().enumerate() {
-                for buf_idx in 0..status.k {
-                    if status.loaded_indices[buf_idx] == expert_id {
-                        bucket_prefetch_slot[bi] = Some(buf_idx);
-                        hit_count += 1;
-                        break;
-                    }
-                }
-            }
-        }
-        pe.prefetch.record_outcome(
-            hit_count,
-            num_buckets as u64 - hit_count,
-        );
-    }
-
-    // Resolve every bucket's expert weights into one uniform-stride
-    // `expert_base` buffer — the layout the gather GEMM and the
-    // per-bucket fallback both index as `expert_base + slot *
-    // expert_stride`. Two cases:
-    //   A. mmap mode, no prefetch hits — the layer's mmap buffer is
-    //      already `num_experts` blocks at `expert_size` stride;
-    //      address it directly (zero copy). `expert_slots` = raw ids.
-    //   B. otherwise — stage each bucket's block into one
-    //      `num_buckets * expert_size` buffer (memcpy prefetch hits,
-    //      copy mmap blocks, pread the misses). `expert_slots` = bi.
-    let any_prefetch_hit =
-        bucket_prefetch_slot.iter().any(|s| s.is_some());
-    let use_mmap_base = mode
-        == crate::riir::io::expert_io::ExpertIoMode::Mmap
-        && !any_prefetch_hit;
-
-    let staged: Option<MtlBuffer<u8>> = if use_mmap_base {
-        None
-    } else {
-        let mut host = vec![0u8; num_buckets * expert_size];
-        let mut blob_scratch = vec![0u8; expert_size];
-        for (bi, &expert_id) in buckets.expert_ids.iter().enumerate() {
-            let dst =
-                &mut host[bi * expert_size..(bi + 1) * expert_size];
-            if let Some(buf_idx) = bucket_prefetch_slot[bi] {
-                let pe = prefetch
-                    .as_ref()
-                    .expect("prefetch slot requires env");
-                let buf = moe_buffers.data_prefetch_buffer(
-                    buffer_pool,
-                    pe.prefetch_set,
-                    buf_idx,
-                );
-                // SAFETY: shared-storage Metal buffer, `expert_size`
-                // bytes; no GPU dispatch reads it during this copy.
-                let src = unsafe {
-                    std::slice::from_raw_parts(
-                        buf.contents() as *const u8,
-                        expert_size,
-                    )
-                };
-                dst.copy_from_slice(src);
-            } else if mode
-                == crate::riir::io::expert_io::ExpertIoMode::Mmap
-            {
-                let (buf, off) = expert_files
-                    .mmap_buffer_for_expert(layer_idx, expert_id as u32)
-                    .expect("mmap layer present in mmap mode");
-                // SAFETY: as above; `off` is within the mmap buffer.
-                let src = unsafe {
-                    std::slice::from_raw_parts(
-                        (buf.contents() as *const u8)
-                            .add(off as usize),
-                        expert_size,
-                    )
-                };
-                dst.copy_from_slice(src);
-            } else {
-                expert_files.read_expert(
-                    layer_idx,
-                    expert_id as usize,
-                    &mut blob_scratch,
-                )?;
-                dst.copy_from_slice(&blob_scratch);
-            }
-        }
-        Some(MtlBuffer::<u8>::with_data(&device, &host))
-    };
-    let (expert_base, expert_slots): (&Buffer, Vec<u32>) = match &staged
-    {
-        Some(buf) => {
-            (buf.buffer(), (0..num_buckets as u32).collect())
-        }
-        None => {
-            let (base, _off) = expert_files
-                .mmap_buffer_for_expert(layer_idx, 0)
-                .expect("mmap layer present in mmap mode");
-            (base, buckets.expert_ids.iter().map(|&e| e as u32).collect())
-        }
-    };
-    let expert_stride = expert_size as u64;
-
-    // Per-assignment-row expansion of `expert_slots` — the gather
-    // kernel's row→slot table.
-    let mut expert_indices_host = vec![0u32; total_assignments];
-    for bi in 0..num_buckets {
-        let start = buckets.offsets[bi] as usize;
-        let end = buckets.offsets[bi + 1] as usize;
-        expert_indices_host[start..end].fill(expert_slots[bi]);
-    }
-    let expert_indices =
-        MtlBuffer::<u32>::with_data(&device, &expert_indices_host);
-
-    // `MOEFLUX_MOE_GATHER=0` opts out of the MLX gather GEMM (mirrors
-    // `MetalBackend`'s field; full-attn runs the imperative path).
-    let moe_gather = std::env::var("MOEFLUX_MOE_GATHER")
-        .map_or(true, |val| val != "0");
-
-    let mut bucket_input_host = vec![0.0f32; total_assignments * hidden_dim];
-    for assignment_idx in 0..total_assignments {
-        let t = buckets.token_idx[assignment_idx] as usize;
-        let src = &h_post_stack[t * hidden_dim..(t + 1) * hidden_dim];
-        let dst_off = assignment_idx * hidden_dim;
-        bucket_input_host[dst_off..dst_off + hidden_dim].copy_from_slice(src);
-    }
-
-    let bucket_input =
-        MtlBuffer::<f32>::with_data(&device, &bucket_input_host);
-    let bucket_gate = MtlBuffer::<f32>::with_len(
-        &device,
-        total_assignments * v.moe_intermediate,
-    );
-    let bucket_up = MtlBuffer::<f32>::with_len(
-        &device,
-        total_assignments * v.moe_intermediate,
-    );
-    let bucket_act = MtlBuffer::<f32>::with_len(
-        &device,
-        total_assignments * v.moe_intermediate,
-    );
-    let bucket_out =
-        MtlBuffer::<f32>::with_len(&device, total_assignments * hidden_dim);
-    let bucket_token_idx =
-        MtlBuffer::<i32>::with_data(&device, &buckets.token_idx);
-    let bucket_weights =
-        MtlBuffer::<f32>::with_data(&device, &buckets.weights);
-    let out_sum_zeros = vec![0.0f32; n_tokens * hidden_dim];
-    let out_sum = MtlBuffer::<f32>::with_data(&device, &out_sum_zeros);
-
-    let swiglu = metal.pipeline("swiglu_fused")?.clone();
-    let bucket_accumulate =
-        metal.pipeline("moe_bucket_accumulate")?.clone();
-    // 3e encodes into the same cmdbuf the 3d block opened above —
-    // GPU runs 3d's matvecs+swiglu+down concurrently with CPU's bucket
-    // setup, then 3e dispatches after them in the same buffer.
-    encode_moe_batched_permute_fuse(
-        cmdbuf,
-        &mv,
-        metal.kernels(),
-        &swiglu,
-        &bucket_accumulate,
-        expert_base,
-        expert_stride,
-        expert_indices.buffer(),
-        &expert_slots,
-        bucket_input.buffer(),
-        bucket_gate.buffer(),
-        bucket_up.buffer(),
-        bucket_act.buffer(),
-        bucket_out.buffer(),
-        bucket_token_idx.buffer(),
-        bucket_weights.buffer(),
-        out_sum.buffer(),
-        &buckets,
-        v,
-        moe_gather,
-    );
-    // S7-2: GPU combine into hidden_out_buf — replaces the CPU loop
-    // that read h_mid_stack / shared_out_stack / shared_gate_scores /
-    // moe_sum_host. With this on the same cmdbuf as 3d/3e, the final
-    // hidden state for this layer is on GPU and feeds directly into
-    // the next layer's input without a host bounce.
-    let combine_pso = metal
-        .pipeline("moe_combine_residual_n_tokens")?
-        .clone();
-    encode_moe_combine_residual_n_tokens(
-        cmdbuf,
-        &combine_pso,
-        h_mid_gpu,
-        out_sum.buffer(),
-        shared_down_buf.buffer(),
-        shared_gate_gpu,
-        hidden_out_gpu,
-        n_tokens as u32,
-        hidden_dim as u32,
-    );
-    metal.commit_and_wait_labeled(cmdbuf, "batched_shared_ffn_moe_combine");
-
-    // Phase 3: record_actual for prefetch's next-token prediction.
-    // See `batched_linear_attn_layer_forward` for the semantic.
-    if let Some(pe) = prefetch.as_mut() {
-        use crate::riir::moe::expert_forward::MAX_K;
-        let mut actuals: [i32; MAX_K] = [0; MAX_K];
-        let len = k_active.min(MAX_K).min(all_routing_indices.len());
-        actuals[..len].copy_from_slice(&all_routing_indices[..len]);
-        pe.prefetch.record_actual(layer_idx, actuals);
-    }
-
-    Ok(())
+        expert_files,
+        moe_buffers,
+        prefetch,
+        hidden_out_id,
+    )
 }
