@@ -889,6 +889,32 @@ impl Backend for CpuBackend {
                     *eps,
                 );
             }
+            Op::KvCacheAppendNTokens {
+                k_src,
+                v_src,
+                k_cache,
+                v_cache,
+                kv_dim,
+                n_tokens,
+                kv_start,
+                ..
+            } => {
+                let kv_dim = *kv_dim as usize;
+                let len = *n_tokens as usize * kv_dim;
+                let start = *kv_start as usize * kv_dim;
+                {
+                    let k_src_buf = self.read_f32(*k_src);
+                    let mut k_cache_buf = self.write_f32(*k_cache);
+                    k_cache_buf[start..start + len]
+                        .copy_from_slice(&k_src_buf[..len]);
+                }
+                {
+                    let v_src_buf = self.read_f32(*v_src);
+                    let mut v_cache_buf = self.write_f32(*v_cache);
+                    v_cache_buf[start..start + len]
+                        .copy_from_slice(&v_src_buf[..len]);
+                }
+            }
             Op::RopeNTokens {
                 x,
                 inv_freq,

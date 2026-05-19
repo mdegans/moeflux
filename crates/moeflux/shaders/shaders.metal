@@ -3262,3 +3262,33 @@ kernel void rms_norm_per_head_n_tokens(
         xh[i] = xh[i] * inv_rms * w;
     }
 }
+
+
+// ============================================================================
+// Kernel: KvCacheAppendNTokens — append k/v scratch into the resident cache
+// ============================================================================
+// Strided copy of the per-token k/v scratch stacks `[n_tokens, kv_dim]` into
+// the GPU-resident KV cache `[MAX_SEQ_LEN, kv_dim]` at row `kv_start`. Both
+// the source and the destination window are contiguous; one thread per
+// (token, channel) copies k and v together. Diff oracle: two windowed
+// `copy_from_slice`s.
+
+kernel void kv_cache_append_n_tokens(
+    device const float* k_src    [[buffer(0)]],  // [n_tokens, kv_dim]
+    device const float* v_src    [[buffer(1)]],  // [n_tokens, kv_dim]
+    device float*       k_cache  [[buffer(2)]],  // [MAX_SEQ_LEN, kv_dim]
+    device float*       v_cache  [[buffer(3)]],  // [MAX_SEQ_LEN, kv_dim]
+    constant uint&      kv_dim   [[buffer(4)]],
+    constant uint&      n_tokens [[buffer(5)]],
+    constant uint&      kv_start [[buffer(6)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    uint total = n_tokens * kv_dim;
+    if (tid >= total) return;
+
+    uint t   = tid / kv_dim;
+    uint i   = tid % kv_dim;
+    uint dst = (kv_start + t) * kv_dim + i;
+    k_cache[dst] = k_src[tid];
+    v_cache[dst] = v_src[tid];
+}

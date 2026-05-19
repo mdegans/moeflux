@@ -86,6 +86,7 @@ pub const ALL_KERNELS: &[&str] = &[
     "gated_delta_net_chunkwise",
     "gated_delta_net_step",
     "gated_rms_norm",
+    "kv_cache_append_n_tokens",
     "mla_sdpa_tile_accumulate",
     "mla_sdpa_tile_finalize",
     "moe_combine_residual",

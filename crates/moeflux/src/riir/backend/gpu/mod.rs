@@ -464,6 +464,7 @@ pub struct MetalBackend {
     sigmoid_gate_pso: ComputePipelineState,
     split_q_gate_pso: ComputePipelineState,
     rms_norm_per_head_pso: ComputePipelineState,
+    kv_cache_append_pso: ComputePipelineState,
     moe_combine_residual_n_pso: ComputePipelineState,
     moe_bucket_accumulate_pso: ComputePipelineState,
     /// When set (env `MOEFLUX_PROFILE_PER_OP`), [`Backend::execute`]
@@ -504,6 +505,8 @@ impl MetalBackend {
         let split_q_gate_pso = metal.pipeline("split_q_gate")?.clone();
         let rms_norm_per_head_pso =
             metal.pipeline("rms_norm_per_head_n_tokens")?.clone();
+        let kv_cache_append_pso =
+            metal.pipeline("kv_cache_append_n_tokens")?.clone();
         let moe_combine_residual_n_pso =
             metal.pipeline("moe_combine_residual_n_tokens")?.clone();
         let moe_bucket_accumulate_pso =
@@ -527,6 +530,7 @@ impl MetalBackend {
             sigmoid_gate_pso,
             split_q_gate_pso,
             rms_norm_per_head_pso,
+            kv_cache_append_pso,
             moe_combine_residual_n_pso,
             moe_bucket_accumulate_pso,
             profile_per_op: std::env::var_os("MOEFLUX_PROFILE_PER_OP")
@@ -859,6 +863,38 @@ impl Backend for MetalBackend {
                         *n_tokens as NSUInteger,
                         1,
                     ),
+                    MTLSize::new(256, 1, 1),
+                );
+                enc.end_encoding();
+            }
+            Op::KvCacheAppendNTokens {
+                k_src,
+                v_src,
+                k_cache,
+                v_cache,
+                kv_dim,
+                n_tokens,
+                kv_start,
+                ..
+            } => {
+                let kvd = *kv_dim;
+                let nt = *n_tokens;
+                let ks = *kv_start;
+                let total = nt * kvd;
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(
+                    &self.kv_cache_append_pso,
+                );
+                enc.set_buffer(0, Some(self.pool.handle(*k_src)), 0);
+                enc.set_buffer(1, Some(self.pool.handle(*v_src)), 0);
+                enc.set_buffer(2, Some(self.pool.handle(*k_cache)), 0);
+                enc.set_buffer(3, Some(self.pool.handle(*v_cache)), 0);
+                enc.set_bytes(4, 4, (&kvd as *const u32).cast());
+                enc.set_bytes(5, 4, (&nt as *const u32).cast());
+                enc.set_bytes(6, 4, (&ks as *const u32).cast());
+                let num_tgs = (total + 255) / 256;
+                enc.dispatch_thread_groups(
+                    MTLSize::new(num_tgs as NSUInteger, 1, 1),
                     MTLSize::new(256, 1, 1),
                 );
                 enc.end_encoding();

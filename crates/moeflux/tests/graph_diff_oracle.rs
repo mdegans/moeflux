@@ -882,6 +882,125 @@ fn check_rms_norm_per_head(num_heads: u32) {
 }
 
 // ============================================================================
+// Test: KvCacheAppendNTokens through both backends (prefill arc, phase 1e)
+// ============================================================================
+
+#[test]
+#[ignore = "long-running GPU test"]
+fn graph_metal_matches_cpu_kv_cache_append() {
+    let n_tokens: u32 = 8;
+    let kv_dim: u32 = 1024;
+    let kv_start: u32 = 5; // nonzero — exercises the row offset
+    let cache_rows: u32 = 16;
+    let src_total = (n_tokens * kv_dim) as usize;
+    let cache_total = (cache_rows * kv_dim) as usize;
+    let win = (kv_start * kv_dim) as usize
+        ..((kv_start + n_tokens) * kv_dim) as usize;
+
+    let mut rng = Rng::new(0x6CA_C7E);
+    let k_data: Vec<f32> =
+        (0..src_total).map(|_| rng.next_f32_unit()).collect();
+    let v_data: Vec<f32> =
+        (0..src_total).map(|_| rng.next_f32_unit()).collect();
+
+    let build = |ks, vs, kc, vc| Op::KvCacheAppendNTokens {
+        label: "test_kv_append",
+        k_src: ks,
+        v_src: vs,
+        k_cache: kc,
+        v_cache: vc,
+        kv_dim,
+        n_tokens,
+        kv_start,
+    };
+
+    // CPU path — cache buffers start zeroed (pool.alloc zero-fills).
+    let mut cpu_wf = dummy_weight_file("kv_append_cpu");
+    let mut cpu = CpuBackend::new(cpu_wf.take());
+    let cpu_ks =
+        cpu.pool_mut().alloc(src_total * 4, "k_src", false).unwrap();
+    let cpu_vs =
+        cpu.pool_mut().alloc(src_total * 4, "v_src", false).unwrap();
+    let cpu_kc = cpu
+        .pool_mut()
+        .alloc(cache_total * 4, "k_cache", false)
+        .unwrap();
+    let cpu_vc = cpu
+        .pool_mut()
+        .alloc(cache_total * 4, "v_cache", false)
+        .unwrap();
+    cpu.pool_mut().upload(cpu_ks, bytes_of_f32(&k_data)).unwrap();
+    cpu.pool_mut().upload(cpu_vs, bytes_of_f32(&v_data)).unwrap();
+    let mut g_cpu = Graph::new();
+    g_cpu.push(build(cpu_ks, cpu_vs, cpu_kc, cpu_vc));
+    cpu.execute(&g_cpu, "diff_oracle").unwrap();
+    let mut cpu_kc_bytes = vec![0u8; cache_total * 4];
+    let mut cpu_vc_bytes = vec![0u8; cache_total * 4];
+    cpu.pool().download(cpu_kc, &mut cpu_kc_bytes).unwrap();
+    cpu.pool().download(cpu_vc, &mut cpu_vc_bytes).unwrap();
+    let cpu_kc_f32 = f32_of_bytes(&cpu_kc_bytes);
+    let cpu_vc_f32 = f32_of_bytes(&cpu_vc_bytes);
+
+    // GPU path
+    let mut gpu_wf = dummy_weight_file("kv_append_gpu");
+    let metal_ctx = MetalContext::new().expect("MetalContext::new");
+    let wf_ref = gpu_wf.wf.as_ref().unwrap();
+    let wf_buf = MtlWeightBuf::wrap(wf_ref, metal_ctx.device());
+    let _ = gpu_wf.take();
+    let mut gpu =
+        MetalBackend::new(metal_ctx, wf_buf).expect("MetalBackend::new");
+    let gpu_ks =
+        gpu.pool_mut().alloc(src_total * 4, "k_src", false).unwrap();
+    let gpu_vs =
+        gpu.pool_mut().alloc(src_total * 4, "v_src", false).unwrap();
+    let gpu_kc = gpu
+        .pool_mut()
+        .alloc(cache_total * 4, "k_cache", false)
+        .unwrap();
+    let gpu_vc = gpu
+        .pool_mut()
+        .alloc(cache_total * 4, "v_cache", false)
+        .unwrap();
+    gpu.pool_mut().upload(gpu_ks, bytes_of_f32(&k_data)).unwrap();
+    gpu.pool_mut().upload(gpu_vs, bytes_of_f32(&v_data)).unwrap();
+    let mut g_gpu = Graph::new();
+    g_gpu.push(build(gpu_ks, gpu_vs, gpu_kc, gpu_vc));
+    gpu.execute(&g_gpu, "diff_oracle").unwrap();
+    let mut gpu_kc_bytes = vec![0u8; cache_total * 4];
+    let mut gpu_vc_bytes = vec![0u8; cache_total * 4];
+    gpu.pool().download(gpu_kc, &mut gpu_kc_bytes).unwrap();
+    gpu.pool().download(gpu_vc, &mut gpu_vc_bytes).unwrap();
+    let gpu_kc_f32 = f32_of_bytes(&gpu_kc_bytes);
+    let gpu_vc_f32 = f32_of_bytes(&gpu_vc_bytes);
+
+    // Pure strided copy — require bit-exact CPU vs GPU.
+    assert_eq!(cpu_kc_f32, gpu_kc_f32, "k_cache differs CPU vs GPU");
+    assert_eq!(cpu_vc_f32, gpu_vc_f32, "v_cache differs CPU vs GPU");
+
+    // The appended window matches the source bit-exactly...
+    assert_eq!(&cpu_kc_f32[win.clone()], &k_data[..], "k window");
+    assert_eq!(&cpu_vc_f32[win.clone()], &v_data[..], "v window");
+    // ...and rows outside `[kv_start, kv_start+n_tokens)` are untouched
+    // (still zero) — catches a missing row-offset.
+    let untouched_nonzero = cpu_kc_f32[..win.start]
+        .iter()
+        .chain(cpu_kc_f32[win.end..].iter())
+        .any(|&v| v != 0.0);
+    assert!(
+        !untouched_nonzero,
+        "kv_cache_append wrote outside the [{}, {}) row window",
+        kv_start,
+        kv_start + n_tokens
+    );
+
+    eprintln!(
+        "[s15-p1e kv_cache_append] N={} kv_dim={} kv_start={}: \
+         bit-exact, window + offset verified",
+        n_tokens, kv_dim, kv_start
+    );
+}
+
+// ============================================================================
 // Test: SwigluFusedBatched through both backends
 // ============================================================================
 

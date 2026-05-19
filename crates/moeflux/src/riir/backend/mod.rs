@@ -306,10 +306,9 @@ pub trait Backend {
 /// ## What is *not* in this enum
 ///
 /// MLA variants (`MlaQPrime4Bit`, `MlaSdpaTileAccumulate`,
-/// `MlaSdpaTileFinalize`) and the full-attn-GPU `KvCacheAppendNTokens`
-/// are reserved for future sessions when their producers are
-/// rewritten. Don't add unused variants — each one expands the
-/// `encode_op` match arms in every backend.
+/// `MlaSdpaTileFinalize`) are reserved for future sessions when their
+/// producers are rewritten. Don't add unused variants — each one
+/// expands the `encode_op` match arms in every backend.
 #[derive(Debug)]
 pub enum Op {
     /// Fused RMS-norm with bf16 weight over `[n_tokens, dim]`.
@@ -483,6 +482,21 @@ pub enum Op {
         gate: BufId,
         dim: u32,
         n_tokens: u32,
+    },
+
+    /// Append per-token k/v scratch into the GPU-resident KV cache.
+    /// `k_src`/`v_src` are `[n_tokens, kv_dim]`; the cache buffers are
+    /// `[MAX_SEQ_LEN, kv_dim]`. Writes rows `[kv_start, kv_start +
+    /// n_tokens)`. Both backends do a strided copy — bit-exact.
+    KvCacheAppendNTokens {
+        label: &'static str,
+        k_src: BufId,
+        v_src: BufId,
+        k_cache: BufId,
+        v_cache: BufId,
+        kv_dim: u32,
+        n_tokens: u32,
+        kv_start: u32,
     },
 
     /// MoE softmax + top-K selection. Reads `[n_tokens, n_experts]`
@@ -666,6 +680,7 @@ impl Op {
             Op::SigmoidGateNTokens { label, .. } => label,
             Op::SplitQGate { label, .. } => label,
             Op::RmsNormPerHeadNTokens { label, .. } => label,
+            Op::KvCacheAppendNTokens { label, .. } => label,
             Op::MoeSoftmaxTopK { label, .. } => label,
             Op::MoeNormalizeWeights { label, .. } => label,
             Op::MoeBatchedPermuteFuse { label, .. } => label,
@@ -694,6 +709,7 @@ impl Op {
             Op::SigmoidGateNTokens { .. } => "SigmoidGateNTokens",
             Op::SplitQGate { .. } => "SplitQGate",
             Op::RmsNormPerHeadNTokens { .. } => "RmsNormPerHeadNTokens",
+            Op::KvCacheAppendNTokens { .. } => "KvCacheAppendNTokens",
             Op::MoeSoftmaxTopK { .. } => "MoeSoftmaxTopK",
             Op::MoeNormalizeWeights { .. } => "MoeNormalizeWeights",
             Op::MoeBatchedPermuteFuse { .. } => "MoeBatchedPermuteFuse",
@@ -726,6 +742,9 @@ impl Op {
             Op::SigmoidGateNTokens { x, gate, .. } => vec![*x, *gate],
             Op::SplitQGate { q_proj, .. } => vec![*q_proj],
             Op::RmsNormPerHeadNTokens { x, .. } => vec![*x],
+            Op::KvCacheAppendNTokens { k_src, v_src, .. } => {
+                vec![*k_src, *v_src]
+            }
             Op::MoeSoftmaxTopK { logits, .. } => vec![*logits],
             Op::MoeNormalizeWeights { weights, .. } => vec![*weights],
             Op::MoeBatchedPermuteFuse {
@@ -793,6 +812,9 @@ impl Op {
                 q_out, gate_out, ..
             } => vec![*q_out, *gate_out],
             Op::RmsNormPerHeadNTokens { x, .. } => vec![*x], // in-place
+            Op::KvCacheAppendNTokens {
+                k_cache, v_cache, ..
+            } => vec![*k_cache, *v_cache],
             Op::MoeSoftmaxTopK {
                 indices_out,
                 weights_out,
@@ -975,6 +997,16 @@ mod tests {
             head_dim: 128,
             n_tokens: 8,
             eps: 1e-6,
+        });
+        g.push(Op::KvCacheAppendNTokens {
+            label: "kv_cache_append",
+            k_src: buf(44),
+            v_src: buf(45),
+            k_cache: buf(46),
+            v_cache: buf(47),
+            kv_dim: 1024,
+            n_tokens: 8,
+            kv_start: 0,
         });
         g.push(Op::MoeSoftmaxTopK {
             label: "moe_topk",
