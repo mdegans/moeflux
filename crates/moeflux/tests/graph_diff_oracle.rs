@@ -9,22 +9,16 @@
 //!
 //! ## Scope
 //!
-//! Exercises the 8 Op variants that are wired in both backends per
-//! S7-3:
-//! - ResidualAddNTokens (weight-free)
-//! - RmsNormBf16NTokens (bf16 weight from synthetic file)
-//! - MatvecNTokens (4-bit quantized weight)
-//! - SwigluFusedBatched (weight-free)
-//! - MoeSoftmaxTopK (weight-free)
-//! - MoeNormalizeWeights (in-place, weight-free)
-//! - MoeCombineResidualNTokens (weight-free)
-//! - MatvecNTokens 8-bit variant (8-bit quantized weight)
+//! Exercises every Op variant wired in both backends — one diff test
+//! per variant, each landing alongside its producer wire-up. As of
+//! the prefill arc (phase 1a) that covers ResidualAddNTokens,
+//! RmsNormBf16NTokens, MatvecNTokens (4-bit + 8-bit), SwigluFusedBatched,
+//! MoeSoftmaxTopK, MoeNormalizeWeights, MoeCombineResidualNTokens,
+//! RmsNormQkNTokens, RopeNTokens, the GatedDeltaNet family, and
+//! SdpaCausalTiled.
 //!
-//! The remaining 7 variants (RmsNormQkNTokens, SdpaCausalTiled,
-//! MoeBatchedPermuteFuse, Conv1dStepNTokens, ComputeDecayBetaNTokens,
-//! GatedDeltaNetStepNTokens, GatedRmsNormNTokens, LmHead) wire in
-//! later checkpoints alongside their producers, and are not
-//! exercised here.
+//! Still un-tested here (wire in alongside their producers):
+//! MoeBatchedPermuteFuse and LmHead.
 //!
 //! ## Synthetic weight file
 //!
@@ -411,6 +405,134 @@ fn graph_metal_matches_cpu_rope_n_tokens() {
         "non-rotated tail channels [{}, {}) were modified — partial \
          rotary stride bug",
         rotary_dim, head_dim
+    );
+}
+
+// ============================================================================
+// Test: SdpaCausalTiled through both backends (prefill arc, phase 1a)
+// ============================================================================
+
+#[test]
+#[ignore = "long-running GPU test"]
+fn graph_metal_matches_cpu_sdpa_causal_tiled() {
+    // Two GQA fan-outs: heads_per_kv=2 selects the folded gqa2 kernel,
+    // heads_per_kv=1 the unfolded one. head_dim is pinned at 256
+    // (`SdpaCall::encode` asserts it).
+    check_sdpa_causal_tiled(2);
+    check_sdpa_causal_tiled(1);
+}
+
+fn check_sdpa_causal_tiled(heads_per_kv: u32) {
+    let n_tokens: u32 = 8;
+    let num_heads: u32 = 16;
+    let head_dim: u32 = 256;
+    let num_kv_heads = num_heads / heads_per_kv;
+    let kv_dim = num_kv_heads * head_dim;
+    let q_dim = num_heads * head_dim;
+    let q_total = (n_tokens * q_dim) as usize;
+    let kv_total = (n_tokens * kv_dim) as usize;
+    let softmax_scale = 1.0f32 / (head_dim as f32).sqrt();
+
+    let mut rng = Rng::new(0x5D9A_0000 + heads_per_kv as u64);
+    let q_data: Vec<f32> =
+        (0..q_total).map(|_| rng.next_f32_unit()).collect();
+    let k_data: Vec<f32> =
+        (0..kv_total).map(|_| rng.next_f32_unit()).collect();
+    let v_data: Vec<f32> =
+        (0..kv_total).map(|_| rng.next_f32_unit()).collect();
+
+    let build = |op_q, op_k, op_v, op_out| Op::SdpaCausalTiled {
+        label: "test_sdpa",
+        q: op_q,
+        k: op_k,
+        v: op_v,
+        attn_out: op_out,
+        n_tokens,
+        num_heads,
+        heads_per_kv,
+        head_dim,
+        kv_dim,
+        kv_start: 0,
+        kv_len_total: n_tokens,
+        softmax_scale,
+    };
+
+    // CPU path
+    let mut cpu_wf = dummy_weight_file("sdpa_cpu");
+    let mut cpu = CpuBackend::new(cpu_wf.take());
+    let cpu_q = cpu.pool_mut().alloc(q_total * 4, "q", false).unwrap();
+    let cpu_k = cpu.pool_mut().alloc(kv_total * 4, "k", false).unwrap();
+    let cpu_v = cpu.pool_mut().alloc(kv_total * 4, "v", false).unwrap();
+    let cpu_out =
+        cpu.pool_mut().alloc(q_total * 4, "out", false).unwrap();
+    cpu.pool_mut().upload(cpu_q, bytes_of_f32(&q_data)).unwrap();
+    cpu.pool_mut().upload(cpu_k, bytes_of_f32(&k_data)).unwrap();
+    cpu.pool_mut().upload(cpu_v, bytes_of_f32(&v_data)).unwrap();
+    let mut g_cpu = Graph::new();
+    g_cpu.push(build(cpu_q, cpu_k, cpu_v, cpu_out));
+    cpu.execute(&g_cpu, "diff_oracle").unwrap();
+    let mut cpu_out_bytes = vec![0u8; q_total * 4];
+    cpu.pool().download(cpu_out, &mut cpu_out_bytes).unwrap();
+    let cpu_out_f32 = f32_of_bytes(&cpu_out_bytes);
+
+    // GPU path
+    let mut gpu_wf = dummy_weight_file("sdpa_gpu");
+    let metal_ctx = MetalContext::new().expect("MetalContext::new");
+    let wf_ref = gpu_wf.wf.as_ref().unwrap();
+    let wf_buf = MtlWeightBuf::wrap(wf_ref, metal_ctx.device());
+    let _ = gpu_wf.take();
+    let mut gpu =
+        MetalBackend::new(metal_ctx, wf_buf).expect("MetalBackend::new");
+    let gpu_q = gpu.pool_mut().alloc(q_total * 4, "q", false).unwrap();
+    let gpu_k = gpu.pool_mut().alloc(kv_total * 4, "k", false).unwrap();
+    let gpu_v = gpu.pool_mut().alloc(kv_total * 4, "v", false).unwrap();
+    let gpu_out =
+        gpu.pool_mut().alloc(q_total * 4, "out", false).unwrap();
+    gpu.pool_mut().upload(gpu_q, bytes_of_f32(&q_data)).unwrap();
+    gpu.pool_mut().upload(gpu_k, bytes_of_f32(&k_data)).unwrap();
+    gpu.pool_mut().upload(gpu_v, bytes_of_f32(&v_data)).unwrap();
+    let mut g_gpu = Graph::new();
+    g_gpu.push(build(gpu_q, gpu_k, gpu_v, gpu_out));
+    gpu.execute(&g_gpu, "diff_oracle").unwrap();
+    let mut gpu_out_bytes = vec![0u8; q_total * 4];
+    gpu.pool().download(gpu_out, &mut gpu_out_bytes).unwrap();
+    let gpu_out_f32 = f32_of_bytes(&gpu_out_bytes);
+
+    // Primary check: CPU arm vs GPU flash kernel.
+    let cos = cosine_sim(&cpu_out_f32, &gpu_out_f32);
+    let max_abs = cpu_out_f32
+        .iter()
+        .zip(gpu_out_f32.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+
+    // Guard: SDPA output is not a copy of q — a value-weighted
+    // average of v differs from q at O(1). Catches a no-op kernel
+    // (which a CPU-vs-GPU-only cosine could miss if both no-op'd).
+    let vs_q = cpu_out_f32
+        .iter()
+        .zip(q_data.iter())
+        .map(|(o, i)| (o - i).abs())
+        .fold(0.0f32, f32::max);
+
+    eprintln!(
+        "[s15-p1a sdpa_causal_tiled] N={} heads={} heads_per_kv={} \
+         head_dim={}: cos={:.9}, max_abs={:.3e}, vs_q={:.3e}",
+        n_tokens, num_heads, heads_per_kv, head_dim, cos, max_abs, vs_q
+    );
+    assert!(
+        cos >= COSINE_FLOOR,
+        "cosine {} below floor {} (max_abs={}, heads_per_kv={})",
+        cos,
+        COSINE_FLOOR,
+        max_abs,
+        heads_per_kv,
+    );
+    assert!(
+        vs_q > 0.01,
+        "SDPA output looks like a copy of q (vs_q={}) — the kernel \
+         did not attend over v",
+        vs_q,
     );
 }
 

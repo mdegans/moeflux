@@ -416,19 +416,19 @@ pub enum Op {
         total: u32,
     },
 
-    /// Batched tiled causal SDPA. Three accumulator buffers
-    /// (`running_max`, `running_denom`, `v_partial`) survive across
-    /// tile dispatches; the encoder issues N tile-passes + a
-    /// finalize pass.
+    /// Batched causal SDPA. `q` is `[n_tokens, num_heads, head_dim]`;
+    /// `k`/`v` are the GPU-resident KV cache, `[kv_len_total, kv_dim]`
+    /// row-major — token `t` (absolute position `kv_start + t`)
+    /// attends causally over rows `[0, kv_start + t]`. The Metal arm
+    /// dispatches the production flash kernel (`SdpaCall`); the GQA
+    /// fold is derived internally from `heads_per_kv`. Diff oracle:
+    /// `attn::sdpa` (single-pass per-token compute).
     SdpaCausalTiled {
         label: &'static str,
         q: BufId,
         k: BufId,
         v: BufId,
         attn_out: BufId,
-        running_max: BufId,
-        running_denom: BufId,
-        v_partial: BufId,
         n_tokens: u32,
         num_heads: u32,
         heads_per_kv: u32,
@@ -670,15 +670,7 @@ impl Op {
             Op::ZeroBuffer { .. } => vec![],
             Op::MatvecNTokens { input, .. } => vec![*input],
             Op::SwigluFusedBatched { gate, up, .. } => vec![*gate, *up],
-            Op::SdpaCausalTiled {
-                q,
-                k,
-                v,
-                running_max,
-                running_denom,
-                v_partial,
-                ..
-            } => vec![*q, *k, *v, *running_max, *running_denom, *v_partial],
+            Op::SdpaCausalTiled { q, k, v, .. } => vec![*q, *k, *v],
             Op::MoeSoftmaxTopK { logits, .. } => vec![*logits],
             Op::MoeNormalizeWeights { weights, .. } => vec![*weights],
             Op::MoeBatchedPermuteFuse {
@@ -740,13 +732,7 @@ impl Op {
             Op::ZeroBuffer { buf, .. } => vec![*buf],
             Op::MatvecNTokens { output, .. } => vec![*output],
             Op::SwigluFusedBatched { out, .. } => vec![*out],
-            Op::SdpaCausalTiled {
-                attn_out,
-                running_max,
-                running_denom,
-                v_partial,
-                ..
-            } => vec![*attn_out, *running_max, *running_denom, *v_partial],
+            Op::SdpaCausalTiled { attn_out, .. } => vec![*attn_out],
             Op::MoeSoftmaxTopK {
                 indices_out,
                 weights_out,
@@ -896,9 +882,6 @@ mod tests {
             k: buf(12),
             v: buf(13),
             attn_out: buf(14),
-            running_max: buf(15),
-            running_denom: buf(16),
-            v_partial: buf(17),
             n_tokens: 8,
             num_heads: 16,
             heads_per_kv: 2,

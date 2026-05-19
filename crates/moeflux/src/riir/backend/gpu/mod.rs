@@ -37,7 +37,7 @@ use crate::riir::backend::gpu::gpu_norm::{
 };
 use crate::riir::backend::gpu::metal::{MetalContext, MetalError, MtlBuffer};
 use crate::riir::io::mtl_weight_buf::MtlWeightBuf;
-use moeflux_metal::{QmmCall, QuantWeights};
+use moeflux_metal::{QmmCall, QuantWeights, SdpaCall};
 
 /// Metal buffer pool. Storage is `Vec<Buffer>` indexed *indirectly*
 /// by `BufId` through `bufid_to_physical`. Pre-`commit_plan` the
@@ -874,10 +874,44 @@ impl Backend for MetalBackend {
                 );
                 enc.end_encoding();
             }
-            Op::SdpaCausalTiled { .. } => {
-                todo!(
-                    "SdpaCausalTiled encode_op: needs kv_dim arg disambiguation; defer to S7-7 producer wire-up"
-                )
+            Op::SdpaCausalTiled {
+                q,
+                k,
+                v,
+                attn_out,
+                n_tokens,
+                num_heads,
+                heads_per_kv,
+                head_dim,
+                kv_dim,
+                kv_start,
+                kv_len_total,
+                softmax_scale,
+                ..
+            } => {
+                // GQA-fold: even `heads_per_kv` → two query-heads
+                // share a threadgroup (`attn_sdpa_causal_flash_gqa2`);
+                // odd falls back to the unfolded kernel. Same rule as
+                // the imperative path (`full_attn_forward.rs`).
+                let fold = if *heads_per_kv % 2 == 0 { 2 } else { 1 };
+                self.metal.kernels().encode(
+                    cmd,
+                    &SdpaCall {
+                        q: self.pool.handle(*q),
+                        k_cache: self.pool.handle(*k),
+                        v_cache: self.pool.handle(*v),
+                        out: self.pool.handle(*attn_out),
+                        n_tokens: *n_tokens,
+                        num_heads: *num_heads,
+                        heads_per_kv: *heads_per_kv,
+                        head_dim: *head_dim,
+                        kv_dim: *kv_dim,
+                        start_pos: *kv_start,
+                        kv_len: *kv_len_total,
+                        softmax_scale: *softmax_scale,
+                        fold,
+                    },
+                );
             }
             Op::MoeBatchedPermuteFuse {
                 expert_base,
