@@ -326,8 +326,8 @@ impl HeadTailScratch {
 /// - **MoE working set** (`shared_ffn_gate` … `expert_indices`):
 ///   `shared_ffn_gate` … `out_sum` are colorable transients
 ///   (`persistent = false`); the host-uploaded inputs (`bucket_input`,
-///   `bucket_token_idx`, `bucket_weights`, `expert_base`,
-///   `expert_indices`) are `persistent = true`.
+///   `bucket_token_idx`, `bucket_weights`, `expert_indices`) are
+///   `persistent = true`.
 pub struct MoeGraphScratch {
     // Graph1→MoE boundary (persistent, never aliased).
     pub h_mid: BufId,
@@ -352,13 +352,6 @@ pub struct MoeGraphScratch {
     /// MoE permute-fuse scatter accumulator. `Op::ZeroBuffer` clears
     /// it each layer before `Op::MoeBatchedPermuteFuse` accumulates.
     pub out_sum: BufId,
-    /// Pread-mode expert-weight staging buffer — every expert's block
-    /// packed contiguously at `expert_size_4bit()` stride, the gather
-    /// GEMM's `expert_base`. The producer `read_expert`s each layer's
-    /// hit experts into their slot. `None` in mmap mode, which
-    /// addresses the layer's mmap buffer directly via
-    /// `ExpertFiles::mmap_id_for_expert`.
-    pub expert_base: Option<BufId>,
     /// Per-assignment-row expert slot table (`u32`), `chunk *
     /// k_active` wide — the gather kernel's `indices`. Filled per
     /// layer from `buckets`.
@@ -375,12 +368,10 @@ impl MoeGraphScratch {
     /// FFN intermediates are `persistent = false` (the first MoE block
     /// call `commit_plan`s + pins them); the boundary buffers +
     /// host-uploaded inputs are `persistent = true`. `k_active` sizes
-    /// the bucket-flat buffers; `pread_mode` gates the per-expert
-    /// weight staging blob (skipped in mmap mode).
+    /// the bucket-flat buffers.
     pub fn new(
         pool: &mut MetalBufferPool,
         k_active: usize,
-        pread_mode: bool,
     ) -> Self {
         let v = VARIANT;
         let chunk = crate::riir::BATCHED_CHUNK_SIZE;
@@ -436,15 +427,6 @@ impl MoeGraphScratch {
             p(chunk * k_active * f32_sz, "mgs.bucket_token_idx");
         let bucket_weights =
             p(chunk * k_active * f32_sz, "mgs.bucket_weights");
-        // One staging buffer holding every expert's block at
-        // `expert_size_4bit()` stride. Pread-only — mmap mode points
-        // the gather GEMM straight at the layer mmap buffer. (Prefetch
-        // is decode-only; the batched prefill path that reaches here
-        // always runs prefetch-disabled, so pread is the only IO mode
-        // that needs a staging copy.)
-        let expert_base = pread_mode.then(|| {
-            p(v.num_experts * v.expert_size_4bit(), "mgs.expert_base")
-        });
         let expert_indices = p(
             chunk * k_active * std::mem::size_of::<u32>(),
             "mgs.expert_indices",
@@ -467,7 +449,6 @@ impl MoeGraphScratch {
             bucket_token_idx,
             bucket_weights,
             out_sum,
-            expert_base,
             expert_indices,
             commit_planned: std::cell::Cell::new(false),
         }
@@ -701,7 +682,11 @@ pub(in crate::riir) fn bits_of(wf: &WeightFile, name: &str) -> u32 {
 /// kernel's demand-fault handler is about to do anyway).
 pub(in crate::riir) struct PrefetchEnv<'a> {
     pub prefetch: &'a mut crate::riir::io::prefetch::PrefetchState,
-    pub prefetch_set: usize,
+    // `prefetch_set` field removed 2026-05-20 alongside the pread
+    // teardown: it indexed the cold-path lookup of
+    // `moe_buffers.data_prefetch_id(set, buf_idx)` inside
+    // `moe_block_forward`, which is gone. `pe.prefetch.record_actual`
+    // (still used by the producer) doesn't need it.
 }
 
 /// Adapter naming the o_proj weights + input shape to use for one
@@ -2577,71 +2562,28 @@ where
     let total_assignments = buckets.token_idx.len();
     debug_assert_eq!(total_assignments, n_tokens * k_active);
 
-    let mode = expert_files.mode();
     let num_buckets = buckets.expert_ids.len();
-    let mut bucket_prefetch_slot: Vec<Option<usize>> = vec![None; num_buckets];
-    let mut hit_count: u64 = 0;
-    if let Some(pe) = prefetch.as_mut() {
-        if let Some(status) = pe.prefetch.wait_for(layer_idx) {
-            for (bi, &expert_id) in buckets.expert_ids.iter().enumerate() {
-                for buf_idx in 0..status.k {
-                    if status.loaded_indices[buf_idx] == expert_id {
-                        bucket_prefetch_slot[bi] = Some(buf_idx);
-                        hit_count += 1;
-                        break;
-                    }
-                }
-            }
-        }
-        pe.prefetch
-            .record_outcome(hit_count, num_buckets as u64 - hit_count);
-    }
-
-    // Resolve every bucket's expert weights into one uniform-stride
-    // `expert_base` buffer. mmap mode points the gather GEMM straight
-    // at the layer's mmap buffer (zero copy); pread mode `read_expert`s
-    // each hit expert into the run-lifetime staging buffer. Prefetch is
-    // decode-only and never active on this batched prefill path, so the
-    // prefetch-hit memcpy below is a cold correctness path.
-    let expert_base_id: crate::riir::backend::BufId =
-        if mode == crate::riir::io::expert_io::ExpertIoMode::Mmap {
-            expert_files
-                .mmap_id_for_expert(layer_idx, 0)
-                .expect("mmap layer present in mmap mode")
-                .0
-        } else {
-            let base_id =
-                moe.expert_base.expect("pread mode has expert_base");
-            let expert_size = v.expert_size_4bit();
-            let mut blob_scratch = vec![0u8; expert_size];
-            let pool = backend.pool_mut();
-            for (bi, &expert_id) in buckets.expert_ids.iter().enumerate() {
-                let off = expert_id as usize * expert_size;
-                if let Some(buf_idx) = bucket_prefetch_slot[bi] {
-                    // Cold path: copy a prefetched block into staging.
-                    let pe = prefetch
-                        .as_ref()
-                        .expect("prefetch slot requires env");
-                    let src_id = moe_buffers
-                        .data_prefetch_id(pe.prefetch_set, buf_idx);
-                    pool.download(src_id, &mut blob_scratch)?;
-                } else {
-                    expert_files.read_expert(
-                        layer_idx,
-                        expert_id as usize,
-                        &mut blob_scratch,
-                    )?;
-                }
-                pool.upload_at(base_id, off, &blob_scratch)?;
-            }
-            base_id
-        };
+    // 2026-05-20 pread teardown: the staging-blob path (per-bucket
+    // `read_expert` + `pool.upload_at`) was deleted. Expert weights
+    // are read by the gather GEMM straight from the layer's mmap'd
+    // buffer — zero copy, OS page cache manages the working set.
+    // The `prefetch` env is also unused on the batched path
+    // (the orchestrator never fires prefetch dispatch here); the
+    // `Option<PrefetchEnv>` arg stays in the signature for the
+    // per-token oracle caller but is always `None` from prefill.
+    // Both `prefetch` and `moe_buffers` will become removable
+    // once task-7 confirms decode prefetch isn't load-bearing.
+    let _ = prefetch;
+    let _ = moe_buffers;
+    let expert_base_id: crate::riir::backend::BufId = expert_files
+        .mmap_id_for_expert(layer_idx, 0)
+        .expect("mmap layer present (expert I/O is always mmap)")
+        .0;
 
     // `expert_slots[bi]` is the block index of `buckets.expert_ids[bi]`
-    // within `expert_base` — the raw expert id in both modes (mmap is
-    // `num_experts` blocks; the pread staging buffer is filled by id).
-    // `expert_indices` expands it per assignment row for the gather
-    // kernel's per-row `indices`.
+    // within the layer's mmap buffer (`num_experts` blocks at
+    // `expert_size` stride). `expert_indices` expands it per
+    // assignment row for the gather kernel's per-row `indices`.
     let expert_slots: Vec<u32> =
         buckets.expert_ids.iter().map(|&e| e as u32).collect();
     let mut expert_indices_host = vec![0u32; total_assignments];

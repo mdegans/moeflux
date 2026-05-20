@@ -125,50 +125,25 @@ pub enum ExpertIoError {
     },
 }
 
-/// Expert-blob I/O backend selected at process startup from the
-/// `MOEFLUX_EXPERT_IO` env var. Mirrors the runtime `mmap_base !=
-/// NULL` switch in the C path's `InferPreadTask` (infer.m).
-///
-/// - **Pread** (default, value `pread`): per-call `pread` into a
-///   user-space buffer, then `MtlBuffer::with_data` to copy into a
-///   fresh GPU-shared Metal buffer. Two memcpys per expert per call.
-///   The historical Rust path.
-/// - **Mmap** (opt-in, value `mmap`): per-layer mmap'd region wrapped
-///   once as a Metal-shared `Buffer` via `newBufferWithBytesNoCopy`.
-///   Per-call: bind `(layer_buf, expert_idx * expert_size)`. Zero
-///   copy. Kernel demand-pages on first access. The page cache is
-///   the sole working-set manager.
-///
-/// Both modes coexist behind this env so we can A/B on a given
-/// device + model without rebuilding. The mmap path's win depends on
-/// whether the working set fits in the page cache with headroom —
-/// per Mike on 2026-05-14: "IDK if zero copy will be an improvement,
-/// relying page cache alone. But it's worth trying and for some
-/// devices/models might be the better option."
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExpertIoMode {
-    Pread,
-    Mmap,
-}
-
-impl ExpertIoMode {
-    /// Read `MOEFLUX_EXPERT_IO` once at startup. Unrecognised values
-    /// fall back to `Pread` with a warning so a typo doesn't silently
-    /// pick the wrong backend.
-    fn from_env() -> Self {
-        match std::env::var("MOEFLUX_EXPERT_IO").as_deref() {
-            Ok("mmap") => ExpertIoMode::Mmap,
-            Ok("pread") | Err(_) => ExpertIoMode::Pread,
-            Ok(other) => {
-                eprintln!(
-                    "[experts] MOEFLUX_EXPERT_IO={other:?} unrecognised; \
-                     using `pread`. Valid values: pread | mmap."
-                );
-                ExpertIoMode::Pread
-            }
-        }
-    }
-}
+// Expert I/O is always mmap. The previous `ExpertIoMode::Pread` mode
+// staged each layer's experts into a single GPU buffer via a tight
+// synchronous `pread` + `pool.upload_at` loop on the calling thread
+// (see git history for the deleted code). On 2026-05-20 we measured
+// that path against mmap on a 15692-token prefill: same wall-clock
+// (74.5s vs 73.8s, within noise), but pread mode burned ~36% more
+// main-thread CPU on a workload that was already GPU-bound at the
+// MLX `affine_gather_qmm_rhs` kernel's 20.83% register-pressure
+// occupancy ceiling. The OS page cache + readahead does the work
+// pread mode was meant to manage, and unified-memory Metal can read
+// the mmap'd region directly with no staging copy.
+//
+// If you are tempted to add a pread fallback back: don't. The path
+// it was solving (low-RAM hardware where the expert working set
+// can't fit in the page cache) has never been hit on supported
+// devices and would benefit more from `madvise(MADV_RANDOM)` or
+// `MADV_DONTNEED` on the mmap than from re-introducing serial pread
+// on the GPU's critical path. See
+// `.claude/memory/pread_teardown_landed.md` for the full rationale.
 
 /// Per-layer file handles for the active variant. Slot `i` is `None`
 /// if `experts_dir/packed_experts/layer_<i>.bin` was missing at
@@ -189,12 +164,9 @@ pub struct ExpertFiles {
     /// Directory the files were opened relative to. Kept for
     /// diagnostics / debug-impl; never re-read.
     experts_dir: PathBuf,
-    /// Backend selected at process startup from `MOEFLUX_EXPERT_IO`.
-    mode: ExpertIoMode,
     /// Per-layer Metal buffer wrapping the mmap'd region via
-    /// `newBufferWithBytesNoCopy`. Populated only when
-    /// `mode == Mmap`, by `attach_to_device` once the Metal backend
-    /// exists. `None` for the Pread mode and for missing layers.
+    /// `newBufferWithBytesNoCopy`. Populated by `attach_to_device`
+    /// once the Metal backend exists. `None` for missing layers.
     /// Declared before `mmap_layers` so it drops first.
     mmap_buffers: Vec<Option<Buffer>>,
     /// S10b-pre-2 — per-layer `BufId` parallel to `mmap_buffers`.
@@ -221,7 +193,15 @@ impl ExpertFiles {
     /// by [`Self::attach_to_device`] once the Metal backend exists.
     pub fn open(experts_dir: &Path) -> Result<Self, ExpertIoError> {
         let v: Variant = VARIANT;
-        let mode = ExpertIoMode::from_env();
+        if let Ok(val) = std::env::var("MOEFLUX_EXPERT_IO") {
+            if val != "mmap" {
+                eprintln!(
+                    "[experts] MOEFLUX_EXPERT_IO={val:?} ignored; \
+                     expert I/O is always mmap (pread mode was removed \
+                     2026-05-20 — see expert_io.rs comment)."
+                );
+            }
+        }
         let subdir = experts_dir.join("packed_experts");
         let mut layers = Vec::with_capacity(v.num_layers);
         let mut mmap_layers: Vec<Option<Mmap>> =
@@ -231,20 +211,18 @@ impl ExpertFiles {
             match File::open(&path) {
                 Ok(f) => {
                     disable_readahead(&f);
-                    if mode == ExpertIoMode::Mmap {
-                        // SAFETY: file is owned by the closure for the
-                        // duration of the mmap call; the resulting
-                        // mapping survives the file handle (closed when
-                        // `f` drops at end of this match arm). Returned
-                        // mapping is read-only, no aliasing concerns.
-                        let mmap = unsafe { Mmap::map(&f) }.map_err(|e| {
-                            ExpertIoError::Io {
-                                layer: i,
-                                source: e,
-                            }
-                        })?;
-                        mmap_layers[i] = Some(mmap);
-                    }
+                    // SAFETY: file is owned by the closure for the
+                    // duration of the mmap call; the resulting mapping
+                    // survives the file handle (closed when `f` drops
+                    // at end of this match arm). Returned mapping is
+                    // read-only, no aliasing concerns.
+                    let mmap = unsafe { Mmap::map(&f) }.map_err(|e| {
+                        ExpertIoError::Io {
+                            layer: i,
+                            source: e,
+                        }
+                    })?;
+                    mmap_layers[i] = Some(mmap);
                     layers.push(Some(f));
                 }
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -260,18 +238,15 @@ impl ExpertFiles {
         }
         let mmap_buffers = (0..v.num_layers).map(|_| None).collect();
         let mmap_buf_ids = (0..v.num_layers).map(|_| None).collect();
-        if mode == ExpertIoMode::Mmap {
-            eprintln!(
-                "[experts] MOEFLUX_EXPERT_IO=mmap — {} layer(s) mmap'd \
-                 (Metal buffers built on first batched call)",
-                mmap_layers.iter().filter(|m| m.is_some()).count()
-            );
-        }
+        eprintln!(
+            "[experts] {} layer(s) mmap'd \
+             (Metal buffers built on first batched call)",
+            mmap_layers.iter().filter(|m| m.is_some()).count()
+        );
         Ok(Self {
             layers,
             expert_size: v.expert_size_4bit(),
             experts_dir: experts_dir.to_path_buf(),
-            mode,
             mmap_buffers,
             mmap_buf_ids,
             mmap_layers,
@@ -282,7 +257,7 @@ impl ExpertFiles {
     /// `newBufferWithBytesNoCopy`, and register the buffer with the
     /// graph-mode buffer pool. Idempotent: the second call is a no-op.
     /// Called once from `ensure_linear_resources` after the Metal
-    /// backend is created. No-op when `mode == Pread`.
+    /// backend is created.
     ///
     /// S10b-pre-2: parameter changed from `&Device` to
     /// `&mut MetalBufferPool`. The buffer is stored in both
@@ -290,9 +265,6 @@ impl ExpertFiles {
     /// `mmap_buf_ids` (new `BufId` accessor for graph-mode `Op`s);
     /// they share an NSObject-refcounted clone of the same backing.
     pub fn attach_to_device(&mut self, pool: &mut MetalBufferPool) {
-        if self.mode != ExpertIoMode::Mmap {
-            return;
-        }
         for i in 0..self.mmap_layers.len() {
             if self.mmap_buffers[i].is_some() {
                 continue;
@@ -353,18 +325,13 @@ impl ExpertFiles {
         layer_idx: usize,
         expert_idx: u32,
     ) -> Option<(BufId, u64)> {
-        if self.mode != ExpertIoMode::Mmap {
-            return None;
-        }
         let id = self.mmap_buf_ids.get(layer_idx)?.as_ref()?;
         let off = (expert_idx as u64) * (self.expert_size as u64);
         Some((*id, off))
     }
 
     /// Returns `Some((layer_buf, byte_offset))` for `(layer_idx,
-    /// expert_idx)` when running in mmap mode and the layer file
-    /// opened. Returns `None` for pread mode (caller must fall back
-    /// to [`Self::read_expert`] + `MtlBuffer::with_data`) and for
+    /// expert_idx)` when the layer file opened. Returns `None` for
     /// missing layers (caller treats the expert output as zeros, per
     /// the C-side `fused_layer_forward` semantic).
     pub fn mmap_buffer_for_expert(
@@ -372,19 +339,9 @@ impl ExpertFiles {
         layer_idx: usize,
         expert_idx: u32,
     ) -> Option<(&Buffer, u64)> {
-        if self.mode != ExpertIoMode::Mmap {
-            return None;
-        }
         let buf = self.mmap_buffers.get(layer_idx)?.as_ref()?;
         let off = (expert_idx as u64) * (self.expert_size as u64);
         Some((buf, off))
-    }
-
-    /// Active backend selected at startup. Callers may branch on this
-    /// to skip the per-expert pread + `MtlBuffer::with_data` work when
-    /// the mmap fast path applies.
-    pub fn mode(&self) -> ExpertIoMode {
-        self.mode
     }
 
     /// Read one expert's `EXPERT_SIZE` bytes into `out`. `out.len()`

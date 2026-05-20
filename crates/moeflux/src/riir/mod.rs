@@ -1463,13 +1463,11 @@ impl RsCtx<MetalBackend> {
         }
         if self.moe_graph_scratch.is_none() {
             let k_active = self.k_active;
-            let pread =
-                self.experts.mode() == io::expert_io::ExpertIoMode::Pread;
             let pool =
                 self.backend.as_mut().expect("just-set").pool_mut();
             self.moe_graph_scratch = Some(
                 attn::linear_attn_forward::MoeGraphScratch::new(
-                    pool, k_active, pread,
+                    pool, k_active,
                 ),
             );
         }
@@ -1688,10 +1686,13 @@ impl RsCtx<MetalBackend> {
         self.ensure_linear_resources()?;
         let k_active = self.k_active;
 
-        // Field-disjoint mutable borrows. Phase 1 had dropped
-        // moe_buffers / prefetch / io_pool — Phase 3 re-introduces them
-        // for the N=1 prefetch state machine (eval_token re-routed
-        // through this path).
+        // Field-disjoint mutable borrows. `io_pool` dropped here on
+        // 2026-05-20 alongside the pread teardown — the batched
+        // orchestrator no longer fires prefetch dispatch (the N=1
+        // re-route to this path was reverted in session 5). `prefetch`
+        // stays for the `prefetch.drain()` housekeeping below; the
+        // `Option<PrefetchEnv>` plumbed into producers is always
+        // `None`. Task-7 will rip the rest once decode A/B confirms.
         let Self {
             wf,
             backend,
@@ -1706,7 +1707,6 @@ impl RsCtx<MetalBackend> {
             hidden_double_buffer,
             head_tail_scratch,
             deferred,
-            io_pool,
             prefetch,
             ..
         } = self;
@@ -1737,7 +1737,6 @@ impl RsCtx<MetalBackend> {
             .expect("ensure_linear_resources");
         let moe_buffers =
             moe_buffers.as_mut().expect("ensure_linear_resources");
-        let io_pool: &rayon::ThreadPool = &*io_pool;
 
         // Drain any stale deferred state — neither batched path uses
         // the ring, but a prior per-token oracle call on the same
@@ -1745,19 +1744,21 @@ impl RsCtx<MetalBackend> {
         // batched path's MoE permute-fuse would race with. Defensive.
         moe::deferred::discard_deferred_experts_in(deferred);
 
-        // Phase 3: prefetch is enabled only at N == 1 (eval_token
-        // shape after re-route) and only in pread mode (mmap mode
-        // has no I/O cost to prefetch over). At N > 1 the bucket
-        // spans multiple unique experts per layer and the per-token
-        // K-slot prefetch state machine can't satisfy them. Drain
-        // any in-flight prefetch from a prior eval_token to keep
-        // the state machine consistent — the next eval_token will
-        // re-prime from this chunk's record_actuals.
-        let prefetch_enabled =
-            n == 1 && experts.mode() == io::expert_io::ExpertIoMode::Pread;
-        if !prefetch_enabled {
-            prefetch.drain();
-        }
+        // The batched orchestrator never fires prefetch — eval_token
+        // routes through the per-token oracle (see session-5 revert),
+        // and at N > 1 the bucket spans multiple unique experts per
+        // layer which the per-token K-slot prefetch state machine
+        // can't satisfy. Drain any in-flight prefetch from a prior
+        // eval_token so the state machine stays consistent for the
+        // next eval_token's re-prime via record_actuals.
+        //
+        // The `prefetch_enabled` gate was tied to `pread_mode` until
+        // the 2026-05-20 pread teardown; the dead `if prefetch_enabled`
+        // dispatch branch in this loop was removed at the same time.
+        // The per-token oracle keeps its own prefetch dispatch
+        // (mod.rs around line 2565) for the decode path — pending the
+        // task-7 A/B on whether it actually helps decode.
+        prefetch.drain();
 
         // Prefill arc Phase 4 — GPU embedding gather. Upload the N
         // token ids (N×4 bytes), then one `EmbedGatherNTokens` Op
@@ -1809,36 +1810,15 @@ impl RsCtx<MetalBackend> {
 
         for layer_idx in 0..v.num_layers {
             backend.begin_layer(chunk_idx, layer_idx);
-            let prefetch_set = layer_idx % 2;
-            // Phase 3: fire async prefetch for THIS layer before the
-            // batched compute. Disk I/O overlaps with this layer's
-            // matvecs / SDPA / linear-attn kernels; the wait happens
-            // inside the layer forward right before MoE permute-fuse.
-            // Skipped when prefetch is disabled (N != 1 or mmap mode).
-            if prefetch_enabled {
-                if let Some(predicted) = prefetch.predict_for(layer_idx) {
-                    // S10b-1a-ii: re-borrow the pool just for the
-                    // data_prefetch_slots_mut_array lookup; borrow
-                    // ends after `dispatch` consumes the slot array.
-                    let pool = backend.pool_mut();
-                    let data_prefetch = moe_buffers
-                        .data_prefetch_slots_mut_array(pool, prefetch_set);
-                    prefetch.dispatch(
-                        layer_idx,
-                        predicted,
-                        k_active,
-                        data_prefetch,
-                        io_pool,
-                        experts,
-                    );
-                }
-            }
-            let prefetch_env = prefetch_enabled.then(|| {
-                attn::linear_attn_forward::PrefetchEnv {
-                    prefetch: &mut *prefetch,
-                    prefetch_set,
-                }
-            });
+            // Prefetch is never fired by the batched orchestrator
+            // (see the drain() above this loop and its surrounding
+            // comment). `PrefetchEnv` is always None on this path —
+            // producers' `bucket_prefetch_slot` cold-correctness
+            // branches that key on `Some(prefetch_env)` are dead
+            // code post-2026-05-20 pread teardown and will be
+            // pruned alongside the task-7 A/B.
+            let prefetch_env: Option<attn::linear_attn_forward::PrefetchEnv> =
+                None;
             let is_full = v.layer_kind(layer_idx)
                 == variants::LayerKind::FullAttn;
             if is_full {
