@@ -38,3 +38,14 @@ instantiate_kernel(
 instantiate_kernel(
     "affine_gather_qmm_rhs_float_gs_64_b_4_t_true",
     affine_gather_qmm_rhs, float, 64, 4, 32, 32, 32, 2, 2, true, bfloat16_t)
+
+// Experimental BM=64 variant — 2× rows per threadgroup, same K/N work.
+// Aimed at lifting the 20.83% occupancy ceiling we measured on the
+// BM=32 PSO by amortizing register cost across more output elements
+// per thread. Selected at runtime via MOEFLUX_GATHER_QMM_TILE=64.
+// Template axis order is <T, group_size, bits, BM, BN, BK, WM, WN,
+// transpose, ScaleT>; WM scales with BM to keep one simdgroup per
+// (BM/16) rows.
+instantiate_kernel(
+    "affine_gather_qmm_rhs_float_gs_64_b_4_t_true_bm64",
+    affine_gather_qmm_rhs, float, 64, 4, 64, 32, 32, 4, 2, true, bfloat16_t)

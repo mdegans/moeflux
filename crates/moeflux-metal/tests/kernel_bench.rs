@@ -23,7 +23,10 @@
 use std::time::{Duration, Instant};
 
 use metal::{Buffer, CommandBufferRef, Device, MTLResourceOptions};
-use moeflux_metal::{GatherQmmCall, Kernels, QmmCall, QuantWeights};
+use moeflux_metal::{
+    set_gather_tile_variant_override, GatherQmmCall, GatherTileVariant,
+    Kernels, QmmCall, QuantWeights,
+};
 
 // Target measured-cmdbuf GPU time; K is chosen per shape so
 // `K * single_dispatch ≈ TARGET_MS`.
@@ -349,11 +352,6 @@ fn bench_gather_qmm_a3b_moe() {
     let queue = device.new_command_queue();
     let mut rng = XorShift::new(0xDEAD_BEEF);
 
-    eprintln!(
-        "\nGatherQmmCall (MoE expert matmul) — a3b shapes, 4-bit gs_64, \
-         128 experts:"
-    );
-
     let n_tokens = A3B_CHUNK * A3B_K_ACTIVE; // 65536 assignments
     let n_experts = A3B_NUM_EXPERTS;
     let indices = bucket_indices(&mut rng, n_tokens as usize, n_experts);
@@ -364,6 +362,10 @@ fn bench_gather_qmm_a3b_moe() {
         (A3B_MOE_INTERMEDIATE, A3B_HIDDEN, "expert_down (in=768 out=2048)"),
     ];
 
+    // Per-shape: build buffers once, then re-run measure under each
+    // tile variant. Variants A/B back-to-back in one process keeps
+    // page cache / thermal / scheduler state identical across the
+    // pair (per `feedback_bench_discipline.md`).
     for &(in_dim, out_dim, label) in cases {
         // Build n_experts distinct weight blocks at uniform stride.
         let experts: Vec<(Vec<u32>, Vec<u16>, Vec<u16>)> = (0..n_experts)
@@ -371,11 +373,6 @@ fn bench_gather_qmm_a3b_moe() {
             .collect();
         let (wf, s_off, b_off, stride_bytes) =
             pack_experts_into_buf(&device, &experts);
-        // QmmCall convention: packed_offset is within-block (0 from
-        // the block start, but the kernel adds expert_idx * stride_w).
-        // s_off / b_off are within-block scale / bias offsets in their
-        // bf16 element domain (stride_s == stride_w / 2 from the
-        // bf16-2-byte vs. packed-4-byte ratio in this layout).
         let x: Vec<f32> = (0..(n_tokens * in_dim) as usize)
             .map(|_| rng.unit())
             .collect();
@@ -419,9 +416,20 @@ fn bench_gather_qmm_a3b_moe() {
             );
         };
 
-        let (k, per) = measure(&device, &queue, &encode);
         let flops =
             2.0 * n_tokens as f64 * in_dim as f64 * out_dim as f64;
-        report(label, k, &per, flops);
+
+        eprintln!(
+            "\nGatherQmmCall {label} — a3b 4-bit gs_64, {n_experts} experts:"
+        );
+        for (variant, vlabel) in &[
+            (GatherTileVariant::Bm32Wm2, "BM=32 WM=2 (default)"),
+            (GatherTileVariant::Bm64Wm4, "BM=64 WM=4 (experimental)"),
+        ] {
+            set_gather_tile_variant_override(Some(*variant));
+            let (k, per) = measure(&device, &queue, &encode);
+            report(vlabel, k, &per, flops);
+        }
+        set_gather_tile_variant_override(None);
     }
 }

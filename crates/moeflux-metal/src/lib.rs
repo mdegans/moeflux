@@ -91,10 +91,90 @@ const QMM_T_UNALIGNED: &str = "affine_qmm_t_float_gs_64_b_4_alN_false_batch_0";
 /// The gathered MoE GEMM. One Metal function; its `align_M/N/K` are
 /// function constants (indices 200/201/202), specialised per PSO.
 const GATHER_QMM_RHS: &str = "affine_gather_qmm_rhs_float_gs_64_b_4_t_true";
+/// Experimental BM=64 / WM=4 variant of the gather kernel. Same
+/// alignment-flag PSO matrix as the BM=32 default; selected at
+/// runtime by [`gather_tile_variant`] (env `MOEFLUX_GATHER_QMM_TILE`).
+const GATHER_QMM_RHS_BM64: &str =
+    "affine_gather_qmm_rhs_float_gs_64_b_4_t_true_bm64";
 // Function-constant indices for the gather kernel's alignment flags.
 const FC_ALIGN_M: NSUInteger = 200;
 const FC_ALIGN_N: NSUInteger = 201;
 const FC_ALIGN_K: NSUInteger = 202;
+
+/// Threadgroup-size + M-tile selector for the gather kernel. The
+/// `Bm32Wm2` variant matches MLX's default tile; `Bm64Wm4` doubles
+/// the rows per threadgroup at the cost of doubling threads-per-
+/// threadgroup (128 -> 256), targeting the 20.83% register-occupancy
+/// ceiling we measured 2026-05-20.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatherTileVariant {
+    Bm32Wm2,
+    Bm64Wm4,
+}
+
+impl GatherTileVariant {
+    /// M-axis tile size (rows per threadgroup).
+    fn bm(self) -> u32 {
+        match self {
+            GatherTileVariant::Bm32Wm2 => 32,
+            GatherTileVariant::Bm64Wm4 => 64,
+        }
+    }
+    /// Threadgroup shape `(simd_lanes, WM, WN)`. Threads per group =
+    /// `simd_lanes × WM × WN` = 128 for BM=32, 256 for BM=64.
+    fn threadgroup_yxz(self) -> (u64, u64, u64) {
+        match self {
+            GatherTileVariant::Bm32Wm2 => (32, 2, 2),
+            GatherTileVariant::Bm64Wm4 => (32, 4, 2),
+        }
+    }
+}
+
+// Override sentinels for `OVERRIDE`. 0 = no override (use env-cached
+// default); 1 = force `Bm32Wm2`; 2 = force `Bm64Wm4`.
+static OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+/// Process-wide gather-tile selection. Override (if set) wins;
+/// otherwise reads `MOEFLUX_GATHER_QMM_TILE` once at first access.
+/// Unrecognised env values fall back to BM=32 with a startup warning.
+pub fn gather_tile_variant() -> GatherTileVariant {
+    use std::sync::atomic::Ordering;
+    match OVERRIDE.load(Ordering::Relaxed) {
+        1 => return GatherTileVariant::Bm32Wm2,
+        2 => return GatherTileVariant::Bm64Wm4,
+        _ => {}
+    }
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<GatherTileVariant> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        match std::env::var("MOEFLUX_GATHER_QMM_TILE").as_deref() {
+            Ok("32") | Err(_) => GatherTileVariant::Bm32Wm2,
+            Ok("64") => GatherTileVariant::Bm64Wm4,
+            Ok(other) => {
+                eprintln!(
+                    "[moeflux-metal] MOEFLUX_GATHER_QMM_TILE={other:?} \
+                     unrecognised; using BM=32. Valid: 32 | 64."
+                );
+                GatherTileVariant::Bm32Wm2
+            }
+        }
+    })
+}
+
+/// Set a process-wide override that bypasses the env-cached default.
+/// `None` clears the override (env-cached default takes over again).
+/// Intended for benches that A/B both tile variants back-to-back in
+/// one process — eliminates between-run system-state drift.
+pub fn set_gather_tile_variant_override(v: Option<GatherTileVariant>) {
+    use std::sync::atomic::Ordering;
+    let val: u8 = match v {
+        None => 0,
+        Some(GatherTileVariant::Bm32Wm2) => 1,
+        Some(GatherTileVariant::Bm64Wm4) => 2,
+    };
+    OVERRIDE.store(val, Ordering::Relaxed);
+}
 
 /// The FA2 batched-prefill causal SDPA kernel (`sdpa.metal`).
 const SDPA: &str = "attn_sdpa_causal_flash";
@@ -317,6 +397,11 @@ pub struct Kernels {
     /// up front so a [`GatherQmmCall`] dispatch picks the exact-fit PSO
     /// for any M/N/K without a bounds-unsafe fallback in release builds.
     gather: [ComputePipelineState; 8],
+    /// BM=64 / WM=4 variant of the gather kernel — same alignment-PSO
+    /// matrix shape as `gather`. Selected at dispatch time by
+    /// [`gather_tile_variant`]. Both arrays always built; the extra
+    /// metallib bytes (~20 KB) are negligible.
+    gather_bm64: [ComputePipelineState; 8],
     /// FA2 batched-prefill causal SDPA (`attn_sdpa_causal_flash`).
     sdpa: ComputePipelineState,
     /// GQA-folded SDPA (`attn_sdpa_causal_flash_gqa2`) — `SdpaCall::fold == 2`.
@@ -360,55 +445,62 @@ impl Kernels {
         // kernel's align_M/N/K are function constants; `idx` bit 0/1/2 is
         // align_M/N/K. Specialising all eight keeps the gather dispatch
         // exact-fit (no bounds-unsafe align=true path for ragged dims).
-        let build_gather =
-            |idx: usize| -> Result<ComputePipelineState, MlxError> {
-                let fcv = FunctionConstantValues::new();
-                for (fc_index, bit) in
-                    [(FC_ALIGN_M, 0), (FC_ALIGN_N, 1), (FC_ALIGN_K, 2)]
-                {
-                    let value = (idx >> bit) & 1 == 1;
-                    fcv.set_constant_value_at_index(
-                        &value as *const bool as *const c_void,
-                        MTLDataType::Bool,
-                        fc_index,
-                    );
-                }
-                let function = library
-                    .get_function(GATHER_QMM_RHS, Some(fcv))
-                    .map_err(|e| {
-                        MlxError::Pipeline(GATHER_QMM_RHS.to_string(), e)
-                    })?;
-                let pipeline = device
-                    .new_compute_pipeline_state_with_function(&function)
-                    .map_err(|e| {
-                        MlxError::Pipeline(GATHER_QMM_RHS.to_string(), e)
-                    })?;
-                let got = pipeline.max_total_threads_per_threadgroup();
-                if got < QMM_T_THREADS_PER_GROUP {
-                    return Err(MlxError::ThreadgroupTooSmall {
-                        kernel: GATHER_QMM_RHS.to_string(),
-                        needed: QMM_T_THREADS_PER_GROUP,
-                        got,
-                    });
-                }
-                Ok(pipeline)
+        let build_gather = |name: &'static str,
+                            needed_threads: u64,
+                            idx: usize|
+         -> Result<ComputePipelineState, MlxError> {
+            let fcv = FunctionConstantValues::new();
+            for (fc_index, bit) in
+                [(FC_ALIGN_M, 0), (FC_ALIGN_N, 1), (FC_ALIGN_K, 2)]
+            {
+                let value = (idx >> bit) & 1 == 1;
+                fcv.set_constant_value_at_index(
+                    &value as *const bool as *const c_void,
+                    MTLDataType::Bool,
+                    fc_index,
+                );
+            }
+            let function = library
+                .get_function(name, Some(fcv))
+                .map_err(|e| MlxError::Pipeline(name.to_string(), e))?;
+            let pipeline = device
+                .new_compute_pipeline_state_with_function(&function)
+                .map_err(|e| MlxError::Pipeline(name.to_string(), e))?;
+            let got = pipeline.max_total_threads_per_threadgroup();
+            if got < needed_threads {
+                return Err(MlxError::ThreadgroupTooSmall {
+                    kernel: name.to_string(),
+                    needed: needed_threads,
+                    got,
+                });
+            }
+            Ok(pipeline)
+        };
+        let build_gather_array =
+            |name: &'static str, needed_threads: u64|
+             -> Result<[ComputePipelineState; 8], MlxError> {
+                Ok([
+                    build_gather(name, needed_threads, 0)?,
+                    build_gather(name, needed_threads, 1)?,
+                    build_gather(name, needed_threads, 2)?,
+                    build_gather(name, needed_threads, 3)?,
+                    build_gather(name, needed_threads, 4)?,
+                    build_gather(name, needed_threads, 5)?,
+                    build_gather(name, needed_threads, 6)?,
+                    build_gather(name, needed_threads, 7)?,
+                ])
             };
 
-        let gather = [
-            build_gather(0)?,
-            build_gather(1)?,
-            build_gather(2)?,
-            build_gather(3)?,
-            build_gather(4)?,
-            build_gather(5)?,
-            build_gather(6)?,
-            build_gather(7)?,
-        ];
+        let gather =
+            build_gather_array(GATHER_QMM_RHS, QMM_T_THREADS_PER_GROUP)?;
+        // BM=64/WM=4 variant runs 256 threads/threadgroup.
+        let gather_bm64 = build_gather_array(GATHER_QMM_RHS_BM64, 256)?;
 
         Ok(Self {
             qmm_t_aligned: build(QMM_T_ALIGNED)?,
             qmm_t_unaligned: build(QMM_T_UNALIGNED)?,
             gather,
+            gather_bm64,
             sdpa: build(SDPA)?,
             sdpa_gqa2: build(SDPA_GQA2)?,
         })
@@ -486,13 +578,19 @@ impl KernelCall for QmmCall<'_> {
 /// bounds-unsafe path. Encoding cannot fail.
 impl KernelCall for GatherQmmCall<'_> {
     fn encode(&self, kernels: &Kernels, cmdbuf: &CommandBufferRef) {
-        let align_m = self.n_tokens % QMM_T_TILE == 0;
+        let variant = gather_tile_variant();
+        let bm = variant.bm();
+        // BN stays 32 in both variants; only the M-tile changes with BM.
+        let align_m = self.n_tokens % bm == 0;
         let align_n = self.out_dim % QMM_T_TILE == 0;
         let align_k = self.in_dim % QMM_T_TILE == 0;
         let idx = usize::from(align_m)
             | (usize::from(align_n) << 1)
             | (usize::from(align_k) << 2);
-        let pipeline = &kernels.gather[idx];
+        let pipeline = match variant {
+            GatherTileVariant::Bm32Wm2 => &kernels.gather[idx],
+            GatherTileVariant::Bm64Wm4 => &kernels.gather_bm64[idx],
+        };
 
         // The kernel's K/N/M are `int`; moeflux's dims fit i32. Strides
         // are `uint64_t` (per-expert block stride — bytes / ScaleT elems).
@@ -516,13 +614,15 @@ impl KernelCall for GatherQmmCall<'_> {
         enc.set_bytes(9, 8, (&stride_w as *const u64).cast());
         enc.set_bytes(10, 8, (&stride_s as *const u64).cast());
 
-        // One threadgroup per 32x32 output tile; grid is (N tiles, M tiles).
+        // Grid: one threadgroup per (BN × BM) output tile. BN=32 fixed;
+        // BM scales with the variant.
         let grid = MTLSize::new(
             self.out_dim.div_ceil(QMM_T_TILE) as NSUInteger,
-            self.n_tokens.div_ceil(QMM_T_TILE) as NSUInteger,
+            self.n_tokens.div_ceil(bm) as NSUInteger,
             1,
         );
-        enc.dispatch_thread_groups(grid, MTLSize::new(32, 2, 2));
+        let (tg_x, tg_y, tg_z) = variant.threadgroup_yxz();
+        enc.dispatch_thread_groups(grid, MTLSize::new(tg_x, tg_y, tg_z));
         enc.end_encoding();
     }
 }
