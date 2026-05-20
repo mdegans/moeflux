@@ -423,6 +423,7 @@ fn bench_gather_qmm_a3b_moe() {
             "\nGatherQmmCall {label} — a3b 4-bit gs_64, {n_experts} experts:"
         );
         for (variant, vlabel) in &[
+            (GatherTileVariant::Bm16Wm2, "BM=16 WM=2 (experimental)"),
             (GatherTileVariant::Bm32Wm2, "BM=32 WM=2 (default)"),
             (GatherTileVariant::Bm64Wm4, "BM=64 WM=4 (experimental)"),
         ] {

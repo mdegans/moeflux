@@ -46,6 +46,26 @@ instantiate_kernel(
 // Template axis order is <T, group_size, bits, BM, BN, BK, WM, WN,
 // transpose, ScaleT>; WM scales with BM to keep one simdgroup per
 // (BM/16) rows.
+//
+// 2026-05-20 result: 23-26% SLOWER than BM=32 (post-reboot,
+// confirmed). Kept compiled for reproducibility — see
+// `kernel_bench_bm_sweep.md`.
 instantiate_kernel(
     "affine_gather_qmm_rhs_float_gs_64_b_4_t_true_bm64",
     affine_gather_qmm_rhs, float, 64, 4, 64, 32, 32, 4, 2, true, bfloat16_t)
+
+// Experimental BM=16 variant — 0.5× rows per threadgroup, same
+// per-thread MMA-tiles-along-M. Tests the opposite hypothesis from
+// BM=64: smaller tile → more threadgroups → potentially higher
+// achieved occupancy if the per-threadgroup resource budget is what
+// limits us (rather than per-thread register pressure).
+// (BM/WM)/8 = (16/2)/8 = 1 simdgroup_matrix tile along M per
+// simdgroup, vs 2 for BM=32 and BM=64.
+//
+// 2026-05-20 result: 7-10% SLOWER than BM=32. Tile-M dimension is
+// fully explored; BM=32 is the apex on this hardware. See
+// `gather_qmm_arch_pivot_plan.md` for why the next lever isn't
+// tile-tuning.
+instantiate_kernel(
+    "affine_gather_qmm_rhs_float_gs_64_b_4_t_true_bm16",
+    affine_gather_qmm_rhs, float, 64, 4, 16, 32, 32, 2, 2, true, bfloat16_t)

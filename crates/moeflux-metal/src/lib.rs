@@ -96,18 +96,21 @@ const GATHER_QMM_RHS: &str = "affine_gather_qmm_rhs_float_gs_64_b_4_t_true";
 /// runtime by [`gather_tile_variant`] (env `MOEFLUX_GATHER_QMM_TILE`).
 const GATHER_QMM_RHS_BM64: &str =
     "affine_gather_qmm_rhs_float_gs_64_b_4_t_true_bm64";
+/// Experimental BM=16 / WM=2 variant of the gather kernel.
+const GATHER_QMM_RHS_BM16: &str =
+    "affine_gather_qmm_rhs_float_gs_64_b_4_t_true_bm16";
 // Function-constant indices for the gather kernel's alignment flags.
 const FC_ALIGN_M: NSUInteger = 200;
 const FC_ALIGN_N: NSUInteger = 201;
 const FC_ALIGN_K: NSUInteger = 202;
 
-/// Threadgroup-size + M-tile selector for the gather kernel. The
-/// `Bm32Wm2` variant matches MLX's default tile; `Bm64Wm4` doubles
-/// the rows per threadgroup at the cost of doubling threads-per-
-/// threadgroup (128 -> 256), targeting the 20.83% register-occupancy
-/// ceiling we measured 2026-05-20.
+/// Threadgroup-size + M-tile selector for the gather kernel.
+/// `Bm32Wm2` matches MLX's default. `Bm16Wm2` halves the M tile;
+/// `Bm64Wm4` doubles it. All three are always built; switch at
+/// runtime via [`gather_tile_variant`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GatherTileVariant {
+    Bm16Wm2,
     Bm32Wm2,
     Bm64Wm4,
 }
@@ -116,22 +119,25 @@ impl GatherTileVariant {
     /// M-axis tile size (rows per threadgroup).
     fn bm(self) -> u32 {
         match self {
+            GatherTileVariant::Bm16Wm2 => 16,
             GatherTileVariant::Bm32Wm2 => 32,
             GatherTileVariant::Bm64Wm4 => 64,
         }
     }
     /// Threadgroup shape `(simd_lanes, WM, WN)`. Threads per group =
-    /// `simd_lanes × WM × WN` = 128 for BM=32, 256 for BM=64.
+    /// `simd_lanes × WM × WN` = 128 for BM=16/32, 256 for BM=64.
     fn threadgroup_yxz(self) -> (u64, u64, u64) {
         match self {
-            GatherTileVariant::Bm32Wm2 => (32, 2, 2),
+            GatherTileVariant::Bm16Wm2 | GatherTileVariant::Bm32Wm2 => {
+                (32, 2, 2)
+            }
             GatherTileVariant::Bm64Wm4 => (32, 4, 2),
         }
     }
 }
 
 // Override sentinels for `OVERRIDE`. 0 = no override (use env-cached
-// default); 1 = force `Bm32Wm2`; 2 = force `Bm64Wm4`.
+// default); 1 = `Bm32Wm2`; 2 = `Bm64Wm4`; 3 = `Bm16Wm2`.
 static OVERRIDE: std::sync::atomic::AtomicU8 =
     std::sync::atomic::AtomicU8::new(0);
 
@@ -143,6 +149,7 @@ pub fn gather_tile_variant() -> GatherTileVariant {
     match OVERRIDE.load(Ordering::Relaxed) {
         1 => return GatherTileVariant::Bm32Wm2,
         2 => return GatherTileVariant::Bm64Wm4,
+        3 => return GatherTileVariant::Bm16Wm2,
         _ => {}
     }
     use std::sync::OnceLock;
@@ -151,10 +158,11 @@ pub fn gather_tile_variant() -> GatherTileVariant {
         match std::env::var("MOEFLUX_GATHER_QMM_TILE").as_deref() {
             Ok("32") | Err(_) => GatherTileVariant::Bm32Wm2,
             Ok("64") => GatherTileVariant::Bm64Wm4,
+            Ok("16") => GatherTileVariant::Bm16Wm2,
             Ok(other) => {
                 eprintln!(
                     "[moeflux-metal] MOEFLUX_GATHER_QMM_TILE={other:?} \
-                     unrecognised; using BM=32. Valid: 32 | 64."
+                     unrecognised; using BM=32. Valid: 16 | 32 | 64."
                 );
                 GatherTileVariant::Bm32Wm2
             }
@@ -164,7 +172,7 @@ pub fn gather_tile_variant() -> GatherTileVariant {
 
 /// Set a process-wide override that bypasses the env-cached default.
 /// `None` clears the override (env-cached default takes over again).
-/// Intended for benches that A/B both tile variants back-to-back in
+/// Intended for benches that A/B tile variants back-to-back in
 /// one process — eliminates between-run system-state drift.
 pub fn set_gather_tile_variant_override(v: Option<GatherTileVariant>) {
     use std::sync::atomic::Ordering;
@@ -172,6 +180,7 @@ pub fn set_gather_tile_variant_override(v: Option<GatherTileVariant>) {
         None => 0,
         Some(GatherTileVariant::Bm32Wm2) => 1,
         Some(GatherTileVariant::Bm64Wm4) => 2,
+        Some(GatherTileVariant::Bm16Wm2) => 3,
     };
     OVERRIDE.store(val, Ordering::Relaxed);
 }
@@ -399,9 +408,12 @@ pub struct Kernels {
     gather: [ComputePipelineState; 8],
     /// BM=64 / WM=4 variant of the gather kernel — same alignment-PSO
     /// matrix shape as `gather`. Selected at dispatch time by
-    /// [`gather_tile_variant`]. Both arrays always built; the extra
-    /// metallib bytes (~20 KB) are negligible.
+    /// [`gather_tile_variant`]. All arrays always built; the extra
+    /// metallib bytes (~20 KB per variant) are negligible.
     gather_bm64: [ComputePipelineState; 8],
+    /// BM=16 / WM=2 variant of the gather kernel — same alignment-PSO
+    /// matrix shape as `gather`.
+    gather_bm16: [ComputePipelineState; 8],
     /// FA2 batched-prefill causal SDPA (`attn_sdpa_causal_flash`).
     sdpa: ComputePipelineState,
     /// GQA-folded SDPA (`attn_sdpa_causal_flash_gqa2`) — `SdpaCall::fold == 2`.
@@ -495,12 +507,19 @@ impl Kernels {
             build_gather_array(GATHER_QMM_RHS, QMM_T_THREADS_PER_GROUP)?;
         // BM=64/WM=4 variant runs 256 threads/threadgroup.
         let gather_bm64 = build_gather_array(GATHER_QMM_RHS_BM64, 256)?;
+        // BM=16/WM=2 variant runs the same 128 threads/threadgroup as
+        // the BM=32 default.
+        let gather_bm16 = build_gather_array(
+            GATHER_QMM_RHS_BM16,
+            QMM_T_THREADS_PER_GROUP,
+        )?;
 
         Ok(Self {
             qmm_t_aligned: build(QMM_T_ALIGNED)?,
             qmm_t_unaligned: build(QMM_T_UNALIGNED)?,
             gather,
             gather_bm64,
+            gather_bm16,
             sdpa: build(SDPA)?,
             sdpa_gqa2: build(SDPA_GQA2)?,
         })
@@ -590,6 +609,7 @@ impl KernelCall for GatherQmmCall<'_> {
         let pipeline = match variant {
             GatherTileVariant::Bm32Wm2 => &kernels.gather[idx],
             GatherTileVariant::Bm64Wm4 => &kernels.gather_bm64[idx],
+            GatherTileVariant::Bm16Wm2 => &kernels.gather_bm16[idx],
         };
 
         // The kernel's K/N/M are `int`; moeflux's dims fit i32. Strides
