@@ -479,6 +479,23 @@ pub struct MetalBackend {
     /// `affine_gather_qmm_rhs` GEMM path. Default on; the `=0` escape
     /// hatch keeps the slower path reachable for A/B and bisecting.
     moe_gather: bool,
+    /// When true (default, env `MOEFLUX_MATVEC_M1_V3=0` to disable),
+    /// 4-bit `Op::MatvecNTokens` at `n_tokens == 1` routes through
+    /// `encode_matvec_n_tokens` (which dispatches the dedicated
+    /// `dequant_matvec_4bit_v3` per-row-tile matvec — the OLD
+    /// `GpuLmHead::forward` kernel choice) instead of MLX's `QmmCall`
+    /// tiled GEMM. The two kernels are cosine-1.0 equivalent (proven
+    /// via `batched_diff_oracle::dequant_matvec_4bit_n_tokens_v3_n1_
+    /// matches_single` and the MLX qmm gate); the choice is purely
+    /// per-shape perf. QmmCall is tuned for batched M (~12x at prefill
+    /// shapes); `_v3` is tuned for M=1. Session 17 measured a -9% on
+    /// the short prompt after the lm_head fell through to QmmCall;
+    /// session 18 could not reproduce the gap (machine-state-
+    /// dependent), but routing M=1 to `_v3` is the architecturally
+    /// correct default and matches the OLD GpuLmHead semantics. The
+    /// `=0` escape hatch keeps the QmmCall-at-M=1 path reachable for
+    /// future A/B work without a rebuild.
+    matvec_m1_v3: bool,
 }
 
 impl MetalBackend {
@@ -539,6 +556,8 @@ impl MetalBackend {
             profile_per_op: std::env::var_os("MOEFLUX_PROFILE_PER_OP")
                 .is_some(),
             moe_gather: std::env::var("MOEFLUX_MOE_GATHER")
+                .map_or(true, |v| v != "0"),
+            matvec_m1_v3: std::env::var("MOEFLUX_MATVEC_M1_V3")
                 .map_or(true, |v| v != "0"),
         })
     }
@@ -716,9 +735,22 @@ impl Backend for MetalBackend {
                 n_tokens,
                 ..
             } => {
-                if weight.bits == 4 {
-                    // 4-bit: MLX's tiled quantized GEMM (~12x the old
-                    // dequant_matvec_4bit matvec at prefill shapes).
+                // 4-bit dispatch fork:
+                //   * n_tokens >  1 → QmmCall (MLX tiled GEMM, ~12x
+                //     the old hand-rolled matvec at prefill shapes).
+                //   * n_tokens == 1 → encode_matvec_n_tokens, which
+                //     picks dequant_matvec_4bit_v3 (the OLD
+                //     GpuLmHead::forward kernel choice; tuned for the
+                //     single-row case where the GEMM loses to the
+                //     dedicated per-row-tile matvec).
+                // The M=1 branch is gated by `matvec_m1_v3` (env
+                // `MOEFLUX_MATVEC_M1_V3=0` forces QmmCall at M=1 too,
+                // for A/B work without a rebuild). See the field doc
+                // for full rationale + session-17/18 history.
+                let force_qmm_at_m1 = !self.matvec_m1_v3;
+                if weight.bits == 4
+                    && (*n_tokens > 1 || force_qmm_at_m1)
+                {
                     self.metal.kernels().encode(
                         cmd,
                         &QmmCall {
@@ -738,9 +770,11 @@ impl Backend for MetalBackend {
                         },
                     );
                 } else {
-                    // 8-bit (a3b mlp.gate / shared_expert_gate) stays on
-                    // the per-token dequant matvec — moeflux-metal's qmm_t
-                    // is instantiated 4-bit only.
+                    // 4-bit @ n_tokens == 1: dequant_matvec_4bit_v3
+                    //   (or _fast for in_dim > 4096), per above.
+                    // 8-bit (a3b mlp.gate / shared_expert_gate): stays
+                    //   on the per-token dequant matvec at all M —
+                    //   moeflux-metal's qmm_t is instantiated 4-bit only.
                     encode_matvec_n_tokens(
                         cmd,
                         &self.matvec_pipes,
