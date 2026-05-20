@@ -283,6 +283,12 @@ pub trait Backend {
         self.encode_graph(graph, &mut ctx);
         self.submit_and_wait(ctx, label)
     }
+
+    /// Hook fired by the prefill orchestrator at the top of each
+    /// layer iteration. Default no-op. Currently used by `MetalBackend`
+    /// to gate `MTLCaptureManager` start/stop against the env-driven
+    /// [`crate::riir::gpu_capture`] window.
+    fn begin_layer(&mut self, _chunk_idx: usize, _layer_idx: usize) {}
 }
 
 /// One typed dispatch into the backend.

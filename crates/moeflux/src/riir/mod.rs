@@ -26,6 +26,7 @@ use ::metal::Buffer;
 
 pub mod attn;
 pub mod backend;
+pub mod gpu_capture;
 pub mod io;
 pub mod moe;
 pub mod snapshot;
@@ -1641,6 +1642,7 @@ impl RsCtx<MetalBackend> {
         let chunk_size = batched_chunk_size();
         let n = tokens.len();
         let mut chunk_start = 0usize;
+        let mut chunk_idx = 0usize;
         let mut logits_owned = logits_out;
         while chunk_start < n {
             let chunk_end = (chunk_start + chunk_size).min(n);
@@ -1656,8 +1658,10 @@ impl RsCtx<MetalBackend> {
                 chunk_tokens,
                 chunk_start_pos,
                 chunk_logits,
+                chunk_idx,
             )?;
             chunk_start = chunk_end;
+            chunk_idx += 1;
         }
         Ok(())
     }
@@ -1673,6 +1677,7 @@ impl RsCtx<MetalBackend> {
         tokens: &[i32],
         start_pos: i32,
         logits_out: Option<&mut [f32]>,
+        chunk_idx: usize,
     ) -> Result<(), RsError> {
         use attn::full_attn_forward::batched_full_attn_layer_forward;
 
@@ -1803,6 +1808,7 @@ impl RsCtx<MetalBackend> {
             .map_err(|_| RsError::EvalFailed)?;
 
         for layer_idx in 0..v.num_layers {
+            backend.begin_layer(chunk_idx, layer_idx);
             let prefetch_set = layer_idx % 2;
             // Phase 3: fire async prefetch for THIS layer before the
             // batched compute. Disk I/O overlaps with this layer's
@@ -1906,6 +1912,12 @@ impl RsCtx<MetalBackend> {
             // safe because we re-fetch via `pool.handle(...)` each
             // iteration.
             std::mem::swap(&mut hidden_a_id, &mut hidden_b_id);
+        }
+        // Safety net for the gpu_capture hook: if the window extends
+        // past the chunk's last layer (e.g. user set n_layers too
+        // large), stop here so the trace still gets written.
+        if gpu_capture::config().is_some() {
+            gpu_capture::stop();
         }
 
         // Prefill arc Phase 4 — GPU final norm + lm_head. The layer

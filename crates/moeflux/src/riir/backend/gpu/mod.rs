@@ -651,6 +651,17 @@ impl Backend for MetalBackend {
         self.submit_and_wait(ctx, label)
     }
 
+    fn begin_layer(&mut self, chunk_idx: usize, layer_idx: usize) {
+        let Some(cfg) = crate::riir::gpu_capture::config() else {
+            return;
+        };
+        if cfg.start_at(chunk_idx, layer_idx) {
+            crate::riir::gpu_capture::start(self.metal.device(), cfg);
+        } else if cfg.stop_at(chunk_idx, layer_idx) {
+            crate::riir::gpu_capture::stop();
+        }
+    }
+
     fn encode_op(&self, op: &Op, ctx: &mut MetalEncodeCtx) {
         let cmd: &CommandBufferRef = &ctx.cmdbuf;
         match op {
