@@ -1,8 +1,41 @@
 ---
 name: gather-qmm-arch-pivot-plan
-description: Plan-of-record for replacing in-kernel gather (`affine_gather_qmm_rhs`) with a two-stage routing + plain-`affine_qmm_t` design, motivated by the 2026-05-20 tile-sweep that showed the MLX-tuned BM=32 is already optimal on Apple Silicon and the 18-25% gap to dense throughput is gather-overhead, not tile-shape.
+description: DEAD 2026-05-20 — empirical microbench + real htpe distribution showed this plan's per-expert dense dispatch loses 12% on the MoE matmul stage using our `affine_qmm_t` kernel. Superseded by `gather_qmm_pivot_dead.md` (data) + `llama_cpp_moe_differentiators.md` (what to attack instead). Kept as a pre-empirical reference for the analytical reasoning that didn't survive contact with the data.
 metadata:
   type: project
+---
+
+# DEAD — see `gather_qmm_pivot_dead.md`
+
+This plan was killed the same day it was drafted by three empirical
+measurements:
+
+1. **Small-M `affine_qmm_t` sweep** showed dense crosses gather at
+   M≈700 for gate/up and M≈400 for down. The plan's "M=512 → 7740
+   GFLOP/s threshold" was a single-point heuristic that didn't
+   account for the cross-over shape.
+
+2. **Real htpe distribution from a3b prefill** revealed the plan's
+   mean-tokens-per-expert assumption was wrong by 2× (a3b has 256
+   experts not 128 — mean htpe is 256, not 512). Distribution is
+   also heavy-left: ~30% of cells live at M<64 where dense is
+   catastrophic (37% of gather throughput).
+
+3. **Direct microbench**
+   (`bench_per_expert_vs_gather_real_distribution`) confirmed:
+   dense loses by 12% on the MoE matmul stage at the real
+   distribution. ~6% end-to-end prefill regression if shipped.
+
+The 1k-tok/s llama.cpp reference that motivated this plan turned
+out to come from **kernel-level differentiators** (single-dispatch
+per-expert grid with SIMD-group MMA, plus MTLResidencySet for
+buffer pinning), not from the dispatch pattern itself. See
+`llama_cpp_moe_differentiators.md`.
+
+Everything below this line is the original 2026-05-20 plan, kept
+intact as a record of the analytical reasoning that didn't survive
+empirical contact.
+
 ---
 
 # Why pivot

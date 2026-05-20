@@ -340,6 +340,281 @@ fn bench_qmm_t_a3b_dense() {
 }
 
 // ---------------------------------------------------------------------------
+// Small-M dense bench — `QmmCall` at *per-expert* a3b shapes, swept
+// across M. Motivated by `gather_qmm_arch_pivot_plan.md`: a two-stage
+// routing design would replace the in-kernel gather with one
+// `affine_qmm_t` per expert at M = htpe[e] (mean = chunk×k_active /
+// num_experts = 65536 / 128 = 512). The pivot only wins if dense
+// throughput holds up at M=512 against the gather kernel's
+// ~7186-7768 GFLOP/s.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore]
+fn bench_qmm_t_a3b_per_expert_small_m() {
+    let device = Device::system_default().expect("no Metal device");
+    let kernels = Kernels::new(&device).expect("build moeflux-metal kernels");
+    let queue = device.new_command_queue();
+    let mut rng = XorShift::new(0xFEED_F00D);
+
+    eprintln!(
+        "\nQmmCall (dense matmul) — per-expert a3b shapes, M-sweep, 4-bit gs_64:"
+    );
+
+    // (in_dim, out_dim, label) — per-expert MoE matmul shapes. Gate
+    // and up share the same shape; down is the transpose-ish.
+    let cases: &[(u32, u32, &str)] = &[
+        (A3B_HIDDEN, A3B_MOE_INTERMEDIATE, "expert_gate|up (in=2048 out=768)"),
+        (A3B_MOE_INTERMEDIATE, A3B_HIDDEN, "expert_down    (in=768 out=2048)"),
+    ];
+
+    // M values: 64/256/512/1024 are the pivot-plan's small-M sweep.
+    // 4096/8192 anchor the curve against the existing dense bench.
+    let m_values: &[u32] = &[64, 256, 512, 1024, 4096, 8192];
+
+    for &(in_dim, out_dim, label) in cases {
+        eprintln!("\n  {label}:");
+        let (packed, scales, biases) =
+            gen_weights(&mut rng, out_dim as usize, in_dim as usize);
+        let (wf, w_off, s_off, b_off) =
+            pack_one_block_into_buf(&device, &packed, &scales, &biases);
+
+        // Allocate input + output sized for the largest M; re-use the
+        // same buffers across the sweep (the kernel reads only the
+        // first `n_tokens` rows).
+        let m_max = *m_values.iter().max().unwrap();
+        let x: Vec<f32> = (0..(m_max * in_dim) as usize)
+            .map(|_| rng.unit())
+            .collect();
+        let in_buf = device.new_buffer_with_data(
+            x.as_ptr() as *const _,
+            std::mem::size_of_val(&x[..]) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let out_buf = device.new_buffer(
+            m_max as u64 * out_dim as u64 * 4,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        for &n_tokens in m_values {
+            let encode = |cmd: &CommandBufferRef| {
+                kernels.encode(
+                    cmd,
+                    &QmmCall {
+                        weights: QuantWeights {
+                            buffer: &wf,
+                            packed_offset: w_off,
+                            scales_offset: s_off,
+                            biases_offset: b_off,
+                        },
+                        input: &in_buf,
+                        input_offset: 0,
+                        output: &out_buf,
+                        output_offset: 0,
+                        in_dim,
+                        out_dim,
+                        n_tokens,
+                    },
+                );
+            };
+
+            let (k, per) = measure(&device, &queue, &encode);
+            let flops =
+                2.0 * n_tokens as f64 * in_dim as f64 * out_dim as f64;
+            report(&format!("M={n_tokens:<5}"), k, &per, flops);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-expert dense vs gather, on the *real* router distribution from
+// a3b prefill. Settles the question raised by
+// `gather_qmm_arch_pivot_plan.md`: does the per-expert dispatch
+// pattern (llama.cpp's `mul_mat_id`) beat the in-kernel gather, on
+// *our* `affine_qmm_t` kernel, on the real htpe distribution? Result
+// isolates dispatch-pattern from kernel-throughput — if dense loses
+// here, the issue isn't the pattern, it's the kernel at small M.
+//
+// Distribution sourced from a real `prefill_prompt_long.txt` run
+// (15692 tokens, chunk 0, layer 0). Sum = 65536 (= 8192 × 8).
+// num_zero = ~29 experts unused. Distribution shape captured by
+// `htpe_analyze.py`:
+//   1..15     12.6% of cells   0.3% of compute
+//   16..63    16.9% of cells   2.7% of compute
+//   64..255   29.9% of cells  17.4% of compute
+//   256..511  15.4% of cells  22.6% of compute
+//   512..1023  9.4% of cells  27.1% of compute
+//   1024+      4.4% of cells  29.8% of compute
+// ---------------------------------------------------------------------------
+
+const HTPE_A3B_L0C0: [u32; 256] = [
+    59, 0, 402, 0, 0, 523, 371, 174, 588, 29, 428, 704, 0, 1120, 119, 0,
+    1010, 292, 58, 681, 924, 176, 293, 56, 58, 58, 309, 0, 1151, 877, 1, 0,
+    232, 116, 0, 59, 117, 1, 466, 112, 58, 877, 58, 2, 117, 176, 0, 103,
+    748, 234, 702, 293, 351, 0, 167, 0, 0, 59, 118, 59, 58, 512, 1873, 0,
+    312, 232, 333, 520, 117, 243, 293, 0, 979, 0, 114, 302, 752, 1, 780, 425,
+    116, 236, 116, 118, 0, 234, 584, 230, 38, 132, 0, 0, 427, 239, 394, 1,
+    246, 1411, 176, 29, 0, 211, 0, 0, 112, 92, 59, 165, 176, 58, 0, 56,
+    2, 1403, 0, 118, 602, 351, 0, 95, 496, 117, 59, 524, 1247, 53, 0, 0,
+    550, 120, 0, 231, 128, 0, 177, 580, 59, 0, 0, 293, 112, 0, 1403, 0,
+    175, 0, 175, 58, 410, 271, 1291, 0, 0, 234, 58, 304, 234, 0, 0, 1222,
+    268, 194, 58, 326, 252, 43, 1403, 292, 208, 0, 550, 117, 58, 1, 821, 31,
+    170, 28, 60, 0, 174, 58, 0, 0, 0, 292, 176, 295, 120, 0, 0, 818,
+    2898, 118, 0, 267, 174, 60, 526, 233, 1, 275, 0, 6, 291, 1338, 53, 149,
+    59, 351, 232, 1072, 58, 1, 0, 898, 174, 0, 98, 0, 1302, 198, 802, 716,
+    0, 58, 293, 0, 0, 174, 1, 0, 0, 0, 150, 1, 0, 139, 1, 280, 352,
+    294, 60, 346, 186, 0, 0, 295, 0, 174, 58, 58, 58, 1, 1054, 0,
+];
+
+#[test]
+#[ignore]
+fn bench_per_expert_vs_gather_real_distribution() {
+    let device = Device::system_default().expect("no Metal device");
+    let kernels = Kernels::new(&device).expect("build moeflux-metal kernels");
+    let queue = device.new_command_queue();
+    let mut rng = XorShift::new(0xC0FF_EE42);
+
+    let htpe = HTPE_A3B_L0C0;
+    let n_experts = htpe.len() as u32;
+    let total: u32 = htpe.iter().sum();
+    assert_eq!(total, 65536, "expected 8192 × 8 = 65536 assignments");
+
+    // Bucket-permuted offsets. `offsets[e+1] - offsets[e] = htpe[e]`.
+    let mut offsets = vec![0u32; (n_experts + 1) as usize];
+    for e in 0..n_experts as usize {
+        offsets[e + 1] = offsets[e] + htpe[e];
+    }
+    let n_active = htpe.iter().filter(|&&c| c > 0).count();
+
+    // expert_indices for gather: bucket e occupies rows
+    // [offsets[e], offsets[e+1]) and all hold the index `e`.
+    let mut indices = vec![0u32; total as usize];
+    for e in 0..n_experts as usize {
+        let (lo, hi) = (offsets[e] as usize, offsets[e + 1] as usize);
+        indices[lo..hi].fill(e as u32);
+    }
+
+    eprintln!(
+        "\nPer-expert dense vs gather on real a3b distribution \
+         (n_experts={n_experts}, active={n_active}, total={total}):"
+    );
+
+    let cases: &[(u32, u32, &str)] = &[
+        (A3B_HIDDEN, A3B_MOE_INTERMEDIATE, "gate|up (in=2048 out=768)"),
+        (A3B_MOE_INTERMEDIATE, A3B_HIDDEN, "down    (in=768 out=2048)"),
+    ];
+
+    for &(in_dim, out_dim, label) in cases {
+        // Build n_experts distinct weight blocks at uniform stride.
+        let experts: Vec<(Vec<u32>, Vec<u16>, Vec<u16>)> = (0..n_experts)
+            .map(|_| gen_weights(&mut rng, out_dim as usize, in_dim as usize))
+            .collect();
+        let (wf, s_off, b_off, stride_bytes) =
+            pack_experts_into_buf(&device, &experts);
+
+        let x: Vec<f32> = (0..(total * in_dim) as usize)
+            .map(|_| rng.unit())
+            .collect();
+        let in_buf = device.new_buffer_with_data(
+            x.as_ptr() as *const _,
+            std::mem::size_of_val(&x[..]) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let idx_buf = device.new_buffer_with_data(
+            indices.as_ptr() as *const _,
+            std::mem::size_of_val(&indices[..]) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let out_buf = device.new_buffer(
+            total as u64 * out_dim as u64 * 4,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        // Total FLOPs for the matmul (sum across all M).
+        let flops =
+            2.0 * total as f64 * in_dim as f64 * out_dim as f64;
+
+        eprintln!("\n  {label}:");
+
+        // --- Gather, BM=32 (default). ---
+        set_gather_tile_variant_override(Some(GatherTileVariant::Bm32Wm2));
+        let encode_gather = |cmd: &CommandBufferRef| {
+            kernels.encode(
+                cmd,
+                &GatherQmmCall {
+                    weights: QuantWeights {
+                        buffer: &wf,
+                        packed_offset: 0,
+                        scales_offset: s_off,
+                        biases_offset: b_off,
+                    },
+                    input: &in_buf,
+                    input_offset: 0,
+                    output: &out_buf,
+                    output_offset: 0,
+                    indices: &idx_buf,
+                    indices_offset: 0,
+                    in_dim,
+                    out_dim,
+                    n_tokens: total,
+                    stride_w: stride_bytes,
+                    stride_s: stride_bytes / 2,
+                },
+            );
+        };
+        let (k_g, per_g) = measure(&device, &queue, &encode_gather);
+        report("gather  (1 dispatch)", k_g, &per_g, flops);
+        set_gather_tile_variant_override(None);
+
+        // --- Per-expert dense: N dispatches into one cmdbuf. ---
+        // Mirrors what the pivot would issue. Skips empty experts.
+        let encode_dense = |cmd: &CommandBufferRef| {
+            for e in 0..n_experts as usize {
+                let m = htpe[e];
+                if m == 0 {
+                    continue;
+                }
+                let row_off = offsets[e] as u64;
+                let exp_base = e as u64 * stride_bytes;
+                kernels.encode(
+                    cmd,
+                    &QmmCall {
+                        weights: QuantWeights {
+                            buffer: &wf,
+                            packed_offset: exp_base,
+                            scales_offset: exp_base + s_off,
+                            biases_offset: exp_base + b_off,
+                        },
+                        input: &in_buf,
+                        input_offset: row_off * in_dim as u64 * 4,
+                        output: &out_buf,
+                        output_offset: row_off * out_dim as u64 * 4,
+                        in_dim,
+                        out_dim,
+                        n_tokens: m,
+                    },
+                );
+            }
+        };
+        let (k_d, per_d) = measure(&device, &queue, &encode_dense);
+        report(
+            &format!("dense   ({n_active} dispatches)"),
+            k_d,
+            &per_d,
+            flops,
+        );
+
+        let med_g = median(&per_g);
+        let med_d = median(&per_d);
+        eprintln!(
+            "    → dense/gather = {:.3}× ({})",
+            med_d / med_g,
+            if med_d < med_g { "dense WINS" } else { "gather WINS" }
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // MoE gather bench — `GatherQmmCall` at a3b shapes. M = chunk ×
 // k_active = 65536 (one full prefill chunk's assignments).
 // ---------------------------------------------------------------------------

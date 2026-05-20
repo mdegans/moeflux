@@ -41,3 +41,78 @@ Every change to a vendored file is marked inline with a `moeflux-mlx:`
 comment so it is distinguishable from upstream MLX code. The principal
 adaptation is a `ScaleT` template parameter on the quantized block loader
 so it reads bf16 scales/biases while accumulating in f32.
+
+
+llama.cpp (MoE gathered matmul kernel)
+======================================
+
+The `shaders/gather_mm_id.metal` file is a port of the
+`kernel_mul_mm_id_map0` + `kernel_mul_mm_id` pair from llama.cpp's
+Metal backend.
+
+  Project : llama.cpp
+            (https://github.com/ggml-org/llama.cpp)
+  File    : ggml/src/ggml-metal/ggml-metal.metal (lines 9618 and 9684,
+            commit-equivalent inspected 2026-05-20)
+  License : MIT
+  Copyright © 2023-2024 Georgi Gerganov & ggml-org contributors
+
+llama.cpp's MIT license text is identical to MLX's above; reproduced
+here for completeness:
+
+    Permission is hereby granted, free of charge, to any person obtaining
+    a copy of this software and associated documentation files (the
+    "Software"), to deal in the Software without restriction, including
+    without limitation the rights to use, copy, modify, merge, publish,
+    distribute, sublicense, and/or sell copies of the Software, and to
+    permit persons to whom the Software is furnished to do so, subject to
+    the following conditions:
+
+    The above copyright notice and this permission notice shall be
+    included in all copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+    EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+    MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+    IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+    CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+    TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+    SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+What's ported 1:1
+-----------------
+
+- Algorithmic shape: one dispatch covers all experts (`tgpig.z =
+  expert_id`); per-expert M-aware tile work via `htpe[expert]`
+  early-return; in-kernel gather of activations via
+  `hids[expert][n] = token*k + slot` rather than a host-side
+  bucket-permute.
+- Tile sizes (NR0=64, NR1=32, NK=32), threadgroup-memory layout
+  (`sa` at offset 0, `sb` at offset 4096, output stage reuses the
+  first 8 KB), simdgroup MMA fragment indexing (`mc[8]` indexed
+  by `(sgitg, ik)`), and output store ordering.
+- `mul_mm_id_map0`: same staged-load + per-expert-thread structure
+  (with `K_TOPK` template parameter; instantiated for k=8 for a3b).
+
+What's moeflux-adapted
+----------------------
+
+- Quant format: **W4_gs64** (4-bit affine weights, group_size=64,
+  bf16 scales+biases per group). llama.cpp's templated
+  `dequantize_func` hook is replaced with an inline dequant of the
+  16 nibbles the kernel needs per K-tile.
+- Input/output element type fixed to f32 (llama.cpp templates over
+  half/bfloat/f32).
+- `combine_topk` reduction kernel — a small moeflux-specific
+  post-pass that combines the slot-indexed gather output by the
+  per-token router weights. Not present in llama.cpp (their MoE
+  pipeline does the combine in a separate `ggml_mul_mat` node).
+
+What we explicitly DON'T port
+-----------------------------
+
+- The `GGML_METAL_HAS_TENSOR` path (Apple TensorOps; M5-only
+  hardware we don't target).
+- The `FC_mul_mm_bc_inp` byte-copy fast-path (only meaningful for
+  float inputs, not quantized; we always dequant).
+- Multi-quant template instantiations (we have one format).

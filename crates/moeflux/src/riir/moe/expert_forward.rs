@@ -1486,6 +1486,185 @@ fn encode_moe_gather(
     }
 }
 
+/// One-dispatch MoE matmul via `moeflux_mm_id` (Differentiator 1 from
+/// `.claude/memory/llama_cpp_moe_differentiators.md`). Eliminates the
+/// host-side bucket-permute and per-row expert indirection that
+/// [`encode_moe_gather`] above carries.
+///
+/// Pipeline (per layer):
+/// 1. `MoeIdMap0Call` — build `htpe[n_experts]` + `hids[n_experts,
+///    n_tokens]` from the router's per-token `indices[n_tokens, k]`.
+/// 2. `MoeGatherIdCall` for **gate** — `h_mid → gate_mid`.
+/// 3. `MoeGatherIdCall` for **up** — `h_mid → up_mid`.
+/// 4. SwiGLU — `silu(gate_mid) * up_mid → gate_mid` (in-place; gate
+///    and "act" share the same buffer; safe because each thread reads
+///    gate[i] + up[i] before writing gate[i]).
+/// 5. `MoeGatherIdCall` for **down** — `gate_mid (now silu*up) →
+///    down_mid`. Note `ne11 = k` here: input is per-(token, slot).
+/// 6. `MoeCombineTopkCall` — `down_mid × weights → out_sum`.
+///
+/// All scratch (htpe, hids, gate_mid, up_mid, down_mid) is provided
+/// by the producer; sized for the chunk width at construction.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_moe_gather_id_fuse(
+    cmdbuf: &CommandBufferRef,
+    kernels: &Kernels,
+    swiglu: &ComputePipelineState,
+    expert_base: &Buffer,
+    expert_stride: u64,
+    indices: &Buffer,
+    weights: &Buffer,
+    h_mid: &Buffer,
+    out_sum: &Buffer,
+    htpe: &Buffer,
+    hids: &Buffer,
+    gate_mid: &Buffer,
+    up_mid: &Buffer,
+    down_mid: &Buffer,
+    n_tokens: u32,
+    n_experts: u32,
+    k: u32,
+    v: Variant,
+) {
+    if n_tokens == 0 {
+        return;
+    }
+    let hidden_dim = v.hidden_dim as u32;
+    let moe_inter = v.moe_intermediate as u32;
+
+    // --- 1. map0 ---
+    kernels.encode(
+        cmdbuf,
+        &moeflux_metal::MoeIdMap0Call {
+            indices,
+            indices_offset: 0,
+            htpe,
+            htpe_offset: 0,
+            hids,
+            hids_offset: 0,
+            n_experts,
+            n_tokens,
+            k,
+        },
+    );
+
+    // Helper closure: encode one MoE matmul. `ne11`, `nb11`, `nb12`
+    // differ between gate/up (input = [n_tokens, hidden]) and down
+    // (input = [n_tokens, k, moe_inter]).
+    let mm_id = |src1: &Buffer,
+                 dst: &Buffer,
+                 k_in: u32,
+                 n_out: u32,
+                 packed_off: u64,
+                 scales_off: u64,
+                 biases_off: u64,
+                 ne11: u32,
+                 nb11: u64,
+                 nb12: u64| {
+        kernels.encode(
+            cmdbuf,
+            &moeflux_metal::MoeGatherIdCall {
+                src0: expert_base,
+                src0_offset: 0,
+                src1,
+                src1_offset: 0,
+                htpe,
+                htpe_offset: 0,
+                hids,
+                hids_offset: 0,
+                dst,
+                dst_offset: 0,
+                k_in,
+                n_out,
+                n_experts,
+                n_tokens,
+                k,
+                ne11,
+                nb02: expert_stride,
+                nb01_w: (k_in / 2) as u64,
+                nb01_s: (k_in / 32) as u64, // (K/64)*2 bytes
+                packed_off,
+                scales_off,
+                biases_off,
+                nb10: 4,
+                nb11,
+                nb12,
+            },
+        );
+    };
+
+    // --- 2. gate: h_mid → gate_mid ---
+    mm_id(
+        h_mid,
+        gate_mid,
+        hidden_dim,
+        moe_inter,
+        v.gate_w_off_4bit() as u64,
+        v.gate_s_off_4bit() as u64,
+        v.gate_b_off_4bit() as u64,
+        /* ne11 */ 1,
+        /* nb11 */ 0,
+        /* nb12 */ (hidden_dim * 4) as u64,
+    );
+    // --- 3. up: h_mid → up_mid ---
+    mm_id(
+        h_mid,
+        up_mid,
+        hidden_dim,
+        moe_inter,
+        v.up_w_off_4bit() as u64,
+        v.up_s_off_4bit() as u64,
+        v.up_b_off_4bit() as u64,
+        /* ne11 */ 1,
+        /* nb11 */ 0,
+        /* nb12 */ (hidden_dim * 4) as u64,
+    );
+
+    // --- 4. SwiGLU: silu(gate_mid) * up_mid → gate_mid (in-place) ---
+    // The flat element count covers all (n_tokens × k × moe_inter)
+    // slots; the SwiGLU kernel is element-wise so layout is moot.
+    encode_swiglu_at(
+        cmdbuf,
+        swiglu,
+        gate_mid,
+        up_mid,
+        gate_mid, // in-place
+        0,
+        n_tokens * k * moe_inter,
+    );
+
+    // --- 5. down: gate_mid (silu*up) → down_mid ---
+    // Input is [n_tokens, k, moe_inter] → ne11 = k (per-slot stride).
+    mm_id(
+        gate_mid,
+        down_mid,
+        moe_inter,
+        hidden_dim,
+        v.down_w_off_4bit() as u64,
+        v.down_s_off_4bit() as u64,
+        v.down_b_off_4bit() as u64,
+        /* ne11 */ k,
+        /* nb11 */ (moe_inter * 4) as u64,
+        /* nb12 */ (k * moe_inter * 4) as u64,
+    );
+
+    // --- 6. combine_topk: down_mid × weights → out_sum ---
+    kernels.encode(
+        cmdbuf,
+        &moeflux_metal::MoeCombineTopkCall {
+            mid: down_mid,
+            mid_offset: 0,
+            weights,
+            weights_offset: 0,
+            out: out_sum,
+            out_offset: 0,
+            n_tokens,
+            hidden_dim,
+            k,
+        },
+    );
+}
+
 /// Per-bucket fallback: a hand-rolled matvec sequence per non-empty
 /// bucket. Bucket `bi` uses the expert block at `expert_base +
 /// expert_slots[bi] * expert_stride`. Kept as the shape the

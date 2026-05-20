@@ -37,6 +37,23 @@ use metal::{
     Buffer, CommandBufferRef, ComputePipelineState, MTLSize, NSUInteger,
 };
 
+/// Process-wide cache for `MOEFLUX_MOE_GATHER_ID`. Set to `1` /
+/// `true` / `on` to route the batched MoE block through
+/// `Op::MoeGatherIdFuse` (the one-dispatch `gather_mm_id.metal`
+/// kernel ported from llama.cpp) instead of
+/// `Op::MoeBatchedPermuteFuse`. Defaults to OFF until the engine-
+/// level A/B bench shows it's a win.
+fn moe_gather_id_enabled() -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        match std::env::var("MOEFLUX_MOE_GATHER_ID").as_deref() {
+            Ok("1") | Ok("true") | Ok("on") => true,
+            _ => false,
+        }
+    })
+}
+
 use crate::riir::backend::{Backend, BufId, BufferPool, MetalBufferPool};
 use crate::riir::moe::deferred::{
     gpu_batched_experts_begin, gpu_batched_experts_begin_pre_staged,
@@ -356,6 +373,19 @@ pub struct MoeGraphScratch {
     /// k_active` wide — the gather kernel's `indices`. Filled per
     /// layer from `buckets`.
     pub expert_indices: BufId,
+    /// **`Op::MoeGatherIdFuse` scratch** — per-expert assignment
+    /// count `[n_experts]` u32. Always allocated; only touched by
+    /// the new-kernel path. Tiny (~1 KB at n_experts=256).
+    pub htpe: BufId,
+    /// **`Op::MoeGatherIdFuse` scratch** — per-expert assignment
+    /// list `[n_experts, chunk]` i32 (encoded `token*k + slot`).
+    /// Always allocated; only touched by the new-kernel path.
+    /// `~8 MB` at n_experts=256, chunk=8192. The `bucket_gate` /
+    /// `bucket_up` / `bucket_out` slots above are byte-equivalent
+    /// to the new path's `gate_mid` / `up_mid` / `down_mid` and
+    /// are reused in-place by `Op::MoeGatherIdFuse` (no second
+    /// allocation; layout interpretation only).
+    pub hids: BufId,
     /// One-time latch: cleared at construction, set by the first MoE
     /// block call after it `commit_plan`s `graph2`. `graph2`'s
     /// topology is identical regardless of which attention kind
@@ -431,6 +461,20 @@ impl MoeGraphScratch {
             chunk * k_active * std::mem::size_of::<u32>(),
             "mgs.expert_indices",
         );
+        // `Op::MoeGatherIdFuse` scratch — sized for the max chunk
+        // width. Persistent because the new kernel's map0 + matmul
+        // dispatches assume these buffers don't get colored under
+        // them by `commit_plan`. `htpe` is small (~1 KB); `hids`
+        // is `n_experts * chunk * 4` bytes.
+        let n_experts = v.num_experts.max(1);
+        let htpe = p(
+            n_experts * std::mem::size_of::<u32>(),
+            "mgs.htpe",
+        );
+        let hids = p(
+            n_experts * chunk * std::mem::size_of::<i32>(),
+            "mgs.hids",
+        );
         Self {
             h_mid,
             h_post,
@@ -450,6 +494,8 @@ impl MoeGraphScratch {
             bucket_weights,
             out_sum,
             expert_indices,
+            htpe,
+            hids,
             commit_planned: std::cell::Cell::new(false),
         }
     }
@@ -2563,6 +2609,32 @@ where
     debug_assert_eq!(total_assignments, n_tokens * k_active);
 
     let num_buckets = buckets.expert_ids.len();
+
+    // Optional htpe (hits-tokens-per-expert) distribution dump. Gated
+    // by `MOEFLUX_LOG_HTPE=1`. One stderr line per layer per chunk,
+    // 128 comma-separated counts. Used to decide the gather→per-expert
+    // dense pivot (see `gather_qmm_arch_pivot_plan.md`): the pivot
+    // win depends on the routing distribution, not just the mean.
+    if std::env::var_os("MOEFLUX_LOG_HTPE").is_some() {
+        let mut counts = vec![0u32; v.num_experts];
+        for bi in 0..num_buckets {
+            let e = buckets.expert_ids[bi] as usize;
+            counts[e] = buckets.offsets[bi + 1] - buckets.offsets[bi];
+        }
+        let mut line = String::with_capacity(v.num_experts * 5);
+        for (i, &c) in counts.iter().enumerate() {
+            if i > 0 {
+                line.push(',');
+            }
+            line.push_str(&c.to_string());
+        }
+        eprintln!(
+            "HTPE layer={layer_idx} n_tokens={n_tokens} k_active={k_active} \
+             num_experts={} counts=[{line}]",
+            v.num_experts,
+        );
+    }
+
     // 2026-05-20 pread teardown: the staging-blob path (per-bucket
     // `read_expert` + `pool.upload_at`) was deleted. Expert weights
     // are read by the gather GEMM straight from the layer's mmap'd
@@ -2596,14 +2668,24 @@ where
     // bucket_input host permute: gather each assignment's token row
     // from h_post into bucket-flat order. Then upload it + the small
     // routing tables into the run-lifetime scratch buffers.
-    let mut bucket_input_host = vec![0.0f32; total_assignments * hidden_dim];
-    for assignment_idx in 0..total_assignments {
-        let t = buckets.token_idx[assignment_idx] as usize;
-        let src = &h_post_stack[t * hidden_dim..(t + 1) * hidden_dim];
-        let dst_off = assignment_idx * hidden_dim;
-        bucket_input_host[dst_off..dst_off + hidden_dim].copy_from_slice(src);
-    }
-    {
+    //
+    // `Op::MoeGatherIdFuse` (the new-kernel path) does NOT consume
+    // `bucket_input` — its kernel gathers per-(token, slot)
+    // activations internally via `hids`. Skipping the host permute
+    // + upload here is the load-bearing "no host-side permute" win
+    // promised by the new path; running it anyway would inflate the
+    // env=on bench by ~tens of ms per layer.
+    if !moe_gather_id_enabled() {
+        let mut bucket_input_host =
+            vec![0.0f32; total_assignments * hidden_dim];
+        for assignment_idx in 0..total_assignments {
+            let t = buckets.token_idx[assignment_idx] as usize;
+            let src =
+                &h_post_stack[t * hidden_dim..(t + 1) * hidden_dim];
+            let dst_off = assignment_idx * hidden_dim;
+            bucket_input_host[dst_off..dst_off + hidden_dim]
+                .copy_from_slice(src);
+        }
         let pool = backend.pool_mut();
         pool.upload(moe.bucket_input, unsafe {
             std::slice::from_raw_parts(
@@ -2611,6 +2693,9 @@ where
                 total_assignments * hidden_dim * f32_sz_u,
             )
         })?;
+    }
+    {
+        let pool = backend.pool_mut();
         pool.upload(moe.bucket_token_idx, unsafe {
             std::slice::from_raw_parts(
                 buckets.token_idx.as_ptr() as *const u8,
@@ -2696,22 +2781,47 @@ where
             buf: moe.out_sum,
             n_bytes: (n_tokens * hidden_dim * f32_sz_u) as u32,
         });
-        g.push(Op::MoeBatchedPermuteFuse {
-            label: "moe.permute_fuse",
-            expert_base: expert_base_id,
-            expert_stride: v.expert_size_4bit() as u64,
-            expert_indices: moe.expert_indices,
-            expert_slots,
-            bucket_input: moe.bucket_input,
-            bucket_gate: moe.bucket_gate,
-            bucket_up: moe.bucket_up,
-            bucket_act: moe.bucket_act,
-            bucket_out: moe.bucket_out,
-            bucket_token_idx: moe.bucket_token_idx,
-            bucket_weights: moe.bucket_weights,
-            out_sum: moe.out_sum,
-            buckets,
-        });
+        if moe_gather_id_enabled() {
+            // New path: one-dispatch MoE matmul (`gather_mm_id.metal`).
+            // Reuses the `bucket_gate` / `bucket_up` / `bucket_out`
+            // BufIds as `gate_mid` / `up_mid` / `down_mid` scratch
+            // (byte-equivalent allocations; the two paths are
+            // mutually exclusive per run).
+            g.push(Op::MoeGatherIdFuse {
+                label: "moe.gather_id_fuse",
+                expert_base: expert_base_id,
+                expert_stride: v.expert_size_4bit() as u64,
+                indices: moe.routing_indices,
+                weights: moe.routing_weights,
+                h_mid: h_mid_id,
+                out_sum: moe.out_sum,
+                htpe: moe.htpe,
+                hids: moe.hids,
+                gate_mid: moe.bucket_gate,
+                up_mid: moe.bucket_up,
+                down_mid: moe.bucket_out,
+                n_tokens: n_tokens as u32,
+                n_experts: v.num_experts as u32,
+                k: k_active as u32,
+            });
+        } else {
+            g.push(Op::MoeBatchedPermuteFuse {
+                label: "moe.permute_fuse",
+                expert_base: expert_base_id,
+                expert_stride: v.expert_size_4bit() as u64,
+                expert_indices: moe.expert_indices,
+                expert_slots,
+                bucket_input: moe.bucket_input,
+                bucket_gate: moe.bucket_gate,
+                bucket_up: moe.bucket_up,
+                bucket_act: moe.bucket_act,
+                bucket_out: moe.bucket_out,
+                bucket_token_idx: moe.bucket_token_idx,
+                bucket_weights: moe.bucket_weights,
+                out_sum: moe.out_sum,
+                buckets,
+            });
+        }
         g.push(Op::MoeCombineResidualNTokens {
             label: "moe.combine",
             h_mid: h_mid_id,

@@ -56,6 +56,10 @@ use metal::{
     DeviceRef, FunctionConstantValues, MTLDataType, MTLSize, NSUInteger,
 };
 
+pub mod residency_set;
+
+pub use residency_set::ResidencySet;
+
 /// Errors from building the MLX kernel library.
 #[derive(Debug, thiserror::Error)]
 pub enum MlxError {
@@ -196,6 +200,34 @@ const FA_BR: u32 = 64;
 /// SDPA threads per threadgroup — must match `FA_THREADS` in `sdpa.metal`.
 const FA_THREADS: u32 = 256;
 
+/// MoE map0 pre-pass kernel name — builds `htpe[]` + `hids[][]` from
+/// per-token expert indices. Single instantiation for top-k = 8.
+const MOE_MM_ID_MAP0_K8: &str = "moeflux_mm_id_map0_k8";
+/// MoE single-dispatch gathered matmul (one of gate / up / down).
+const MOE_MM_ID: &str = "moeflux_mm_id";
+/// Topk-combine reduction kernel — `[n_tokens, k, hidden] × [n_tokens, k]
+/// → [n_tokens, hidden]`.
+const MOE_COMBINE_TOPK: &str = "moeflux_combine_topk";
+
+/// Top-k for the map0 specialization — a3b. If other variants ship,
+/// add their own `MOE_MM_ID_MAP0_K*` instantiation in
+/// `gather_mm_id.metal` and a sibling PSO entry here.
+pub const MOE_MM_ID_TOPK: u32 = 8;
+
+/// Threadgroup-memory budget for the main matmul. NR0×NK halfs
+/// (sa = 4 KB) + NR1×NK halfs (sb = 2 KB) during the K-loop;
+/// reused as NR0×NR1 floats (8 KB) for the output stage. Max wins.
+const MOE_MM_ID_TG_MEM: NSUInteger = 8192;
+/// Threadgroup-memory budget for map0 — `n_experts × topk × u16`.
+/// For a3b: 256 × 8 × 2 = 4096 bytes. Hardcoded for the k=8 variant.
+const MOE_MM_ID_MAP0_TG_MEM: NSUInteger = 4096;
+/// Threads-per-threadgroup for the main matmul (4 simdgroups × 32).
+const MOE_MM_ID_THREADS: NSUInteger = 128;
+/// Output-row tile (must match `NR0` in `gather_mm_id.metal`).
+const MOE_MM_ID_NR0: u32 = 64;
+/// M-row tile (must match `NR1` in `gather_mm_id.metal`).
+const MOE_MM_ID_NR1: u32 = 32;
+
 /// Vendored MLX headers + the moeflux-metal instantiation entry, embedded at
 /// build time. Order is the topological order of the files' `#include`
 /// DAG — dependencies before dependents — so concatenation with quoted
@@ -223,6 +255,9 @@ const SHADER_PARTS: &[&str] = &[
     // moeflux's own kernels — concatenated after the steel headers so
     // they can build on `mlx::steel::MMATile`.
     include_str!("../shaders/sdpa.metal"),
+    // Port of llama.cpp's `kernel_mul_mm_id` (one-dispatch MoE matmul)
+    // with W4_gs64 dequant inlined. See ../NOTICE for attribution.
+    include_str!("../shaders/gather_mm_id.metal"),
 ];
 
 /// Concatenate [`SHADER_PARTS`] into one Metal translation unit. Two kinds
@@ -418,6 +453,14 @@ pub struct Kernels {
     sdpa: ComputePipelineState,
     /// GQA-folded SDPA (`attn_sdpa_causal_flash_gqa2`) — `SdpaCall::fold == 2`.
     sdpa_gqa2: ComputePipelineState,
+    /// MoE map0 pre-pass — `htpe[]` + `hids[][]` from per-token expert
+    /// indices. Top-k = 8 instantiation (`moeflux_mm_id_map0_k8`).
+    moe_mm_id_map0_k8: ComputePipelineState,
+    /// MoE one-dispatch gathered matmul (`moeflux_mm_id`). One PSO
+    /// services gate, up, and down — args differ per call site.
+    moe_mm_id: ComputePipelineState,
+    /// Topk-combine reduction (`moeflux_combine_topk`).
+    moe_combine_topk: ComputePipelineState,
 }
 
 impl Kernels {
@@ -514,6 +557,14 @@ impl Kernels {
             QMM_T_THREADS_PER_GROUP,
         )?;
 
+        // MoE map0 + mm_id PSOs. The map0 needs at least n_experts
+        // threads in one threadgroup; we'd surface the requirement at
+        // the dispatch site via `MoeIdMap0Call::encode`. The main
+        // mm_id PSO needs at least 128 threads (4 simdgroups).
+        let moe_mm_id_map0_k8 = build(MOE_MM_ID_MAP0_K8)?;
+        let moe_mm_id = build(MOE_MM_ID)?;
+        let moe_combine_topk = build(MOE_COMBINE_TOPK)?;
+
         Ok(Self {
             qmm_t_aligned: build(QMM_T_ALIGNED)?,
             qmm_t_unaligned: build(QMM_T_UNALIGNED)?,
@@ -522,6 +573,9 @@ impl Kernels {
             gather_bm16,
             sdpa: build(SDPA)?,
             sdpa_gqa2: build(SDPA_GQA2)?,
+            moe_mm_id_map0_k8,
+            moe_mm_id,
+            moe_combine_topk,
         })
     }
 
@@ -702,3 +756,304 @@ impl KernelCall for SdpaCall<'_> {
         enc.end_encoding();
     }
 }
+
+// ===============================================================
+// MoE one-dispatch gathered matmul (`gather_mm_id.metal`)
+// ===============================================================
+
+/// `constant` args struct for [`MoeIdMap0Call`]. Layout must match
+/// `moeflux_mm_id_map0_args` in `gather_mm_id.metal`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MoeMmIdMap0Args {
+    n_experts: i32,
+    n_tokens: i32,
+    k: i32,
+}
+
+/// `constant` args struct for [`MoeGatherIdCall`]. Layout must match
+/// `moeflux_mm_id_args` in `gather_mm_id.metal`. C++ struct alignment
+/// rules: int32_t (4) and uint64_t (8) — int32_t fields are grouped
+/// at the top to avoid padding; uint64_t fields are contiguous; the
+/// trailing int32_t triple has no padding (8-byte stride is satisfied
+/// after the 3*4 = 12 bytes pad to 16; we explicitly add one i32 of
+/// padding to match Metal MSL's auto-alignment).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MoeMmIdArgs {
+    k_in: i32,
+    n_out: i32,
+    nb02: u64,
+    nb01_w: u64,
+    nb01_s: u64,
+    packed_off: u64,
+    scales_off: u64,
+    biases_off: u64,
+    nb10: u64,
+    nb11: u64,
+    nb12: u64,
+    n_tokens: i32,
+    k: i32,
+    ne11: i32,
+    _pad: i32,
+}
+
+/// `constant` args struct for [`MoeCombineTopkCall`]. Layout must
+/// match `moeflux_combine_topk_args` in `gather_mm_id.metal`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MoeCombineTopkArgs {
+    n_tokens: i32,
+    hidden_dim: i32,
+    k: i32,
+}
+
+/// Run the map0 pre-pass: build `htpe[n_experts]` (per-expert
+/// assignment count) + `hids[n_experts, n_tokens]` (per-expert
+/// assignment list, encoded as `token*k + slot`) from the router's
+/// per-token expert indices.
+///
+/// One dispatch per layer, before the three [`MoeGatherIdCall`]s
+/// (gate/up/down) for that layer.
+#[derive(Clone, Copy)]
+pub struct MoeIdMap0Call<'a> {
+    /// Router indices — `[n_tokens, k]` i32.
+    pub indices: &'a BufferRef,
+    pub indices_offset: u64,
+    /// Output htpe — `[n_experts]` u32.
+    pub htpe: &'a BufferRef,
+    pub htpe_offset: u64,
+    /// Output hids — `[n_experts, n_tokens]` i32. Only the first
+    /// `htpe[e]` entries per expert are valid.
+    pub hids: &'a BufferRef,
+    pub hids_offset: u64,
+    pub n_experts: u32,
+    pub n_tokens: u32,
+    /// Top-k. Currently must equal [`MOE_MM_ID_TOPK`] = 8.
+    pub k: u32,
+}
+
+/// Run one MoE matmul: `dst[t, s, r] = dequant(W[e, r, :]) @ src1[t, ?]`
+/// for every assignment `(t, s)` to expert `e`, where `e =
+/// indices[t, s]`. One dispatch covers all experts (`tgpig.z =
+/// expert`); per-expert M-aware tile work via `htpe[e]` early-return.
+///
+/// `ne11 == 1`: `src1` is `[n_tokens, K]` — used for gate and up
+/// projections (each token's activation feeds all k expert slots).
+/// `ne11 == k`: `src1` is `[n_tokens, k, K]` — used for the down
+/// projection (each (token, slot) has its own activation row from
+/// the SwiGLU output).
+#[derive(Clone, Copy)]
+pub struct MoeGatherIdCall<'a> {
+    /// Layer's expert-blob base — all `n_experts` experts stacked
+    /// at per-expert stride `nb02`.
+    pub src0: &'a BufferRef,
+    pub src0_offset: u64,
+    /// Activations (see `ne11` doc above).
+    pub src1: &'a BufferRef,
+    pub src1_offset: u64,
+    /// `[n_experts]` u32 — from a prior [`MoeIdMap0Call`].
+    pub htpe: &'a BufferRef,
+    pub htpe_offset: u64,
+    /// `[n_experts, n_tokens]` i32 — from a prior [`MoeIdMap0Call`].
+    pub hids: &'a BufferRef,
+    pub hids_offset: u64,
+    /// Output `[n_tokens, k, n_out]` f32. Slot-indexed per token;
+    /// reduce via [`MoeCombineTopkCall`].
+    pub dst: &'a BufferRef,
+    pub dst_offset: u64,
+    /// K — contraction dim. Gate/up: hidden_dim. Down: moe_inter.
+    pub k_in: u32,
+    /// N — output dim per assignment. Gate/up: moe_inter. Down:
+    /// hidden_dim.
+    pub n_out: u32,
+    pub n_experts: u32,
+    pub n_tokens: u32,
+    /// Top-k (must equal [`MOE_MM_ID_TOPK`]).
+    pub k: u32,
+    /// Activation broadcast dim. 1 for gate/up (no slot dim); k
+    /// for down (per-slot activations).
+    pub ne11: u32,
+    /// Per-expert byte stride into `src0`. For a3b W4_gs64:
+    /// `expert_size_4bit = 1,769,472`.
+    pub nb02: u64,
+    /// Packed-weight byte row stride. Gate/up: 1024. Down: 256.
+    pub nb01_w: u64,
+    /// Scales/biases byte row stride. Gate/up: 64. Down: 16.
+    pub nb01_s: u64,
+    /// Within-expert byte offset to this projection's packed bytes.
+    /// Gate: 0. Up: `expert_block_bytes_4bit`. Down:
+    /// `2 * expert_block_bytes_4bit`.
+    pub packed_off: u64,
+    /// Within-expert byte offset to this projection's scales.
+    pub scales_off: u64,
+    /// Within-expert byte offset to this projection's biases.
+    pub biases_off: u64,
+    /// Activation per-element byte stride. f32 → 4.
+    pub nb10: u64,
+    /// Activation per-slot byte stride. 0 for gate/up; `4 * K_in`
+    /// for down.
+    pub nb11: u64,
+    /// Activation per-token byte stride. `4 * K_in` for gate/up;
+    /// `4 * k * K_in` for down.
+    pub nb12: u64,
+}
+
+/// Reduce `mid[n_tokens, k, hidden]` × `weights[n_tokens, k]` →
+/// `out[n_tokens, hidden]`. Single small kernel; trivial vs the
+/// matmul. Runs once per layer after gate/up/down.
+#[derive(Clone, Copy)]
+pub struct MoeCombineTopkCall<'a> {
+    pub mid: &'a BufferRef,
+    pub mid_offset: u64,
+    pub weights: &'a BufferRef,
+    pub weights_offset: u64,
+    pub out: &'a BufferRef,
+    pub out_offset: u64,
+    pub n_tokens: u32,
+    pub hidden_dim: u32,
+    pub k: u32,
+}
+
+impl KernelCall for MoeIdMap0Call<'_> {
+    fn encode(&self, kernels: &Kernels, cmdbuf: &CommandBufferRef) {
+        if self.n_tokens == 0 || self.n_experts == 0 {
+            return;
+        }
+        debug_assert_eq!(
+            self.k, MOE_MM_ID_TOPK,
+            "MoeIdMap0Call::k must equal MOE_MM_ID_TOPK ({} != {})",
+            self.k, MOE_MM_ID_TOPK
+        );
+
+        let args = MoeMmIdMap0Args {
+            n_experts: self.n_experts as i32,
+            n_tokens: self.n_tokens as i32,
+            k: self.k as i32,
+        };
+
+        let enc = cmdbuf.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&kernels.moe_mm_id_map0_k8);
+        enc.set_bytes(
+            0,
+            std::mem::size_of::<MoeMmIdMap0Args>() as NSUInteger,
+            (&args as *const MoeMmIdMap0Args).cast(),
+        );
+        enc.set_buffer(1, Some(self.indices), self.indices_offset);
+        enc.set_buffer(2, Some(self.htpe), self.htpe_offset);
+        enc.set_buffer(3, Some(self.hids), self.hids_offset);
+        enc.set_threadgroup_memory_length(0, MOE_MM_ID_MAP0_TG_MEM);
+
+        // One threadgroup; one thread per expert.
+        enc.dispatch_thread_groups(
+            MTLSize::new(1, 1, 1),
+            MTLSize::new(self.n_experts as NSUInteger, 1, 1),
+        );
+        enc.end_encoding();
+    }
+}
+
+impl KernelCall for MoeGatherIdCall<'_> {
+    fn encode(&self, kernels: &Kernels, cmdbuf: &CommandBufferRef) {
+        if self.n_tokens == 0 || self.n_experts == 0 {
+            return;
+        }
+        debug_assert_eq!(
+            self.k, MOE_MM_ID_TOPK,
+            "MoeGatherIdCall::k must equal MOE_MM_ID_TOPK ({} != {})",
+            self.k, MOE_MM_ID_TOPK
+        );
+
+        let args = MoeMmIdArgs {
+            k_in: self.k_in as i32,
+            n_out: self.n_out as i32,
+            nb02: self.nb02,
+            nb01_w: self.nb01_w,
+            nb01_s: self.nb01_s,
+            packed_off: self.packed_off,
+            scales_off: self.scales_off,
+            biases_off: self.biases_off,
+            nb10: self.nb10,
+            nb11: self.nb11,
+            nb12: self.nb12,
+            n_tokens: self.n_tokens as i32,
+            k: self.k as i32,
+            ne11: self.ne11 as i32,
+            _pad: 0,
+        };
+
+        let enc = cmdbuf.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&kernels.moe_mm_id);
+        enc.set_bytes(
+            0,
+            std::mem::size_of::<MoeMmIdArgs>() as NSUInteger,
+            (&args as *const MoeMmIdArgs).cast(),
+        );
+        enc.set_buffer(1, Some(self.src0), self.src0_offset);
+        enc.set_buffer(2, Some(self.src1), self.src1_offset);
+        enc.set_buffer(3, Some(self.htpe), self.htpe_offset);
+        enc.set_buffer(4, Some(self.hids), self.hids_offset);
+        enc.set_buffer(5, Some(self.dst), self.dst_offset);
+        enc.set_threadgroup_memory_length(0, MOE_MM_ID_TG_MEM);
+
+        // Grid: (ceil(n_tokens/NR1), ceil(n_out/NR0), n_experts).
+        let grid_x = self.n_tokens.div_ceil(MOE_MM_ID_NR1) as NSUInteger;
+        let grid_y = self.n_out.div_ceil(MOE_MM_ID_NR0) as NSUInteger;
+        enc.dispatch_thread_groups(
+            MTLSize::new(grid_x, grid_y, self.n_experts as NSUInteger),
+            MTLSize::new(MOE_MM_ID_THREADS, 1, 1),
+        );
+        enc.end_encoding();
+    }
+}
+
+impl KernelCall for MoeCombineTopkCall<'_> {
+    fn encode(&self, kernels: &Kernels, cmdbuf: &CommandBufferRef) {
+        if self.n_tokens == 0 || self.hidden_dim == 0 {
+            return;
+        }
+        let args = MoeCombineTopkArgs {
+            n_tokens: self.n_tokens as i32,
+            hidden_dim: self.hidden_dim as i32,
+            k: self.k as i32,
+        };
+
+        let enc = cmdbuf.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&kernels.moe_combine_topk);
+        enc.set_bytes(
+            0,
+            std::mem::size_of::<MoeCombineTopkArgs>() as NSUInteger,
+            (&args as *const MoeCombineTopkArgs).cast(),
+        );
+        enc.set_buffer(1, Some(self.mid), self.mid_offset);
+        enc.set_buffer(2, Some(self.weights), self.weights_offset);
+        enc.set_buffer(3, Some(self.out), self.out_offset);
+
+        // One threadgroup per token; 128 threads stride over
+        // hidden_dim. Could tune later if `combine_topk` shows up
+        // in profile.
+        enc.dispatch_thread_groups(
+            MTLSize::new(self.n_tokens as NSUInteger, 1, 1),
+            MTLSize::new(128, 1, 1),
+        );
+        enc.end_encoding();
+    }
+}
+
+#[cfg(test)]
+mod gather_mm_id_tests {
+    use super::*;
+    use metal::Device;
+
+    /// Build the full `Kernels` set, including the new MoE pipelines.
+    /// Failure here = Metal compile error in `gather_mm_id.metal`.
+    /// Fast — no kernel launch, just library + PSO build.
+    #[test]
+    fn moe_mm_id_pipelines_compile() {
+        let device = Device::system_default()
+            .expect("a Metal device for moe_mm_id compile test");
+        let _kernels =
+            Kernels::new(&device).expect("compile gather_mm_id.metal");
+    }
+}
+

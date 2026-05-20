@@ -1060,6 +1060,26 @@ impl Backend for CpuBackend {
                     *k as usize,
                 );
             }
+            Op::MoeGatherIdFuse { label, .. } => {
+                // The kernel-level diff oracle in
+                // `moeflux-metal/tests/gather_mm_id_diff.rs` proves
+                // `moeflux_mm_id` numerically against a plain
+                // dequant-matmul CPU reference. Full-engine
+                // validation runs as a GPU/GPU env-flag A/B in
+                // `tests/diff_oracle.rs` (one env flips
+                // `MoeBatchedPermuteFuse` ↔ `MoeGatherIdFuse`).
+                // A CpuBackend impl would duplicate the kernel-
+                // level reference logic; deferred until a CPU
+                // consumer surfaces. See
+                // `.claude/memory/llama_cpp_moe_differentiators.md`.
+                todo!(
+                    "MoeGatherIdFuse has no CpuBackend encoder — \
+                     this op is GPU-only by design (label: {label}). \
+                     Numerical correctness is gated by the \
+                     gather_mm_id_diff kernel diff oracle + the \
+                     engine-level GPU env-flag A/B test."
+                );
+            }
             Op::MoeBatchedPermuteFuse {
                 expert_base,
                 expert_stride,

@@ -567,6 +567,62 @@ pub enum Op {
         buckets: ExpertBuckets,
     },
 
+    /// MoE gather-by-expert-id fuse (the `gather_mm_id.metal` path).
+    ///
+    /// One-dispatch-per-projection MoE matmul (Diff #1 from
+    /// `.claude/memory/llama_cpp_moe_differentiators.md`). Replaces
+    /// the bucket-permute + per-row-indexed gather of
+    /// [`Self::MoeBatchedPermuteFuse`] with: a map0 pre-pass that
+    /// builds per-expert assignment lists from the router's
+    /// `indices[n_tokens, k]`, then three `moeflux_mm_id` dispatches
+    /// (gate / up / down) that internally early-return per-expert
+    /// based on `htpe[e]` and gather activations via `hids`.
+    ///
+    /// Output of gate/up/down is `[n_tokens, k, dim]` slot-indexed;
+    /// `combine_topk` reduces by `weights[n_tokens, k]` to produce
+    /// `[n_tokens, hidden_dim]` in `out_sum`.
+    ///
+    /// All scratch buffers (`htpe`, `hids`, `gate_mid`, `up_mid`,
+    /// `down_mid`) are pool-allocated per chunk; sized at construction
+    /// for the max chunk width. Currently GPU-only — CPU encode arm
+    /// `todo!()`s with a pointer to the engine-level GPU/GPU diff
+    /// test for validation.
+    MoeGatherIdFuse {
+        label: &'static str,
+        /// Layer's expert blob — `n_experts` experts stacked at
+        /// `expert_stride` byte spacing.
+        expert_base: BufId,
+        /// Per-expert byte stride — `Variant::expert_size_4bit()`.
+        expert_stride: u64,
+        /// Router output — `[n_tokens, k]` i32.
+        indices: BufId,
+        /// Router output — `[n_tokens, k]` f32.
+        weights: BufId,
+        /// Input hidden states — `[n_tokens, hidden_dim]` f32.
+        h_mid: BufId,
+        /// Output — `[n_tokens, hidden_dim]` f32. Accumulator; the
+        /// kernel WRITES (not adds). Combine with shared/residual
+        /// downstream via [`Self::MoeCombineResidualNTokens`].
+        out_sum: BufId,
+        /// Scratch — `[n_experts]` u32, per-expert assignment count.
+        htpe: BufId,
+        /// Scratch — `[n_experts, n_tokens]` i32, per-expert
+        /// assignment list (encoded `token*k + slot`).
+        hids: BufId,
+        /// Scratch — `[n_tokens, k, moe_inter]` f32, gate-proj output
+        /// (also reused in-place as the SwiGLU output that feeds down).
+        gate_mid: BufId,
+        /// Scratch — `[n_tokens, k, moe_inter]` f32, up-proj output.
+        up_mid: BufId,
+        /// Scratch — `[n_tokens, k, hidden_dim]` f32, down-proj
+        /// output (input to combine_topk).
+        down_mid: BufId,
+        n_tokens: u32,
+        n_experts: u32,
+        /// Top-k. Must equal `moeflux_metal::MOE_MM_ID_TOPK` (= 8 for a3b).
+        k: u32,
+    },
+
     /// MoE combine + residual:
     /// `hidden_out[t,i] = h_mid[t,i] + moe_sum[t,i]
     ///                  + sigmoid(shared_gate[t]) * shared_out[t,i]`.
@@ -698,6 +754,7 @@ impl Op {
             Op::MoeSoftmaxTopK { label, .. } => label,
             Op::MoeNormalizeWeights { label, .. } => label,
             Op::MoeBatchedPermuteFuse { label, .. } => label,
+            Op::MoeGatherIdFuse { label, .. } => label,
             Op::MoeCombineResidualNTokens { label, .. } => label,
             Op::Conv1dStepNTokens { label, .. } => label,
             Op::ComputeDecayBetaNTokens { label, .. } => label,
@@ -727,6 +784,7 @@ impl Op {
             Op::MoeSoftmaxTopK { .. } => "MoeSoftmaxTopK",
             Op::MoeNormalizeWeights { .. } => "MoeNormalizeWeights",
             Op::MoeBatchedPermuteFuse { .. } => "MoeBatchedPermuteFuse",
+            Op::MoeGatherIdFuse { .. } => "MoeGatherIdFuse",
             Op::MoeCombineResidualNTokens { .. } => "MoeCombineResidualNTokens",
             Op::Conv1dStepNTokens { .. } => "Conv1dStepNTokens",
             Op::ComputeDecayBetaNTokens { .. } => "ComputeDecayBetaNTokens",
@@ -775,6 +833,13 @@ impl Op {
                 *bucket_token_idx,
                 *bucket_weights,
             ],
+            Op::MoeGatherIdFuse {
+                expert_base,
+                indices,
+                weights,
+                h_mid,
+                ..
+            } => vec![*expert_base, *indices, *weights, *h_mid],
             Op::MoeCombineResidualNTokens {
                 h_mid,
                 moe_sum,
@@ -843,6 +908,17 @@ impl Op {
                 out_sum,
                 ..
             } => vec![*bucket_gate, *bucket_up, *bucket_act, *bucket_out, *out_sum],
+            Op::MoeGatherIdFuse {
+                htpe,
+                hids,
+                gate_mid,
+                up_mid,
+                down_mid,
+                out_sum,
+                ..
+            } => vec![
+                *htpe, *hids, *gate_mid, *up_mid, *down_mid, *out_sum,
+            ],
             Op::MoeCombineResidualNTokens { hidden_out, .. } => vec![*hidden_out],
             Op::Conv1dStepNTokens {
                 conv_state,

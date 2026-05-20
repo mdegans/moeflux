@@ -1397,10 +1397,10 @@ impl RsCtx<MetalBackend> {
 
     fn ensure_linear_resources(&mut self) -> Result<(), RsError> {
         self.ensure_backend()?;
-        // Session-5 Phase 2: when MOEFLUX_EXPERT_IO=mmap, wrap each
-        // mmap'd layer file as a Metal-shared buffer via
+        // Wrap each mmap'd layer file as a Metal-shared buffer via
         // newBufferWithBytesNoCopy. Idempotent (skipped after first
-        // call) and a no-op when mode == Pread.
+        // call). Expert I/O is unconditionally mmap as of
+        // `pread_teardown_landed.md` (2026-05-20).
         {
             let pool =
                 self.backend.as_mut().expect("just-set").pool_mut();

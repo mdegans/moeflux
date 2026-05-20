@@ -42,6 +42,7 @@ use std::path::{Path, PathBuf};
 
 use memmap2::Mmap;
 use metal::{Buffer, MTLResourceOptions, NSUInteger};
+use moeflux_metal::ResidencySet;
 
 use crate::riir::backend::{BufId, MetalBufferPool};
 use crate::riir::variants::{Variant, VARIANT};
@@ -156,6 +157,14 @@ pub enum ExpertIoError {
 /// drop in declaration order, so `mmap_buffers` is declared above
 /// `mmap_layers`. In practice both live for the whole session.
 pub struct ExpertFiles {
+    /// Pin every `mmap_buffers` allocation as GPU-resident across
+    /// cmdbuf boundaries via `MTLResidencySet` (macOS 15+). Populated
+    /// by [`Self::attach_to_device`]. `None` if the residency-set API
+    /// isn't available on this OS or no buffers were attached yet.
+    ///
+    /// **Declared first** so it drops first — `endResidency` runs
+    /// while the registered allocations are still alive.
+    expert_rset: Option<ResidencySet>,
     /// `Some(file)` if the layer file opened, `None` if it was missing.
     layers: Vec<Option<File>>,
     /// Bytes per expert blob for the active variant. Hard-coded to
@@ -187,10 +196,12 @@ impl ExpertFiles {
     /// in the active variant. Missing files leave the slot at `None`.
     /// I/O errors other than `NotFound` propagate.
     ///
-    /// Mirrors the C loop at `metal_infer/infer.m:7580..7605`. When
-    /// `MOEFLUX_EXPERT_IO=mmap` is set, also mmaps each successfully-
-    /// opened layer file; the matching Metal buffer is built lazily
-    /// by [`Self::attach_to_device`] once the Metal backend exists.
+    /// Mirrors the C loop at `metal_infer/infer.m:7580..7605`. Each
+    /// opened layer file is mmap'd unconditionally; the matching
+    /// Metal buffer is built lazily by [`Self::attach_to_device`]
+    /// once the Metal backend exists. The `MOEFLUX_EXPERT_IO` env
+    /// var is now inert — set to anything other than `mmap` and it
+    /// emits a friendly "ignored" warning, then proceeds with mmap.
     pub fn open(experts_dir: &Path) -> Result<Self, ExpertIoError> {
         let v: Variant = VARIANT;
         if let Ok(val) = std::env::var("MOEFLUX_EXPERT_IO") {
@@ -244,6 +255,7 @@ impl ExpertFiles {
             mmap_layers.iter().filter(|m| m.is_some()).count()
         );
         Ok(Self {
+            expert_rset: None,
             layers,
             expert_size: v.expert_size_4bit(),
             experts_dir: experts_dir.to_path_buf(),
@@ -265,6 +277,27 @@ impl ExpertFiles {
     /// `mmap_buf_ids` (new `BufId` accessor for graph-mode `Op`s);
     /// they share an NSObject-refcounted clone of the same backing.
     pub fn attach_to_device(&mut self, pool: &mut MetalBufferPool) {
+        // Lazy-init the residency set on the first attach call. The
+        // capacity hint is the layer count — a slight over-estimate
+        // when some layers are missing, but it's a hint, not a cap.
+        // Returns `None` on macOS < 15; we then attach buffers without
+        // pinning.
+        if self.expert_rset.is_none() {
+            self.expert_rset = ResidencySet::new(
+                pool.device(),
+                "moeflux.experts",
+                self.mmap_layers.len() as u64,
+            );
+            if self.expert_rset.is_none()
+                && !moeflux_metal::residency_set::is_available()
+            {
+                eprintln!(
+                    "[experts] MTLResidencySet unavailable (macOS < 15) \
+                     — expert buffers will not be pinned"
+                );
+            }
+        }
+        let mut added_any = false;
         for i in 0..self.mmap_layers.len() {
             if self.mmap_buffers[i].is_some() {
                 continue;
@@ -307,8 +340,23 @@ impl ExpertFiles {
                 "expert_io.mmap_layer",
                 /* persistent = */ true,
             );
+            if let Some(rset) = self.expert_rset.as_ref() {
+                rset.add_allocation(&buf);
+            }
             self.mmap_buffers[i] = Some(buf);
             self.mmap_buf_ids[i] = Some(id);
+            added_any = true;
+        }
+        // Commit + requestResidency once at the end of the call, only
+        // if we actually staged new allocations. The second
+        // (idempotent) call to `attach_to_device` exits with
+        // `added_any == false` and skips this — re-requesting on an
+        // unchanged set is harmless but pointless.
+        if added_any {
+            if let Some(rset) = self.expert_rset.as_ref() {
+                rset.commit();
+                rset.request_residency();
+            }
         }
     }
 

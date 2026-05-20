@@ -1148,6 +1148,44 @@ impl Backend for MetalBackend {
                     self.moe_gather,
                 );
             }
+            Op::MoeGatherIdFuse {
+                expert_base,
+                expert_stride,
+                indices,
+                weights,
+                h_mid,
+                out_sum,
+                htpe,
+                hids,
+                gate_mid,
+                up_mid,
+                down_mid,
+                n_tokens,
+                n_experts,
+                k,
+                ..
+            } => {
+                crate::riir::moe::expert_forward::encode_moe_gather_id_fuse(
+                    cmd,
+                    self.metal.kernels(),
+                    &self.swiglu_fused_pso,
+                    self.pool.handle(*expert_base),
+                    *expert_stride,
+                    self.pool.handle(*indices),
+                    self.pool.handle(*weights),
+                    self.pool.handle(*h_mid),
+                    self.pool.handle(*out_sum),
+                    self.pool.handle(*htpe),
+                    self.pool.handle(*hids),
+                    self.pool.handle(*gate_mid),
+                    self.pool.handle(*up_mid),
+                    self.pool.handle(*down_mid),
+                    *n_tokens,
+                    *n_experts,
+                    *k,
+                    crate::riir::variants::VARIANT,
+                );
+            }
             Op::Conv1dStepNTokens {
                 qkv_in,
                 conv_state,
