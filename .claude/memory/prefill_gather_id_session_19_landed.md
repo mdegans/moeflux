@@ -1,9 +1,67 @@
 ---
 name: prefill-gather-id-session-19-landed
-description: 2026-05-20 — session 19 landed `Op::MoeGatherIdFuse` + `gather_mm_id.metal` (port of llama.cpp's `kernel_mul_mm_id` for W4_gs64). Kernel-level diff oracle passes at production scale; engine-level integration produces degenerate output (1 token then EoT). Pipeline bug, NOT a kernel bug — investigation bounded for next session.
+description: 2026-05-20 — session 19 landed `Op::MoeGatherIdFuse` + `gather_mm_id.metal` (port of llama.cpp's `kernel_mul_mm_id` for W4_gs64). Kernel-level diff oracle passed at production scale; engine-level integration produced degenerate output (1 token then EoT). **RESOLVED session 20**: producer wired `h_mid_id` (pre-RmsNorm) where the kernel expected `h_post_id` (post-RmsNorm); one-line fix in `linear_attn_forward.rs:2796`. +11% prefill speedup now correctness-confirmed.
 metadata:
   type: project
 ---
+
+# RESOLUTION — 2026-05-20 session 20
+
+**Cause.** `crates/moeflux/src/riir/attn/linear_attn_forward.rs:2796`
+wired `h_mid: h_mid_id` into `Op::MoeGatherIdFuse`. The `Op` field
+is *literally named* `h_mid` (backend/mod.rs:602) so the wiring read
+as natural at the call site. But the kernel expects the post-RmsNorm
+activation that feeds the gate/up matmuls — the same value the
+bucket-permute path uses by gathering rows from `h_post_stack` (the
+host download of `h_post_id`, line 2560 → 2684). In graph1
+`h_mid_id` is the residual-add output (pre-norm); `h_post_id` is
+`RmsNorm(h_mid)` (post-norm). The MoE matmuls received pre-norm
+residual values → garbage logits → `</think>` + EoT.
+
+**Fix.** One-line change at 2796: `h_mid: h_post_id`. Tombstone
+comment added next to it so the next reader sees the trap.
+
+**Verification.**
+- env=on `max_tokens=30, temp=0, seed=42` on
+  `prefill_prompt_long.txt`: **bit-identical to last session's
+  env=off output** (same 30-token continuation, same
+  `stop_reason: max_tokens`). At temp=0 + same seed, matching
+  argmax for 30 tokens means the new path is computing the right
+  thing, not just "something coherent".
+- env=on `max_tokens=200, temp=0` on the same prompt: 200 tokens
+  of coherent technical prose with clean section structure. No
+  drift, no thrashing.
+- env=on `max_tokens=60, temp=0` on a short answerable question
+  ("What is the capital of France?"): 7-token response, "The
+  capital of France is Paris.", `stop_reason: end_turn`. Clean
+  instruction-following.
+
+**Bench claim re-confirmed by inference.** Kernel work is invariant
+to input distribution; the same dispatches ran the whole time, just
+with the wrong input. The session-19 bench numbers (+11% prefill,
+2.31× gap to llama.cpp) stand. A post-reboot re-bench is sensible
+hygiene but the number is not expected to move.
+
+**Why the testing discipline missed it.** Kernel diff oracle covers
+kernel math (synthetic input → expected output). Producer wiring is
+*upstream* of the oracle. Session 19 had kernel diff green + bench
+green + build clean and called it done; engine-level coherence was
+never checked. This is now a recorded discipline:
+[[feedback-coherence-test-before-pipeline-commit]] — any change to
+Op definitions, producer code, or orchestrator dispatch requires a
+short engine-level coherence curl (temp=0, real answerable prompt)
+before commit.
+
+**Structural hardening — open.** The Op field name `h_mid` is the
+proximate trap. Conversation with Mike at end of session 20 left
+this for a follow-up — likely renaming the field to something
+unambiguous (`hidden_in` / `mlp_in`) so the wiring can't read
+"correct" when it isn't. May also warrant semantic tagging on
+BufIds at a higher level.
+
+---
+
+# Original session-19 record (preserved for history)
 
 # What landed
 

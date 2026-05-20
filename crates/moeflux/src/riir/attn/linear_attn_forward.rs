@@ -2793,7 +2793,13 @@ where
                 expert_stride: v.expert_size_4bit() as u64,
                 indices: moe.routing_indices,
                 weights: moe.routing_weights,
-                h_mid: h_mid_id,
+                // NOTE: the `Op::MoeGatherIdFuse` field is literally
+                // named `h_mid` but the kernel expects the *post-norm*
+                // activation that feeds the gate/up matmuls (same as
+                // the bucket-permute path's `bucket_input`, which is
+                // built from `h_post_stack`). Passing `h_mid_id` here
+                // (pre-norm residual) was the session-19 plumbing bug.
+                h_mid: h_post_id,
                 out_sum: moe.out_sum,
                 htpe: moe.htpe,
                 hids: moe.hids,
