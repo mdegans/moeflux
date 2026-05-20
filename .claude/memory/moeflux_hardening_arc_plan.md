@@ -149,15 +149,14 @@ reinforces the other.
 
 - **2026-05-20 session 20:** arc doc landed. Session A executed
   in the same session (commit `ae8c71b` — rename `h_mid → mlp_in`
-  in `Op::MoeGatherIdFuse`). Sessions B and C have Plan-agent
-  designs persisted:
-  - [[moeflux-hardening-session-b-plan]] — selective newtype
-    wrappers via `PostNormBuf`. ~40 net LOC, one ~1h session.
-  - [[moeflux-hardening-session-c-plan]] — engine-level diff
-    harness at `crates/moeflux/tests/engine_op_diff.rs`. ~270 LOC,
-    one ~1.5h session.
-- Sessions B and C are independent; pick by what feels right at
-  the start of the next session. C has slightly broader catch
-  radius (any producer-wiring mistake, not just BufId mix-ups); B
-  is the prettier code move and locks in compile-time prevention
-  for the exact class that bit us.
+  in `Op::MoeGatherIdFuse`).
+- **2026-05-20 design pass with Mike:** Session B scope expanded
+  from narrow (one wrapper) to full typed-`BufId` refactor. The
+  narrow plan ([[moeflux-hardening-session-b-plan]]) is
+  **superseded** by [[moeflux-hardening-session-b-v2-plan]]
+  — every `BufId` in the backend gets a role tag; producer-wiring
+  bugs become compile errors. ~510 net LOC, one focused session.
+- Session C ([[moeflux-hardening-session-c-plan]]) — engine-level
+  diff harness — remains independent. Catches the residual class
+  of bugs the type system can't (e.g., wrong RmsNorm output
+  written into a typed slot upstream of the consumer).

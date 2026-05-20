@@ -16,6 +16,7 @@ pub mod gpu_matvec;
 pub mod gpu_norm;
 pub mod metal;
 
+use super::buftype::Buf;
 use super::{Backend, BufId, BufferPool, Graph, GraphError, Op};
 
 use ::metal::{Buffer, CommandBuffer, MTLSize, NSRange};
@@ -88,20 +89,21 @@ impl MetalBufferPool {
     /// the heap memory; the Metal buffer references it. Required for
     /// pread DMA destinations — the C path documents a 3.6× DMA win
     /// from 2 MiB alignment over 16 KB (`metal_infer/infer.m:1196`).
-    pub fn alloc_aligned(
+    pub fn alloc_aligned<B: Buf>(
         &mut self,
         bytes: usize,
         alignment: usize,
         label: &'static str,
         persistent: bool,
-    ) -> BufId {
+    ) -> BufId<B> {
         let anchor = MtlBuffer::<u8>::with_aligned_len_u8(
             &self.device,
             bytes,
             alignment,
         );
         let buf = anchor.buffer().clone();
-        let id = BufId(self.bufid_to_physical.len() as u32);
+        let id: BufId<B> =
+            BufId::from_raw(self.bufid_to_physical.len() as u32);
         let physical = self.buffers.len() as u32;
         self.buffers.push(buf);
         self.aligned_anchors.push(anchor);
@@ -124,15 +126,16 @@ impl MetalBufferPool {
     ///
     /// Used for mmap'd expert files: `ExpertFiles` owns the `Mmap`
     /// + the wrapping `Buffer`; the pool registers the `Buffer` so
-    /// graph-mode `Op`s can address it via `BufId`.
-    pub fn register_borrowed(
+    /// graph-mode `Op`s can address it via `BufId<B>`.
+    pub fn register_borrowed<B: Buf>(
         &mut self,
         buf: Buffer,
         bytes: usize,
         label: &'static str,
         persistent: bool,
-    ) -> BufId {
-        let id = BufId(self.bufid_to_physical.len() as u32);
+    ) -> BufId<B> {
+        let id: BufId<B> =
+            BufId::from_raw(self.bufid_to_physical.len() as u32);
         let physical = self.buffers.len() as u32;
         self.buffers.push(buf);
         self.labels.push(label);
@@ -149,8 +152,8 @@ impl MetalBufferPool {
     /// is reading from this buffer concurrently. `&self` because
     /// `metal::Buffer` is NSObject-interior-mut; Rust borrow rules
     /// don't apply to its contents.
-    pub fn as_mut_slice_u8(&self, id: BufId) -> &mut [u8] {
-        let idx = id.0 as usize;
+    pub fn as_mut_slice_u8<B: Buf>(&self, id: BufId<B>) -> &mut [u8] {
+        let idx = id.raw() as usize;
         let physical = self.bufid_to_physical[idx] as usize;
         let buf = &self.buffers[physical];
         let bytes = self.byte_sizes[idx];
@@ -171,9 +174,9 @@ impl MetalBufferPool {
     /// PLUS the caller guarantees the `ids` array is duplicate-free —
     /// otherwise the returned references alias and the &mut semantics
     /// is violated.
-    pub fn as_mut_slices_u8<const N: usize>(
+    pub fn as_mut_slices_u8<B: Buf, const N: usize>(
         &self,
-        ids: [BufId; N],
+        ids: [BufId<B>; N],
     ) -> [&mut [u8]; N] {
         ids.map(|id| self.as_mut_slice_u8(id))
     }
@@ -183,13 +186,14 @@ impl BufferPool for MetalBufferPool {
     type Handle = Buffer;
     type Error = GraphError;
 
-    fn alloc(
+    fn alloc<B: Buf>(
         &mut self,
         bytes: usize,
         label: &'static str,
         persistent: bool,
-    ) -> Result<BufId, GraphError> {
-        let id = BufId(self.bufid_to_physical.len() as u32);
+    ) -> Result<BufId<B>, GraphError> {
+        let id: BufId<B> =
+            BufId::from_raw(self.bufid_to_physical.len() as u32);
         let physical = self.buffers.len() as u32;
         let buf = self.device.new_buffer(
             bytes as NSUInteger,
@@ -209,14 +213,21 @@ impl BufferPool for MetalBufferPool {
         Ok(id)
     }
 
-    fn handle(&self, id: BufId) -> &Buffer {
-        let physical = self.bufid_to_physical[id.0 as usize] as usize;
+    fn handle<B: Buf>(&self, id: BufId<B>) -> &Buffer {
+        let physical = self.bufid_to_physical[id.raw() as usize] as usize;
         &self.buffers[physical]
     }
 
-    fn upload(&mut self, id: BufId, host: &[u8]) -> Result<(), GraphError> {
-        let idx = id.0 as usize;
-        let label = *self.labels.get(idx).ok_or(GraphError::BadBufId(id))?;
+    fn upload<B: Buf>(
+        &mut self,
+        id: BufId<B>,
+        host: &[u8],
+    ) -> Result<(), GraphError> {
+        let idx = id.raw() as usize;
+        let label = *self
+            .labels
+            .get(idx)
+            .ok_or(GraphError::BadBufId(id.raw()))?;
         let expected = self.byte_sizes[idx];
         // Prefix semantics: `host` may be shorter than the buffer
         // (once-per-run buffers are sized at max chunk width; a
@@ -240,14 +251,17 @@ impl BufferPool for MetalBufferPool {
         Ok(())
     }
 
-    fn upload_at(
+    fn upload_at<B: Buf>(
         &mut self,
-        id: BufId,
+        id: BufId<B>,
         offset: usize,
         host: &[u8],
     ) -> Result<(), GraphError> {
-        let idx = id.0 as usize;
-        let label = *self.labels.get(idx).ok_or(GraphError::BadBufId(id))?;
+        let idx = id.raw() as usize;
+        let label = *self
+            .labels
+            .get(idx)
+            .ok_or(GraphError::BadBufId(id.raw()))?;
         let expected = self.byte_sizes[idx];
         if offset + host.len() > expected {
             return Err(GraphError::SizeMismatch {
@@ -268,13 +282,16 @@ impl BufferPool for MetalBufferPool {
         Ok(())
     }
 
-    fn download(
+    fn download<B: Buf>(
         &self,
-        id: BufId,
+        id: BufId<B>,
         host: &mut [u8],
     ) -> Result<(), GraphError> {
-        let idx = id.0 as usize;
-        let label = *self.labels.get(idx).ok_or(GraphError::BadBufId(id))?;
+        let idx = id.raw() as usize;
+        let label = *self
+            .labels
+            .get(idx)
+            .ok_or(GraphError::BadBufId(id.raw()))?;
         let expected = self.byte_sizes[idx];
         // Prefix semantics: see `upload`.
         if host.len() > expected {
@@ -322,9 +339,9 @@ impl BufferPool for MetalBufferPool {
         self.buffers.truncate(max_physical);
     }
 
-    fn label(&self, id: BufId) -> &'static str {
+    fn label<B: Buf>(&self, id: BufId<B>) -> &'static str {
         self.labels
-            .get(id.0 as usize)
+            .get(id.raw() as usize)
             .copied()
             .unwrap_or("<bad-bufid>")
     }
@@ -337,10 +354,11 @@ impl BufferPool for MetalBufferPool {
         let coloring = greedy_color(&lifetimes);
 
         let n_bufids = self.bufid_to_physical.len();
-        let aliasable: HashMap<BufId, ColorId> = coloring
+        // Tag-agnostic: aliasable maps raw `u32` indices → ColorId.
+        let aliasable: HashMap<u32, ColorId> = coloring
             .bufid_to_color
             .iter()
-            .filter(|(b, _)| !self.persistent[b.0 as usize])
+            .filter(|(b, _)| !self.persistent[**b as usize])
             .map(|(b, c)| (*b, *c))
             .collect();
 
@@ -366,8 +384,8 @@ impl BufferPool for MetalBufferPool {
             .new_buffer(1, MTLResourceOptions::StorageModeShared);
 
         for bufid_idx in 0..n_bufids {
-            let buf = BufId(bufid_idx as u32);
-            if aliasable.contains_key(&buf) {
+            let key = bufid_idx as u32;
+            if aliasable.contains_key(&key) {
                 continue;
             }
             let old_physical = self.bufid_to_physical[bufid_idx] as usize;
@@ -389,7 +407,7 @@ impl BufferPool for MetalBufferPool {
             let max_size = aliasable
                 .iter()
                 .filter(|&(_, c)| *c == color)
-                .map(|(b, _)| self.byte_sizes[b.0 as usize])
+                .map(|(b, _)| self.byte_sizes[*b as usize])
                 .max()
                 .unwrap_or(0);
             if max_size == 0 {
@@ -412,7 +430,7 @@ impl BufferPool for MetalBufferPool {
 
         for (buf, color) in &aliasable {
             let phys = color_to_physical[color];
-            new_bufid_to_physical[buf.0 as usize] = phys;
+            new_bufid_to_physical[*buf as usize] = phys;
         }
 
         debug_assert!(new_bufid_to_physical.iter().all(|&p| p != u32::MAX));
@@ -423,7 +441,7 @@ impl BufferPool for MetalBufferPool {
         // frozen for the run; flipping `persistent` keeps it (and the
         // shared color buffer it points at) across `reset_transient`.
         for buf in aliasable.keys() {
-            self.persistent[buf.0 as usize] = true;
+            self.persistent[*buf as usize] = true;
         }
     }
 }
@@ -1454,6 +1472,7 @@ impl Backend for MetalBackend {
 
 #[cfg(test)]
 mod tests {
+    use super::super::buftype::{DeprecatedCogitoBuf, ExpertBaseBuf};
     use super::*;
 
     fn dev() -> Device {
@@ -1468,7 +1487,12 @@ mod tests {
         // Use a size that wouldn't naturally land on a 2 MiB boundary
         // (Apple's allocator only does that incidentally for large
         // allocations).
-        let id = pool.alloc_aligned(64 * 1024, TWO_MIB, "test.aligned", true);
+        let id: BufId<DeprecatedCogitoBuf> = pool.alloc_aligned(
+            64 * 1024,
+            TWO_MIB,
+            "test.aligned",
+            true,
+        );
         let buf = pool.handle(id);
         let addr = buf.contents() as usize;
         assert_eq!(
@@ -1488,7 +1512,8 @@ mod tests {
         );
         let raw_ptr_before = raw.contents() as usize;
         let mut pool = MetalBufferPool::new(device);
-        let id = pool.register_borrowed(raw, 128, "test.borrowed", true);
+        let id: BufId<ExpertBaseBuf> =
+            pool.register_borrowed(raw, 128, "test.borrowed", true);
         let pooled = pool.handle(id);
         // The buffer the pool returns should point to the same memory
         // as the buffer we registered (refcounted clone, same backing).
@@ -1499,7 +1524,7 @@ mod tests {
     #[ignore = "needs Metal device"]
     fn as_mut_slice_u8_writes_visible_through_handle() {
         let mut pool = MetalBufferPool::new(dev());
-        let id = pool
+        let id: BufId<DeprecatedCogitoBuf> = pool
             .alloc(64, "test.scratch", true)
             .expect("alloc");
         {
@@ -1523,9 +1548,12 @@ mod tests {
     #[ignore = "needs Metal device"]
     fn as_mut_slices_u8_disjoint_writes_dont_clobber() {
         let mut pool = MetalBufferPool::new(dev());
-        let a = pool.alloc(32, "a", true).expect("alloc");
-        let b = pool.alloc(32, "b", true).expect("alloc");
-        let c = pool.alloc(32, "c", true).expect("alloc");
+        let a: BufId<DeprecatedCogitoBuf> =
+            pool.alloc(32, "a", true).expect("alloc");
+        let b: BufId<DeprecatedCogitoBuf> =
+            pool.alloc(32, "b", true).expect("alloc");
+        let c: BufId<DeprecatedCogitoBuf> =
+            pool.alloc(32, "c", true).expect("alloc");
         {
             let [sa, sb, sc] = pool.as_mut_slices_u8([a, b, c]);
             sa.fill(0xAA);

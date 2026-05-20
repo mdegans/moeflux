@@ -8,7 +8,7 @@
 //!    offsets
 //! 3. **5 linear-attn fused kernels**: conv1d_step → rms_norm_qk →
 //!    compute_decay_beta → gated_delta_net_step → gated_rms_norm
-//!    (output staged into `buffers.batch_out[6]`)
+//!    (output staged into `buffers.o_proj_stack`)
 //! 4. Hand-off to [`post_attention_tail`] which runs:
 //!    - **o_proj** (matvec from `linear_total_value` → HIDDEN_DIM)
 //!    - **Residual add + post-attn RMSNorm**
@@ -54,6 +54,18 @@ fn moe_gather_id_enabled() -> bool {
     })
 }
 
+use crate::riir::backend::buftype::{
+    AlphaStackBuf, AttnInputBuf, AttnOutBuf, BetaGateBuf, BetaStackBuf,
+    BucketActBuf, BucketGateBuf, BucketInputBuf, BucketOutBuf,
+    BucketTokenIdxBuf, BucketUpBuf, BucketWeightsBuf, ConvOutBuf,
+    ConvStateBuf, DeltaOutBuf, DeltaStateBuf, ExpertBaseBuf,
+    ExpertIndicesBuf, GDecayBuf, HiddenBuf, HidsBuf, HtpeBuf, KProjOutBuf,
+    KvCacheKBuf, KvCacheVBuf, LogitsBuf, MoeInputBuf, MoeOutSumBuf,
+    OProjOutBuf, QBuf, QGateBuf, QProjOutBuf, QkvStackBuf, ResidualBuf,
+    RouterIdxBuf, RouterLogitsBuf, RouterWeightsBuf, SharedFfnActBuf,
+    SharedFfnDownBuf, SharedFfnGateBuf, SharedFfnUpBuf, SharedGateBuf,
+    TokenIdsBuf, ValueOutBuf, VProjOutBuf, ZStackBuf,
+};
 use crate::riir::backend::{Backend, BufId, BufferPool, MetalBufferPool};
 use crate::riir::moe::deferred::{
     gpu_batched_experts_begin, gpu_batched_experts_begin_pre_staged,
@@ -132,45 +144,53 @@ pub type LinearAttnForwardError = LayerForwardError;
 ///   outputs read back to host for CPU per-head norm + RoPE + KV
 ///   append + SDPA).
 pub struct LayerForwardBuffers {
-    pub input: BufId,
-    pub normed: BufId,
-    pub residual: BufId,
-    pub h_mid: BufId,
-    pub output: BufId,
-    /// 7 batch-output slots. Sized per slot:
-    /// - [0]: LINEAR_CONV_DIM (qkv) — only used by linear-attn
-    /// - [1]: LINEAR_TOTAL_VALUE (z) — only used by linear-attn
-    /// - [2]: LINEAR_NUM_V_HEADS (beta) — only used by linear-attn
-    /// - [3]: LINEAR_NUM_V_HEADS (alpha) — only used by linear-attn
-    /// - [4]: NUM_EXPERTS (router gate logits) — both paths
-    /// - [5]: 1 (shared-expert gate scalar) — both paths
-    /// - [6]: max(LINEAR_TOTAL_VALUE, NUM_ATTN_HEADS * HEAD_DIM) —
-    ///   o_proj input staging slot for both paths. On qwen3_5_moe
-    ///   variants these two values match exactly (linear: 32*128 =
-    ///   4096 for A3B; full: 16*256 = 4096), so the slot is reused.
-    pub batch_out: [BufId; 7],
+    pub input: BufId<HiddenBuf>,
+    pub normed: BufId<AttnInputBuf>,
+    pub residual: BufId<ResidualBuf>,
+    pub h_mid: BufId<ResidualBuf>,
+    pub output: BufId<HiddenBuf>,
+    // Former `batch_out: [BufId; 7]` — broken into named fields per
+    // tag (plan Q7). The original 7 slots were heterogeneous; the
+    // array layout was a smell, the named fields make the per-slot
+    // role explicit. Slot index ↔ field name mapping:
+    //   [0] → q_stack (linear-attn qkv stack)
+    //   [1] → z_stack (linear-attn z proj)
+    //   [2] → beta_stack
+    //   [3] → alpha_stack
+    //   [4] → gate_logits (router output, both paths)
+    //   [5] → shared_gate (shared-expert gate scalar, both paths)
+    //   [6] → o_proj_stack (o_proj input staging; both paths land
+    //         attention output here)
+    pub q_stack: BufId<QkvStackBuf>,
+    pub z_stack: BufId<ZStackBuf>,
+    pub beta_stack: BufId<BetaStackBuf>,
+    pub alpha_stack: BufId<AlphaStackBuf>,
+    pub gate_logits: BufId<RouterLogitsBuf>,
+    pub shared_gate: BufId<SharedGateBuf>,
+    pub o_proj_stack: BufId<OProjOutBuf>,
     /// Per-linear-layer recurrence state.
-    pub conv_state: Vec<BufId>,
-    pub delta_state: Vec<BufId>,
+    pub conv_state: Vec<BufId<ConvStateBuf>>,
+    pub delta_state: Vec<BufId<DeltaStateBuf>>,
     /// Scratch for one layer's linear-attn pipeline (reused across
     /// layers).
-    pub conv_output: BufId,
-    pub delta_g_decay: BufId,
-    pub delta_beta: BufId,
-    pub delta_output: BufId,
-    pub sum_sq: BufId,
+    pub conv_output: BufId<ConvOutBuf>,
+    pub delta_g_decay: BufId<GDecayBuf>,
+    pub delta_beta: BufId<BetaGateBuf>,
+    pub delta_output: BufId<DeltaOutBuf>,
+    /// 1-float scratch for `rms_norm_sum_sq` intermediate.
+    pub sum_sq: BufId<HiddenBuf>,
     /// Shared-expert intermediate (SHARED_INTERMEDIATE floats).
-    pub shared_gate_out: BufId,
-    pub shared_up_out: BufId,
-    pub shared_act: BufId,
-    pub shared_out: BufId,
+    pub shared_gate_out: BufId<SharedFfnGateBuf>,
+    pub shared_up_out: BufId<SharedFfnUpBuf>,
+    pub shared_act: BufId<SharedFfnActBuf>,
+    pub shared_out: BufId<SharedFfnDownBuf>,
     /// Full-attn projection outputs. `q_proj_out` carries the raw
     /// per-head `(q, gate)` interleave (`num_attn_heads * head_dim *
     /// 2` floats); `k_out` / `v_out` carry the `kv_dim` raw outputs
     /// before per-head norm + RoPE + KV append.
-    pub q_proj_out: BufId,
-    pub k_out: BufId,
-    pub v_out: BufId,
+    pub q_proj_out: BufId<QProjOutBuf>,
+    pub k_out: BufId<KProjOutBuf>,
+    pub v_out: BufId<VProjOutBuf>,
 
     /// Slice 5d-7b — GPU full-attention buffers.
     ///
@@ -180,17 +200,17 @@ pub struct LayerForwardBuffers {
     /// floats each. `fa_idx` = `full_attn_layer_idx_for(layer_idx)`.
     /// Mirrors C `g_metal->buf_kv_k[NUM_FULL_ATTN_LAYERS]` allocation
     /// at `infer.m:1255..1260`.
-    pub gpu_kv_k: Vec<BufId>,
-    pub gpu_kv_v: Vec<BufId>,
+    pub gpu_kv_k: Vec<BufId<KvCacheKBuf>>,
+    pub gpu_kv_v: Vec<BufId<KvCacheVBuf>>,
     /// Shared scratch for the GPU SDPA fast path. Reused across layers
     /// because SDPA is layer-sequential per token (matches C). Sizes:
     /// - `gpu_attn_q` / `gpu_attn_out` / `gpu_attn_gate`:
     ///   `num_attn_heads * head_dim` floats each
     /// - `gpu_attn_scores`: `num_attn_heads * GPU_KV_SEQ` floats
-    pub gpu_attn_q: BufId,
-    pub gpu_attn_scores: BufId,
-    pub gpu_attn_out: BufId,
-    pub gpu_attn_gate: BufId,
+    pub gpu_attn_q: BufId<QBuf>,
+    pub gpu_attn_scores: BufId<HiddenBuf>,
+    pub gpu_attn_out: BufId<AttnOutBuf>,
+    pub gpu_attn_gate: BufId<QGateBuf>,
 }
 
 /// Backwards-compat alias for the original 4c name.
@@ -211,18 +231,18 @@ pub type LinearAttnBuffers = LayerForwardBuffers;
 /// to a small physical set and pins them for the run.
 pub struct LinearAttnGraphScratch {
     // Intra-graph1 transients (colorable).
-    pub normed: BufId,
-    pub qkv_stack: BufId,
-    pub z_stack: BufId,
-    pub beta_stack: BufId,
-    pub alpha_stack: BufId,
-    pub conv_out_stack: BufId,
-    pub g_decay_stack: BufId,
-    pub beta_gate_stack: BufId,
-    pub delta_out_stack: BufId,
-    pub value_out_stack: BufId,
-    pub o_proj_stack: BufId,
-    pub gate_logits: BufId,
+    pub normed: BufId<AttnInputBuf>,
+    pub qkv_stack: BufId<QkvStackBuf>,
+    pub z_stack: BufId<ZStackBuf>,
+    pub beta_stack: BufId<BetaStackBuf>,
+    pub alpha_stack: BufId<AlphaStackBuf>,
+    pub conv_out_stack: BufId<ConvOutBuf>,
+    pub g_decay_stack: BufId<GDecayBuf>,
+    pub beta_gate_stack: BufId<BetaGateBuf>,
+    pub delta_out_stack: BufId<DeltaOutBuf>,
+    pub value_out_stack: BufId<ValueOutBuf>,
+    pub o_proj_stack: BufId<OProjOutBuf>,
+    pub gate_logits: BufId<RouterLogitsBuf>,
     /// One-time latch: cleared at construction, set by the first
     /// producer call after it `commit_plan`s `graph1`. Gates the
     /// lifetime-coloring pass to run exactly once per run. The MoE
@@ -243,23 +263,47 @@ impl LinearAttnGraphScratch {
         let total_value = v.linear_total_value();
         let num_v = v.linear_num_v_heads;
         let delta_out = num_v * Variant::LINEAR_VALUE_DIM;
-        let mut c = |elems: usize, label: &'static str| {
-            pool.alloc(chunk * elems * f32_sz, label, false)
-                .expect("LinearAttnGraphScratch::new pool alloc")
-        };
+        // Closures over `pool` can only fix one tag-arg per call, so
+        // we expand alloc sites inline. `bytes_of` keeps the size
+        // computation close to the site for readability.
+        let bytes_of = |elems: usize| chunk * elems * f32_sz;
         Self {
-            normed: c(hidden, "lags.normed"),
-            qkv_stack: c(conv, "lags.qkv_stack"),
-            z_stack: c(total_value, "lags.z_stack"),
-            beta_stack: c(num_v, "lags.beta_stack"),
-            alpha_stack: c(num_v, "lags.alpha_stack"),
-            conv_out_stack: c(conv, "lags.conv_out_stack"),
-            g_decay_stack: c(num_v, "lags.g_decay_stack"),
-            beta_gate_stack: c(num_v, "lags.beta_gate_stack"),
-            delta_out_stack: c(delta_out, "lags.delta_out_stack"),
-            value_out_stack: c(total_value, "lags.value_out_stack"),
-            o_proj_stack: c(hidden, "lags.o_proj_stack"),
-            gate_logits: c(v.num_experts, "lags.gate_logits"),
+            normed: pool
+                .alloc(bytes_of(hidden), "lags.normed", false)
+                .expect("LinearAttnGraphScratch::new pool alloc"),
+            qkv_stack: pool
+                .alloc(bytes_of(conv), "lags.qkv_stack", false)
+                .expect("LinearAttnGraphScratch::new pool alloc"),
+            z_stack: pool
+                .alloc(bytes_of(total_value), "lags.z_stack", false)
+                .expect("LinearAttnGraphScratch::new pool alloc"),
+            beta_stack: pool
+                .alloc(bytes_of(num_v), "lags.beta_stack", false)
+                .expect("LinearAttnGraphScratch::new pool alloc"),
+            alpha_stack: pool
+                .alloc(bytes_of(num_v), "lags.alpha_stack", false)
+                .expect("LinearAttnGraphScratch::new pool alloc"),
+            conv_out_stack: pool
+                .alloc(bytes_of(conv), "lags.conv_out_stack", false)
+                .expect("LinearAttnGraphScratch::new pool alloc"),
+            g_decay_stack: pool
+                .alloc(bytes_of(num_v), "lags.g_decay_stack", false)
+                .expect("LinearAttnGraphScratch::new pool alloc"),
+            beta_gate_stack: pool
+                .alloc(bytes_of(num_v), "lags.beta_gate_stack", false)
+                .expect("LinearAttnGraphScratch::new pool alloc"),
+            delta_out_stack: pool
+                .alloc(bytes_of(delta_out), "lags.delta_out_stack", false)
+                .expect("LinearAttnGraphScratch::new pool alloc"),
+            value_out_stack: pool
+                .alloc(bytes_of(total_value), "lags.value_out_stack", false)
+                .expect("LinearAttnGraphScratch::new pool alloc"),
+            o_proj_stack: pool
+                .alloc(bytes_of(hidden), "lags.o_proj_stack", false)
+                .expect("LinearAttnGraphScratch::new pool alloc"),
+            gate_logits: pool
+                .alloc(bytes_of(v.num_experts), "lags.gate_logits", false)
+                .expect("LinearAttnGraphScratch::new pool alloc"),
             commit_planned: std::cell::Cell::new(false),
         }
     }
@@ -271,8 +315,8 @@ impl LinearAttnGraphScratch {
 /// per-layer scratch (prefill-arc Phase 3) so the attention scratch
 /// structs hold only per-layer state, not run-level orchestrator state.
 pub struct HiddenDoubleBuffer {
-    pub hidden_a: BufId,
-    pub hidden_b: BufId,
+    pub hidden_a: BufId<HiddenBuf>,
+    pub hidden_b: BufId<HiddenBuf>,
 }
 
 impl HiddenDoubleBuffer {
@@ -282,13 +326,13 @@ impl HiddenDoubleBuffer {
         let v = VARIANT;
         let chunk = crate::riir::BATCHED_CHUNK_SIZE;
         let bytes = chunk * v.hidden_dim * std::mem::size_of::<f32>();
-        let mut p = |label: &'static str| {
-            pool.alloc(bytes, label, true)
-                .expect("HiddenDoubleBuffer::new pool alloc")
-        };
         Self {
-            hidden_a: p("hdb.hidden_a"),
-            hidden_b: p("hdb.hidden_b"),
+            hidden_a: pool
+                .alloc(bytes, "hdb.hidden_a", true)
+                .expect("HiddenDoubleBuffer::new pool alloc"),
+            hidden_b: pool
+                .alloc(bytes, "hdb.hidden_b", true)
+                .expect("HiddenDoubleBuffer::new pool alloc"),
         }
     }
 }
@@ -302,8 +346,8 @@ impl HiddenDoubleBuffer {
 /// - `logits` — `[vocab_size]` f32. The tail's lm-head matvec writes
 ///   the final logits here, downloaded to the caller's slice.
 pub struct HeadTailScratch {
-    pub token_ids: BufId,
-    pub logits: BufId,
+    pub token_ids: BufId<TokenIdsBuf>,
+    pub logits: BufId<LogitsBuf>,
 }
 
 impl HeadTailScratch {
@@ -311,14 +355,14 @@ impl HeadTailScratch {
     pub fn new(pool: &mut MetalBufferPool) -> Self {
         let v = VARIANT;
         let chunk = crate::riir::BATCHED_CHUNK_SIZE;
-        let token_ids = pool
+        let token_ids: BufId<TokenIdsBuf> = pool
             .alloc(
                 chunk * std::mem::size_of::<i32>(),
                 "hts.token_ids",
                 true,
             )
             .expect("HeadTailScratch::new token_ids alloc");
-        let logits = pool
+        let logits: BufId<LogitsBuf> = pool
             .alloc(
                 v.vocab_size * std::mem::size_of::<f32>(),
                 "hts.logits",
@@ -347,45 +391,47 @@ impl HeadTailScratch {
 ///   `persistent = true`.
 pub struct MoeGraphScratch {
     // Graph1→MoE boundary (persistent, never aliased).
-    pub h_mid: BufId,
-    pub h_post: BufId,
-    pub shared_gate: BufId,
-    pub routing_indices: BufId,
-    pub routing_weights: BufId,
+    pub h_mid: BufId<ResidualBuf>,
+    pub h_post: BufId<MoeInputBuf>,
+    pub shared_gate: BufId<SharedGateBuf>,
+    pub routing_indices: BufId<RouterIdxBuf>,
+    pub routing_weights: BufId<RouterWeightsBuf>,
     // Shared FFN intermediates (colorable transients).
-    pub shared_ffn_gate: BufId,
-    pub shared_up: BufId,
-    pub shared_act: BufId,
-    pub shared_down: BufId,
+    pub shared_ffn_gate: BufId<SharedFfnGateBuf>,
+    pub shared_up: BufId<SharedFfnUpBuf>,
+    pub shared_act: BufId<SharedFfnActBuf>,
+    pub shared_down: BufId<SharedFfnDownBuf>,
     // Bucket-flat scratch. Sized for `BATCHED_CHUNK_SIZE * k_active`
     // assignments.
-    pub bucket_input: BufId,
-    pub bucket_gate: BufId,
-    pub bucket_up: BufId,
-    pub bucket_act: BufId,
-    pub bucket_out: BufId,
-    pub bucket_token_idx: BufId,
-    pub bucket_weights: BufId,
+    pub bucket_input: BufId<BucketInputBuf>,
+    pub bucket_gate: BufId<BucketGateBuf>,
+    pub bucket_up: BufId<BucketUpBuf>,
+    pub bucket_act: BufId<BucketActBuf>,
+    pub bucket_out: BufId<BucketOutBuf>,
+    pub bucket_token_idx: BufId<BucketTokenIdxBuf>,
+    pub bucket_weights: BufId<BucketWeightsBuf>,
     /// MoE permute-fuse scatter accumulator. `Op::ZeroBuffer` clears
     /// it each layer before `Op::MoeBatchedPermuteFuse` accumulates.
-    pub out_sum: BufId,
+    pub out_sum: BufId<MoeOutSumBuf>,
     /// Per-assignment-row expert slot table (`u32`), `chunk *
     /// k_active` wide — the gather kernel's `indices`. Filled per
     /// layer from `buckets`.
-    pub expert_indices: BufId,
+    pub expert_indices: BufId<ExpertIndicesBuf>,
     /// **`Op::MoeGatherIdFuse` scratch** — per-expert assignment
     /// count `[n_experts]` u32. Always allocated; only touched by
     /// the new-kernel path. Tiny (~1 KB at n_experts=256).
-    pub htpe: BufId,
+    pub htpe: BufId<HtpeBuf>,
     /// **`Op::MoeGatherIdFuse` scratch** — per-expert assignment
     /// list `[n_experts, chunk]` i32 (encoded `token*k + slot`).
     /// Always allocated; only touched by the new-kernel path.
     /// `~8 MB` at n_experts=256, chunk=8192. The `bucket_gate` /
     /// `bucket_up` / `bucket_out` slots above are byte-equivalent
     /// to the new path's `gate_mid` / `up_mid` / `down_mid` and
-    /// are reused in-place by `Op::MoeGatherIdFuse` (no second
-    /// allocation; layout interpretation only).
-    pub hids: BufId,
+    /// are reused in-place by `Op::MoeGatherIdFuse` via the
+    /// unidirectional `From<BucketGateBuf> for BufId<GateMidBuf>`
+    /// (etc.) impls in `buftype.rs` — no second allocation; the
+    /// `.into()` at the push site documents the path swap.
+    pub hids: BufId<HidsBuf>,
     /// One-time latch: cleared at construction, set by the first MoE
     /// block call after it `commit_plan`s `graph2`. `graph2`'s
     /// topology is identical regardless of which attention kind
@@ -409,72 +455,88 @@ impl MoeGraphScratch {
         let hidden = v.hidden_dim;
         let shared_inter = v.shared_intermediate;
         let moe_inter = v.moe_intermediate;
-        // Colorable transients first (`persistent = false`), then
-        // pinned buffers (`persistent = true`) — two passes so the two
-        // `&mut pool` closures never overlap.
-        let (
-            shared_ffn_gate,
-            shared_up,
-            shared_act,
-            shared_down,
-            bucket_gate,
-            bucket_up,
-            bucket_act,
-            bucket_out,
-            out_sum,
-        ) = {
-            let mut c = |elems: usize, label: &'static str| {
-                pool.alloc(chunk * elems * f32_sz, label, false)
-                    .expect("MoeGraphScratch::new pool alloc")
-            };
-            (
-                c(shared_inter, "mgs.shared_ffn_gate"),
-                c(shared_inter, "mgs.shared_up"),
-                c(shared_inter, "mgs.shared_act"),
-                c(hidden, "mgs.shared_down"),
-                c(k_active * moe_inter, "mgs.bucket_gate"),
-                c(k_active * moe_inter, "mgs.bucket_up"),
-                c(k_active * moe_inter, "mgs.bucket_act"),
-                c(k_active * hidden, "mgs.bucket_out"),
-                c(hidden, "mgs.out_sum"),
-            )
-        };
-        let mut p = |bytes: usize, label: &'static str| {
-            pool.alloc(bytes, label, true)
-                .expect("MoeGraphScratch::new pool alloc")
-        };
         let chk = |elems: usize| chunk * elems * f32_sz;
         // Bucket-flat buffers hold `chunk * k_active` assignments.
         let bkt = |per: usize| chunk * k_active * per * f32_sz;
         let max_k = crate::riir::moe::expert_forward::MAX_K;
-        let h_mid = p(chk(hidden), "mgs.h_mid");
-        let h_post = p(chk(hidden), "mgs.h_post");
-        let shared_gate = p(chk(1), "mgs.shared_gate");
-        let routing_indices = p(chk(max_k), "mgs.routing_indices");
-        let routing_weights = p(chk(max_k), "mgs.routing_weights");
-        let bucket_input = p(bkt(hidden), "mgs.bucket_input");
-        let bucket_token_idx =
-            p(chunk * k_active * f32_sz, "mgs.bucket_token_idx");
-        let bucket_weights =
-            p(chunk * k_active * f32_sz, "mgs.bucket_weights");
-        let expert_indices = p(
-            chunk * k_active * std::mem::size_of::<u32>(),
-            "mgs.expert_indices",
-        );
+        // Colorable transients first (`persistent = false`).
+        let shared_ffn_gate: BufId<SharedFfnGateBuf> = pool
+            .alloc(chk(shared_inter), "mgs.shared_ffn_gate", false)
+            .expect("MoeGraphScratch::new pool alloc");
+        let shared_up: BufId<SharedFfnUpBuf> = pool
+            .alloc(chk(shared_inter), "mgs.shared_up", false)
+            .expect("MoeGraphScratch::new pool alloc");
+        let shared_act: BufId<SharedFfnActBuf> = pool
+            .alloc(chk(shared_inter), "mgs.shared_act", false)
+            .expect("MoeGraphScratch::new pool alloc");
+        let shared_down: BufId<SharedFfnDownBuf> = pool
+            .alloc(chk(hidden), "mgs.shared_down", false)
+            .expect("MoeGraphScratch::new pool alloc");
+        let bucket_gate: BufId<BucketGateBuf> = pool
+            .alloc(chk(k_active * moe_inter), "mgs.bucket_gate", false)
+            .expect("MoeGraphScratch::new pool alloc");
+        let bucket_up: BufId<BucketUpBuf> = pool
+            .alloc(chk(k_active * moe_inter), "mgs.bucket_up", false)
+            .expect("MoeGraphScratch::new pool alloc");
+        let bucket_act: BufId<BucketActBuf> = pool
+            .alloc(chk(k_active * moe_inter), "mgs.bucket_act", false)
+            .expect("MoeGraphScratch::new pool alloc");
+        let bucket_out: BufId<BucketOutBuf> = pool
+            .alloc(chk(k_active * hidden), "mgs.bucket_out", false)
+            .expect("MoeGraphScratch::new pool alloc");
+        let out_sum: BufId<MoeOutSumBuf> = pool
+            .alloc(chk(hidden), "mgs.out_sum", false)
+            .expect("MoeGraphScratch::new pool alloc");
+
+        // Pinned buffers (`persistent = true`) — graph1→MoE boundary
+        // and host-uploaded inputs.
+        let h_mid: BufId<ResidualBuf> = pool
+            .alloc(chk(hidden), "mgs.h_mid", true)
+            .expect("MoeGraphScratch::new pool alloc");
+        let h_post: BufId<MoeInputBuf> = pool
+            .alloc(chk(hidden), "mgs.h_post", true)
+            .expect("MoeGraphScratch::new pool alloc");
+        let shared_gate: BufId<SharedGateBuf> = pool
+            .alloc(chk(1), "mgs.shared_gate", true)
+            .expect("MoeGraphScratch::new pool alloc");
+        let routing_indices: BufId<RouterIdxBuf> = pool
+            .alloc(chk(max_k), "mgs.routing_indices", true)
+            .expect("MoeGraphScratch::new pool alloc");
+        let routing_weights: BufId<RouterWeightsBuf> = pool
+            .alloc(chk(max_k), "mgs.routing_weights", true)
+            .expect("MoeGraphScratch::new pool alloc");
+        let bucket_input: BufId<BucketInputBuf> = pool
+            .alloc(bkt(hidden), "mgs.bucket_input", true)
+            .expect("MoeGraphScratch::new pool alloc");
+        let bucket_token_idx: BufId<BucketTokenIdxBuf> = pool
+            .alloc(chunk * k_active * f32_sz, "mgs.bucket_token_idx", true)
+            .expect("MoeGraphScratch::new pool alloc");
+        let bucket_weights: BufId<BucketWeightsBuf> = pool
+            .alloc(chunk * k_active * f32_sz, "mgs.bucket_weights", true)
+            .expect("MoeGraphScratch::new pool alloc");
+        let expert_indices: BufId<ExpertIndicesBuf> = pool
+            .alloc(
+                chunk * k_active * std::mem::size_of::<u32>(),
+                "mgs.expert_indices",
+                true,
+            )
+            .expect("MoeGraphScratch::new pool alloc");
         // `Op::MoeGatherIdFuse` scratch — sized for the max chunk
         // width. Persistent because the new kernel's map0 + matmul
         // dispatches assume these buffers don't get colored under
         // them by `commit_plan`. `htpe` is small (~1 KB); `hids`
         // is `n_experts * chunk * 4` bytes.
         let n_experts = v.num_experts.max(1);
-        let htpe = p(
-            n_experts * std::mem::size_of::<u32>(),
-            "mgs.htpe",
-        );
-        let hids = p(
-            n_experts * chunk * std::mem::size_of::<i32>(),
-            "mgs.hids",
-        );
+        let htpe: BufId<HtpeBuf> = pool
+            .alloc(n_experts * std::mem::size_of::<u32>(), "mgs.htpe", true)
+            .expect("MoeGraphScratch::new pool alloc");
+        let hids: BufId<HidsBuf> = pool
+            .alloc(
+                n_experts * chunk * std::mem::size_of::<i32>(),
+                "mgs.hids",
+                true,
+            )
+            .expect("MoeGraphScratch::new pool alloc");
         Self {
             h_mid,
             h_post,
@@ -509,117 +571,189 @@ impl LayerForwardBuffers {
     pub fn new(pool: &mut MetalBufferPool) -> Self {
         let v = VARIANT;
         let f32_bytes = |n: usize| n * std::mem::size_of::<f32>();
-        let alloc =
-            |pool: &mut MetalBufferPool, n: usize, label: &'static str| {
-                pool.alloc(f32_bytes(n), label, true)
-                    .expect("LayerForwardBuffers::new pool alloc")
-            };
         let q_dim_full = v.num_attn_heads * v.head_dim;
         let q_proj_dim_full = q_dim_full * 2;
         let kv_dim_full = v.num_kv_heads * v.head_dim;
-        // batch_out[6] is the o_proj input. Both paths land their
-        // attention output here. Linear: linear_total_value; full:
-        // q_dim_full. Pick max so either fits.
+        // The former `batch_out[6]` "o_proj input" slot has to fit
+        // either the linear-attn (`linear_total_value`) or full-attn
+        // (`q_dim_full`) attention output. Pick max so either fits.
         let oproj_in_max = v.linear_total_value().max(q_dim_full);
-        let batch_sizes = [
-            v.linear_conv_dim(),
-            v.linear_total_value(),
-            v.linear_num_v_heads,
-            v.linear_num_v_heads,
-            v.num_experts,
-            1,
-            oproj_in_max,
-        ];
-        let batch_labels: [&'static str; 7] = [
-            "lfb.batch_out[0:qkv]",
-            "lfb.batch_out[1:z]",
-            "lfb.batch_out[2:beta]",
-            "lfb.batch_out[3:alpha]",
-            "lfb.batch_out[4:router_gate]",
-            "lfb.batch_out[5:shared_gate]",
-            "lfb.batch_out[6:oproj_in]",
-        ];
-        let batch_out: [BufId; 7] =
-            std::array::from_fn(|i| alloc(pool, batch_sizes[i], batch_labels[i]));
 
         let num_linear = v.num_layers - num_full_attn_layers(&v);
-        let conv_state = (0..num_linear)
+        let conv_state: Vec<BufId<ConvStateBuf>> = (0..num_linear)
             .map(|_| {
-                alloc(
-                    pool,
-                    (Variant::CONV_KERNEL_SIZE - 1) * v.linear_conv_dim(),
+                pool.alloc(
+                    f32_bytes(
+                        (Variant::CONV_KERNEL_SIZE - 1) * v.linear_conv_dim(),
+                    ),
                     "lfb.conv_state",
+                    true,
                 )
+                .expect("LayerForwardBuffers::new pool alloc")
             })
             .collect();
-        let delta_state = (0..num_linear)
+        let delta_state: Vec<BufId<DeltaStateBuf>> = (0..num_linear)
             .map(|_| {
-                alloc(
-                    pool,
-                    v.linear_num_v_heads
-                        * Variant::LINEAR_VALUE_DIM
-                        * Variant::LINEAR_KEY_DIM,
+                pool.alloc(
+                    f32_bytes(
+                        v.linear_num_v_heads
+                            * Variant::LINEAR_VALUE_DIM
+                            * Variant::LINEAR_KEY_DIM,
+                    ),
                     "lfb.delta_state",
+                    true,
                 )
+                .expect("LayerForwardBuffers::new pool alloc")
             })
             .collect();
 
         let num_full_attn = num_full_attn_layers(&v);
         let gpu_kv_floats = crate::riir::variants::GPU_KV_SEQ * kv_dim_full;
-        let gpu_kv_k = (0..num_full_attn)
-            .map(|_| alloc(pool, gpu_kv_floats, "lfb.gpu_kv_k"))
+        let gpu_kv_k: Vec<BufId<KvCacheKBuf>> = (0..num_full_attn)
+            .map(|_| {
+                pool.alloc(f32_bytes(gpu_kv_floats), "lfb.gpu_kv_k", true)
+                    .expect("LayerForwardBuffers::new pool alloc")
+            })
             .collect();
-        let gpu_kv_v = (0..num_full_attn)
-            .map(|_| alloc(pool, gpu_kv_floats, "lfb.gpu_kv_v"))
+        let gpu_kv_v: Vec<BufId<KvCacheVBuf>> = (0..num_full_attn)
+            .map(|_| {
+                pool.alloc(f32_bytes(gpu_kv_floats), "lfb.gpu_kv_v", true)
+                    .expect("LayerForwardBuffers::new pool alloc")
+            })
             .collect();
 
         Self {
-            input: alloc(pool, v.hidden_dim, "lfb.input"),
-            normed: alloc(pool, v.hidden_dim, "lfb.normed"),
-            residual: alloc(pool, v.hidden_dim, "lfb.residual"),
-            h_mid: alloc(pool, v.hidden_dim, "lfb.h_mid"),
-            output: alloc(pool, v.hidden_dim, "lfb.output"),
-            batch_out,
+            input: pool
+                .alloc(f32_bytes(v.hidden_dim), "lfb.input", true)
+                .expect("LayerForwardBuffers::new pool alloc"),
+            normed: pool
+                .alloc(f32_bytes(v.hidden_dim), "lfb.normed", true)
+                .expect("LayerForwardBuffers::new pool alloc"),
+            residual: pool
+                .alloc(f32_bytes(v.hidden_dim), "lfb.residual", true)
+                .expect("LayerForwardBuffers::new pool alloc"),
+            h_mid: pool
+                .alloc(f32_bytes(v.hidden_dim), "lfb.h_mid", true)
+                .expect("LayerForwardBuffers::new pool alloc"),
+            output: pool
+                .alloc(f32_bytes(v.hidden_dim), "lfb.output", true)
+                .expect("LayerForwardBuffers::new pool alloc"),
+            // Former batch_out[0..7] expanded to named fields.
+            q_stack: pool
+                .alloc(
+                    f32_bytes(v.linear_conv_dim()),
+                    "lfb.batch_out[0:qkv]",
+                    true,
+                )
+                .expect("LayerForwardBuffers::new pool alloc"),
+            z_stack: pool
+                .alloc(
+                    f32_bytes(v.linear_total_value()),
+                    "lfb.batch_out[1:z]",
+                    true,
+                )
+                .expect("LayerForwardBuffers::new pool alloc"),
+            beta_stack: pool
+                .alloc(
+                    f32_bytes(v.linear_num_v_heads),
+                    "lfb.batch_out[2:beta]",
+                    true,
+                )
+                .expect("LayerForwardBuffers::new pool alloc"),
+            alpha_stack: pool
+                .alloc(
+                    f32_bytes(v.linear_num_v_heads),
+                    "lfb.batch_out[3:alpha]",
+                    true,
+                )
+                .expect("LayerForwardBuffers::new pool alloc"),
+            gate_logits: pool
+                .alloc(
+                    f32_bytes(v.num_experts),
+                    "lfb.batch_out[4:router_gate]",
+                    true,
+                )
+                .expect("LayerForwardBuffers::new pool alloc"),
+            shared_gate: pool
+                .alloc(f32_bytes(1), "lfb.batch_out[5:shared_gate]", true)
+                .expect("LayerForwardBuffers::new pool alloc"),
+            o_proj_stack: pool
+                .alloc(
+                    f32_bytes(oproj_in_max),
+                    "lfb.batch_out[6:oproj_in]",
+                    true,
+                )
+                .expect("LayerForwardBuffers::new pool alloc"),
             conv_state,
             delta_state,
-            conv_output: alloc(pool, v.linear_conv_dim(), "lfb.conv_output"),
-            delta_g_decay: alloc(
-                pool,
-                v.linear_num_v_heads,
-                "lfb.delta_g_decay",
-            ),
-            delta_beta: alloc(pool, v.linear_num_v_heads, "lfb.delta_beta"),
-            delta_output: alloc(
-                pool,
-                v.linear_total_value(),
-                "lfb.delta_output",
-            ),
-            sum_sq: alloc(pool, 1, "lfb.sum_sq"),
-            shared_gate_out: alloc(
-                pool,
-                v.shared_intermediate,
-                "lfb.shared_gate_out",
-            ),
-            shared_up_out: alloc(
-                pool,
-                v.shared_intermediate,
-                "lfb.shared_up_out",
-            ),
-            shared_act: alloc(pool, v.shared_intermediate, "lfb.shared_act"),
-            shared_out: alloc(pool, v.hidden_dim, "lfb.shared_out"),
-            q_proj_out: alloc(pool, q_proj_dim_full, "lfb.q_proj_out"),
-            k_out: alloc(pool, kv_dim_full, "lfb.k_out"),
-            v_out: alloc(pool, kv_dim_full, "lfb.v_out"),
+            conv_output: pool
+                .alloc(f32_bytes(v.linear_conv_dim()), "lfb.conv_output", true)
+                .expect("LayerForwardBuffers::new pool alloc"),
+            delta_g_decay: pool
+                .alloc(f32_bytes(v.linear_num_v_heads), "lfb.delta_g_decay", true)
+                .expect("LayerForwardBuffers::new pool alloc"),
+            delta_beta: pool
+                .alloc(f32_bytes(v.linear_num_v_heads), "lfb.delta_beta", true)
+                .expect("LayerForwardBuffers::new pool alloc"),
+            delta_output: pool
+                .alloc(
+                    f32_bytes(v.linear_total_value()),
+                    "lfb.delta_output",
+                    true,
+                )
+                .expect("LayerForwardBuffers::new pool alloc"),
+            sum_sq: pool
+                .alloc(f32_bytes(1), "lfb.sum_sq", true)
+                .expect("LayerForwardBuffers::new pool alloc"),
+            shared_gate_out: pool
+                .alloc(
+                    f32_bytes(v.shared_intermediate),
+                    "lfb.shared_gate_out",
+                    true,
+                )
+                .expect("LayerForwardBuffers::new pool alloc"),
+            shared_up_out: pool
+                .alloc(
+                    f32_bytes(v.shared_intermediate),
+                    "lfb.shared_up_out",
+                    true,
+                )
+                .expect("LayerForwardBuffers::new pool alloc"),
+            shared_act: pool
+                .alloc(f32_bytes(v.shared_intermediate), "lfb.shared_act", true)
+                .expect("LayerForwardBuffers::new pool alloc"),
+            shared_out: pool
+                .alloc(f32_bytes(v.hidden_dim), "lfb.shared_out", true)
+                .expect("LayerForwardBuffers::new pool alloc"),
+            q_proj_out: pool
+                .alloc(f32_bytes(q_proj_dim_full), "lfb.q_proj_out", true)
+                .expect("LayerForwardBuffers::new pool alloc"),
+            k_out: pool
+                .alloc(f32_bytes(kv_dim_full), "lfb.k_out", true)
+                .expect("LayerForwardBuffers::new pool alloc"),
+            v_out: pool
+                .alloc(f32_bytes(kv_dim_full), "lfb.v_out", true)
+                .expect("LayerForwardBuffers::new pool alloc"),
             gpu_kv_k,
             gpu_kv_v,
-            gpu_attn_q: alloc(pool, q_dim_full, "lfb.gpu_attn_q"),
-            gpu_attn_scores: alloc(
-                pool,
-                v.num_attn_heads * crate::riir::variants::GPU_KV_SEQ,
-                "lfb.gpu_attn_scores",
-            ),
-            gpu_attn_out: alloc(pool, q_dim_full, "lfb.gpu_attn_out"),
-            gpu_attn_gate: alloc(pool, q_dim_full, "lfb.gpu_attn_gate"),
+            gpu_attn_q: pool
+                .alloc(f32_bytes(q_dim_full), "lfb.gpu_attn_q", true)
+                .expect("LayerForwardBuffers::new pool alloc"),
+            gpu_attn_scores: pool
+                .alloc(
+                    f32_bytes(
+                        v.num_attn_heads * crate::riir::variants::GPU_KV_SEQ,
+                    ),
+                    "lfb.gpu_attn_scores",
+                    true,
+                )
+                .expect("LayerForwardBuffers::new pool alloc"),
+            gpu_attn_out: pool
+                .alloc(f32_bytes(q_dim_full), "lfb.gpu_attn_out", true)
+                .expect("LayerForwardBuffers::new pool alloc"),
+            gpu_attn_gate: pool
+                .alloc(f32_bytes(q_dim_full), "lfb.gpu_attn_gate", true)
+                .expect("LayerForwardBuffers::new pool alloc"),
         }
     }
 
@@ -744,7 +878,7 @@ pub(in crate::riir) struct OProj {
     pub b_off: u64,
     pub bits: u32,
     /// Number of input floats the matvec reads from
-    /// `buffers.batch_out[6]` (CPU SDPA path) or
+    /// `buffers.o_proj_stack` (CPU SDPA path) or
     /// `buffers.gpu_attn_out` (GPU SDPA path). Linear:
     /// `linear_total_value`. Full: `num_attn_heads * head_dim`.
     pub in_dim: u32,
@@ -762,7 +896,7 @@ pub(in crate::riir) struct OProj {
 /// mirrors are pre-populated by the per-token KV-append memcpy.
 ///
 /// When `None`, the tail follows the existing CPU-attn path: o_proj
-/// reads from `buffers.batch_out[6]` (caller-staged via
+/// reads from `buffers.o_proj_stack` (caller-staged via
 /// `sdpa_cpu` + memcpy).
 pub(in crate::riir) struct GpuAttnEncodeArgs {
     /// Index into `LayerForwardBuffers::gpu_kv_k` / `gpu_kv_v`. From
@@ -944,7 +1078,7 @@ pub fn linear_attn_layer_forward(
                 s_off: qkv_s,
                 b_off: qkv_b,
                 input: buffer_pool.handle(buffers.normed),
-                output: buffer_pool.handle(buffers.batch_out[0]),
+                output: buffer_pool.handle(buffers.q_stack),
                 out_dim: v.linear_conv_dim() as u32,
                 in_dim: v.hidden_dim as u32,
                 bits: qkv_bits,
@@ -954,7 +1088,7 @@ pub fn linear_attn_layer_forward(
                 s_off: z_s,
                 b_off: z_b,
                 input: buffer_pool.handle(buffers.normed),
-                output: buffer_pool.handle(buffers.batch_out[1]),
+                output: buffer_pool.handle(buffers.z_stack),
                 out_dim: v.linear_total_value() as u32,
                 in_dim: v.hidden_dim as u32,
                 bits: z_bits,
@@ -964,7 +1098,7 @@ pub fn linear_attn_layer_forward(
                 s_off: beta_s,
                 b_off: beta_b,
                 input: buffer_pool.handle(buffers.normed),
-                output: buffer_pool.handle(buffers.batch_out[2]),
+                output: buffer_pool.handle(buffers.beta_stack),
                 out_dim: v.linear_num_v_heads as u32,
                 in_dim: v.hidden_dim as u32,
                 bits: beta_bits,
@@ -974,7 +1108,7 @@ pub fn linear_attn_layer_forward(
                 s_off: alpha_s,
                 b_off: alpha_b,
                 input: buffer_pool.handle(buffers.normed),
-                output: buffer_pool.handle(buffers.batch_out[3]),
+                output: buffer_pool.handle(buffers.alpha_stack),
                 out_dim: v.linear_num_v_heads as u32,
                 in_dim: v.hidden_dim as u32,
                 bits: alpha_bits,
@@ -989,7 +1123,7 @@ pub fn linear_attn_layer_forward(
             &lp.conv1d_step,
             &lp.conv1d_state_update,
             buffer_pool.handle(buffers.conv_state[linear_layer_idx]),
-            buffer_pool.handle(buffers.batch_out[0]),
+            buffer_pool.handle(buffers.q_stack),
             0,
             wf_buf.buffer(),
             conv1d_w,
@@ -1008,9 +1142,9 @@ pub fn linear_attn_layer_forward(
         encode_compute_decay_beta(
             cmdbuf,
             &lp.compute_decay_beta,
-            buffer_pool.handle(buffers.batch_out[3]), // alpha
+            buffer_pool.handle(buffers.alpha_stack), // alpha
             0,
-            buffer_pool.handle(buffers.batch_out[2]), // beta
+            buffer_pool.handle(buffers.beta_stack), // beta
             0,
             wf_buf.buffer(),
             a_log,
@@ -1039,11 +1173,11 @@ pub fn linear_attn_layer_forward(
             cmdbuf,
             &lp.gated_rms_norm,
             buffer_pool.handle(buffers.delta_output),
-            buffer_pool.handle(buffers.batch_out[1]), // z
+            buffer_pool.handle(buffers.z_stack), // z
             0,
             wf_buf.buffer(),
             gnorm_w,
-            buffer_pool.handle(buffers.batch_out[6]),
+            buffer_pool.handle(buffers.o_proj_stack),
             0,
             v.linear_num_v_heads as u32,
             Variant::LINEAR_VALUE_DIM as u32,
@@ -1105,7 +1239,7 @@ pub(in crate::riir) struct PostAttnIntermediates {
 /// work up to and including the CPU MoE router) and
 /// [`moe_dispatch_per_token`] (K-expert dispatch + combine + optional
 /// chained rms_norm into the next layer's input). Reads the
-/// attention output from `buffers.batch_out[6]` (caller-staged) and
+/// attention output from `buffers.o_proj_stack` (caller-staged) and
 /// runs the rest of `fused_layer_forward`:
 ///
 /// 1. CMD2: o_proj matvec → residual_add → post-attn rms_norm.
@@ -1384,7 +1518,7 @@ pub(in crate::riir) fn post_attention_pre_moe(
         let oproj_input = if gpu_attn_args.is_some() {
             buffer_pool.handle(buffers.gpu_attn_out)
         } else {
-            buffer_pool.handle(buffers.batch_out[6])
+            buffer_pool.handle(buffers.o_proj_stack)
         };
         encode_matvec(
             cmdbuf,
@@ -1432,7 +1566,7 @@ pub(in crate::riir) fn post_attention_pre_moe(
                 s_off: gate_s,
                 b_off: gate_b,
                 input: buffer_pool.handle(buffers.normed),
-                output: buffer_pool.handle(buffers.batch_out[4]),
+                output: buffer_pool.handle(buffers.gate_logits),
                 out_dim: v.num_experts as u32,
                 in_dim: v.hidden_dim as u32,
                 bits: gate_bits,
@@ -1447,7 +1581,7 @@ pub(in crate::riir) fn post_attention_pre_moe(
                 s_off: seg_s,
                 b_off: seg_b,
                 input: buffer_pool.handle(buffers.normed),
-                output: buffer_pool.handle(buffers.batch_out[5]),
+                output: buffer_pool.handle(buffers.shared_gate),
                 out_dim: 1,
                 in_dim: v.hidden_dim as u32,
                 bits: seg_bits,
@@ -1516,7 +1650,7 @@ pub(in crate::riir) fn post_attention_pre_moe(
 
     // ── CPU: MoE router on the gate logits ───────────────────────
     let mut scores =
-        read_buffer_to_vec(buffer_pool.handle(buffers.batch_out[4]), v.num_experts);
+        read_buffer_to_vec(buffer_pool.handle(buffers.gate_logits), v.num_experts);
     let mut routing_indices = vec![0i32; k_active];
     let mut routing_weights = vec![0f32; k_active];
     moe_router_cpu(
@@ -1528,7 +1662,7 @@ pub(in crate::riir) fn post_attention_pre_moe(
 
     // Read shared-gate score scalar (pre-sigmoid).
     let shared_gate_score = {
-        let s = read_buffer_to_vec(buffer_pool.handle(buffers.batch_out[5]), 1);
+        let s = read_buffer_to_vec(buffer_pool.handle(buffers.shared_gate), 1);
         s[0]
     };
 
@@ -1643,7 +1777,7 @@ pub(in crate::riir) fn post_attention_post_o_proj_to_intermediates(
             s_off: gate_s,
             b_off: gate_b,
             input: buffer_pool.handle(buffers.normed),
-            output: buffer_pool.handle(buffers.batch_out[4]),
+            output: buffer_pool.handle(buffers.gate_logits),
             out_dim: v.num_experts as u32,
             in_dim: v.hidden_dim as u32,
             bits: gate_bits,
@@ -1658,7 +1792,7 @@ pub(in crate::riir) fn post_attention_post_o_proj_to_intermediates(
             s_off: seg_s,
             b_off: seg_b,
             input: buffer_pool.handle(buffers.normed),
-            output: buffer_pool.handle(buffers.batch_out[5]),
+            output: buffer_pool.handle(buffers.shared_gate),
             out_dim: 1,
             in_dim: v.hidden_dim as u32,
             bits: seg_bits,
@@ -1720,7 +1854,7 @@ pub(in crate::riir) fn post_attention_post_o_proj_to_intermediates(
     metal.commit_and_wait_labeled(cmdbuf, "post_attn_post_oproj.cmd");
 
     let mut scores =
-        read_buffer_to_vec(buffer_pool.handle(buffers.batch_out[4]), v.num_experts);
+        read_buffer_to_vec(buffer_pool.handle(buffers.gate_logits), v.num_experts);
     let mut routing_indices = vec![0i32; k_active];
     let mut routing_weights = vec![0f32; k_active];
     moe_router_cpu(
@@ -1730,7 +1864,7 @@ pub(in crate::riir) fn post_attention_post_o_proj_to_intermediates(
         &mut routing_weights,
     )?;
     let shared_gate_score = {
-        let s = read_buffer_to_vec(buffer_pool.handle(buffers.batch_out[5]), 1);
+        let s = read_buffer_to_vec(buffer_pool.handle(buffers.shared_gate), 1);
         s[0]
     };
     Ok(PostAttnIntermediates {
@@ -2133,8 +2267,8 @@ pub(in crate::riir) fn batched_linear_attn_layer_forward<B>(
     // orchestrator owns the alternating double-buffer pair and passes
     // ids per layer; this producer resolves to `&metal::Buffer` via
     // `buffer_pool.handle(...)` at the top of the body.
-    hidden_in_id: crate::riir::backend::BufId,
-    hidden_out_id: crate::riir::backend::BufId,
+    hidden_in_id: BufId<HiddenBuf>,
+    hidden_out_id: BufId<HiddenBuf>,
     // S10b-2: run-lifetime scratch BufIds for the batched graph,
     // allocated once at max chunk width. Replaces the per-layer
     // `pool.alloc` of the pre-MoE transients. `scratch` holds the
@@ -2282,9 +2416,10 @@ where
         // Phase 1a — input rms_norm.
         g.push(Op::RmsNormBf16NTokens {
             label: "linear_attn.input_norm",
-            x: hidden_in_id,
+            // HiddenBuf → RmsNormIn via the union impl.
+            x: hidden_in_id.into(),
             weight_off: layer_cache.input_layernorm_w,
-            out: normed_id,
+            out: normed_id.into(),
             dim: hidden_dim as u32,
             n_tokens: n_tokens as u32,
             eps: RMS_NORM_EPS,
@@ -2294,9 +2429,9 @@ where
         g.push(Op::MatvecNTokens {
             label: "linear_attn.qkv_proj",
             weight: WeightRef { w_off: qkv_w, s_off: qkv_s, b_off: qkv_b, bits: qkv_bits },
-            input: normed_id,
+            input: normed_id.into(),
             input_off: 0,
-            output: qkv_stack_id,
+            output: qkv_stack_id.into(),
             output_off: 0,
             in_dim: hidden_dim as u32,
             out_dim: conv_dim as u32,
@@ -2305,9 +2440,9 @@ where
         g.push(Op::MatvecNTokens {
             label: "linear_attn.z_proj",
             weight: WeightRef { w_off: z_w, s_off: z_s, b_off: z_b, bits: z_bits },
-            input: normed_id,
+            input: normed_id.into(),
             input_off: 0,
-            output: z_stack_id,
+            output: z_stack_id.into(),
             output_off: 0,
             in_dim: hidden_dim as u32,
             out_dim: total_value as u32,
@@ -2316,9 +2451,9 @@ where
         g.push(Op::MatvecNTokens {
             label: "linear_attn.beta_proj",
             weight: WeightRef { w_off: beta_w, s_off: beta_s, b_off: beta_b, bits: beta_bits },
-            input: normed_id,
+            input: normed_id.into(),
             input_off: 0,
-            output: beta_stack_id,
+            output: beta_stack_id.into(),
             output_off: 0,
             in_dim: hidden_dim as u32,
             out_dim: num_v_heads as u32,
@@ -2327,9 +2462,9 @@ where
         g.push(Op::MatvecNTokens {
             label: "linear_attn.alpha_proj",
             weight: WeightRef { w_off: alpha_w, s_off: alpha_s, b_off: alpha_b, bits: alpha_bits },
-            input: normed_id,
+            input: normed_id.into(),
             input_off: 0,
-            output: alpha_stack_id,
+            output: alpha_stack_id.into(),
             output_off: 0,
             in_dim: hidden_dim as u32,
             out_dim: num_v_heads as u32,
@@ -2397,9 +2532,9 @@ where
         g.push(Op::MatvecNTokens {
             label: "linear_attn.o_proj",
             weight: WeightRef { w_off: o_w, s_off: o_s, b_off: o_b, bits: o_bits },
-            input: value_out_stack_id,
+            input: value_out_stack_id.into(),
             input_off: 0,
-            output: o_proj_stack_id,
+            output: o_proj_stack_id.into(),
             output_off: 0,
             in_dim: total_value as u32,
             out_dim: hidden_dim as u32,
@@ -2411,16 +2546,18 @@ where
         g.push(Op::ResidualAddNTokens {
             label: "linear_attn.residual_add",
             a: o_proj_stack_id,
-            b: hidden_in_id,
+            // HiddenBuf → RmsNormIn via the union impl.
+            b: hidden_in_id.into(),
             out: h_mid_id,
             n_tokens: n_tokens as u32,
             dim: hidden_dim as u32,
         });
         g.push(Op::RmsNormBf16NTokens {
             label: "linear_attn.post_attn_norm",
-            x: h_mid_id,
+            // ResidualBuf → RmsNormIn; MoeInputBuf → RmsNormOut.
+            x: h_mid_id.into(),
             weight_off: layer_cache.post_attention_layernorm_w,
-            out: h_post_id,
+            out: h_post_id.into(),
             dim: hidden_dim as u32,
             n_tokens: n_tokens as u32,
             eps: RMS_NORM_EPS,
@@ -2433,9 +2570,9 @@ where
                 b_off: layer_cache.gate.b,
                 bits: gate_bits,
             },
-            input: h_post_id,
+            input: h_post_id.into(),
             input_off: 0,
-            output: gate_logits_id,
+            output: gate_logits_id.into(),
             output_off: 0,
             in_dim: hidden_dim as u32,
             out_dim: v.num_experts as u32,
@@ -2449,9 +2586,9 @@ where
                 b_off: layer_cache.shared.seg_b,
                 bits: seg_bits,
             },
-            input: h_post_id,
+            input: h_post_id.into(),
             input_off: 0,
-            output: shared_gate_id,
+            output: shared_gate_id.into(),
             output_off: 0,
             in_dim: hidden_dim as u32,
             out_dim: 1,
@@ -2529,7 +2666,7 @@ pub(in crate::riir) fn moe_block_forward<B>(
     expert_files: &ExpertFiles,
     moe_buffers: &mut crate::riir::moe::expert_forward::MoeBuffers,
     mut prefetch: Option<PrefetchEnv<'_>>,
-    hidden_out_id: crate::riir::backend::BufId,
+    hidden_out_id: BufId<HiddenBuf>,
 ) -> Result<(), LayerForwardError>
 where
     B: Backend,
@@ -2647,7 +2784,7 @@ where
     // once task-7 confirms decode prefetch isn't load-bearing.
     let _ = prefetch;
     let _ = moe_buffers;
-    let expert_base_id: crate::riir::backend::BufId = expert_files
+    let expert_base_id: BufId<ExpertBaseBuf> = expert_files
         .mmap_id_for_expert(layer_idx, 0)
         .expect("mmap layer present (expert I/O is always mmap)")
         .0;
@@ -2729,9 +2866,9 @@ where
                 b_off: layer_cache.shared.gate_b,
                 bits: s_gate_bits,
             },
-            input: h_post_id,
+            input: h_post_id.into(),
             input_off: 0,
-            output: moe.shared_ffn_gate,
+            output: moe.shared_ffn_gate.into(),
             output_off: 0,
             in_dim: hidden_dim as u32,
             out_dim: v.shared_intermediate as u32,
@@ -2745,9 +2882,9 @@ where
                 b_off: layer_cache.shared.up_b,
                 bits: s_up_bits,
             },
-            input: h_post_id,
+            input: h_post_id.into(),
             input_off: 0,
-            output: moe.shared_up,
+            output: moe.shared_up.into(),
             output_off: 0,
             in_dim: hidden_dim as u32,
             out_dim: v.shared_intermediate as u32,
@@ -2768,9 +2905,9 @@ where
                 b_off: layer_cache.shared.down_b,
                 bits: s_down_bits,
             },
-            input: moe.shared_act,
+            input: moe.shared_act.into(),
             input_off: 0,
-            output: moe.shared_down,
+            output: moe.shared_down.into(),
             output_off: 0,
             in_dim: v.shared_intermediate as u32,
             out_dim: hidden_dim as u32,
@@ -2785,21 +2922,28 @@ where
             // New path: one-dispatch MoE matmul (`gather_mm_id.metal`).
             // Reuses the `bucket_gate` / `bucket_up` / `bucket_out`
             // BufIds as `gate_mid` / `up_mid` / `down_mid` scratch
-            // (byte-equivalent allocations; the two paths are
-            // mutually exclusive per run).
+            // via the unidirectional `From<BucketGateBuf> for
+            // BufId<GateMidBuf>` (etc.) impls in `buftype.rs`. The
+            // `.into()` at the push site is the documentation of
+            // the path swap.
             g.push(Op::MoeGatherIdFuse {
                 label: "moe.gather_id_fuse",
                 expert_base: expert_base_id,
                 expert_stride: v.expert_size_4bit() as u64,
                 indices: moe.routing_indices,
                 weights: moe.routing_weights,
+                // h_post_id is BufId<MoeInputBuf>: the post-norm MoE
+                // input. This is the load-bearing bug-of-record check —
+                // session 19 passed `h_mid` (a BufId<ResidualBuf>) here,
+                // and the type system now rejects that swap at compile
+                // time (no From<ResidualBuf> for BufId<MoeInputBuf>).
                 mlp_in: h_post_id,
                 out_sum: moe.out_sum,
                 htpe: moe.htpe,
                 hids: moe.hids,
-                gate_mid: moe.bucket_gate,
-                up_mid: moe.bucket_up,
-                down_mid: moe.bucket_out,
+                gate_mid: moe.bucket_gate.into(),
+                up_mid: moe.bucket_up.into(),
+                down_mid: moe.bucket_out.into(),
                 n_tokens: n_tokens as u32,
                 n_experts: v.num_experts as u32,
                 k: k_active as u32,

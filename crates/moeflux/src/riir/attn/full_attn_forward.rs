@@ -45,6 +45,10 @@
 use metal::NSUInteger;
 
 use crate::riir::moe::expert_forward::MoeBuffers;
+use crate::riir::backend::buftype::{
+    AttnInputBuf, AttnOutBuf, HiddenBuf, KProjOutBuf, OProjOutBuf, QBuf,
+    QGateBuf, QProjOutBuf, RopeInvFreqBuf, RouterLogitsBuf, VProjOutBuf,
+};
 use crate::riir::backend::{
     Backend, BufId, BufferPool, MetalBufferPool,
 };
@@ -90,18 +94,24 @@ use crate::riir::variants::VARIANT;
 /// Both are orchestrator-owned and passed in per layer.
 pub struct FullAttnGraphScratch {
     // Intra-graph1 transients (colorable).
-    pub normed: BufId,
-    pub q_proj_stack: BufId,
-    pub k_proj_stack: BufId,
-    pub v_proj_stack: BufId,
-    pub q_stack: BufId,
-    pub q_gate_stack: BufId,
-    pub attn_out_stack: BufId,
-    pub o_proj_stack: BufId,
-    pub gate_logits: BufId,
+    /// Pre-attention RMS-norm output — feeds Q/K/V proj matvecs.
+    /// Allocated as the canonical `AttnInputBuf`; the producer's
+    /// `Op::RmsNormBf16NTokens` push converts to the `RmsNormOut`
+    /// union via the existing `From<AttnInputBuf> for BufId<RmsNormOut>`
+    /// impl, and the projection matvecs accept it as input via
+    /// `From<AttnInputBuf> for BufId<MatvecIn>`.
+    pub normed: BufId<AttnInputBuf>,
+    pub q_proj_stack: BufId<QProjOutBuf>,
+    pub k_proj_stack: BufId<KProjOutBuf>,
+    pub v_proj_stack: BufId<VProjOutBuf>,
+    pub q_stack: BufId<QBuf>,
+    pub q_gate_stack: BufId<QGateBuf>,
+    pub attn_out_stack: BufId<AttnOutBuf>,
+    pub o_proj_stack: BufId<OProjOutBuf>,
+    pub gate_logits: BufId<RouterLogitsBuf>,
     /// Precomputed vanilla-RoPE `inv_freq` table — persistent,
     /// read-only, uploaded once at construction.
-    pub inv_freq: BufId,
+    pub inv_freq: BufId<RopeInvFreqBuf>,
     /// One-time `commit_plan` latch for `graph1` — cleared at
     /// construction, set by the first producer call. The MoE `graph2`
     /// has its own latch on `MoeGraphScratch`.
@@ -121,35 +131,37 @@ impl FullAttnGraphScratch {
         let q_dim = v.num_attn_heads * v.head_dim;
         let kv_dim = v.num_kv_heads * v.head_dim;
 
-        // Colorable transients first (`persistent = false`), in their
-        // own `&mut pool` scope so it ends before the persistent pass.
-        let (
-            normed,
-            q_proj_stack,
-            k_proj_stack,
-            v_proj_stack,
-            q_stack,
-            q_gate_stack,
-            attn_out_stack,
-            o_proj_stack,
-            gate_logits,
-        ) = {
-            let mut c = |elems: usize, label: &'static str| {
-                pool.alloc(chunk * elems * f32_sz, label, false)
-                    .expect("FullAttnGraphScratch::new pool alloc")
-            };
-            (
-                c(hidden, "fags.normed"),
-                c(q_dim * 2, "fags.q_proj_stack"),
-                c(kv_dim, "fags.k_proj_stack"),
-                c(kv_dim, "fags.v_proj_stack"),
-                c(q_dim, "fags.q_stack"),
-                c(q_dim, "fags.q_gate_stack"),
-                c(q_dim, "fags.attn_out_stack"),
-                c(hidden, "fags.o_proj_stack"),
-                c(v.num_experts, "fags.gate_logits"),
-            )
-        };
+        // Colorable transients first (`persistent = false`). Each
+        // `pool.alloc::<Tag>` returns a `BufId<Tag>` directly — the
+        // tag at the call site is the only place that names the role.
+        let bytes_of = |elems: usize| chunk * elems * f32_sz;
+        let normed: BufId<AttnInputBuf> = pool
+            .alloc(bytes_of(hidden), "fags.normed", false)
+            .expect("FullAttnGraphScratch::new pool alloc");
+        let q_proj_stack: BufId<QProjOutBuf> = pool
+            .alloc(bytes_of(q_dim * 2), "fags.q_proj_stack", false)
+            .expect("FullAttnGraphScratch::new pool alloc");
+        let k_proj_stack: BufId<KProjOutBuf> = pool
+            .alloc(bytes_of(kv_dim), "fags.k_proj_stack", false)
+            .expect("FullAttnGraphScratch::new pool alloc");
+        let v_proj_stack: BufId<VProjOutBuf> = pool
+            .alloc(bytes_of(kv_dim), "fags.v_proj_stack", false)
+            .expect("FullAttnGraphScratch::new pool alloc");
+        let q_stack: BufId<QBuf> = pool
+            .alloc(bytes_of(q_dim), "fags.q_stack", false)
+            .expect("FullAttnGraphScratch::new pool alloc");
+        let q_gate_stack: BufId<QGateBuf> = pool
+            .alloc(bytes_of(q_dim), "fags.q_gate_stack", false)
+            .expect("FullAttnGraphScratch::new pool alloc");
+        let attn_out_stack: BufId<AttnOutBuf> = pool
+            .alloc(bytes_of(q_dim), "fags.attn_out_stack", false)
+            .expect("FullAttnGraphScratch::new pool alloc");
+        let o_proj_stack: BufId<OProjOutBuf> = pool
+            .alloc(bytes_of(hidden), "fags.o_proj_stack", false)
+            .expect("FullAttnGraphScratch::new pool alloc");
+        let gate_logits: BufId<RouterLogitsBuf> = pool
+            .alloc(bytes_of(v.num_experts), "fags.gate_logits", false)
+            .expect("FullAttnGraphScratch::new pool alloc");
 
         // RoPE frequency table: inv_freq[i] = 1 / theta^(2i/rotary_dim).
         let rotary_dim = v.rotary_dim();
@@ -164,7 +176,7 @@ impl FullAttnGraphScratch {
         // `inv_freq` is the sole persistent buffer — allocated last so
         // the highest BufId index is `persistent = true`, keeping the
         // transients above safe under `reset_transient`.
-        let inv_freq = pool
+        let inv_freq: BufId<RopeInvFreqBuf> = pool
             .alloc(half * f32_sz, "fags.inv_freq", true)
             .expect("FullAttnGraphScratch::new pool alloc");
         pool.upload(inv_freq, unsafe {
@@ -506,7 +518,7 @@ pub(in crate::riir) fn full_attn_pre_moe_layer_forward(
             &mut attn_out,
         )?;
 
-        let dst = buffer_pool.handle(buffers.batch_out[6]).contents() as *mut f32;
+        let dst = buffer_pool.handle(buffers.o_proj_stack).contents() as *mut f32;
         // SAFETY: shared-storage; no GPU work in flight (CMD1
         // committed and waited above).
         unsafe {
@@ -517,10 +529,10 @@ pub(in crate::riir) fn full_attn_pre_moe_layer_forward(
             );
         }
         debug_assert!(
-            buffer_pool.handle(buffers.batch_out[6]).length() as usize
+            buffer_pool.handle(buffers.o_proj_stack).length() as usize
                 >= q_dim * std::mem::size_of::<f32>(),
             "batch_out[6] sized {} bytes, need {} for full-attn o_proj input",
-            buffer_pool.handle(buffers.batch_out[6]).length() as NSUInteger,
+            buffer_pool.handle(buffers.o_proj_stack).length() as NSUInteger,
             q_dim * std::mem::size_of::<f32>(),
         );
         None
@@ -655,8 +667,8 @@ pub(in crate::riir) fn batched_full_attn_layer_forward<B>(
     prefetch: Option<crate::riir::attn::linear_attn_forward::PrefetchEnv<'_>>,
     // S7-2: hidden_in / hidden_out are the orchestrator's run-lifetime
     // double-buffer BufIds, swapped between layers.
-    hidden_in_id: BufId,
-    hidden_out_id: BufId,
+    hidden_in_id: BufId<HiddenBuf>,
+    hidden_out_id: BufId<HiddenBuf>,
     // Run-lifetime scratch, allocated once at max chunk width by
     // `ensure_linear_resources`. `scratch` holds the full-attn
     // `graph1` transients; `moe` is the shared MoE-block scratch
@@ -745,9 +757,9 @@ where
         let mut g = Graph::new();
         g.push(Op::RmsNormBf16NTokens {
             label: "full_attn.input_norm",
-            x: hidden_in_id,
+            x: hidden_in_id.into(),
             weight_off: layer_cache.input_layernorm_w,
-            out: scratch.normed,
+            out: scratch.normed.into(),
             dim: hidden_dim as u32,
             n_tokens: n,
             eps,
@@ -760,9 +772,9 @@ where
                 b_off: attn.q_proj_b,
                 bits: q_bits,
             },
-            input: scratch.normed,
+            input: scratch.normed.into(),
             input_off: 0,
-            output: scratch.q_proj_stack,
+            output: scratch.q_proj_stack.into(),
             output_off: 0,
             in_dim: hidden_dim as u32,
             out_dim: q_proj_dim as u32,
@@ -776,9 +788,9 @@ where
                 b_off: attn.k_proj_b,
                 bits: k_bits,
             },
-            input: scratch.normed,
+            input: scratch.normed.into(),
             input_off: 0,
-            output: scratch.k_proj_stack,
+            output: scratch.k_proj_stack.into(),
             output_off: 0,
             in_dim: hidden_dim as u32,
             out_dim: kv_dim as u32,
@@ -792,9 +804,9 @@ where
                 b_off: attn.v_proj_b,
                 bits: v_bits,
             },
-            input: scratch.normed,
+            input: scratch.normed.into(),
             input_off: 0,
-            output: scratch.v_proj_stack,
+            output: scratch.v_proj_stack.into(),
             output_off: 0,
             in_dim: hidden_dim as u32,
             out_dim: kv_dim as u32,
@@ -811,7 +823,9 @@ where
         });
         g.push(Op::RmsNormPerHeadNTokens {
             label: "full_attn.q_norm",
-            x: scratch.q_stack,
+            // Per-head norm is in-place on the Q stack; QBuf → RmsNormIn
+            // via the union's `From<QBuf>` impl.
+            x: scratch.q_stack.into(),
             weight_off: attn.q_norm_w,
             num_heads: num_attn_heads,
             head_dim,
@@ -820,7 +834,9 @@ where
         });
         g.push(Op::RmsNormPerHeadNTokens {
             label: "full_attn.k_norm",
-            x: scratch.k_proj_stack,
+            // In-place on the K-projection buffer; KProjOutBuf → RmsNormIn
+            // via the union impl.
+            x: scratch.k_proj_stack.into(),
             weight_off: attn.k_norm_w,
             num_heads: num_kv_heads,
             head_dim,
@@ -829,7 +845,7 @@ where
         });
         g.push(Op::RopeNTokens {
             label: "full_attn.q_rope",
-            x: scratch.q_stack,
+            x: scratch.q_stack.into(),
             inv_freq: scratch.inv_freq,
             n_tokens: n,
             num_heads: num_attn_heads,
@@ -839,7 +855,7 @@ where
         });
         g.push(Op::RopeNTokens {
             label: "full_attn.k_rope",
-            x: scratch.k_proj_stack,
+            x: scratch.k_proj_stack.into(),
             inv_freq: scratch.inv_freq,
             n_tokens: n,
             num_heads: num_kv_heads,
@@ -887,9 +903,9 @@ where
                 b_off: attn.o_proj_b,
                 bits: o_bits,
             },
-            input: scratch.attn_out_stack,
+            input: scratch.attn_out_stack.into(),
             input_off: 0,
-            output: scratch.o_proj_stack,
+            output: scratch.o_proj_stack.into(),
             output_off: 0,
             in_dim: q_dim as u32,
             out_dim: hidden_dim as u32,
@@ -898,16 +914,21 @@ where
         g.push(Op::ResidualAddNTokens {
             label: "full_attn.residual_add",
             a: scratch.o_proj_stack,
-            b: hidden_in_id,
+            // The residual `b` slot accepts the hidden double-buffer
+            // input via the RmsNormIn union (HiddenBuf → RmsNormIn).
+            b: hidden_in_id.into(),
             out: moe.h_mid,
             n_tokens: n,
             dim: hidden_dim as u32,
         });
         g.push(Op::RmsNormBf16NTokens {
             label: "full_attn.post_attn_norm",
-            x: moe.h_mid,
+            // ResidualBuf → RmsNormIn via the union impl.
+            x: moe.h_mid.into(),
             weight_off: layer_cache.post_attention_layernorm_w,
-            out: moe.h_post,
+            // MoeGraphScratch::h_post is the post-norm activation
+            // (MoeInputBuf); MoeInputBuf → RmsNormOut via the union impl.
+            out: moe.h_post.into(),
             dim: hidden_dim as u32,
             n_tokens: n,
             eps,
@@ -920,9 +941,9 @@ where
                 b_off: layer_cache.gate.b,
                 bits: gate_bits,
             },
-            input: moe.h_post,
+            input: moe.h_post.into(),
             input_off: 0,
-            output: scratch.gate_logits,
+            output: scratch.gate_logits.into(),
             output_off: 0,
             in_dim: hidden_dim as u32,
             out_dim: v.num_experts as u32,
@@ -936,9 +957,9 @@ where
                 b_off: layer_cache.shared.seg_b,
                 bits: seg_bits,
             },
-            input: moe.h_post,
+            input: moe.h_post.into(),
             input_off: 0,
-            output: moe.shared_gate,
+            output: moe.shared_gate.into(),
             output_off: 0,
             in_dim: hidden_dim as u32,
             out_dim: 1,

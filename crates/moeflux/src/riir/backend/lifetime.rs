@@ -29,7 +29,7 @@
 
 use std::collections::HashMap;
 
-use super::{BufId, Graph};
+use super::Graph;
 
 /// Live range of a transient BufId in op-index coordinates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,12 +42,15 @@ pub struct Interval {
     pub last_read_op: u32,
 }
 
-/// Per-BufId lifetime intervals. Only BufIds that are written by at
-/// least one `Op` appear in `intervals` — pure external inputs are
-/// absent and must not be aliased.
+/// Per-BufId lifetime intervals — keyed by the raw `u32` index.
+/// Tag-agnostic: this pass cares only about index coordinates, not
+/// role tags, so it never imports a [`super::buftype::Buf`] tag.
+/// Only BufIds that are written by at least one `Op` appear in
+/// `intervals` — pure external inputs are absent and must not be
+/// aliased.
 #[derive(Debug, Default)]
 pub struct Lifetimes {
-    pub intervals: HashMap<BufId, Interval>,
+    pub intervals: HashMap<u32, Interval>,
 }
 
 /// Walk `graph.ops` once, building per-BufId `Interval`s.
@@ -65,15 +68,15 @@ pub struct Lifetimes {
 ///    earlier and last_read_op extends to this op. Both branches
 ///    produce a correct interval.
 pub fn analyze_lifetimes(graph: &Graph) -> Lifetimes {
-    let mut first_write: HashMap<BufId, u32> = HashMap::new();
-    let mut last_read: HashMap<BufId, u32> = HashMap::new();
+    let mut first_write: HashMap<u32, u32> = HashMap::new();
+    let mut last_read: HashMap<u32, u32> = HashMap::new();
 
     for (op_idx, op) in graph.ops.iter().enumerate() {
         let op_idx = op_idx as u32;
-        for buf in op.writes() {
+        for buf in op.writes_raw() {
             first_write.entry(buf).or_insert(op_idx);
         }
-        for buf in op.reads() {
+        for buf in op.reads_raw() {
             if first_write.contains_key(&buf) {
                 last_read.insert(buf, op_idx);
             }
@@ -105,9 +108,9 @@ pub type ColorId = u32;
 /// Result of greedy linear-scan interval coloring.
 #[derive(Debug, Default)]
 pub struct ColoringMap {
-    /// `BufId` → physical-slot index. Multiple BufIds may share a
-    /// color when their intervals don't overlap.
-    pub bufid_to_color: HashMap<BufId, ColorId>,
+    /// `BufId` raw index → physical-slot index. Multiple BufIds may
+    /// share a color when their intervals don't overlap.
+    pub bufid_to_color: HashMap<u32, ColorId>,
     /// Number of distinct colors (= physical slots needed for the
     /// colorable BufIds). Tight upper bound on simultaneous-live
     /// transient buffers.
@@ -127,16 +130,16 @@ pub struct ColoringMap {
 /// running this on identical lifetimes therefore agree on the
 /// physical layout.
 pub fn greedy_color(lifetimes: &Lifetimes) -> ColoringMap {
-    let mut intervals: Vec<(BufId, Interval)> = lifetimes
+    let mut intervals: Vec<(u32, Interval)> = lifetimes
         .intervals
         .iter()
         .map(|(b, i)| (*b, *i))
         .collect();
-    intervals.sort_by_key(|(b, i)| (i.first_write_op, b.0));
+    intervals.sort_by_key(|(b, i)| (i.first_write_op, *b));
 
     let mut active: Vec<(ColorId, u32)> = Vec::new();
     let mut next_color: ColorId = 0;
-    let mut bufid_to_color: HashMap<BufId, ColorId> =
+    let mut bufid_to_color: HashMap<u32, ColorId> =
         HashMap::with_capacity(intervals.len());
 
     for (buf, interval) in &intervals {
@@ -185,19 +188,29 @@ pub fn greedy_color(lifetimes: &Lifetimes) -> ColoringMap {
 
 #[cfg(test)]
 mod tests {
+    use super::super::buftype::{
+        Buf, BufId, ConvOutBuf, HiddenBuf, OProjOutBuf, ResidualBuf,
+    };
     use super::super::Op;
     use super::*;
 
-    fn buf(n: u32) -> BufId {
-        BufId(n)
+    /// Mint a typed `BufId<B>` from a raw index for fixtures.
+    fn buf<B: Buf>(n: u32) -> BufId<B> {
+        BufId::from_raw(n)
     }
 
+    /// Synthesize a `ResidualAddNTokens` against raw indices; the tag
+    /// choices below match the `Op::ResidualAddNTokens` field-tag
+    /// inventory (a = `OProjOutBuf`, b = `RmsNormIn` union over
+    /// `HiddenBuf`, out = `ResidualBuf`). Live-range coloring is
+    /// tag-agnostic so the assignments are just there to satisfy
+    /// the type checker.
     fn resid(a: u32, b: u32, out: u32) -> Op {
         Op::ResidualAddNTokens {
             label: "test",
-            a: buf(a),
-            b: buf(b),
-            out: buf(out),
+            a: buf::<OProjOutBuf>(a),
+            b: buf::<HiddenBuf>(b).into(),
+            out: buf::<ResidualBuf>(out),
             n_tokens: 1,
             dim: 1,
         }
@@ -218,13 +231,13 @@ mod tests {
         g.push(resid(0, 1, 2));
         let lt = analyze_lifetimes(&g);
         assert_eq!(lt.intervals.len(), 1);
-        assert!(lt.intervals.contains_key(&buf(2)));
-        assert!(!lt.intervals.contains_key(&buf(0)));
-        assert!(!lt.intervals.contains_key(&buf(1)));
+        assert!(lt.intervals.contains_key(&2));
+        assert!(!lt.intervals.contains_key(&0));
+        assert!(!lt.intervals.contains_key(&1));
         // `out` is never read after being written → live range is
         // just the write op.
         assert_eq!(
-            lt.intervals[&buf(2)],
+            lt.intervals[&2],
             Interval { first_write_op: 0, last_read_op: 0 }
         );
     }
@@ -246,19 +259,19 @@ mod tests {
         // tmp1..tmp3 and final → 4 entries.
         assert_eq!(lt.intervals.len(), 4);
         assert_eq!(
-            lt.intervals[&buf(5)],
+            lt.intervals[&5],
             Interval { first_write_op: 0, last_read_op: 1 }
         );
         assert_eq!(
-            lt.intervals[&buf(6)],
+            lt.intervals[&6],
             Interval { first_write_op: 1, last_read_op: 2 }
         );
         assert_eq!(
-            lt.intervals[&buf(7)],
+            lt.intervals[&7],
             Interval { first_write_op: 2, last_read_op: 3 }
         );
         assert_eq!(
-            lt.intervals[&buf(8)],
+            lt.intervals[&8],
             Interval { first_write_op: 3, last_read_op: 3 }
         );
     }
@@ -269,7 +282,7 @@ mod tests {
         let mut g = Graph::new();
         g.push(Op::RmsNormQkNTokens {
             label: "qk",
-            x: buf(0),
+            x: buf::<ConvOutBuf>(0),
             num_k_heads: 4,
             key_dim: 128,
             key_offset_per_token: 512,
@@ -279,7 +292,7 @@ mod tests {
         let lt = analyze_lifetimes(&g);
         // x is written at op 0, read at op 0 → single-point.
         assert_eq!(
-            lt.intervals[&buf(0)],
+            lt.intervals[&0],
             Interval { first_write_op: 0, last_read_op: 0 }
         );
     }
@@ -297,17 +310,17 @@ mod tests {
         // color.
         let mut lt = Lifetimes::default();
         lt.intervals.insert(
-            buf(0),
+            0,
             Interval { first_write_op: 0, last_read_op: 1 },
         );
         lt.intervals.insert(
-            buf(1),
+            1,
             Interval { first_write_op: 2, last_read_op: 3 },
         );
         let cm = greedy_color(&lt);
         assert_eq!(cm.color_count, 1);
-        assert_eq!(cm.bufid_to_color[&buf(0)], 0);
-        assert_eq!(cm.bufid_to_color[&buf(1)], 0);
+        assert_eq!(cm.bufid_to_color[&0], 0);
+        assert_eq!(cm.bufid_to_color[&1], 0);
     }
 
     #[test]
@@ -315,16 +328,16 @@ mod tests {
         // tmp1 live [0,2], tmp2 live [1,3] — overlap at op 1-2.
         let mut lt = Lifetimes::default();
         lt.intervals.insert(
-            buf(0),
+            0,
             Interval { first_write_op: 0, last_read_op: 2 },
         );
         lt.intervals.insert(
-            buf(1),
+            1,
             Interval { first_write_op: 1, last_read_op: 3 },
         );
         let cm = greedy_color(&lt);
         assert_eq!(cm.color_count, 2);
-        assert_ne!(cm.bufid_to_color[&buf(0)], cm.bufid_to_color[&buf(1)]);
+        assert_ne!(cm.bufid_to_color[&0], cm.bufid_to_color[&1]);
     }
 
     #[test]
@@ -381,7 +394,7 @@ mod tests {
             let mut lt = Lifetimes::default();
             for &(b, fw, lr) in order {
                 lt.intervals.insert(
-                    buf(b),
+                    b,
                     Interval { first_write_op: fw, last_read_op: lr },
                 );
             }

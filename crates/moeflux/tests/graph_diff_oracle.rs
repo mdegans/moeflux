@@ -32,6 +32,9 @@
 use std::fs;
 use std::path::PathBuf;
 
+use moeflux::riir::backend::buftype::{
+    BufId, HiddenBuf, OProjOutBuf, ResidualBuf,
+};
 use moeflux::riir::backend::{
     Backend, BufferPool, CpuBackend, Graph, MetalBackend, Op, WeightRef,
 };
@@ -1369,27 +1372,37 @@ fn graph_metal_matches_cpu_colored() {
     let a_data: Vec<f32> = (0..total).map(|_| rng.next_f32_unit()).collect();
     let b_data: Vec<f32> = (0..total).map(|_| rng.next_f32_unit()).collect();
 
-    // Build a Graph against the given (pool, a, b, tmps) IDs.
+    // Build a Graph that mirrors the production
+    // `Op::ResidualAddNTokens` field tags exactly: `a: OProjOutBuf`
+    // (the layer's attention contribution), `b: RmsNormIn` (the
+    // residual stream — union, accepts `ResidualBuf` for the chain
+    // step via the existing `From<ResidualBuf> for BufId<RmsNormIn>`
+    // impl), `out: ResidualBuf` (the new residual). The chain is
+    // structured `tmp_i = a + tmp_{i-1}`: `a` stays the fixed
+    // OProjOutBuf input across all ops; the running residual is
+    // threaded through the `b` slot. Live ranges are still
+    // single-write / single-read per intermediate, so coloring's
+    // structure is the same as a `tmp = tmp + b` chain.
     let build_graph =
-        |a: moeflux::riir::backend::BufId,
-         b: moeflux::riir::backend::BufId,
-         tmps: &[moeflux::riir::backend::BufId]| {
+        |a: BufId<OProjOutBuf>,
+         b: BufId<HiddenBuf>,
+         tmps: &[BufId<ResidualBuf>]| {
             let mut g = Graph::new();
-            // op 0: tmp_0 = a + b
+            // op 0: tmp_0 = a + b (HiddenBuf → RmsNormIn).
             g.push(Op::ResidualAddNTokens {
                 label: "tmp_0",
                 a,
-                b,
+                b: b.into(),
                 out: tmps[0],
                 n_tokens,
                 dim,
             });
-            // op i: tmp_i = tmp_{i-1} + b
+            // op i: tmp_i = a + tmp_{i-1} (ResidualBuf → RmsNormIn).
             for i in 1..(n_intermediates as usize) {
                 g.push(Op::ResidualAddNTokens {
                     label: "tmp_i",
-                    a: tmps[i - 1],
-                    b,
+                    a,
+                    b: tmps[i - 1].into(),
                     out: tmps[i],
                     n_tokens,
                     dim,
@@ -1401,9 +1414,11 @@ fn graph_metal_matches_cpu_colored() {
     // CPU path
     let mut cpu_wf = dummy_weight_file("colored_cpu");
     let mut cpu = CpuBackend::new(cpu_wf.take());
-    let cpu_a = cpu.pool_mut().alloc(total * 4, "a", false).unwrap();
-    let cpu_b = cpu.pool_mut().alloc(total * 4, "b", false).unwrap();
-    let mut cpu_tmps = Vec::new();
+    let cpu_a: BufId<OProjOutBuf> =
+        cpu.pool_mut().alloc(total * 4, "a", false).unwrap();
+    let cpu_b: BufId<HiddenBuf> =
+        cpu.pool_mut().alloc(total * 4, "b", false).unwrap();
+    let mut cpu_tmps: Vec<BufId<ResidualBuf>> = Vec::new();
     for _ in 0..n_intermediates {
         cpu_tmps.push(cpu.pool_mut().alloc(total * 4, "tmp", false).unwrap());
     }
@@ -1427,9 +1442,11 @@ fn graph_metal_matches_cpu_colored() {
     let wf_buf = MtlWeightBuf::wrap(wf_ref, metal_ctx.device());
     let _ = gpu_wf.take();
     let mut gpu = MetalBackend::new(metal_ctx, wf_buf).expect("MetalBackend::new");
-    let gpu_a = gpu.pool_mut().alloc(total * 4, "a", false).unwrap();
-    let gpu_b = gpu.pool_mut().alloc(total * 4, "b", false).unwrap();
-    let mut gpu_tmps = Vec::new();
+    let gpu_a: BufId<OProjOutBuf> =
+        gpu.pool_mut().alloc(total * 4, "a", false).unwrap();
+    let gpu_b: BufId<HiddenBuf> =
+        gpu.pool_mut().alloc(total * 4, "b", false).unwrap();
+    let mut gpu_tmps: Vec<BufId<ResidualBuf>> = Vec::new();
     for _ in 0..n_intermediates {
         gpu_tmps.push(gpu.pool_mut().alloc(total * 4, "tmp", false).unwrap());
     }

@@ -52,6 +52,7 @@ use metal::{
 
 use moeflux_metal::{GatherQmmCall, Kernels, QuantWeights};
 
+use crate::riir::backend::buftype::DeprecatedCogitoBuf;
 use crate::riir::backend::{BufId, BufferPool, MetalBufferPool};
 use crate::riir::backend::gpu::gpu_matvec::{encode_matvec_n_tokens, MatvecPipelines};
 use crate::riir::backend::gpu::gpu_norm::{encode_rms_norm_bf16_into, RmsNormBf16Pipelines};
@@ -349,29 +350,40 @@ fn encode_swiglu(
 ///   physical buffers — no race. By the time layer N+2's prefetch
 ///   writes set `N % 2` again, the depth-2 ring has drained layer
 ///   N's deferred so set `N % 2` is safe to overwrite.
+/// Per-token cogito MoE path buffers — every field tagged
+/// [`DeprecatedCogitoBuf`].
+///
+/// This struct is **frozen** pending M5 Studio (need 512 GB unified RAM
+/// for cogito 600B-class models). When the cogito path is rewritten
+/// post-M5, retype the fields properly (per-role tags from
+/// [`crate::riir::backend::buftype`]). Do not iterate on this path
+/// without retagging — the single-tag scheme exists because every
+/// `pool.alloc` here lives behind the same legacy code path; splitting
+/// the tags ad hoc would invite the bug class the rest of the backend
+/// just eliminated.
 pub struct MoeBuffers {
     /// Sync-pread (miss) target. See type-level docs. `u8`-typed
     /// (expert blob bytes); 2 MiB aligned via `pool.alloc_aligned`.
-    data_synced: [BufId; MAX_K],
+    data_synced: [BufId<DeprecatedCogitoBuf>; MAX_K],
     /// Async-prefetch (hit) target — two parity-keyed sets. Layer N's
     /// prefetch writes set `N % 2`; the encoder for layer N reads from
     /// the same set. See type-level docs for the soundness argument.
     /// 2 MiB aligned via `pool.alloc_aligned`.
-    data_prefetch: [[BufId; MAX_K]; 2],
-    gate: [BufId; MAX_K],
-    up: [BufId; MAX_K],
-    act: [BufId; MAX_K],
-    out: [BufId; MAX_K],
-    input: BufId,
-    h_mid: BufId,
-    shared_out: BufId,
-    moe_hidden: BufId,
-    combine_params: BufId,
+    data_prefetch: [[BufId<DeprecatedCogitoBuf>; MAX_K]; 2],
+    gate: [BufId<DeprecatedCogitoBuf>; MAX_K],
+    up: [BufId<DeprecatedCogitoBuf>; MAX_K],
+    act: [BufId<DeprecatedCogitoBuf>; MAX_K],
+    out: [BufId<DeprecatedCogitoBuf>; MAX_K],
+    input: BufId<DeprecatedCogitoBuf>,
+    h_mid: BufId<DeprecatedCogitoBuf>,
+    shared_out: BufId<DeprecatedCogitoBuf>,
+    moe_hidden: BufId<DeprecatedCogitoBuf>,
+    combine_params: BufId<DeprecatedCogitoBuf>,
     /// Phase 2 (cogito-v2 full-GPU): MoE router-gate logits buffer,
     /// `[num_experts]` f32. The GPU `bf16_matvec` dispatch writes
     /// here; CPU `noaux_tc` routing reads it back via
     /// [`Self::gate_logits_to_vec`]. ~1 KB at num_experts=256.
-    gate_logits: BufId,
+    gate_logits: BufId<DeprecatedCogitoBuf>,
 }
 
 impl MoeBuffers {
@@ -392,15 +404,16 @@ impl MoeBuffers {
         let v: Variant = VARIANT;
         const TWO_MIB: usize = 2 * 1024 * 1024;
         let f32_size = std::mem::size_of::<f32>();
-        let data_synced: [BufId; MAX_K] = std::array::from_fn(|_| {
-            pool.alloc_aligned(
-                v.expert_size_4bit(),
-                TWO_MIB,
-                "moe.data_synced",
-                true,
-            )
-        });
-        let data_prefetch: [[BufId; MAX_K]; 2] =
+        let data_synced: [BufId<DeprecatedCogitoBuf>; MAX_K] =
+            std::array::from_fn(|_| {
+                pool.alloc_aligned(
+                    v.expert_size_4bit(),
+                    TWO_MIB,
+                    "moe.data_synced",
+                    true,
+                )
+            });
+        let data_prefetch: [[BufId<DeprecatedCogitoBuf>; MAX_K]; 2] =
             std::array::from_fn(|_| {
                 std::array::from_fn(|_| {
                     pool.alloc_aligned(
@@ -416,7 +429,7 @@ impl MoeBuffers {
         // a release-mode failure would indicate a global-allocator bug
         // we don't try to recover from. The probe accepts a slice of
         // BufIds and resolves each through the pool.
-        let probe = |label: &str, ids: &[BufId]| {
+        let probe = |label: &str, ids: &[BufId<DeprecatedCogitoBuf>]| {
             for (slot, &id) in ids.iter().enumerate() {
                 let addr = pool.handle(id).contents() as usize;
                 debug_assert_eq!(
@@ -429,38 +442,49 @@ impl MoeBuffers {
         probe("synced", &data_synced[..]);
         probe("prefetch[0]", &data_prefetch[0][..]);
         probe("prefetch[1]", &data_prefetch[1][..]);
-        let gate: [BufId; MAX_K] = std::array::from_fn(|_| {
-            pool.alloc(v.moe_intermediate * f32_size, "moe.gate", true)
+        let gate: [BufId<DeprecatedCogitoBuf>; MAX_K] =
+            std::array::from_fn(|_| {
+                pool.alloc(
+                    v.moe_intermediate * f32_size,
+                    "moe.gate",
+                    true,
+                )
                 .expect("pool.alloc moe.gate")
-        });
-        let up: [BufId; MAX_K] = std::array::from_fn(|_| {
-            pool.alloc(v.moe_intermediate * f32_size, "moe.up", true)
-                .expect("pool.alloc moe.up")
-        });
-        let act: [BufId; MAX_K] = std::array::from_fn(|_| {
-            pool.alloc(v.moe_intermediate * f32_size, "moe.act", true)
-                .expect("pool.alloc moe.act")
-        });
-        let out: [BufId; MAX_K] = std::array::from_fn(|_| {
-            pool.alloc(v.hidden_dim * f32_size, "moe.out", true)
-                .expect("pool.alloc moe.out")
-        });
-        let input = pool
+            });
+        let up: [BufId<DeprecatedCogitoBuf>; MAX_K] = std::array::from_fn(
+            |_| {
+                pool.alloc(v.moe_intermediate * f32_size, "moe.up", true)
+                    .expect("pool.alloc moe.up")
+            },
+        );
+        let act: [BufId<DeprecatedCogitoBuf>; MAX_K] = std::array::from_fn(
+            |_| {
+                pool.alloc(v.moe_intermediate * f32_size, "moe.act", true)
+                    .expect("pool.alloc moe.act")
+            },
+        );
+        let out: [BufId<DeprecatedCogitoBuf>; MAX_K] = std::array::from_fn(
+            |_| {
+                pool.alloc(v.hidden_dim * f32_size, "moe.out", true)
+                    .expect("pool.alloc moe.out")
+            },
+        );
+        let input: BufId<DeprecatedCogitoBuf> = pool
             .alloc(v.hidden_dim * f32_size, "moe.input", true)
             .expect("pool.alloc moe.input");
-        let h_mid = pool
+        let h_mid: BufId<DeprecatedCogitoBuf> = pool
             .alloc(v.hidden_dim * f32_size, "moe.h_mid", true)
             .expect("pool.alloc moe.h_mid");
-        let shared_out = pool
+        let shared_out: BufId<DeprecatedCogitoBuf> = pool
             .alloc(v.hidden_dim * f32_size, "moe.shared_out", true)
             .expect("pool.alloc moe.shared_out");
-        let moe_hidden = pool
+        let moe_hidden: BufId<DeprecatedCogitoBuf> = pool
             .alloc(v.hidden_dim * f32_size, "moe.moe_hidden", true)
             .expect("pool.alloc moe.moe_hidden");
-        let combine_params = pool
+        let combine_params: BufId<DeprecatedCogitoBuf> = pool
             .alloc(18 * f32_size, "moe.combine_params", true)
             .expect("pool.alloc moe.combine_params");
-        let gate_logits = pool
+        let gate_logits: BufId<DeprecatedCogitoBuf> = pool
             .alloc(
                 v.num_experts.max(1) * f32_size,
                 "moe.gate_logits",
@@ -485,38 +509,41 @@ impl MoeBuffers {
 
     // -------- BufId accessors (graph-mode addressing) --------
 
-    pub(crate) fn moe_hidden_id(&self) -> BufId {
+    pub(crate) fn moe_hidden_id(&self) -> BufId<DeprecatedCogitoBuf> {
         self.moe_hidden
     }
-    pub(crate) fn out_id(&self, slot: usize) -> BufId {
+    pub(crate) fn out_id(&self, slot: usize) -> BufId<DeprecatedCogitoBuf> {
         self.out[slot]
     }
-    pub(crate) fn gate_id(&self, slot: usize) -> BufId {
+    pub(crate) fn gate_id(&self, slot: usize) -> BufId<DeprecatedCogitoBuf> {
         self.gate[slot]
     }
-    pub(crate) fn up_id(&self, slot: usize) -> BufId {
+    pub(crate) fn up_id(&self, slot: usize) -> BufId<DeprecatedCogitoBuf> {
         self.up[slot]
     }
-    pub(crate) fn act_id(&self, slot: usize) -> BufId {
+    pub(crate) fn act_id(&self, slot: usize) -> BufId<DeprecatedCogitoBuf> {
         self.act[slot]
     }
-    pub(crate) fn h_mid_id(&self) -> BufId {
+    pub(crate) fn h_mid_id(&self) -> BufId<DeprecatedCogitoBuf> {
         self.h_mid
     }
-    pub(crate) fn shared_out_id(&self) -> BufId {
+    pub(crate) fn shared_out_id(&self) -> BufId<DeprecatedCogitoBuf> {
         self.shared_out
     }
-    pub(crate) fn combine_params_id(&self) -> BufId {
+    pub(crate) fn combine_params_id(&self) -> BufId<DeprecatedCogitoBuf> {
         self.combine_params
     }
-    pub(crate) fn data_synced_id(&self, slot: usize) -> BufId {
+    pub(crate) fn data_synced_id(
+        &self,
+        slot: usize,
+    ) -> BufId<DeprecatedCogitoBuf> {
         self.data_synced[slot]
     }
     pub(crate) fn data_prefetch_id(
         &self,
         set: usize,
         slot: usize,
-    ) -> BufId {
+    ) -> BufId<DeprecatedCogitoBuf> {
         debug_assert!(set < 2);
         debug_assert!(slot < MAX_K);
         self.data_prefetch[set][slot]

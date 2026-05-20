@@ -36,21 +36,10 @@
 //!   expects in each buffer (f32, bf16-packed-u16, u8 quantized,
 //!   etc.).
 
-use std::fmt;
-
 use crate::riir::moe::moe_router::ExpertBuckets;
 
-/// Identifier into a [`BufferPool`]. Backend-agnostic; each backend
-/// translates `BufId` to its native handle internally (e.g.
-/// `metal::Buffer`, `RefCell<Vec<u8>>`).
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
-pub struct BufId(pub u32);
-
-impl fmt::Display for BufId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "%{}", self.0)
-    }
-}
+pub mod buftype;
+pub use buftype::*;
 
 /// Reference to a weight tensor in the backend's mmap'd weight
 /// file. Carries byte offsets into the file; the backend resolves
@@ -81,8 +70,8 @@ pub struct WeightRef {
 /// `From` impls into this where appropriate.
 #[derive(Debug, thiserror::Error)]
 pub enum GraphError {
-    #[error("buffer id {0:?} out of range")]
-    BadBufId(BufId),
+    #[error("buffer id {0} out of range")]
+    BadBufId(u32),
     #[error("buffer size mismatch for {label:?}: expected {expected} bytes, got {actual}")]
     SizeMismatch { label: &'static str, expected: usize, actual: usize },
     /// Backend-specific error escape hatch. Used by [`Backend::open`]
@@ -106,19 +95,20 @@ pub trait BufferPool {
     type Handle;
     type Error: std::error::Error + Send + Sync + 'static;
 
-    /// Reserve a buffer of `bytes` bytes. The returned `BufId` is
+    /// Reserve a buffer of `bytes` bytes. The returned `BufId<B>` is
     /// stable for the lifetime of the pool (or until
     /// [`Self::reset_transient`] for non-persistent ids).
     ///
-    /// `label` is a `&'static str` for debug / inspection only —
-    /// the pool may store it, the producer doesn't depend on it
-    /// being unique.
-    fn alloc(
+    /// Generic on the buffer's role tag `B: Buf` — producers spell the
+    /// tag explicitly at the alloc site (e.g. `pool.alloc::<MoeInputBuf>(...)`)
+    /// so the returned id carries the role through the type system.
+    /// `label` is a `&'static str` for debug / inspection only.
+    fn alloc<B: Buf>(
         &mut self,
         bytes: usize,
         label: &'static str,
         persistent: bool,
-    ) -> Result<BufId, Self::Error>;
+    ) -> Result<BufId<B>, Self::Error>;
 
     /// Look up a buffer's backend-native handle.
     ///
@@ -126,26 +116,22 @@ pub trait BufferPool {
     /// mutability the backend provides (Metal: writes go through
     /// `.contents()` regardless of Rust-level mutability; CPU:
     /// `RefCell<Vec<u8>>` ).
-    fn handle(&self, id: BufId) -> &Self::Handle;
+    fn handle<B: Buf>(&self, id: BufId<B>) -> &Self::Handle;
 
-    /// Bulk-copy `host` bytes into the buffer at `id`. Used at
-    /// graph-build time for inputs (embeddings, routing tables).
-    ///
-    /// Prefix semantics: `host` may be *shorter* than the buffer, in
-    /// which case only the leading `host.len()` bytes are written.
-    /// This lets once-per-run buffers be sized at max chunk width
-    /// while a smaller chunk uploads only its rows. A `host` *longer*
-    /// than the buffer is rejected with `SizeMismatch`.
-    fn upload(&mut self, id: BufId, host: &[u8]) -> Result<(), Self::Error>;
+    /// Bulk-copy `host` bytes into the buffer at `id`. Prefix semantics
+    /// (see trait doc).
+    fn upload<B: Buf>(
+        &mut self,
+        id: BufId<B>,
+        host: &[u8],
+    ) -> Result<(), Self::Error>;
 
     /// Bulk-copy `host` bytes into the buffer at `id` starting at
-    /// byte `offset`. Like [`Self::upload`] but for filling one
-    /// sub-region of a larger buffer — e.g. one expert's weight block
-    /// within a packed expert-weight staging buffer. `offset +
-    /// host.len()` must fit the buffer or `SizeMismatch` is returned.
-    fn upload_at(
+    /// byte `offset`. `offset + host.len()` must fit the buffer or
+    /// `SizeMismatch` is returned.
+    fn upload_at<B: Buf>(
         &mut self,
-        id: BufId,
+        id: BufId<B>,
         offset: usize,
         host: &[u8],
     ) -> Result<(), Self::Error>;
@@ -153,7 +139,11 @@ pub trait BufferPool {
     /// Bulk-copy bytes out of the buffer at `id` into `host`. Used
     /// for the routing readback at the two-phase split. Prefix
     /// semantics mirror [`Self::upload`].
-    fn download(&self, id: BufId, host: &mut [u8]) -> Result<(), Self::Error>;
+    fn download<B: Buf>(
+        &self,
+        id: BufId<B>,
+        host: &mut [u8],
+    ) -> Result<(), Self::Error>;
 
     /// Release all non-persistent allocations. Persistent buffers
     /// keep their `BufId`s; transient ones are eligible to be
@@ -161,7 +151,7 @@ pub trait BufferPool {
     fn reset_transient(&mut self);
 
     /// Label of the buffer at `id`, for [`Graph::dump`] inspection.
-    fn label(&self, id: BufId) -> &'static str;
+    fn label<B: Buf>(&self, id: BufId<B>) -> &'static str;
 
     /// Apply lifetime-aware buffer aliasing for `graph`. After this
     /// call, multiple `BufId`s with disjoint live ranges may share a
@@ -323,9 +313,9 @@ pub enum Op {
     /// threadgroup per token; sum_sq stays in tg-mem.
     RmsNormBf16NTokens {
         label: &'static str,
-        x: BufId,
+        x: BufId<RmsNormIn>,
         weight_off: u64,
-        out: BufId,
+        out: BufId<RmsNormOut>,
         dim: u32,
         n_tokens: u32,
         eps: f32,
@@ -339,11 +329,12 @@ pub enum Op {
     /// + num_k_heads * key_dim`, but for `q|k|v` layouts (linear-
     /// attn `conv_out`) it must include the trailing V region.
     ///
+    /// Linear-attn-only — `x` is the conv1d output (q | k | v stack).
     /// Dispatched as a single batched kernel — `(num_k_heads,
     /// n_tokens)` threadgroups, one per (head, token).
     RmsNormQkNTokens {
         label: &'static str,
-        x: BufId,
+        x: BufId<ConvOutBuf>,
         num_k_heads: u32,
         key_dim: u32,
         key_offset_per_token: u32,
@@ -362,9 +353,12 @@ pub enum Op {
     /// Op pushed once per buffer (q and k live in separate buffers,
     /// so unlike [`Op::RmsNormQkNTokens`] they can't fuse into one
     /// dispatch). Diff oracle: `attn::rms_norm::rms_norm_per_head_cpu`.
+    ///
+    /// In-place; `x` accepts QBuf or KProjOutBuf via the [`RmsNormIn`]
+    /// union (existing `From` impls).
     RmsNormPerHeadNTokens {
         label: &'static str,
-        x: BufId,
+        x: BufId<RmsNormIn>,
         weight_off: u64,
         num_heads: u32,
         head_dim: u32,
@@ -379,10 +373,13 @@ pub enum Op {
     /// length frequency table — the kernel is agnostic to vanilla vs
     /// YaRN-rescaled, so a future `factor` knob only touches the
     /// table, never this Op. Diff oracle: `attn::rope::apply_rotary_emb`.
+    ///
+    /// In-place on `x`; `x` accepts QBuf or KProjOutBuf via the
+    /// [`RmsNormIn`] union.
     RopeNTokens {
         label: &'static str,
-        x: BufId,
-        inv_freq: BufId,
+        x: BufId<RmsNormIn>,
+        inv_freq: BufId<RopeInvFreqBuf>,
         n_tokens: u32,
         num_heads: u32,
         head_dim: u32,
@@ -398,20 +395,24 @@ pub enum Op {
     /// gate interleaved with the query; this splits them apart.
     SplitQGate {
         label: &'static str,
-        q_proj: BufId,
-        q_out: BufId,
-        gate_out: BufId,
+        q_proj: BufId<QProjOutBuf>,
+        q_out: BufId<QBuf>,
+        gate_out: BufId<QGateBuf>,
         num_heads: u32,
         head_dim: u32,
         n_tokens: u32,
     },
 
     /// Residual add over `[n_tokens, dim]`: `out = a + b`.
+    ///
+    /// `a` is the o_proj output (the layer's attention contribution);
+    /// `b` is the residual stream (`RmsNormIn` union — accepts
+    /// `EmbedOutBuf`/`ResidualBuf`/`HiddenBuf` via existing impls).
     ResidualAddNTokens {
         label: &'static str,
-        a: BufId,
-        b: BufId,
-        out: BufId,
+        a: BufId<OProjOutBuf>,
+        b: BufId<RmsNormIn>,
+        out: BufId<ResidualBuf>,
         n_tokens: u32,
         dim: u32,
     },
@@ -423,7 +424,7 @@ pub enum Op {
     /// (no read) so lifetime coloring sees a clean def point.
     ZeroBuffer {
         label: &'static str,
-        buf: BufId,
+        buf: BufId<MoeOutSumBuf>,
         n_bytes: u32,
     },
 
@@ -433,9 +434,9 @@ pub enum Op {
     MatvecNTokens {
         label: &'static str,
         weight: WeightRef,
-        input: BufId,
+        input: BufId<MatvecIn>,
         input_off: u64,
-        output: BufId,
+        output: BufId<MatvecOut>,
         output_off: u64,
         in_dim: u32,
         out_dim: u32,
@@ -443,14 +444,13 @@ pub enum Op {
     },
 
     /// SwiGLU element-wise fused: `out[i] = silu(gate[i]) * up[i]`
-    /// over `total` elements (typically `n_tokens *
-    /// ffn_intermediate_dim` or, for permuted MoE, the bucket-flat
-    /// equivalent).
+    /// over `total` elements. Used for the shared-FFN SwiGLU on
+    /// post-norm activations.
     SwigluFusedBatched {
         label: &'static str,
-        gate: BufId,
-        up: BufId,
-        out: BufId,
+        gate: BufId<SharedFfnGateBuf>,
+        up: BufId<SharedFfnUpBuf>,
+        out: BufId<SharedFfnActBuf>,
         total: u32,
     },
 
@@ -463,10 +463,10 @@ pub enum Op {
     /// `attn::sdpa` (single-pass per-token compute).
     SdpaCausalTiled {
         label: &'static str,
-        q: BufId,
-        k: BufId,
-        v: BufId,
-        attn_out: BufId,
+        q: BufId<QBuf>,
+        k: BufId<KvCacheKBuf>,
+        v: BufId<KvCacheVBuf>,
+        attn_out: BufId<AttnOutBuf>,
         n_tokens: u32,
         num_heads: u32,
         heads_per_kv: u32,
@@ -477,15 +477,15 @@ pub enum Op {
         softmax_scale: f32,
     },
 
-    /// Per-token sigmoid gate, in-place: `x[t,i] *= sigmoid(gate[t,i])`
-    /// over `[n_tokens, dim]`. Element-wise — `dim` and `n_tokens` are
-    /// kept for clarity but the encoder collapses them into one flat
-    /// dispatch of `dim * n_tokens` threads. Used for the full-attn
-    /// per-head query gate (`attn_out *= sigmoid(q_gate)`).
+    /// Per-token sigmoid gate, in-place on the attention output:
+    /// `attn_out[t,i] *= sigmoid(gate[t,i])` over `[n_tokens, dim]`.
+    /// Element-wise — `dim` and `n_tokens` are kept for clarity but
+    /// the encoder collapses them into one flat dispatch of
+    /// `dim * n_tokens` threads. Full-attn per-head query gate.
     SigmoidGateNTokens {
         label: &'static str,
-        x: BufId,
-        gate: BufId,
+        x: BufId<AttnOutBuf>,
+        gate: BufId<QGateBuf>,
         dim: u32,
         n_tokens: u32,
     },
@@ -496,10 +496,10 @@ pub enum Op {
     /// n_tokens)`. Both backends do a strided copy — bit-exact.
     KvCacheAppendNTokens {
         label: &'static str,
-        k_src: BufId,
-        v_src: BufId,
-        k_cache: BufId,
-        v_cache: BufId,
+        k_src: BufId<KProjOutBuf>,
+        v_src: BufId<VProjOutBuf>,
+        k_cache: BufId<KvCacheKBuf>,
+        v_cache: BufId<KvCacheVBuf>,
         kv_dim: u32,
         n_tokens: u32,
         kv_start: u32,
@@ -510,9 +510,9 @@ pub enum Op {
     /// weights.
     MoeSoftmaxTopK {
         label: &'static str,
-        logits: BufId,
-        indices_out: BufId,
-        weights_out: BufId,
+        logits: BufId<RouterLogitsBuf>,
+        indices_out: BufId<RouterIdxBuf>,
+        weights_out: BufId<RouterWeightsBuf>,
         n_tokens: u32,
         n_experts: u32,
         k: u32,
@@ -522,7 +522,7 @@ pub enum Op {
     /// on `[n_tokens, k]` weights.
     MoeNormalizeWeights {
         label: &'static str,
-        weights: BufId,
+        weights: BufId<RouterWeightsBuf>,
         n_tokens: u32,
         k: u32,
     },
@@ -545,25 +545,25 @@ pub enum Op {
     MoeBatchedPermuteFuse {
         label: &'static str,
         /// Base buffer holding every expert's packed weight block.
-        expert_base: BufId,
+        expert_base: BufId<ExpertBaseBuf>,
         /// Byte stride between consecutive expert blocks in
         /// `expert_base`.
         expert_stride: u64,
         /// Per-assignment-row expert slot (`u32`). Length =
         /// `total_assignments`; the gather kernel's `indices`.
-        expert_indices: BufId,
+        expert_indices: BufId<ExpertIndicesBuf>,
         /// Per-bucket expert slot into `expert_base`. Length =
         /// `buckets.expert_ids.len()`; the per-bucket fallback's
         /// selector.
         expert_slots: Vec<u32>,
-        bucket_input: BufId,
-        bucket_gate: BufId,
-        bucket_up: BufId,
-        bucket_act: BufId,
-        bucket_out: BufId,
-        bucket_token_idx: BufId,
-        bucket_weights: BufId,
-        out_sum: BufId,
+        bucket_input: BufId<BucketInputBuf>,
+        bucket_gate: BufId<BucketGateBuf>,
+        bucket_up: BufId<BucketUpBuf>,
+        bucket_act: BufId<BucketActBuf>,
+        bucket_out: BufId<BucketOutBuf>,
+        bucket_token_idx: BufId<BucketTokenIdxBuf>,
+        bucket_weights: BufId<BucketWeightsBuf>,
+        out_sum: BufId<MoeOutSumBuf>,
         buckets: ExpertBuckets,
     },
 
@@ -591,36 +591,39 @@ pub enum Op {
         label: &'static str,
         /// Layer's expert blob — `n_experts` experts stacked at
         /// `expert_stride` byte spacing.
-        expert_base: BufId,
+        expert_base: BufId<ExpertBaseBuf>,
         /// Per-expert byte stride — `Variant::expert_size_4bit()`.
         expert_stride: u64,
         /// Router output — `[n_tokens, k]` i32.
-        indices: BufId,
+        indices: BufId<RouterIdxBuf>,
         /// Router output — `[n_tokens, k]` f32.
-        weights: BufId,
+        weights: BufId<RouterWeightsBuf>,
         /// Input to the MoE-MLP matmul stack — the **post-RmsNorm**
         /// hidden state (`[n_tokens, hidden_dim]` f32). This is the
         /// same value the bucket-permute path feeds its bucket_input
         /// host-permute from. Do NOT pass the pre-norm residual
-        /// (`MoeGraphScratch::h_mid`) — that was the session-19 bug.
-        mlp_in: BufId,
+        /// (`MoeGraphScratch::h_mid`) — that was the session-19 bug,
+        /// now a compile error: pre-norm = `BufId<ResidualBuf>`,
+        /// post-norm = `BufId<MoeInputBuf>`; the type system rejects
+        /// the swap.
+        mlp_in: BufId<MoeInputBuf>,
         /// Output — `[n_tokens, hidden_dim]` f32. Accumulator; the
         /// kernel WRITES (not adds). Combine with shared/residual
         /// downstream via [`Self::MoeCombineResidualNTokens`].
-        out_sum: BufId,
+        out_sum: BufId<MoeOutSumBuf>,
         /// Scratch — `[n_experts]` u32, per-expert assignment count.
-        htpe: BufId,
+        htpe: BufId<HtpeBuf>,
         /// Scratch — `[n_experts, n_tokens]` i32, per-expert
         /// assignment list (encoded `token*k + slot`).
-        hids: BufId,
+        hids: BufId<HidsBuf>,
         /// Scratch — `[n_tokens, k, moe_inter]` f32, gate-proj output
         /// (also reused in-place as the SwiGLU output that feeds down).
-        gate_mid: BufId,
+        gate_mid: BufId<GateMidBuf>,
         /// Scratch — `[n_tokens, k, moe_inter]` f32, up-proj output.
-        up_mid: BufId,
+        up_mid: BufId<UpMidBuf>,
         /// Scratch — `[n_tokens, k, hidden_dim]` f32, down-proj
         /// output (input to combine_topk).
-        down_mid: BufId,
+        down_mid: BufId<DownMidBuf>,
         n_tokens: u32,
         n_experts: u32,
         /// Top-k. Must equal `moeflux_metal::MOE_MM_ID_TOPK` (= 8 for a3b).
@@ -632,11 +635,11 @@ pub enum Op {
     ///                  + sigmoid(shared_gate[t]) * shared_out[t,i]`.
     MoeCombineResidualNTokens {
         label: &'static str,
-        h_mid: BufId,
-        moe_sum: BufId,
-        shared_out: BufId,
-        shared_gate: BufId,
-        hidden_out: BufId,
+        h_mid: BufId<ResidualBuf>,
+        moe_sum: BufId<MoeOutSumBuf>,
+        shared_out: BufId<SharedFfnDownBuf>,
+        shared_gate: BufId<SharedGateBuf>,
+        hidden_out: BufId<HiddenBuf>,
         n_tokens: u32,
         dim: u32,
     },
@@ -646,10 +649,10 @@ pub enum Op {
     /// kernel-window of prior values forward across tokens).
     Conv1dStepNTokens {
         label: &'static str,
-        qkv_in: BufId,
-        conv_state: BufId,
+        qkv_in: BufId<QkvStackBuf>,
+        conv_state: BufId<ConvStateBuf>,
         weight_off: u64,
-        conv_out: BufId,
+        conv_out: BufId<ConvOutBuf>,
         conv_dim: u32,
         n_tokens: u32,
     },
@@ -658,12 +661,12 @@ pub enum Op {
     /// projections, with bf16 a_log + dt_bias weights.
     ComputeDecayBetaNTokens {
         label: &'static str,
-        alpha_in: BufId,
-        beta_in: BufId,
+        alpha_in: BufId<AlphaStackBuf>,
+        beta_in: BufId<BetaStackBuf>,
         a_log_off: u64,
         dt_bias_off: u64,
-        g_decay_out: BufId,
-        beta_gate_out: BufId,
+        g_decay_out: BufId<GDecayBuf>,
+        beta_gate_out: BufId<BetaGateBuf>,
         num_v_heads: u32,
         n_tokens: u32,
     },
@@ -673,11 +676,11 @@ pub enum Op {
     /// hidden state forward).
     GatedDeltaNetStepNTokens {
         label: &'static str,
-        state: BufId,
-        conv_out: BufId,
-        g_decay: BufId,
-        beta_gate: BufId,
-        output: BufId,
+        state: BufId<DeltaStateBuf>,
+        conv_out: BufId<ConvOutBuf>,
+        g_decay: BufId<GDecayBuf>,
+        beta_gate: BufId<BetaGateBuf>,
+        output: BufId<DeltaOutBuf>,
         num_v_heads: u32,
         value_dim: u32,
         k_heads_per_v: u32,
@@ -693,11 +696,11 @@ pub enum Op {
     /// `chunk_size` is the inner chunk length `C`.
     GatedDeltaNetChunkwise {
         label: &'static str,
-        state: BufId,
-        conv_out: BufId,
-        g_decay: BufId,
-        beta_gate: BufId,
-        output: BufId,
+        state: BufId<DeltaStateBuf>,
+        conv_out: BufId<ConvOutBuf>,
+        g_decay: BufId<GDecayBuf>,
+        beta_gate: BufId<BetaGateBuf>,
+        output: BufId<DeltaOutBuf>,
         num_v_heads: u32,
         value_dim: u32,
         k_heads_per_v: u32,
@@ -709,10 +712,10 @@ pub enum Op {
     /// * value_dim]`.
     GatedRmsNormNTokens {
         label: &'static str,
-        values: BufId,
-        z: BufId,
+        values: BufId<DeltaOutBuf>,
+        z: BufId<ZStackBuf>,
         weight_off: u64,
-        output: BufId,
+        output: BufId<ValueOutBuf>,
         num_v_heads: u32,
         value_dim: u32,
         n_tokens: u32,
@@ -731,9 +734,9 @@ pub enum Op {
     /// the CPU arm resolves the same bytes via `WeightFile::bytes_at`.
     EmbedGatherNTokens {
         label: &'static str,
-        token_ids: BufId,
+        token_ids: BufId<TokenIdsBuf>,
         weight: WeightRef,
-        hidden_out: BufId,
+        hidden_out: BufId<EmbedOutBuf>,
         hidden_dim: u32,
         n_tokens: u32,
     },
@@ -799,30 +802,40 @@ impl Op {
         }
     }
 
-    /// BufIds this op *reads from*. Includes RMW buffers (which
-    /// also appear in [`Self::writes`]).
+    /// Raw `u32` indices this op *reads from* — tag-agnostic, used by
+    /// [`lifetime::analyze_lifetimes`]. Includes RMW buffers (which
+    /// also appear in [`Self::writes_raw`]).
     ///
-    /// Consumed by the S7-5 lifetime-coloring pass to compute each
-    /// BufId's last-read index. Producers don't need to call this
+    /// The lifetime / coloring pass operates on indices only — it
+    /// doesn't care about role tags — so this helper unwraps every
+    /// `BufId<B>` to its inner `u32`. Producers don't call this
     /// directly.
-    pub fn reads(&self) -> Vec<BufId> {
+    pub fn reads_raw(&self) -> Vec<u32> {
         match self {
-            Op::RmsNormBf16NTokens { x, .. } => vec![*x],
-            Op::RmsNormQkNTokens { x, .. } => vec![*x],
-            Op::RopeNTokens { x, inv_freq, .. } => vec![*x, *inv_freq],
-            Op::ResidualAddNTokens { a, b, .. } => vec![*a, *b],
-            Op::ZeroBuffer { .. } => vec![],
-            Op::MatvecNTokens { input, .. } => vec![*input],
-            Op::SwigluFusedBatched { gate, up, .. } => vec![*gate, *up],
-            Op::SdpaCausalTiled { q, k, v, .. } => vec![*q, *k, *v],
-            Op::SigmoidGateNTokens { x, gate, .. } => vec![*x, *gate],
-            Op::SplitQGate { q_proj, .. } => vec![*q_proj],
-            Op::RmsNormPerHeadNTokens { x, .. } => vec![*x],
-            Op::KvCacheAppendNTokens { k_src, v_src, .. } => {
-                vec![*k_src, *v_src]
+            Op::RmsNormBf16NTokens { x, .. } => vec![x.raw()],
+            Op::RmsNormQkNTokens { x, .. } => vec![x.raw()],
+            Op::RopeNTokens { x, inv_freq, .. } => {
+                vec![x.raw(), inv_freq.raw()]
             }
-            Op::MoeSoftmaxTopK { logits, .. } => vec![*logits],
-            Op::MoeNormalizeWeights { weights, .. } => vec![*weights],
+            Op::ResidualAddNTokens { a, b, .. } => vec![a.raw(), b.raw()],
+            Op::ZeroBuffer { .. } => vec![],
+            Op::MatvecNTokens { input, .. } => vec![input.raw()],
+            Op::SwigluFusedBatched { gate, up, .. } => {
+                vec![gate.raw(), up.raw()]
+            }
+            Op::SdpaCausalTiled { q, k, v, .. } => {
+                vec![q.raw(), k.raw(), v.raw()]
+            }
+            Op::SigmoidGateNTokens { x, gate, .. } => {
+                vec![x.raw(), gate.raw()]
+            }
+            Op::SplitQGate { q_proj, .. } => vec![q_proj.raw()],
+            Op::RmsNormPerHeadNTokens { x, .. } => vec![x.raw()],
+            Op::KvCacheAppendNTokens { k_src, v_src, .. } => {
+                vec![k_src.raw(), v_src.raw()]
+            }
+            Op::MoeSoftmaxTopK { logits, .. } => vec![logits.raw()],
+            Op::MoeNormalizeWeights { weights, .. } => vec![weights.raw()],
             Op::MoeBatchedPermuteFuse {
                 expert_base,
                 expert_indices,
@@ -831,11 +844,11 @@ impl Op {
                 bucket_weights,
                 ..
             } => vec![
-                *expert_base,
-                *expert_indices,
-                *bucket_input,
-                *bucket_token_idx,
-                *bucket_weights,
+                expert_base.raw(),
+                expert_indices.raw(),
+                bucket_input.raw(),
+                bucket_token_idx.raw(),
+                bucket_weights.raw(),
             ],
             Op::MoeGatherIdFuse {
                 expert_base,
@@ -843,67 +856,92 @@ impl Op {
                 weights,
                 mlp_in,
                 ..
-            } => vec![*expert_base, *indices, *weights, *mlp_in],
+            } => vec![
+                expert_base.raw(),
+                indices.raw(),
+                weights.raw(),
+                mlp_in.raw(),
+            ],
             Op::MoeCombineResidualNTokens {
                 h_mid,
                 moe_sum,
                 shared_out,
                 shared_gate,
                 ..
-            } => vec![*h_mid, *moe_sum, *shared_out, *shared_gate],
+            } => vec![
+                h_mid.raw(),
+                moe_sum.raw(),
+                shared_out.raw(),
+                shared_gate.raw(),
+            ],
             Op::Conv1dStepNTokens {
                 qkv_in,
                 conv_state,
                 ..
-            } => vec![*qkv_in, *conv_state],
+            } => vec![qkv_in.raw(), conv_state.raw()],
             Op::ComputeDecayBetaNTokens {
                 alpha_in, beta_in, ..
-            } => vec![*alpha_in, *beta_in],
+            } => vec![alpha_in.raw(), beta_in.raw()],
             Op::GatedDeltaNetStepNTokens {
                 state,
                 conv_out,
                 g_decay,
                 beta_gate,
                 ..
-            } => vec![*state, *conv_out, *g_decay, *beta_gate],
+            } => vec![
+                state.raw(),
+                conv_out.raw(),
+                g_decay.raw(),
+                beta_gate.raw(),
+            ],
             Op::GatedDeltaNetChunkwise {
                 state,
                 conv_out,
                 g_decay,
                 beta_gate,
                 ..
-            } => vec![*state, *conv_out, *g_decay, *beta_gate],
-            Op::GatedRmsNormNTokens { values, z, .. } => vec![*values, *z],
-            Op::EmbedGatherNTokens { token_ids, .. } => vec![*token_ids],
+            } => vec![
+                state.raw(),
+                conv_out.raw(),
+                g_decay.raw(),
+                beta_gate.raw(),
+            ],
+            Op::GatedRmsNormNTokens { values, z, .. } => {
+                vec![values.raw(), z.raw()]
+            }
+            Op::EmbedGatherNTokens { token_ids, .. } => vec![token_ids.raw()],
         }
     }
 
-    /// BufIds this op *writes to*. RMW buffers also appear in
-    /// [`Self::reads`].
-    pub fn writes(&self) -> Vec<BufId> {
+    /// Raw `u32` indices this op *writes to* — tag-agnostic, used by
+    /// [`lifetime::analyze_lifetimes`]. RMW buffers also appear in
+    /// [`Self::reads_raw`].
+    pub fn writes_raw(&self) -> Vec<u32> {
         match self {
-            Op::RmsNormBf16NTokens { out, .. } => vec![*out],
-            Op::RmsNormQkNTokens { x, .. } => vec![*x], // in-place
-            Op::RopeNTokens { x, .. } => vec![*x], // in-place
-            Op::ResidualAddNTokens { out, .. } => vec![*out],
-            Op::ZeroBuffer { buf, .. } => vec![*buf],
-            Op::MatvecNTokens { output, .. } => vec![*output],
-            Op::SwigluFusedBatched { out, .. } => vec![*out],
-            Op::SdpaCausalTiled { attn_out, .. } => vec![*attn_out],
-            Op::SigmoidGateNTokens { x, .. } => vec![*x], // in-place
+            Op::RmsNormBf16NTokens { out, .. } => vec![out.raw()],
+            Op::RmsNormQkNTokens { x, .. } => vec![x.raw()], // in-place
+            Op::RopeNTokens { x, .. } => vec![x.raw()],      // in-place
+            Op::ResidualAddNTokens { out, .. } => vec![out.raw()],
+            Op::ZeroBuffer { buf, .. } => vec![buf.raw()],
+            Op::MatvecNTokens { output, .. } => vec![output.raw()],
+            Op::SwigluFusedBatched { out, .. } => vec![out.raw()],
+            Op::SdpaCausalTiled { attn_out, .. } => vec![attn_out.raw()],
+            Op::SigmoidGateNTokens { x, .. } => vec![x.raw()], // in-place
             Op::SplitQGate {
                 q_out, gate_out, ..
-            } => vec![*q_out, *gate_out],
-            Op::RmsNormPerHeadNTokens { x, .. } => vec![*x], // in-place
+            } => vec![q_out.raw(), gate_out.raw()],
+            Op::RmsNormPerHeadNTokens { x, .. } => vec![x.raw()], // in-place
             Op::KvCacheAppendNTokens {
                 k_cache, v_cache, ..
-            } => vec![*k_cache, *v_cache],
+            } => vec![k_cache.raw(), v_cache.raw()],
             Op::MoeSoftmaxTopK {
                 indices_out,
                 weights_out,
                 ..
-            } => vec![*indices_out, *weights_out],
-            Op::MoeNormalizeWeights { weights, .. } => vec![*weights], // in-place
+            } => vec![indices_out.raw(), weights_out.raw()],
+            Op::MoeNormalizeWeights { weights, .. } => {
+                vec![weights.raw()] // in-place
+            }
             Op::MoeBatchedPermuteFuse {
                 bucket_gate,
                 bucket_up,
@@ -911,7 +949,13 @@ impl Op {
                 bucket_out,
                 out_sum,
                 ..
-            } => vec![*bucket_gate, *bucket_up, *bucket_act, *bucket_out, *out_sum],
+            } => vec![
+                bucket_gate.raw(),
+                bucket_up.raw(),
+                bucket_act.raw(),
+                bucket_out.raw(),
+                out_sum.raw(),
+            ],
             Op::MoeGatherIdFuse {
                 htpe,
                 hids,
@@ -921,23 +965,34 @@ impl Op {
                 out_sum,
                 ..
             } => vec![
-                *htpe, *hids, *gate_mid, *up_mid, *down_mid, *out_sum,
+                htpe.raw(),
+                hids.raw(),
+                gate_mid.raw(),
+                up_mid.raw(),
+                down_mid.raw(),
+                out_sum.raw(),
             ],
-            Op::MoeCombineResidualNTokens { hidden_out, .. } => vec![*hidden_out],
+            Op::MoeCombineResidualNTokens { hidden_out, .. } => {
+                vec![hidden_out.raw()]
+            }
             Op::Conv1dStepNTokens {
                 conv_state,
                 conv_out,
                 ..
-            } => vec![*conv_state, *conv_out], // conv_state is RMW
+            } => vec![conv_state.raw(), conv_out.raw()], // conv_state is RMW
             Op::ComputeDecayBetaNTokens {
                 g_decay_out,
                 beta_gate_out,
                 ..
-            } => vec![*g_decay_out, *beta_gate_out],
-            Op::GatedDeltaNetStepNTokens { state, output, .. } => vec![*state, *output], // state is RMW
-            Op::GatedDeltaNetChunkwise { state, output, .. } => vec![*state, *output], // state is RMW
-            Op::GatedRmsNormNTokens { output, .. } => vec![*output],
-            Op::EmbedGatherNTokens { hidden_out, .. } => vec![*hidden_out],
+            } => vec![g_decay_out.raw(), beta_gate_out.raw()],
+            Op::GatedDeltaNetStepNTokens { state, output, .. } => {
+                vec![state.raw(), output.raw()] // state is RMW
+            }
+            Op::GatedDeltaNetChunkwise { state, output, .. } => {
+                vec![state.raw(), output.raw()] // state is RMW
+            }
+            Op::GatedRmsNormNTokens { output, .. } => vec![output.raw()],
+            Op::EmbedGatherNTokens { hidden_out, .. } => vec![hidden_out.raw()],
         }
     }
 }
@@ -1001,8 +1056,11 @@ pub use gpu::{MetalBackend, MetalBufferPool, MetalConfig, MetalEncodeCtx};
 mod tests {
     use super::*;
 
-    fn buf(n: u32) -> BufId {
-        BufId(n)
+    /// Mint a typed `BufId<B>` from a raw index, for fixtures. Tests
+    /// don't care about which physical pool the id came from; they
+    /// just need stable index values across `one_of_each`.
+    fn buf<B: Buf>(n: u32) -> BufId<B> {
+        BufId::from_raw(n)
     }
 
     /// One of every variant, with minimal-ish stub fields.
@@ -1010,16 +1068,16 @@ mod tests {
         let mut g = Graph::new();
         g.push(Op::RmsNormBf16NTokens {
             label: "rms_in",
-            x: buf(0),
+            x: buf::<EmbedOutBuf>(0).into(),
             weight_off: 0,
-            out: buf(1),
+            out: buf::<AttnInputBuf>(1).into(),
             dim: 4096,
             n_tokens: 8,
             eps: 1e-6,
         });
         g.push(Op::RmsNormQkNTokens {
             label: "qk_norm",
-            x: buf(2),
+            x: buf::<ConvOutBuf>(2),
             num_k_heads: 4,
             key_dim: 128,
             key_offset_per_token: 512,
@@ -1028,18 +1086,18 @@ mod tests {
         });
         g.push(Op::ResidualAddNTokens {
             label: "resid",
-            a: buf(3),
-            b: buf(4),
-            out: buf(5),
+            a: buf::<OProjOutBuf>(3),
+            b: buf::<HiddenBuf>(4).into(),
+            out: buf::<ResidualBuf>(5),
             n_tokens: 8,
             dim: 4096,
         });
         g.push(Op::MatvecNTokens {
             label: "q_proj",
             weight: WeightRef { w_off: 0, s_off: 0, b_off: 0, bits: 4 },
-            input: buf(6),
+            input: buf::<AttnInputBuf>(6).into(),
             input_off: 0,
-            output: buf(7),
+            output: buf::<QProjOutBuf>(7).into(),
             output_off: 0,
             in_dim: 4096,
             out_dim: 4096,
@@ -1047,17 +1105,17 @@ mod tests {
         });
         g.push(Op::SwigluFusedBatched {
             label: "ffn_swiglu",
-            gate: buf(8),
-            up: buf(9),
-            out: buf(10),
+            gate: buf::<SharedFfnGateBuf>(8),
+            up: buf::<SharedFfnUpBuf>(9),
+            out: buf::<SharedFfnActBuf>(10),
             total: 8 * 1024,
         });
         g.push(Op::SdpaCausalTiled {
             label: "sdpa",
-            q: buf(11),
-            k: buf(12),
-            v: buf(13),
-            attn_out: buf(14),
+            q: buf::<QBuf>(11),
+            k: buf::<KvCacheKBuf>(12),
+            v: buf::<KvCacheVBuf>(13),
+            attn_out: buf::<AttnOutBuf>(14),
             n_tokens: 8,
             num_heads: 16,
             heads_per_kv: 2,
@@ -1069,23 +1127,23 @@ mod tests {
         });
         g.push(Op::SigmoidGateNTokens {
             label: "sigmoid_gate",
-            x: buf(15),
-            gate: buf(16),
+            x: buf::<AttnOutBuf>(15),
+            gate: buf::<QGateBuf>(16),
             dim: 1024,
             n_tokens: 8,
         });
         g.push(Op::SplitQGate {
             label: "split_q_gate",
-            q_proj: buf(40),
-            q_out: buf(41),
-            gate_out: buf(42),
+            q_proj: buf::<QProjOutBuf>(40),
+            q_out: buf::<QBuf>(41),
+            gate_out: buf::<QGateBuf>(42),
             num_heads: 16,
             head_dim: 128,
             n_tokens: 8,
         });
         g.push(Op::RmsNormPerHeadNTokens {
             label: "rms_norm_per_head",
-            x: buf(43),
+            x: buf::<QBuf>(43).into(),
             weight_off: 0,
             num_heads: 16,
             head_dim: 128,
@@ -1094,43 +1152,43 @@ mod tests {
         });
         g.push(Op::KvCacheAppendNTokens {
             label: "kv_cache_append",
-            k_src: buf(44),
-            v_src: buf(45),
-            k_cache: buf(46),
-            v_cache: buf(47),
+            k_src: buf::<KProjOutBuf>(44),
+            v_src: buf::<VProjOutBuf>(45),
+            k_cache: buf::<KvCacheKBuf>(46),
+            v_cache: buf::<KvCacheVBuf>(47),
             kv_dim: 1024,
             n_tokens: 8,
             kv_start: 0,
         });
         g.push(Op::MoeSoftmaxTopK {
             label: "moe_topk",
-            logits: buf(18),
-            indices_out: buf(19),
-            weights_out: buf(20),
+            logits: buf::<RouterLogitsBuf>(18),
+            indices_out: buf::<RouterIdxBuf>(19),
+            weights_out: buf::<RouterWeightsBuf>(20),
             n_tokens: 8,
             n_experts: 128,
             k: 8,
         });
         g.push(Op::MoeNormalizeWeights {
             label: "moe_norm",
-            weights: buf(20),
+            weights: buf::<RouterWeightsBuf>(20),
             n_tokens: 8,
             k: 8,
         });
         g.push(Op::MoeBatchedPermuteFuse {
             label: "moe_pf",
-            expert_base: buf(21),
+            expert_base: buf::<ExpertBaseBuf>(21),
             expert_stride: 0,
-            expert_indices: buf(35),
+            expert_indices: buf::<ExpertIndicesBuf>(35),
             expert_slots: vec![0],
-            bucket_input: buf(22),
-            bucket_gate: buf(23),
-            bucket_up: buf(24),
-            bucket_act: buf(25),
-            bucket_out: buf(26),
-            bucket_token_idx: buf(27),
-            bucket_weights: buf(28),
-            out_sum: buf(29),
+            bucket_input: buf::<BucketInputBuf>(22),
+            bucket_gate: buf::<BucketGateBuf>(23),
+            bucket_up: buf::<BucketUpBuf>(24),
+            bucket_act: buf::<BucketActBuf>(25),
+            bucket_out: buf::<BucketOutBuf>(26),
+            bucket_token_idx: buf::<BucketTokenIdxBuf>(27),
+            bucket_weights: buf::<BucketWeightsBuf>(28),
+            out_sum: buf::<MoeOutSumBuf>(29),
             buckets: ExpertBuckets {
                 expert_ids: vec![0],
                 offsets: vec![0, 8],
@@ -1140,41 +1198,41 @@ mod tests {
         });
         g.push(Op::MoeCombineResidualNTokens {
             label: "moe_combine",
-            h_mid: buf(30),
-            moe_sum: buf(31),
-            shared_out: buf(32),
-            shared_gate: buf(33),
-            hidden_out: buf(34),
+            h_mid: buf::<ResidualBuf>(30),
+            moe_sum: buf::<MoeOutSumBuf>(31),
+            shared_out: buf::<SharedFfnDownBuf>(32),
+            shared_gate: buf::<SharedGateBuf>(33),
+            hidden_out: buf::<HiddenBuf>(34),
             n_tokens: 8,
             dim: 4096,
         });
         g.push(Op::Conv1dStepNTokens {
             label: "conv1d",
-            qkv_in: buf(35),
-            conv_state: buf(36),
+            qkv_in: buf::<QkvStackBuf>(35),
+            conv_state: buf::<ConvStateBuf>(36),
             weight_off: 0,
-            conv_out: buf(37),
+            conv_out: buf::<ConvOutBuf>(37),
             conv_dim: 5120,
             n_tokens: 8,
         });
         g.push(Op::ComputeDecayBetaNTokens {
             label: "decay_beta",
-            alpha_in: buf(38),
-            beta_in: buf(39),
+            alpha_in: buf::<AlphaStackBuf>(38),
+            beta_in: buf::<BetaStackBuf>(39),
             a_log_off: 0,
             dt_bias_off: 0,
-            g_decay_out: buf(40),
-            beta_gate_out: buf(41),
+            g_decay_out: buf::<GDecayBuf>(40),
+            beta_gate_out: buf::<BetaGateBuf>(41),
             num_v_heads: 16,
             n_tokens: 8,
         });
         g.push(Op::GatedDeltaNetStepNTokens {
             label: "delta_net",
-            state: buf(42),
-            conv_out: buf(43),
-            g_decay: buf(44),
-            beta_gate: buf(45),
-            output: buf(46),
+            state: buf::<DeltaStateBuf>(42),
+            conv_out: buf::<ConvOutBuf>(43),
+            g_decay: buf::<GDecayBuf>(44),
+            beta_gate: buf::<BetaGateBuf>(45),
+            output: buf::<DeltaOutBuf>(46),
             num_v_heads: 16,
             value_dim: 128,
             k_heads_per_v: 2,
@@ -1182,10 +1240,10 @@ mod tests {
         });
         g.push(Op::GatedRmsNormNTokens {
             label: "gated_rms",
-            values: buf(47),
-            z: buf(48),
+            values: buf::<DeltaOutBuf>(47),
+            z: buf::<ZStackBuf>(48),
             weight_off: 0,
-            output: buf(49),
+            output: buf::<ValueOutBuf>(49),
             num_v_heads: 16,
             value_dim: 128,
             n_tokens: 8,
@@ -1193,9 +1251,9 @@ mod tests {
         });
         g.push(Op::EmbedGatherNTokens {
             label: "embed_gather",
-            token_ids: buf(50),
+            token_ids: buf::<TokenIdsBuf>(50),
             weight: WeightRef { w_off: 0, s_off: 0, b_off: 0, bits: 4 },
-            hidden_out: buf(51),
+            hidden_out: buf::<EmbedOutBuf>(51),
             hidden_dim: 2048,
             n_tokens: 8,
         });
@@ -1259,13 +1317,13 @@ mod tests {
         let g = one_of_each();
         for op in &g.ops {
             assert!(
-                !op.reads().is_empty(),
-                "{} produced empty reads()",
+                !op.reads_raw().is_empty(),
+                "{} produced empty reads_raw()",
                 op.variant_name()
             );
             assert!(
-                !op.writes().is_empty(),
-                "{} produced empty writes()",
+                !op.writes_raw().is_empty(),
+                "{} produced empty writes_raw()",
                 op.variant_name()
             );
         }
@@ -1277,7 +1335,7 @@ mod tests {
             ops: vec![
                 Op::RmsNormQkNTokens {
                     label: "qk",
-                    x: buf(2),
+                    x: buf::<ConvOutBuf>(2),
                     num_k_heads: 4,
                     key_dim: 128,
                     key_offset_per_token: 512,
@@ -1286,30 +1344,30 @@ mod tests {
                 },
                 Op::MoeNormalizeWeights {
                     label: "moe_norm",
-                    weights: buf(20),
+                    weights: buf::<RouterWeightsBuf>(20),
                     n_tokens: 8,
                     k: 8,
                 },
                 Op::Conv1dStepNTokens {
                     label: "conv1d",
-                    qkv_in: buf(35),
-                    conv_state: buf(36),
+                    qkv_in: buf::<QkvStackBuf>(35),
+                    conv_state: buf::<ConvStateBuf>(36),
                     weight_off: 0,
-                    conv_out: buf(37),
+                    conv_out: buf::<ConvOutBuf>(37),
                     conv_dim: 5120,
                     n_tokens: 8,
                 },
             ],
         };
         // RmsNormQkNTokens: x is read and written
-        assert!(g.ops[0].reads().contains(&buf(2)));
-        assert!(g.ops[0].writes().contains(&buf(2)));
+        assert!(g.ops[0].reads_raw().contains(&2));
+        assert!(g.ops[0].writes_raw().contains(&2));
         // MoeNormalizeWeights: weights is read and written
-        assert!(g.ops[1].reads().contains(&buf(20)));
-        assert!(g.ops[1].writes().contains(&buf(20)));
+        assert!(g.ops[1].reads_raw().contains(&20));
+        assert!(g.ops[1].writes_raw().contains(&20));
         // Conv1dStepNTokens: conv_state is read and written
-        assert!(g.ops[2].reads().contains(&buf(36)));
-        assert!(g.ops[2].writes().contains(&buf(36)));
+        assert!(g.ops[2].reads_raw().contains(&36));
+        assert!(g.ops[2].writes_raw().contains(&36));
     }
 
     #[test]
@@ -1330,18 +1388,18 @@ mod tests {
         let mut g = Graph::new();
         g.push(Op::RmsNormBf16NTokens {
             label: "rms_in",
-            x: buf(0),
+            x: buf::<EmbedOutBuf>(0).into(),
             weight_off: 0,
-            out: buf(1),
+            out: buf::<AttnInputBuf>(1).into(),
             dim: 64,
             n_tokens: 2,
             eps: 1e-6,
         });
         g.push(Op::ResidualAddNTokens {
             label: "resid",
-            a: buf(1),
-            b: buf(0),
-            out: buf(2),
+            a: buf::<OProjOutBuf>(1),
+            b: buf::<EmbedOutBuf>(0).into(),
+            out: buf::<ResidualBuf>(2),
             n_tokens: 2,
             dim: 64,
         });
@@ -1354,7 +1412,8 @@ mod tests {
 
     #[test]
     fn bufid_display_uses_percent_prefix() {
-        assert_eq!(format!("{}", buf(42)), "%42");
+        let id: BufId<MoeInputBuf> = BufId::from_raw(42);
+        assert_eq!(format!("{id}"), "%42");
     }
 
 }

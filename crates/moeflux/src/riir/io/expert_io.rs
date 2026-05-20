@@ -44,6 +44,7 @@ use memmap2::Mmap;
 use metal::{Buffer, MTLResourceOptions, NSUInteger};
 use moeflux_metal::ResidencySet;
 
+use crate::riir::backend::buftype::ExpertBaseBuf;
 use crate::riir::backend::{BufId, MetalBufferPool};
 use crate::riir::variants::{Variant, VARIANT};
 
@@ -185,7 +186,7 @@ pub struct ExpertFiles {
     /// `BufId` rather than `&Buffer`. The pool holds a refcounted
     /// clone of the same `Buffer` that lives in `mmap_buffers`;
     /// drop order is irrelevant (BufId is `Copy`).
-    mmap_buf_ids: Vec<Option<BufId>>,
+    mmap_buf_ids: Vec<Option<BufId<ExpertBaseBuf>>>,
     /// Per-layer mmap. Populated at `open` time when `mode == Mmap`.
     /// `None` for the Pread mode and for missing layers.
     mmap_layers: Vec<Option<Mmap>>,
@@ -372,7 +373,7 @@ impl ExpertFiles {
         &self,
         layer_idx: usize,
         expert_idx: u32,
-    ) -> Option<(BufId, u64)> {
+    ) -> Option<(BufId<ExpertBaseBuf>, u64)> {
         let id = self.mmap_buf_ids.get(layer_idx)?.as_ref()?;
         let off = (expert_idx as u64) * (self.expert_size as u64);
         Some((*id, off))

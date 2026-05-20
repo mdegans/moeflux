@@ -29,6 +29,7 @@ use crate::riir::moe::moe_cpu::moe_permute_fuse_cpu;
 use crate::riir::variants::{GROUP_SIZE, VARIANT};
 use crate::riir::io::weight_file::WeightFile;
 
+use super::buftype::Buf;
 use super::{Backend, BufId, BufferPool, Graph, GraphError, Op};
 
 /// CPU buffer pool: physical storage is `Vec<RefCell<Vec<u8>>>`,
@@ -80,13 +81,14 @@ impl BufferPool for CpuBufferPool {
     type Handle = RefCell<Vec<u8>>;
     type Error = GraphError;
 
-    fn alloc(
+    fn alloc<B: Buf>(
         &mut self,
         bytes: usize,
         label: &'static str,
         persistent: bool,
-    ) -> Result<BufId, GraphError> {
-        let id = BufId(self.bufid_to_physical.len() as u32);
+    ) -> Result<BufId<B>, GraphError> {
+        let id: BufId<B> =
+            BufId::from_raw(self.bufid_to_physical.len() as u32);
         let physical = self.buffers.len() as u32;
         self.buffers.push(RefCell::new(vec![0u8; bytes]));
         self.labels.push(label);
@@ -96,14 +98,21 @@ impl BufferPool for CpuBufferPool {
         Ok(id)
     }
 
-    fn handle(&self, id: BufId) -> &RefCell<Vec<u8>> {
-        let physical = self.bufid_to_physical[id.0 as usize] as usize;
+    fn handle<B: Buf>(&self, id: BufId<B>) -> &RefCell<Vec<u8>> {
+        let physical = self.bufid_to_physical[id.raw() as usize] as usize;
         &self.buffers[physical]
     }
 
-    fn upload(&mut self, id: BufId, host: &[u8]) -> Result<(), GraphError> {
-        let idx = id.0 as usize;
-        let label = *self.labels.get(idx).ok_or(GraphError::BadBufId(id))?;
+    fn upload<B: Buf>(
+        &mut self,
+        id: BufId<B>,
+        host: &[u8],
+    ) -> Result<(), GraphError> {
+        let idx = id.raw() as usize;
+        let label = *self
+            .labels
+            .get(idx)
+            .ok_or(GraphError::BadBufId(id.raw()))?;
         let expected = self.byte_sizes[idx];
         // Prefix semantics: `host` may be shorter than the buffer
         // (once-per-run buffers are sized at max chunk width; a
@@ -121,14 +130,17 @@ impl BufferPool for CpuBufferPool {
         Ok(())
     }
 
-    fn upload_at(
+    fn upload_at<B: Buf>(
         &mut self,
-        id: BufId,
+        id: BufId<B>,
         offset: usize,
         host: &[u8],
     ) -> Result<(), GraphError> {
-        let idx = id.0 as usize;
-        let label = *self.labels.get(idx).ok_or(GraphError::BadBufId(id))?;
+        let idx = id.raw() as usize;
+        let label = *self
+            .labels
+            .get(idx)
+            .ok_or(GraphError::BadBufId(id.raw()))?;
         let expected = self.byte_sizes[idx];
         if offset + host.len() > expected {
             return Err(GraphError::SizeMismatch {
@@ -143,9 +155,16 @@ impl BufferPool for CpuBufferPool {
         Ok(())
     }
 
-    fn download(&self, id: BufId, host: &mut [u8]) -> Result<(), GraphError> {
-        let idx = id.0 as usize;
-        let label = *self.labels.get(idx).ok_or(GraphError::BadBufId(id))?;
+    fn download<B: Buf>(
+        &self,
+        id: BufId<B>,
+        host: &mut [u8],
+    ) -> Result<(), GraphError> {
+        let idx = id.raw() as usize;
+        let label = *self
+            .labels
+            .get(idx)
+            .ok_or(GraphError::BadBufId(id.raw()))?;
         let expected = self.byte_sizes[idx];
         // Prefix semantics: see `upload`.
         if host.len() > expected {
@@ -193,9 +212,9 @@ impl BufferPool for CpuBufferPool {
         self.buffers.truncate(max_physical);
     }
 
-    fn label(&self, id: BufId) -> &'static str {
+    fn label<B: Buf>(&self, id: BufId<B>) -> &'static str {
         self.labels
-            .get(id.0 as usize)
+            .get(id.raw() as usize)
             .copied()
             .unwrap_or("<bad-bufid>")
     }
@@ -210,11 +229,13 @@ impl BufferPool for CpuBufferPool {
         // Filter coloring: persistent BufIds keep their dedicated
         // physical buffer (content must survive `reset_transient`).
         // Non-persistent colorable BufIds are eligible for aliasing.
+        // Aliasable is keyed by raw `u32` index — coloring is
+        // tag-agnostic.
         let n_bufids = self.bufid_to_physical.len();
-        let aliasable: HashMap<BufId, ColorId> = coloring
+        let aliasable: HashMap<u32, ColorId> = coloring
             .bufid_to_color
             .iter()
-            .filter(|(b, _)| !self.persistent[b.0 as usize])
+            .filter(|(b, _)| !self.persistent[**b as usize])
             .map(|(b, c)| (*b, *c))
             .collect();
 
@@ -230,8 +251,8 @@ impl BufferPool for CpuBufferPool {
         let mut new_bufid_to_physical: Vec<u32> = vec![u32::MAX; n_bufids];
         let mut old_to_new: HashMap<usize, u32> = HashMap::new();
         for bufid_idx in 0..n_bufids {
-            let buf = BufId(bufid_idx as u32);
-            if aliasable.contains_key(&buf) {
+            let key = bufid_idx as u32;
+            if aliasable.contains_key(&key) {
                 continue;
             }
             let old_physical = self.bufid_to_physical[bufid_idx] as usize;
@@ -254,7 +275,7 @@ impl BufferPool for CpuBufferPool {
             let max_size = aliasable
                 .iter()
                 .filter(|&(_, c)| *c == color)
-                .map(|(b, _)| self.byte_sizes[b.0 as usize])
+                .map(|(b, _)| self.byte_sizes[*b as usize])
                 .max()
                 .unwrap_or(0);
             if max_size == 0 {
@@ -269,7 +290,7 @@ impl BufferPool for CpuBufferPool {
         // Phase 3: point each aliasable BufId at its color's slot.
         for (buf, color) in &aliasable {
             let phys = color_to_physical[color];
-            new_bufid_to_physical[buf.0 as usize] = phys;
+            new_bufid_to_physical[*buf as usize] = phys;
         }
 
         debug_assert!(new_bufid_to_physical.iter().all(|&p| p != u32::MAX));
@@ -280,7 +301,7 @@ impl BufferPool for CpuBufferPool {
         // frozen for the run; flipping `persistent` keeps it (and the
         // shared color buffer it points at) across `reset_transient`.
         for buf in aliasable.keys() {
-            self.persistent[buf.0 as usize] = true;
+            self.persistent[*buf as usize] = true;
         }
     }
 }
@@ -315,32 +336,32 @@ impl CpuBackend {
     // Slice accessors over pool buffers
     // ------------------------------------------------------------------
 
-    fn read_f32(&self, id: BufId) -> Ref<'_, [f32]> {
+    fn read_f32<B: Buf>(&self, id: BufId<B>) -> Ref<'_, [f32]> {
         Ref::map(self.pool.handle(id).borrow(), |v| bytes_as::<f32>(v))
     }
 
-    fn write_f32(&self, id: BufId) -> RefMut<'_, [f32]> {
+    fn write_f32<B: Buf>(&self, id: BufId<B>) -> RefMut<'_, [f32]> {
         RefMut::map(self.pool.handle(id).borrow_mut(), |v| {
             bytes_as_mut::<f32>(v)
         })
     }
 
     #[allow(dead_code)]
-    fn read_i32(&self, id: BufId) -> Ref<'_, [i32]> {
+    fn read_i32<B: Buf>(&self, id: BufId<B>) -> Ref<'_, [i32]> {
         Ref::map(self.pool.handle(id).borrow(), |v| bytes_as::<i32>(v))
     }
 
-    fn write_i32(&self, id: BufId) -> RefMut<'_, [i32]> {
+    fn write_i32<B: Buf>(&self, id: BufId<B>) -> RefMut<'_, [i32]> {
         RefMut::map(self.pool.handle(id).borrow_mut(), |v| {
             bytes_as_mut::<i32>(v)
         })
     }
 
-    fn read_bytes(&self, id: BufId) -> Ref<'_, [u8]> {
+    fn read_bytes<B: Buf>(&self, id: BufId<B>) -> Ref<'_, [u8]> {
         Ref::map(self.pool.handle(id).borrow(), |v| v.as_slice())
     }
 
-    fn write_bytes(&self, id: BufId) -> RefMut<'_, [u8]> {
+    fn write_bytes<B: Buf>(&self, id: BufId<B>) -> RefMut<'_, [u8]> {
         RefMut::map(self.pool.handle(id).borrow_mut(), |v| v.as_mut_slice())
     }
 }
@@ -1443,25 +1464,25 @@ fn bytemuck_f32(b: &[u8]) -> &[f32] {
 
 #[cfg(test)]
 mod tests {
+    use super::super::buftype::{HiddenBuf, MoeInputBuf, ResidualBuf};
     use super::*;
-
 
     #[test]
     fn cpu_pool_alloc_returns_sequential_bufids() {
         let mut p = CpuBufferPool::new();
-        let a = p.alloc(64, "a", false).unwrap();
-        let b = p.alloc(128, "b", true).unwrap();
-        let c = p.alloc(32, "c", false).unwrap();
-        assert_eq!(a, BufId(0));
-        assert_eq!(b, BufId(1));
-        assert_eq!(c, BufId(2));
+        let a: BufId<HiddenBuf> = p.alloc(64, "a", false).unwrap();
+        let b: BufId<HiddenBuf> = p.alloc(128, "b", true).unwrap();
+        let c: BufId<HiddenBuf> = p.alloc(32, "c", false).unwrap();
+        assert_eq!(a.raw(), 0);
+        assert_eq!(b.raw(), 1);
+        assert_eq!(c.raw(), 2);
         assert_eq!(p.physical_buffer_count(), 3);
     }
 
     #[test]
     fn cpu_pool_upload_download_round_trips() {
         let mut p = CpuBufferPool::new();
-        let id = p.alloc(16, "x", false).unwrap();
+        let id: BufId<MoeInputBuf> = p.alloc(16, "x", false).unwrap();
         let payload = vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
         p.upload(id, &payload).unwrap();
         let mut out = vec![0u8; 16];
@@ -1472,7 +1493,7 @@ mod tests {
     #[test]
     fn cpu_pool_upload_rejects_size_mismatch() {
         let mut p = CpuBufferPool::new();
-        let id = p.alloc(16, "x", false).unwrap();
+        let id: BufId<MoeInputBuf> = p.alloc(16, "x", false).unwrap();
         let too_big = vec![0u8; 17];
         match p.upload(id, &too_big) {
             Err(GraphError::SizeMismatch { label, expected, actual }) => {
@@ -1487,21 +1508,27 @@ mod tests {
     #[test]
     fn cpu_pool_reset_transient_keeps_persistent_prefix() {
         let mut p = CpuBufferPool::new();
-        let _persistent_a = p.alloc(64, "kv_a", true).unwrap();
-        let _persistent_b = p.alloc(64, "kv_b", true).unwrap();
-        let _transient = p.alloc(32, "intermed", false).unwrap();
+        let _persistent_a: BufId<HiddenBuf> =
+            p.alloc(64, "kv_a", true).unwrap();
+        let _persistent_b: BufId<HiddenBuf> =
+            p.alloc(64, "kv_b", true).unwrap();
+        let _transient: BufId<HiddenBuf> =
+            p.alloc(32, "intermed", false).unwrap();
         assert_eq!(p.physical_buffer_count(), 3);
         p.reset_transient();
         assert_eq!(p.physical_buffer_count(), 2);
-        // The persistent ids are still valid.
-        assert_eq!(p.label(BufId(0)), "kv_a");
-        assert_eq!(p.label(BufId(1)), "kv_b");
+        // The persistent ids are still valid (re-mint typed ids
+        // pointing at the same raw indices to ask the pool).
+        let id0: BufId<HiddenBuf> = BufId::from_raw(0);
+        let id1: BufId<HiddenBuf> = BufId::from_raw(1);
+        assert_eq!(p.label(id0), "kv_a");
+        assert_eq!(p.label(id1), "kv_b");
     }
 
     #[test]
     fn cpu_pool_handle_returns_refcell_with_zeros() {
         let mut p = CpuBufferPool::new();
-        let id = p.alloc(12, "z", false).unwrap();
+        let id: BufId<ResidualBuf> = p.alloc(12, "z", false).unwrap();
         let handle = p.handle(id);
         let borrowed = handle.borrow();
         assert_eq!(&*borrowed, &[0u8; 12]);

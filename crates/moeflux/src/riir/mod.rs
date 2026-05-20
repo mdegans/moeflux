@@ -1249,7 +1249,7 @@ impl RsCtx<MetalBackend> {
         read_into(pool.handle(bufs.h_mid), h_mid_out);
         read_into(pool.handle(bufs.shared_out), shared_out_out);
         if let Some(gate_dst) = gate_score_out {
-            let s = pool.handle(bufs.batch_out[5]).contents() as *const f32;
+            let s = pool.handle(bufs.shared_gate).contents() as *const f32;
             // SAFETY: shared storage.
             *gate_dst = unsafe { *s };
         }
@@ -1796,11 +1796,17 @@ impl RsCtx<MetalBackend> {
             .upload(head_tail_scratch.token_ids, bytemuck::cast_slice(tokens))
             .expect("pool upload token ids");
         let mut g_head = Graph::new();
+        // The head writes the embedding-gather output into the
+        // run-lifetime `hidden_a` slot of the cross-layer double-
+        // buffer (`BufId<HiddenBuf>`). The Op's `hidden_out` slot is
+        // typed `BufId<EmbedOutBuf>` — same physical role at the
+        // top of the model, with a dedicated `From<HiddenBuf> for
+        // BufId<EmbedOutBuf>` impl that documents the bridge here.
         g_head.push(Op::EmbedGatherNTokens {
             label: "embed_gather",
             token_ids: head_tail_scratch.token_ids,
             weight: embed_weight,
-            hidden_out: hidden_a_id,
+            hidden_out: hidden_a_id.into(),
             hidden_dim: hidden_dim as u32,
             n_tokens: n as u32,
         });
@@ -1930,9 +1936,21 @@ impl RsCtx<MetalBackend> {
             let mut g_tail = Graph::new();
             g_tail.push(Op::RmsNormBf16NTokens {
                 label: "final_norm",
-                x: hidden_a_id,
+                // Last layer wrote into `hidden_a`; norm reads it
+                // (HiddenBuf → RmsNormIn) and writes the post-norm
+                // value into `hidden_b` (HiddenBuf → TailNormedBuf →
+                // RmsNormOut, via the union impl).
+                x: hidden_a_id.into(),
                 weight_off: norm_off,
-                out: hidden_b_id,
+                out: {
+                    // Two-step to RmsNormOut: HiddenBuf → TailNormedBuf
+                    // → RmsNormOut. Documented in buftype.rs above
+                    // the `HiddenBuf -> TailNormedBuf` impl.
+                    let tail: crate::riir::backend::BufId<
+                        crate::riir::backend::buftype::TailNormedBuf,
+                    > = hidden_b_id.into();
+                    tail.into()
+                },
                 dim: hidden_dim as u32,
                 n_tokens: n as u32,
                 eps: variants::RMS_NORM_EPS,
@@ -1940,12 +1958,21 @@ impl RsCtx<MetalBackend> {
             g_tail.push(Op::MatvecNTokens {
                 label: "lm_head",
                 weight: lm_head_weight,
-                input: hidden_b_id,
+                // lm_head matvec reads the tail-normed buffer (we just
+                // wrote it through `final_norm`). HiddenBuf →
+                // TailNormedBuf → MatvecIn via the `TailNormedBuf ->
+                // MatvecIn` union impl.
+                input: {
+                    let tail: crate::riir::backend::BufId<
+                        crate::riir::backend::buftype::TailNormedBuf,
+                    > = hidden_b_id.into();
+                    tail.into()
+                },
                 input_off: ((n - 1)
                     * hidden_dim
                     * std::mem::size_of::<f32>())
                     as u64,
-                output: head_tail_scratch.logits,
+                output: head_tail_scratch.logits.into(),
                 output_off: 0,
                 in_dim: hidden_dim as u32,
                 out_dim: v.vocab_size as u32,

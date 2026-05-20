@@ -25,6 +25,7 @@
 
 use metal::{Buffer, Device, MTLResourceOptions, NSUInteger};
 
+use crate::riir::backend::buftype::{KvCacheKBuf, KvCacheVBuf};
 use crate::riir::backend::gpu::MetalBufferPool;
 use crate::riir::backend::{BufId, BufferPool};
 use crate::riir::variants::{Variant, MAX_SEQ_LEN, VARIANT};
@@ -56,8 +57,8 @@ use crate::riir::variants::{Variant, MAX_SEQ_LEN, VARIANT};
 pub struct KvCache {
     /// Pool `BufId` for the `[MAX_SEQ_LEN, num_kv_heads * head_dim]`
     /// row-major f32 K cache. `None` until [`Self::ensure_buffers`].
-    pub k_id: Option<BufId>,
-    pub v_id: Option<BufId>,
+    pub k_id: Option<BufId<KvCacheKBuf>>,
+    pub v_id: Option<BufId<KvCacheVBuf>>,
     pub len: i32,
 }
 
