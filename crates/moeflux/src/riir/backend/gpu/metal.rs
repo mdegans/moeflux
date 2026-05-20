@@ -36,7 +36,61 @@ pub use metal::{
     MTLResourceOptions, NSUInteger,
 };
 
+use objc::{msg_send, sel, sel_impl};
+
 use moeflux_metal::Kernels;
+
+/// Read the UTF-8 bytes out of an `NSString *`. Pure-Objective-C helper —
+/// `metal-rs`'s `nsstring_as_str` is crate-private, so we have our own.
+/// Caller must hold a live reference to the underlying NSString.
+unsafe fn nsstring_as_str<'a>(nsstr: &'a objc::runtime::Object) -> &'a str {
+    let bytes: *const i8 = unsafe { msg_send![nsstr, UTF8String] };
+    let len: NSUInteger = unsafe { msg_send![nsstr, length] };
+    if bytes.is_null() || len == 0 {
+        return "";
+    }
+    let slice = unsafe { std::slice::from_raw_parts(bytes.cast::<u8>(), len as usize) };
+    std::str::from_utf8(slice).unwrap_or("<invalid utf-8>")
+}
+
+/// Format the `NSError` attached to a faulted `MTLCommandBuffer` for
+/// panic output. Maps the integer error code to the
+/// [`MTLCommandBufferError`](metal::MTLCommandBufferError) variant name
+/// (Timeout / PageFault / OutOfMemory / …) so the panic message names
+/// the failure class, not just "completed with error status".
+///
+/// Returns `"<no NSError>"` when `cmdbuf.error` is nil (the cmdbuf is
+/// in `Error` status but Apple didn't attach a reason — rare).
+fn cmdbuf_error_detail(cmdbuf: &CommandBufferRef) -> String {
+    unsafe {
+        let err: *mut objc::runtime::Object = msg_send![cmdbuf, error];
+        if err.is_null() {
+            return "<no NSError>".to_string();
+        }
+        let code: isize = msg_send![err, code];
+        let desc_obj: *mut objc::runtime::Object = msg_send![err, localizedDescription];
+        let desc = if desc_obj.is_null() {
+            "<no description>"
+        } else {
+            nsstring_as_str(&*desc_obj)
+        };
+        // Names from MTLCommandBufferError. See metal-rs commandbuffer.rs.
+        let kind = match code {
+            0 => "None",
+            1 => "Internal",
+            2 => "Timeout",
+            3 => "PageFault",
+            4 => "Blacklisted",
+            7 => "NotPermitted",
+            8 => "OutOfMemory",
+            9 => "InvalidResource",
+            10 => "Memoryless",
+            11 => "DeviceRemoved",
+            _ => "Unknown",
+        };
+        format!("{kind}({code}): {desc}")
+    }
+}
 
 /// Errors from the Metal backend.
 #[derive(Debug, thiserror::Error)]
@@ -263,11 +317,15 @@ impl MetalContext {
         let cpu_wait_ns = t0.elapsed().as_nanos() as u64;
 
         // Fail fast — previously a cmdbuf error was silently swallowed.
+        // `cmdbuf_error_detail` extracts the NSError code + localized
+        // description so the panic names the failure class (Timeout /
+        // PageFault / OutOfMemory / …) rather than "error status".
         if cmdbuf.status() == metal::MTLCommandBufferStatus::Error {
+            let detail = cmdbuf_error_detail(cmdbuf);
             panic!(
                 "Metal command buffer '{label}' completed with error \
-                 status; rerun with MTL_DEBUG_LAYER=1 \
-                 MTL_SHADER_VALIDATION=1 for the fault detail"
+                 status: {detail}. Rerun with MTL_DEBUG_LAYER=1 \
+                 MTL_SHADER_VALIDATION=1 for the fault detail."
             );
         }
 

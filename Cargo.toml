@@ -32,6 +32,11 @@ rayon       = "1.10"
 libc        = "0.2"
 # POD reinterpret casts (&[f32] <-> &[u8]) for state snapshot I/O.
 bytemuck    = "1"
+# Direct Objective-C messaging for surfacing `cmdbuf.error()` detail —
+# metal-rs defines `MTLCommandBufferError` but exposes no accessor for
+# the NSError on a failed command buffer. Already a transitive dep of
+# `metal`; declaring direct so we can use `msg_send!`.
+objc        = "0.2"
 
 [profile.release]
 opt-level = 3
