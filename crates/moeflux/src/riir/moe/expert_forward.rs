@@ -1494,14 +1494,18 @@ fn encode_moe_gather(
 /// Pipeline (per layer):
 /// 1. `MoeIdMap0Call` — build `htpe[n_experts]` + `hids[n_experts,
 ///    n_tokens]` from the router's per-token `indices[n_tokens, k]`.
-/// 2. `MoeGatherIdCall` for **gate** — `h_mid → gate_mid`.
-/// 3. `MoeGatherIdCall` for **up** — `h_mid → up_mid`.
+/// 2. `MoeGatherIdCall` for **gate** — `mlp_in → gate_mid`.
+/// 3. `MoeGatherIdCall` for **up** — `mlp_in → up_mid`.
 /// 4. SwiGLU — `silu(gate_mid) * up_mid → gate_mid` (in-place; gate
 ///    and "act" share the same buffer; safe because each thread reads
 ///    gate[i] + up[i] before writing gate[i]).
 /// 5. `MoeGatherIdCall` for **down** — `gate_mid (now silu*up) →
 ///    down_mid`. Note `ne11 = k` here: input is per-(token, slot).
 /// 6. `MoeCombineTopkCall` — `down_mid × weights → out_sum`.
+///
+/// `mlp_in` is the **post-RmsNorm** hidden state — the input the
+/// gate/up matmuls expect. NOT the pre-norm residual (that's a
+/// different buffer; see `Op::MoeGatherIdFuse::mlp_in` doc).
 ///
 /// All scratch (htpe, hids, gate_mid, up_mid, down_mid) is provided
 /// by the producer; sized for the chunk width at construction.
@@ -1514,7 +1518,7 @@ pub fn encode_moe_gather_id_fuse(
     expert_stride: u64,
     indices: &Buffer,
     weights: &Buffer,
-    h_mid: &Buffer,
+    mlp_in: &Buffer,
     out_sum: &Buffer,
     htpe: &Buffer,
     hids: &Buffer,
@@ -1593,9 +1597,9 @@ pub fn encode_moe_gather_id_fuse(
         );
     };
 
-    // --- 2. gate: h_mid → gate_mid ---
+    // --- 2. gate: mlp_in → gate_mid ---
     mm_id(
-        h_mid,
+        mlp_in,
         gate_mid,
         hidden_dim,
         moe_inter,
@@ -1606,9 +1610,9 @@ pub fn encode_moe_gather_id_fuse(
         /* nb11 */ 0,
         /* nb12 */ (hidden_dim * 4) as u64,
     );
-    // --- 3. up: h_mid → up_mid ---
+    // --- 3. up: mlp_in → up_mid ---
     mm_id(
-        h_mid,
+        mlp_in,
         up_mid,
         hidden_dim,
         moe_inter,

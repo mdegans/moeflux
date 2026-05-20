@@ -598,8 +598,12 @@ pub enum Op {
         indices: BufId,
         /// Router output — `[n_tokens, k]` f32.
         weights: BufId,
-        /// Input hidden states — `[n_tokens, hidden_dim]` f32.
-        h_mid: BufId,
+        /// Input to the MoE-MLP matmul stack — the **post-RmsNorm**
+        /// hidden state (`[n_tokens, hidden_dim]` f32). This is the
+        /// same value the bucket-permute path feeds its bucket_input
+        /// host-permute from. Do NOT pass the pre-norm residual
+        /// (`MoeGraphScratch::h_mid`) — that was the session-19 bug.
+        mlp_in: BufId,
         /// Output — `[n_tokens, hidden_dim]` f32. Accumulator; the
         /// kernel WRITES (not adds). Combine with shared/residual
         /// downstream via [`Self::MoeCombineResidualNTokens`].
@@ -837,9 +841,9 @@ impl Op {
                 expert_base,
                 indices,
                 weights,
-                h_mid,
+                mlp_in,
                 ..
-            } => vec![*expert_base, *indices, *weights, *h_mid],
+            } => vec![*expert_base, *indices, *weights, *mlp_in],
             Op::MoeCombineResidualNTokens {
                 h_mid,
                 moe_sum,
