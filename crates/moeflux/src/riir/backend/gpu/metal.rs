@@ -358,6 +358,34 @@ impl MetalContext {
             .expect("cmdbuf_stats mutex poisoned")
             .clear();
     }
+
+    /// Drain the command queue: submit an empty cmdbuf and wait for
+    /// it. Metal serializes cmdbufs within a queue, so waiting on an
+    /// empty cmdbuf submitted after every prior one forces them all
+    /// to drain first.
+    ///
+    /// Use as an explicit synchronization barrier when the writer
+    /// cmdbuf isn't held by the caller — `memory_clear`,
+    /// `state_save` / `state_load`, end-of-request points. Avoids
+    /// relying on the implicit "the last forward's last cmdbuf
+    /// already drained" invariant.
+    ///
+    /// O(committed cmdbufs in flight) wait — cheap when the queue is
+    /// already idle. Panics on cmdbuf error (matches
+    /// [`Self::commit_and_wait_labeled`] discipline).
+    pub fn drain_queue(&self) {
+        let cmdbuf = self.queue.new_command_buffer();
+        cmdbuf.commit();
+        cmdbuf.wait_until_completed();
+        if cmdbuf.status() == metal::MTLCommandBufferStatus::Error {
+            let detail = cmdbuf_error_detail(cmdbuf);
+            panic!(
+                "drain_queue: barrier cmdbuf completed with error \
+                 status: {detail}. Rerun with MTL_DEBUG_LAYER=1 \
+                 MTL_SHADER_VALIDATION=1 for the fault detail."
+            );
+        }
+    }
 }
 
 impl std::fmt::Debug for MetalContext {
@@ -657,5 +685,18 @@ mod tests {
         assert_eq!(buf.len(), 1024);
         let read = buf.to_vec();
         assert_eq!(read, data);
+    }
+
+    /// `drain_queue` on an idle queue should complete instantly and
+    /// leave the context healthy for subsequent work. Smoke only —
+    /// real drain-after-work coverage falls out of every test that
+    /// commits a kernel and reads results back.
+    #[test]
+    #[ignore = "needs Metal device"]
+    fn drain_queue_smoke() {
+        let backend = MetalContext::new().expect("MetalContext::new");
+        backend.drain_queue();
+        // Second call must also be fine — queue is still alive.
+        backend.drain_queue();
     }
 }
