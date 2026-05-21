@@ -198,6 +198,10 @@ pub struct MetalContext {
     kernels: Kernels,
 }
 
+/// Set once on first [`MetalContext::new`] call. See body for the
+/// `AGX_RELAX_CDM_CTXSTORE_TIMEOUT` workaround.
+static AGX_TIMEOUT_INIT: std::sync::Once = std::sync::Once::new();
+
 impl MetalContext {
     /// Open the system-default Metal device, build a command queue,
     /// and compile `shaders.metal` into a `Library`.
@@ -207,6 +211,25 @@ impl MetalContext {
     /// every kernel up front (e.g. for diagnostics or to amortize
     /// JIT cost), call [`Self::warm_all`].
     pub fn new() -> Result<Self, MetalError> {
+        // Workaround for the macOS GPU watchdog killing long-running
+        // cmdbufs with `kIOGPUCommandBufferCallbackErrorImpactingInteractivity`.
+        // Without this, our `graph_full_attn` cmdbufs on long-prefill
+        // workloads trip the interactivity timeout — first prefill
+        // sometimes squeaks under, subsequent prefills (warmer chip,
+        // tighter scheduler) crash. Mirrors llama.cpp's mitigation
+        // (`ggml-metal.cpp:921-923`, `setenv("AGX_RELAX_CDM_CTXSTORE_TIMEOUT", "1", true)`).
+        // ref: https://github.com/ggml-org/llama.cpp/issues/20141
+        //
+        // SAFETY: edition-2024 marks `set_var` unsafe because concurrent
+        // env access across threads is UB. We gate with `Once` and call
+        // it before any Metal API touches the device — at this point
+        // moeflux is single-threaded (engine construction is sequential
+        // and happens before any inference threads spawn). No other
+        // code in this process reads `AGX_RELAX_CDM_CTXSTORE_TIMEOUT`.
+        AGX_TIMEOUT_INIT.call_once(|| unsafe {
+            std::env::set_var("AGX_RELAX_CDM_CTXSTORE_TIMEOUT", "1");
+        });
+
         let device = Device::system_default().ok_or(MetalError::NoDevice)?;
         let queue = device.new_command_queue();
 
