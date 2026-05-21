@@ -5,6 +5,16 @@ metadata:
   type: project
 ---
 
+> **SUPERSEDED as primary framing (2026-05-21)**: A Metal capture
+> with the post-flip defaults showed `attn_sdpa_causal_flash_gqa2`
+> at 60.97% of GPU time and `moeflux_mm_id` at only 11.30%. The
+> kernel-port arc closed +11% — matching mm_id's share — so further
+> MoE matmul work cannot dent the residual 2.3× gap. The gap is in
+> attention. See [[prefill-sdpa-dominant-finding]]. This memo is
+> retained for historical context on the three MoE differentiators
+> (kernel port: LANDED; residency set: LANDED; quant format:
+> deprioritized per [[feedback-vendor-recommended-lever-priority]]).
+
 # Context
 
 After `gather_qmm_pivot_dead.md` killed the dispatch-pattern pivot,

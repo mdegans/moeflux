@@ -154,11 +154,12 @@ hypotheses yet, just buckets the profile could land in:
 # Sustained-throughput measurement (added 2026-05-21)
 
 After fixing the `kIOGPUCommandBufferCallbackErrorImpactingInteractivity`
-crash via the `AGX_RELAX_CDM_CTXSTORE_TIMEOUT=1` env var (mirrors
-llama.cpp `ggml-metal.cpp:921-923`; fix landed in
-`crates/moeflux/src/riir/backend/gpu/metal.rs:201-225` with
-provenance comment), we captured sustained throughput from a
-long-running blallama serving multiple sequential prefills:
+crash via `AGX_RELAX_CDM_CTXSTORE_TIMEOUT=1` (mirrors llama.cpp
+`ggml-metal.cpp:921-923`; **set programmatically** in
+`crates/moeflux/src/riir/backend/gpu/metal.rs:201-225` via a
+`Once` before any Metal API call — no shell-side env needed),
+we captured sustained throughput from a long-running blallama
+serving multiple sequential prefills:
 
 | iter | prefill_tok/s | elapsed |
 |---|---|---|
