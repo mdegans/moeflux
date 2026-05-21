@@ -785,36 +785,74 @@ kernel void attn_sdpa_causal_flash_v2(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // Finalize: O / row_l, written via simdgroup_store + scalar finalize.
-    // The full lo[] is FA_BR × FA_HD = 64 KB — too large to stage at
-    // once. Serialize per-simdgroup: each simdgroup in turn writes its 8
-    // rows × 256 cols (8 KB) into a scratch slot, then all threads
-    // cooperate to write that slot to device with 1/row_l normalization
-    // and per-row tail guard.
-    threadgroup float* sg_stage = (threadgroup float*)kv_stage4;
-    for (uint active_sg = 0; active_sg < FA_SIMDS; ++active_sg) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (simd_id == active_sg) {
-            for (uint k = 0; k < FA_D8; ++k) {
-                simdgroup_store(lo[k], sg_stage + k * 8, FA_HD);
+    // Finalize: rescale lo by 1/row_l, then write to device.
+    //
+    // Fast path (br_valid == FA_BR, the common case in prefill):
+    //   - Build 1/row_l diag matrix per simdgroup (reuse diag_rc slot)
+    //   - simdgroup_multiply lo[k] by inv_diag — in-place rescale
+    //   - simdgroup_store lo[k] directly to device output
+    //   - All 8 simdgroups write in parallel, zero barriers
+    //
+    // Slow path (br_valid < FA_BR, last tile of a prefill):
+    //   - Same rescale, then stage per-simdgroup to TG mem and scalar
+    //     write only valid rows. Per-simdgroup serialization for
+    //     correctness, cost amortized because only the last tile is
+    //     partial.
+    {
+        threadgroup float* my_diag = diag_rc + simd_id * 64;
+        if (lane < 8) {
+            uint row = simd_id * 8 + lane;
+            float denom = (row < br_valid) ? row_l[row] : 0.0f;
+            float inv = (denom > 0.0f) ? 1.0f / denom : 0.0f;
+            for (uint j = 0; j < 8; ++j) {
+                my_diag[lane * 8 + j] = (j == lane) ? inv : 0.0f;
             }
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        uint sg_first_row = active_sg * 8;
-        if (sg_first_row >= br_valid) {
-            continue;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    {
+        simdgroup_float8x8 inv_diag;
+        simdgroup_load(inv_diag, diag_rc + simd_id * 64, 8);
+        for (uint k = 0; k < FA_D8; ++k) {
+            simdgroup_multiply(lo[k], inv_diag, lo[k]);
         }
-        uint sg_valid_rows = min((uint)8, br_valid - sg_first_row);
+    }
 
-        for (uint i = lid; i < sg_valid_rows * FA_HD; i += FA_THREADS) {
-            uint r_local = i / FA_HD;
-            uint d = i % FA_HD;
-            uint r_abs = sg_first_row + r_local;
-            float denom = row_l[r_abs];
-            float inv = (denom > 0.0f) ? (1.0f / denom) : 0.0f;
-            out[((size_t)(q0 + r_abs) * num_heads + h) * FA_HD + d]
-                = sg_stage[r_local * FA_HD + d] * inv;
+    if (br_valid == FA_BR) {
+        // Fast path: direct device write, all simdgroups in parallel.
+        device float* osrc =
+            out + ((size_t)(q0 + simd_id * 8) * num_heads + h) * FA_HD;
+        ulong out_stride = (ulong)num_heads * FA_HD;
+        for (uint k = 0; k < FA_D8; ++k) {
+            simdgroup_store(lo[k], osrc + k * 8, out_stride);
+        }
+    } else {
+        // Slow path: per-simdgroup staged finalize with tail guard.
+        // lo was already rescaled by inv_rl above; scalar write copies
+        // straight to device without further divide.
+        threadgroup float* sg_stage = (threadgroup float*)kv_stage4;
+        for (uint active_sg = 0; active_sg < FA_SIMDS; ++active_sg) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_id == active_sg) {
+                for (uint k = 0; k < FA_D8; ++k) {
+                    simdgroup_store(lo[k], sg_stage + k * 8, FA_HD);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            uint sg_first_row = active_sg * 8;
+            if (sg_first_row >= br_valid) {
+                continue;
+            }
+            uint sg_valid_rows = min((uint)8, br_valid - sg_first_row);
+
+            for (uint i = lid; i < sg_valid_rows * FA_HD; i += FA_THREADS) {
+                uint r_local = i / FA_HD;
+                uint d = i % FA_HD;
+                uint r_abs = sg_first_row + r_local;
+                out[((size_t)(q0 + r_abs) * num_heads + h) * FA_HD + d]
+                    = sg_stage[r_local * FA_HD + d];
+            }
         }
     }
 }
@@ -1002,38 +1040,70 @@ static void sdpa_v2_gqa_impl(
         }
     }
 
-    // Finalize per head — same serialized-per-simdgroup scheme as v2 G=1.
-    // FA_BR × FA_HD = 64 KB doesn't fit in TG mem; stage one simdgroup's
-    // 8 rows at a time into an 8 KB slot in kv_K, then write to device
-    // with 1/row_l normalization and tail guard.
-    threadgroup float* sg_stage = kv_K;
+    // Finalize per head — same fast/slow split as v2 G=1, applied per
+    // head g. Fast path (br_valid == FA_BR): per-simdgroup direct
+    // device write after diag-rescale. Slow path: per-simdgroup
+    // serialized stage + scalar copy.
     for (uint g = 0; g < FA_GROUP; ++g) {
         uint h = h_base + g;
-        for (uint active_sg = 0; active_sg < FA_SIMDS; ++active_sg) {
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (simd_id == active_sg) {
-                for (uint k = 0; k < FA_D8; ++k) {
-                    simdgroup_store(lo[g][k], sg_stage + k * 8, FA_HD);
+
+        // Build 1/row_l diag for head g.
+        {
+            threadgroup float* my_diag = diag_rc + simd_id * 64;
+            if (lane < 8) {
+                uint row = simd_id * 8 + lane;
+                float denom = (row < br_valid)
+                    ? row_l[g * FA_BR + row] : 0.0f;
+                float inv = (denom > 0.0f) ? (1.0f / denom) : 0.0f;
+                for (uint j = 0; j < 8; ++j) {
+                    my_diag[lane * 8 + j] = (j == lane) ? inv : 0.0f;
                 }
             }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            uint sg_first_row = active_sg * 8;
-            if (sg_first_row >= br_valid) {
-                continue;
-            }
-            uint sg_valid_rows = min((uint)8, br_valid - sg_first_row);
-
-            for (uint i = lid; i < sg_valid_rows * FA_HD; i += FA_THREADS) {
-                uint r_local = i / FA_HD;
-                uint d = i % FA_HD;
-                uint r_abs = sg_first_row + r_local;
-                float denom = row_l[g * FA_BR + r_abs];
-                float inv = (denom > 0.0f) ? (1.0f / denom) : 0.0f;
-                out[((size_t)(q0 + r_abs) * num_heads + h) * FA_HD + d]
-                    = sg_stage[r_local * FA_HD + d] * inv;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            simdgroup_float8x8 inv_diag;
+            simdgroup_load(inv_diag, diag_rc + simd_id * 64, 8);
+            for (uint k = 0; k < FA_D8; ++k) {
+                simdgroup_multiply(lo[g][k], inv_diag, lo[g][k]);
             }
         }
+
+        if (br_valid == FA_BR) {
+            device float* osrc =
+                out + ((size_t)(q0 + simd_id * 8) * num_heads + h) * FA_HD;
+            ulong out_stride = (ulong)num_heads * FA_HD;
+            for (uint k = 0; k < FA_D8; ++k) {
+                simdgroup_store(lo[g][k], osrc + k * 8, out_stride);
+            }
+        } else {
+            threadgroup float* sg_stage = kv_K;
+            for (uint active_sg = 0; active_sg < FA_SIMDS; ++active_sg) {
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (simd_id == active_sg) {
+                    for (uint k = 0; k < FA_D8; ++k) {
+                        simdgroup_store(lo[g][k], sg_stage + k * 8, FA_HD);
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                uint sg_first_row = active_sg * 8;
+                if (sg_first_row >= br_valid) {
+                    continue;
+                }
+                uint sg_valid_rows = min((uint)8, br_valid - sg_first_row);
+
+                for (uint i = lid; i < sg_valid_rows * FA_HD; i += FA_THREADS) {
+                    uint r_local = i / FA_HD;
+                    uint d = i % FA_HD;
+                    uint r_abs = sg_first_row + r_local;
+                    out[((size_t)(q0 + r_abs) * num_heads + h) * FA_HD + d]
+                        = sg_stage[r_local * FA_HD + d];
+                }
+            }
+        }
+        // Barrier before next head's diag build (we reuse diag_rc).
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
 
