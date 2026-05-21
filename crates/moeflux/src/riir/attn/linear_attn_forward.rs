@@ -37,19 +37,28 @@ use metal::{
     Buffer, CommandBufferRef, ComputePipelineState, MTLSize, NSUInteger,
 };
 
-/// Process-wide cache for `MOEFLUX_MOE_GATHER_ID`. Set to `1` /
-/// `true` / `on` to route the batched MoE block through
-/// `Op::MoeGatherIdFuse` (the one-dispatch `gather_mm_id.metal`
-/// kernel ported from llama.cpp) instead of
-/// `Op::MoeBatchedPermuteFuse`. Defaults to OFF until the engine-
-/// level A/B bench shows it's a win.
+/// Process-wide cache for `MOEFLUX_MOE_GATHER_ID`. Routes the
+/// batched MoE block through `Op::MoeGatherIdFuse` (the one-
+/// dispatch `gather_mm_id.metal` kernel ported from llama.cpp)
+/// vs `Op::MoeBatchedPermuteFuse` (the older MLX-vendored
+/// `affine_gather_qmm_rhs` path).
+///
+/// **Default: ON.** Set `MOEFLUX_MOE_GATHER_ID=0` / `false` /
+/// `off` to force the old path (kept for diff-oracle and A/B work).
+///
+/// 2026-05-21: flipped to ON-by-default after engine-level A/B on
+/// a3b + 15.7k prefill measured **+11% throughput** (333 → 369.8
+/// mean tok/s, n=5, peak-to-peak 0.49%) with no coherence
+/// regression (jaccard 0.9469 / 1.0 / 0.9873; cosine ≥0.999973
+/// across the three completion prompts in the moeflux_coherence
+/// harness).
 fn moe_gather_id_enabled() -> bool {
     use std::sync::OnceLock;
     static CACHED: OnceLock<bool> = OnceLock::new();
     *CACHED.get_or_init(|| {
         match std::env::var("MOEFLUX_MOE_GATHER_ID").as_deref() {
-            Ok("1") | Ok("true") | Ok("on") => true,
-            _ => false,
+            Ok("0") | Ok("false") | Ok("off") => false,
+            _ => true,
         }
     })
 }
