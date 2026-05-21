@@ -195,6 +195,15 @@ const SDPA: &str = "attn_sdpa_causal_flash";
 /// staging each K/V block once for both query-heads. Used when
 /// `SdpaCall::fold == 2`.
 const SDPA_GQA2: &str = "attn_sdpa_causal_flash_gqa2";
+/// v2 of the unfolded SDPA — replaces v1's scalar QK^T / P·V loops with
+/// `simdgroup_multiply_accumulate` on 8×8 simdgroup matrix tiles. Same
+/// dispatch shape and buffer signature as `SDPA`. Selected when
+/// `SdpaCall::v2 && SdpaCall::fold == 1`.
+const SDPA_V2: &str = "attn_sdpa_causal_flash_v2";
+/// v2 of the GQA-folded SDPA. Same simdgroup-MMA conversion, plus the
+/// FA_GROUP=2 K/V-co-stage reuse from `SDPA_GQA2`. Selected when
+/// `SdpaCall::v2 && SdpaCall::fold == 2`.
+const SDPA_GQA2_V2: &str = "attn_sdpa_causal_flash_gqa2_v2";
 /// SDPA query-tile size — must match `FA_BR` in `sdpa.metal`.
 const FA_BR: u32 = 64;
 /// SDPA threads per threadgroup — must match `FA_THREADS` in `sdpa.metal`.
@@ -411,6 +420,11 @@ pub struct SdpaCall<'a> {
     /// (`attn_sdpa_causal_flash_gqa2`). Must divide both `num_heads` and
     /// `heads_per_kv`.
     pub fold: u32,
+    /// Route through the v2 simdgroup-MMA kernels
+    /// (`attn_sdpa_causal_flash_v2` / `_gqa2_v2`) instead of v1.
+    /// Default `false` for safe landing; flipped by
+    /// `MOEFLUX_SDPA_V2` at the engine layer.
+    pub v2: bool,
 }
 
 /// A kernel invocation that encodes itself into a command buffer using
@@ -453,6 +467,10 @@ pub struct Kernels {
     sdpa: ComputePipelineState,
     /// GQA-folded SDPA (`attn_sdpa_causal_flash_gqa2`) — `SdpaCall::fold == 2`.
     sdpa_gqa2: ComputePipelineState,
+    /// v2 unfolded SDPA — simdgroup-MMA port. `SdpaCall::v2 && fold == 1`.
+    sdpa_v2: ComputePipelineState,
+    /// v2 GQA-folded SDPA — simdgroup-MMA port. `SdpaCall::v2 && fold == 2`.
+    sdpa_gqa2_v2: ComputePipelineState,
     /// MoE map0 pre-pass — `htpe[]` + `hids[][]` from per-token expert
     /// indices. Top-k = 8 instantiation (`moeflux_mm_id_map0_k8`).
     moe_mm_id_map0_k8: ComputePipelineState,
@@ -573,6 +591,8 @@ impl Kernels {
             gather_bm16,
             sdpa: build(SDPA)?,
             sdpa_gqa2: build(SDPA_GQA2)?,
+            sdpa_v2: build(SDPA_V2)?,
+            sdpa_gqa2_v2: build(SDPA_GQA2_V2)?,
             moe_mm_id_map0_k8,
             moe_mm_id,
             moe_combine_topk,
@@ -726,12 +746,14 @@ impl KernelCall for SdpaCall<'_> {
             "fold must divide num_heads"
         );
 
-        // GQA-fold: one threadgroup per (q_tile, head-group of `fold`
-        // query-heads). fold == 1 is the unfolded kernel.
-        let pso = if self.fold > 1 {
-            &kernels.sdpa_gqa2
-        } else {
-            &kernels.sdpa
+        // GQA-fold × v2: four-way PSO select. fold == 1 is unfolded,
+        // fold == 2 is GQA-folded; v2 routes either through the
+        // simdgroup-MMA port.
+        let pso = match (self.fold > 1, self.v2) {
+            (false, false) => &kernels.sdpa,
+            (true, false) => &kernels.sdpa_gqa2,
+            (false, true) => &kernels.sdpa_v2,
+            (true, true) => &kernels.sdpa_gqa2_v2,
         };
         let num_q_tiles = self.n_tokens.div_ceil(FA_BR);
         let total_tgs = num_q_tiles * (self.num_heads / self.fold);

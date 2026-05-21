@@ -548,6 +548,7 @@ fn bench_sdpa(metal: &mut MetalContext) {
                     kv_len,
                     softmax_scale: scale,
                     fold: 1,
+                    v2: false,
                 },
             );
         };

@@ -1124,6 +1124,7 @@ impl Backend for MetalBackend {
                         kv_len: *kv_len_total,
                         softmax_scale: *softmax_scale,
                         fold,
+                        v2: crate::riir::attn::linear_attn_forward::sdpa_v2_enabled(),
                     },
                 );
             }

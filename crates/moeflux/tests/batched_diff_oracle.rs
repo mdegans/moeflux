@@ -588,6 +588,7 @@ fn run_batched_sdpa_flash(
     kv_len: u32,
     scale: f32,
     fold: u32,
+    v2: bool,
 ) -> Vec<f32> {
     let out_total =
         n_tokens as usize * num_heads as usize * head_dim as usize;
@@ -618,6 +619,7 @@ fn run_batched_sdpa_flash(
             kv_len,
             softmax_scale: scale,
             fold,
+            v2,
         },
     );
     cmdbuf.commit();
@@ -630,7 +632,13 @@ fn run_batched_sdpa_flash(
 /// absolute position `start_pos` against a per-token `sdpa_cpu` oracle
 /// (each query `q` attends to `KV[0 .. start_pos+q+1]`). Per-token
 /// cosine must clear `COSINE_FLOOR`.
-fn flash_diff_tokenwise(n_tokens: u32, start_pos: u32, seed: u64, fold: u32) {
+fn flash_diff_tokenwise(
+    n_tokens: u32,
+    start_pos: u32,
+    seed: u64,
+    fold: u32,
+    v2: bool,
+) {
     let num_heads = VARIANT.num_attn_heads as u32;
     let num_kv_heads = VARIANT.num_kv_heads as u32;
     let head_dim = VARIANT.head_dim as u32;
@@ -671,6 +679,7 @@ fn flash_diff_tokenwise(n_tokens: u32, start_pos: u32, seed: u64, fold: u32) {
     let gpu = run_batched_sdpa_flash(
         &mut metal, &q_data, &k_data, &v_data, n_tokens, num_heads,
         heads_per_kv, head_dim, kv_dim, start_pos, kv_len, scale, fold,
+        v2,
     );
 
     assert!(
@@ -699,12 +708,12 @@ fn flash_diff_tokenwise(n_tokens: u32, start_pos: u32, seed: u64, fold: u32) {
         }
         assert!(
             cos >= COSINE_FLOOR,
-            "flash N={n_tokens} start_pos={start_pos} fold={fold} \
+            "flash N={n_tokens} start_pos={start_pos} fold={fold} v2={v2} \
              token {q} cosine {cos} below floor {COSINE_FLOOR}"
         );
     }
     eprintln!(
-        "flash N={n_tokens} start_pos={start_pos} fold={fold}: \
+        "flash N={n_tokens} start_pos={start_pos} fold={fold} v2={v2}: \
          worst per-token cosine = {worst:.9}"
     );
 }
@@ -713,21 +722,21 @@ fn flash_diff_tokenwise(n_tokens: u32, start_pos: u32, seed: u64, fold: u32) {
 #[test]
 #[ignore = "long-running GPU test"]
 fn sdpa_causal_flash_n1_single_block() {
-    flash_diff_tokenwise(1, 63, 0x5DA0_F1A5_0000_0001, 1);
+    flash_diff_tokenwise(1, 63, 0x5DA0_F1A5_0000_0001, 1, false);
 }
 
 /// N=1, kv_len=5000 — many KV blocks, exercises the online merge.
 #[test]
 #[ignore = "long-running GPU test"]
 fn sdpa_causal_flash_n1_multi_block() {
-    flash_diff_tokenwise(1, 4999, 0x5DA0_F1A5_0000_0002, 1);
+    flash_diff_tokenwise(1, 4999, 0x5DA0_F1A5_0000_0002, 1, false);
 }
 
 /// N=4, start_pos=4 — per-query causal cutoff across a small tile.
 #[test]
 #[ignore = "long-running GPU test"]
 fn sdpa_causal_flash_n4_tokenwise() {
-    flash_diff_tokenwise(4, 4, 0x5DA0_F1A5_0000_0003, 1);
+    flash_diff_tokenwise(4, 4, 0x5DA0_F1A5_0000_0003, 1, false);
 }
 
 /// M=512, start_pos=0 — square causal: 16 query tiles, heavy causal
@@ -735,7 +744,7 @@ fn sdpa_causal_flash_n4_tokenwise() {
 #[test]
 #[ignore = "long-running GPU test"]
 fn sdpa_causal_flash_m512_square_causal() {
-    flash_diff_tokenwise(512, 0, 0x5DA0_F1A5_0000_0004, 1);
+    flash_diff_tokenwise(512, 0, 0x5DA0_F1A5_0000_0004, 1, false);
 }
 
 /// M=1500, start_pos=4096 — deep chunk (kv_len > M), and 1500 is not a
@@ -743,7 +752,7 @@ fn sdpa_causal_flash_m512_square_causal() {
 #[test]
 #[ignore = "long-running GPU test"]
 fn sdpa_causal_flash_m1500_deep_chunk() {
-    flash_diff_tokenwise(1500, 4096, 0x5DA0_F1A5_0000_0005, 1);
+    flash_diff_tokenwise(1500, 4096, 0x5DA0_F1A5_0000_0005, 1, false);
 }
 
 // GQA-folded kernel (`attn_sdpa_causal_flash_gqa2`, fold=2) — same five
@@ -753,31 +762,98 @@ fn sdpa_causal_flash_m1500_deep_chunk() {
 #[test]
 #[ignore = "long-running GPU test"]
 fn sdpa_causal_flash_gqa2_n1_single_block() {
-    flash_diff_tokenwise(1, 63, 0x5DA0_F1A5_0000_0001, 2);
+    flash_diff_tokenwise(1, 63, 0x5DA0_F1A5_0000_0001, 2, false);
 }
 
 #[test]
 #[ignore = "long-running GPU test"]
 fn sdpa_causal_flash_gqa2_n1_multi_block() {
-    flash_diff_tokenwise(1, 4999, 0x5DA0_F1A5_0000_0002, 2);
+    flash_diff_tokenwise(1, 4999, 0x5DA0_F1A5_0000_0002, 2, false);
 }
 
 #[test]
 #[ignore = "long-running GPU test"]
 fn sdpa_causal_flash_gqa2_n4_tokenwise() {
-    flash_diff_tokenwise(4, 4, 0x5DA0_F1A5_0000_0003, 2);
+    flash_diff_tokenwise(4, 4, 0x5DA0_F1A5_0000_0003, 2, false);
 }
 
 #[test]
 #[ignore = "long-running GPU test"]
 fn sdpa_causal_flash_gqa2_m512_square_causal() {
-    flash_diff_tokenwise(512, 0, 0x5DA0_F1A5_0000_0004, 2);
+    flash_diff_tokenwise(512, 0, 0x5DA0_F1A5_0000_0004, 2, false);
 }
 
 #[test]
 #[ignore = "long-running GPU test"]
 fn sdpa_causal_flash_gqa2_m1500_deep_chunk() {
-    flash_diff_tokenwise(1500, 4096, 0x5DA0_F1A5_0000_0005, 2);
+    flash_diff_tokenwise(1500, 4096, 0x5DA0_F1A5_0000_0005, 2, false);
+}
+
+// ---------------------------------------------------------------------------
+// v2 (`_v2`/`_gqa2_v2`) kernels — simdgroup-MMA port. Same five shapes for
+// each fold against the same `sdpa_cpu` oracle. Numerical floor is identical
+// (`COSINE_FLOOR = 0.9999`); v2 must be bit-equivalent within the same ULP
+// envelope as v1.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "long-running GPU test"]
+fn sdpa_v2_causal_flash_n1_single_block() {
+    flash_diff_tokenwise(1, 63, 0x5DA0_F1A5_0000_0001, 1, true);
+}
+
+#[test]
+#[ignore = "long-running GPU test"]
+fn sdpa_v2_causal_flash_n1_multi_block() {
+    flash_diff_tokenwise(1, 4999, 0x5DA0_F1A5_0000_0002, 1, true);
+}
+
+#[test]
+#[ignore = "long-running GPU test"]
+fn sdpa_v2_causal_flash_n4_tokenwise() {
+    flash_diff_tokenwise(4, 4, 0x5DA0_F1A5_0000_0003, 1, true);
+}
+
+#[test]
+#[ignore = "long-running GPU test"]
+fn sdpa_v2_causal_flash_m512_square_causal() {
+    flash_diff_tokenwise(512, 0, 0x5DA0_F1A5_0000_0004, 1, true);
+}
+
+#[test]
+#[ignore = "long-running GPU test"]
+fn sdpa_v2_causal_flash_m1500_deep_chunk() {
+    flash_diff_tokenwise(1500, 4096, 0x5DA0_F1A5_0000_0005, 1, true);
+}
+
+#[test]
+#[ignore = "long-running GPU test"]
+fn sdpa_v2_causal_flash_gqa2_n1_single_block() {
+    flash_diff_tokenwise(1, 63, 0x5DA0_F1A5_0000_0001, 2, true);
+}
+
+#[test]
+#[ignore = "long-running GPU test"]
+fn sdpa_v2_causal_flash_gqa2_n1_multi_block() {
+    flash_diff_tokenwise(1, 4999, 0x5DA0_F1A5_0000_0002, 2, true);
+}
+
+#[test]
+#[ignore = "long-running GPU test"]
+fn sdpa_v2_causal_flash_gqa2_n4_tokenwise() {
+    flash_diff_tokenwise(4, 4, 0x5DA0_F1A5_0000_0003, 2, true);
+}
+
+#[test]
+#[ignore = "long-running GPU test"]
+fn sdpa_v2_causal_flash_gqa2_m512_square_causal() {
+    flash_diff_tokenwise(512, 0, 0x5DA0_F1A5_0000_0004, 2, true);
+}
+
+#[test]
+#[ignore = "long-running GPU test"]
+fn sdpa_v2_causal_flash_gqa2_m1500_deep_chunk() {
+    flash_diff_tokenwise(1500, 4096, 0x5DA0_F1A5_0000_0005, 2, true);
 }
 
 // ---------------------------------------------------------------------------

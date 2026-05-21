@@ -63,6 +63,30 @@ fn moe_gather_id_enabled() -> bool {
     })
 }
 
+/// Process-wide cache for `MOEFLUX_SDPA_V2`. Routes the full-attn SDPA
+/// dispatch through the v2 simdgroup-MMA kernels
+/// (`attn_sdpa_causal_flash_v2` / `_gqa2_v2`) instead of v1's scalar-FMA
+/// loops.
+///
+/// **Default: OFF** during landing — v1 stays the production path. The
+/// 2026-05-21 capture identified v1 SDPA at 60.97% of GPU time (18.7%
+/// occupancy, register-pressure-bound); v2 replaces the QK^T and P·V
+/// scalar reductions with `simdgroup_multiply_accumulate` on 8×8
+/// `simdgroup_float8x8` tiles. Engine-level A/B + coherence check
+/// pending. The default will flip in a follow-up commit if green.
+///
+/// Set `MOEFLUX_SDPA_V2=1` / `true` / `on` to opt into v2.
+pub(in crate::riir) fn sdpa_v2_enabled() -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        matches!(
+            std::env::var("MOEFLUX_SDPA_V2").as_deref(),
+            Ok("1") | Ok("true") | Ok("on")
+        )
+    })
+}
+
 use crate::riir::backend::buftype::{
     AlphaStackBuf, AttnInputBuf, AttnOutBuf, BetaGateBuf, BetaStackBuf,
     BucketActBuf, BucketGateBuf, BucketInputBuf, BucketOutBuf,
