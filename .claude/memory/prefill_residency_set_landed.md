@@ -88,6 +88,113 @@ page-cache state. The pinning will matter more under memory
 contention (other processes competing for working-set), but does
 not contribute to peak throughput on an isolated bench.
 
+# Clarification (added 2026-05-21): kernel path used for this bench
+
+The 333 tok/s number above was measured with `MOEFLUX_MOE_GATHER_ID`
+**unset** (default at the time), routing the MoE matmul through
+the OLD `affine_gather_qmm_rhs` path via `Op::MoeBatchedPermuteFuse`.
+
+The NEW `moeflux_mm_id` kernel (the llama.cpp `kernel_mul_mm_id`
+port, in `crates/moeflux-metal/shaders/gather_mm_id.metal`) landed
+in the **same session-19 commit** (`5a45af3`) as the residency-set
+integration, but defaulted OFF pending A/B.
+
+# A/B result (2026-05-21): kernel port wins +11%; default flipped
+
+Engine-level A/B run on a3b + `prefill_prompt_long.txt` (15,692
+tokens, max-tokens=1), post-reboot + post-system-settle (load
+average 1m=3.07, well below 5m=40.13 — load falling):
+
+| path | tok/s (n=5) | peak-to-peak | spread |
+|---|---|---|---|
+| OFF (`affine_gather_qmm_rhs`) | ~333 mean | (recalled steady) | — |
+| **ON (`moeflux_mm_id` port)** | **369.8 mean** | 1.81 | 0.49% |
+
+ON breakdown: 369.05 / 370.86 / 369.05 / 369.85 / 370.24.
+
+**+11.0% throughput.** Stable, repeatable.
+
+Coherence harness ([[moeflux-hardening-session-c-landed]] artifact 2)
+run 2026-05-21:
+
+| prompt | jaccard mean (top-20) | cosine mean |
+|---|---|---|
+| `tobe` | 0.9469 | 0.999973 |
+| `constitution` | 1.0000 | 1.000000 |
+| `hobbit` | 0.9873 | 0.999984 |
+
+Test green (`moeflux_coherence_a_vs_b ... ok`, 59.23s). Both paths
+mathematically equivalent; safe to flip.
+
+**Default flipped 2026-05-21**:
+`crates/moeflux/src/riir/attn/linear_attn_forward.rs:40-65` —
+inverted to ON by default; `MOEFLUX_MOE_GATHER_ID=0` / `false` /
+`off` forces the old path (preserved for diff-oracle + A/B work).
+
+# Strategic implication (revised 2026-05-21)
+
+The "kernel algorithm closes most of the remaining gap" framing in
+[[llama-cpp-moe-differentiators]] was **wrong** — empirically, the
+kernel port closed **11%** of the gap, not "most." The remaining
+gap to llama.cpp (~370 vs ~855-900 tok/s = ~2.3-2.4×) is in
+**something not catalogued in that memo**. The three named
+differentiators are now either landed (residency, kernel) or
+deprioritized per [[feedback-vendor-recommended-lever-priority]]
+(quant format — Apple-recommended, measure-to-rule-out only).
+
+Next: profile the new-default config to find where the residual
+~2.3× lives. Candidate unnamed levers — none of these are
+hypotheses yet, just buckets the profile could land in:
+- Non-kernel GPU overhead (cmdbuf encoding, dispatch scheduling)
+- MoE routing / bucket-build cost
+- Sub-kernel detail differences vs llama.cpp not captured by the
+  algorithm-level port
+- Host-side work that survived Phase 4 of the full-attn migration
+
+# Sustained-throughput measurement (added 2026-05-21)
+
+After fixing the `kIOGPUCommandBufferCallbackErrorImpactingInteractivity`
+crash via the `AGX_RELAX_CDM_CTXSTORE_TIMEOUT=1` env var (mirrors
+llama.cpp `ggml-metal.cpp:921-923`; fix landed in
+`crates/moeflux/src/riir/backend/gpu/metal.rs:201-225` with
+provenance comment), we captured sustained throughput from a
+long-running blallama serving multiple sequential prefills:
+
+| iter | prefill_tok/s | elapsed |
+|---|---|---|
+| 1 | 363.55 | 43.16s |
+| 2 | 376.83 | 41.64s |
+| 3 | 375.71 | 41.77s |
+
+**Sustained: ~376 tok/s. First-prefill: 363 tok/s. Delta: ~3.5%.**
+
+The first-prefill overhead is the `commit_plan` re-zero one-time
+cost — `MetalBufferPool::commit_plan` (lines 420-425 in
+`gpu/mod.rs`) re-zeroes color buffers that were already zero-filled
+at alloc time. Subsequent prefills hit the pinned pool and pay no
+re-zero. The agent's `__bzero` audit predicted ~8-12% improvement;
+measured is ~3.5%. Smaller than estimated but real.
+
+**Honest gap to llama.cpp**: ~376 vs ~855-900 = **~2.3-2.4× in
+steady state**. The startup-amortization story was directionally
+right but small — it didn't shrink the gap meaningfully. The
+residual is in genuine steady-state GPU work efficiency, not
+in startup-amplified-by-bench-protocol effects.
+
+**Future work — `commit_plan` redundant re-zero (3.5% lever):**
+Track "newly allocated this commit_plan" transients; skip re-zero
+for them. Filed for a future session. Small lever but cheap.
+
+# Cross-references (updated 2026-05-21)
+
+- [[llama-cpp-moe-differentiators]] — superseded. The
+  "Differentiator 1 closes most of the gap" framing didn't survive
+  the A/B (kernel port closed 11%); the remaining 2.3× is in
+  un-catalogued territory.
+- [[feedback-vendor-recommended-lever-priority]] — applied:
+  Q4_K_S quant format stays deprioritized; measure-to-rule-out
+  before chasing.
+
 # Scope changes from the plan
 
 ## Phase 3 deferred

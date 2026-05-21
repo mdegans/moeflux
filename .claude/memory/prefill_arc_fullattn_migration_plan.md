@@ -142,10 +142,51 @@ Phase-1 kernel lands its diff test before being wired. Phase 5:
   `future_work_diff_oracle_parallel_segv`). All 3 model variants
   compile.
 
-- Phases 4–5 — not started. **Next session resumes at Phase 4**
-  (orchestrator cleanup in `mod.rs` + GPU embedding gather + GPU final
-  norm via the `LmHead` Op — its Metal arm is the last `todo!()`).
-  Phase 4 touches the orchestrator across several seams — give it its
-  own design / plan-mode pass (`feedback_design_before_execute`); the
-  one-line "O1–O7" sketch above is only a skeleton. Then Phase 5
-  (measure: reprofile vs session-13 + bench post-reboot).
+- **Phase 4 — DONE** (sessions 18-19, 2026-05-19/05-20). Landed
+  opportunistically across five commits — the plan's "O1–O7"
+  sketch translated cleanly to discrete Op work without needing a
+  separate design pass:
+  - `17c198a` (2026-05-19) — `Op::EmbedGatherNTokens` kernel + Op
+    (CPU oracle + Metal `embed_gather_4bit` shader). Diff-test-
+    first per the arc's discipline; `graph_metal_matches_cpu_embed_gather`
+    landed green.
+  - `4c37f3a` (2026-05-19) — `Op::LmHead` deleted as redundant.
+    Final-norm + lm_head projection is exactly `RmsNormBf16NTokens`
+    + `MatvecNTokens` (both already wired on both backends). The
+    Metal arm `todo!()` is gone; `encode_op` has zero `todo!()`
+    arms.
+  - `4cbf14f` (2026-05-19) — orchestrator HEAD swap. CPU
+    `embed_lookup` (67 MB host stack + pool.upload) → upload token
+    ids only (N×4 bytes) → `g_head` graph with single
+    `Op::EmbedGatherNTokens` dequantizing rows straight into
+    `hidden_a` GPU buffer. Persistent `HeadTailScratch { token_ids,
+    logits }` BufIds, allocated once at construction. Canary:
+    graph_diff_oracle 18/18, batched_diff_oracle 23/23,
+    diff_oracle 12/12, checkpoint_restore 7/7.
+  - `ab40bb0` (2026-05-19) — orchestrator TAIL swap. The 67 MB
+    `n × hidden_dim` download + CPU rms_norm + reupload path is
+    eliminated. `g_tail` graph: `RmsNormBf16NTokens` (hidden_a →
+    hidden_b) + `MatvecNTokens` projecting last token's row →
+    logits. Only logits (~vocab×4 bytes) cross the bus. Canary
+    battery green.
+  - `5d93ba6` (2026-05-20) — `pread` mode teardown in
+    `moe_block_forward`. The `ExpertIoMode::Pread` synchronous
+    staging loop + `MOEFLUX_EXPERT_IO=pread` enum value deleted.
+    Mmap'd expert buffers are now unconditional; the OS page
+    cache serves what pread tried to manage. Citation:
+    [[pread-teardown-landed]] (74.5s wall-clock vs 73.8s, same GPU
+    time at 20.8% occupancy — 36% main-thread CPU savings, no GPU
+    cost). Session-13's 26% `pread` line item is **gone** from
+    the prefill critical path.
+
+- Phase 5 — pending (measure). Reprofile vs session-13 +
+  warm-state bench post-reboot. Note for the reprofile: the
+  expected GPU-idle drop from 97.5% should be the headline. If
+  GPU is still substantially idle, there's more host-side work
+  to find that we haven't catalogued. Also: the bench should
+  cover **both** `MOEFLUX_MOE_GATHER_ID` settings (default OFF
+  on the old `affine_gather_qmm_rhs` path; ON on the new
+  `moeflux_mm_id` port from session 19). The 333 tok/s number in
+  [[prefill-residency-set-landed]] was on the OFF path; the A/B
+  has not yet been recorded. See that memo's
+  "Clarification (added 2026-05-21)" section.
