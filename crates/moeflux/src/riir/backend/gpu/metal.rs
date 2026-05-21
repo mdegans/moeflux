@@ -524,11 +524,26 @@ impl<T: Copy> MtlBuffer<T> {
 ///
 /// # Safety
 ///
-/// No GPU command buffer that reads or writes `buf` may be in flight:
-/// shared-storage memory is read directly from the CPU, and a
-/// concurrent GPU writer is undefined behaviour. `n * size_of::<T>()`
-/// must not exceed the buffer's byte length, and `contents()` must be
-/// `T`-aligned (Metal shared buffers are page-aligned).
+/// This is the canonical safety contract for shared-storage Metal
+/// buffer CPU access in moeflux. Every `unsafe` slice over an
+/// `MTLBuffer` in this crate forwards to this contract.
+///
+/// - **No GPU work in flight**: `MTLResourceStorageModeShared` puts
+///   the buffer in unified memory; the bytes the GPU touches *are*
+///   the bytes `contents()` returns. A GPU command buffer that reads
+///   or writes `buf` running concurrently with this CPU access is
+///   undefined behaviour. Callers must have driven the relevant
+///   command buffer to completion (`wait_until_completed`) or have
+///   independent evidence no kernel touches `buf`.
+/// - **Aliasing**: the mutable variant ([`buffer_as_mut_slice`])
+///   requires the caller hold unique access for the returned slice's
+///   lifetime — no other CPU or GPU reader/writer.
+/// - **Bounds**: `n * size_of::<T>()` must not exceed the buffer's
+///   byte length.
+/// - **Alignment**: `contents()` must be `T`-aligned. In practice
+///   shared buffers are page-aligned (16 KiB on Apple Silicon), so
+///   this holds for every native scalar moeflux uses. Compound
+///   element types over `T`-aligned bases are fine.
 pub unsafe fn buffer_as_slice<T>(buf: &metal::BufferRef, n: usize) -> &[T] {
     // SAFETY: forwarded to the caller's contract above.
     unsafe { std::slice::from_raw_parts(buf.contents() as *const T, n) }
@@ -539,7 +554,8 @@ pub unsafe fn buffer_as_slice<T>(buf: &metal::BufferRef, n: usize) -> &[T] {
 /// # Safety
 ///
 /// See [`buffer_as_slice`]; the caller additionally holds unique
-/// access to the buffer for the returned slice's lifetime.
+/// access to the buffer for the returned slice's lifetime — no other
+/// CPU or GPU reader/writer.
 pub unsafe fn buffer_as_mut_slice<T>(
     buf: &metal::BufferRef,
     n: usize,

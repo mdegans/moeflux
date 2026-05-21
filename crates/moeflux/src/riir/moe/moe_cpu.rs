@@ -330,7 +330,13 @@ pub fn moe_permute_fuse_cpu(
 /// must therefore be empty. Panics if not — this is a converter bug
 /// we want loud, not soft.
 fn bytemuck_u16(bytes: &[u8]) -> &[u16] {
-    // SAFETY: align_to is safe by definition.
+    // Layout invariants: BF16 storage on disk is little-endian u16,
+    // so a `&[u16]` view over the same bytes is the bit pattern we
+    // want to decode. Verified at compile time.
+    static_assertions::assert_eq_size!(u16, [u8; 2]);
+    static_assertions::const_assert_eq!(std::mem::align_of::<u16>(), 2);
+    // SAFETY: `align_to::<u16>` is sound for any `&[u8]` — the unsafe
+    // block contains no other operations.
     let (head, body, tail) = unsafe { bytes.align_to::<u16>() };
     assert!(
         head.is_empty() && tail.is_empty(),

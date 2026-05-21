@@ -615,9 +615,14 @@ impl MoeBuffers {
     }
 
     /// Zero `bufs.h_mid`. Used when the layer's residual contribution
-    /// should equal `Σ moe + shared_out` exactly.
+    /// should equal `Σ moe + shared_out` exactly. Caller must ensure
+    /// no GPU work touches `bufs.h_mid` concurrently — call before
+    /// encoding the layer's command buffer or after waiting on the
+    /// previous one.
     pub(crate) fn stage_host_h_mid_zero(&self, pool: &MetalBufferPool) {
         let buf = pool.handle(self.h_mid);
+        // SAFETY: see method docs — caller's GPU-quiescence invariant
+        // covers the canonical `buffer_as_mut_slice` contract.
         let dst: &mut [f32] =
             unsafe { buffer_as_mut_slice::<f32>(buf, VARIANT.hidden_dim) };
         dst.fill(0.0);
@@ -630,6 +635,9 @@ impl MoeBuffers {
         pool: &MetalBufferPool,
     ) -> Vec<f32> {
         let buf = pool.handle(self.moe_hidden);
+        // SAFETY: see method docs — caller has drained the writing
+        // cmdbuf, so no concurrent GPU access. Forwards to
+        // `buffer_as_slice`.
         let src: &[f32] =
             unsafe { buffer_as_slice::<f32>(buf, VARIANT.hidden_dim) };
         src.to_vec()
@@ -662,6 +670,8 @@ impl MoeBuffers {
     ) -> Vec<f32> {
         let buf = pool.handle(self.gate_logits);
         let n = VARIANT.num_experts.max(1);
+        // SAFETY: see method docs — caller has drained the writing
+        // cmdbuf. Forwards to `buffer_as_slice`.
         let src: &[f32] = unsafe { buffer_as_slice::<f32>(buf, n) };
         src.to_vec()
     }
@@ -822,7 +832,12 @@ pub(crate) fn gpu_batched_experts_encode(
         dst.copy_from_slice(src);
     }
     bufs.stage_host_input(buffer_pool, h_post);
-    // h_mid + shared_out: f32 copies through raw slice cast.
+    // h_mid + shared_out + combine_params: f32 copies through raw
+    // slice casts. SAFETY for all three: the caller path drains the
+    // previous layer's deferred experts before staging the next
+    // layer's inputs (see `complete_deferred_experts_into` at the
+    // top of each layer step), so no GPU work is in flight against
+    // these buffers. Each cast forwards to `buffer_as_mut_slice`.
     {
         let buf = buffer_pool.handle(bufs.h_mid_id());
         let dst: &mut [f32] =
@@ -931,6 +946,9 @@ pub(crate) fn gpu_batched_experts_encode_pre_staged(
     // pread, data_prefetch via 5d-6b's async prefetch).
     {
         let buf = buffer_pool.handle(bufs.combine_params_id());
+        // SAFETY: same drain-before-stage discipline as the buf
+        // variant above — caller has waited on the previous layer's
+        // experts. Forwards to `buffer_as_mut_slice`.
         let params: &mut [f32] =
             unsafe { buffer_as_mut_slice::<f32>(buf, 18) };
         params.fill(0.0);

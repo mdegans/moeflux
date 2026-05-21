@@ -429,10 +429,13 @@ fn bytes_as_u32<'a>(
     name: &str,
     bytes: &'a [u8],
 ) -> Result<&'a [u32], CpuMatvecError> {
-    // SAFETY: `align_to` is safe by definition. We additionally
-    // assert no unaligned head/tail so the body covers the full
-    // tensor; the converter pads to 8 bytes so this never fires
-    // in practice but if it ever does it's a real bug we want loud.
+    // 4-bit-packed weight blocks store 8 nibbles per u32 in
+    // little-endian order — the body is the bit pattern we want.
+    static_assertions::assert_eq_size!(u32, [u8; 4]);
+    static_assertions::const_assert_eq!(std::mem::align_of::<u32>(), 4);
+    // SAFETY: `align_to::<u32>` is sound for any `&[u8]`. We require
+    // head/tail to be empty (converter pads to 8 bytes); the
+    // Misaligned error fires loudly if a future converter regresses.
     let (head, body, tail) = unsafe { bytes.align_to::<u32>() };
     if !head.is_empty() || !tail.is_empty() {
         return Err(CpuMatvecError::Misaligned {
@@ -447,6 +450,11 @@ fn bytes_as_u16<'a>(
     name: &str,
     bytes: &'a [u8],
 ) -> Result<&'a [u16], CpuMatvecError> {
+    // BF16 scales / biases storage on disk is little-endian u16.
+    static_assertions::assert_eq_size!(u16, [u8; 2]);
+    static_assertions::const_assert_eq!(std::mem::align_of::<u16>(), 2);
+    // SAFETY: `align_to::<u16>` is sound for any `&[u8]`. Head/tail
+    // empty is the converter's alignment guarantee — checked below.
     let (head, body, tail) = unsafe { bytes.align_to::<u16>() };
     if !head.is_empty() || !tail.is_empty() {
         return Err(CpuMatvecError::Misaligned {

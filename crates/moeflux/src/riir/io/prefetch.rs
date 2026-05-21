@@ -143,10 +143,26 @@ impl DataPrefetchPtr {
         }
     }
 
-    /// SAFETY: caller upholds the drain-before-touch invariant from
-    /// the module docs.
+    /// Reconstruct the original `&mut [u8]` from the stored address.
+    ///
+    /// # Safety
+    ///
+    /// Caller must uphold the module-level soundness invariants:
+    /// - The backing `MoeBuffers.data_prefetch[slot]` allocation must
+    ///   still be alive (i.e. its owning `RsCtx` has not been dropped
+    ///   and the buffer has not been reallocated). Reallocation is
+    ///   forbidden by construction — slots are sized once at lazy
+    ///   init.
+    /// - No other thread may be reading or writing the same slot
+    ///   concurrently. The K worker closures get *disjoint* slot
+    ///   pointers, so this holds when called from a worker; for
+    ///   anything else, the caller must drain in-flight prefetches
+    ///   (`PrefetchState::wait_for` / `drain` / `invalidate_all`)
+    ///   first.
+    /// - The arbitrary lifetime `'a` chosen by the caller must not
+    ///   outlive the underlying allocation.
     unsafe fn as_mut_slice<'a>(self) -> &'a mut [u8] {
-        // SAFETY: forwarded — caller's invariant covers this.
+        // SAFETY: forwarded — see the safety contract above.
         unsafe {
             std::slice::from_raw_parts_mut(
                 self.ptr_addr as *mut u8,
@@ -171,11 +187,24 @@ impl ExpertFilesPtr {
         }
     }
 
-    /// SAFETY: caller upholds the drain-before-touch invariant from
-    /// the module docs (specifically, the referent outlives all
-    /// in-flight readers).
+    /// Reconstruct the original `&ExpertFiles` from the stored
+    /// address.
+    ///
+    /// # Safety
+    ///
+    /// The `ExpertFiles` lives on `RsCtx` and is never moved or
+    /// dropped while prefetch tasks are in flight — the
+    /// `PrefetchState` is drained before any teardown path. Callers
+    /// must preserve that property:
+    /// - Never construct an `ExpertFilesPtr` and let it outlive the
+    ///   `RsCtx` that holds the `ExpertFiles`.
+    /// - The arbitrary lifetime `'a` chosen by the caller must not
+    ///   outlive the underlying `RsCtx`.
+    /// - `ExpertFiles`'s public surface is `&self`-only (`pread64` is
+    ///   per-call-offset thread-safe per POSIX), so concurrent worker
+    ///   calls through this reference are fine.
     unsafe fn as_ref<'a>(self) -> &'a ExpertFiles {
-        // SAFETY: forwarded — caller's invariant covers this.
+        // SAFETY: forwarded — see the safety contract above.
         unsafe { &*(self.addr as *const ExpertFiles) }
     }
 }

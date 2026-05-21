@@ -80,6 +80,14 @@ impl MtlWeightBuf {
         // Subtract that to recover the mmap base. The simpler path
         // would be a `WeightFile::mmap_ptr()` accessor; adding one
         // here keeps the API surface tight.
+        //
+        // The pointer arithmetic assumes `tensor_bytes` and
+        // `tensor_info` agree on the offset — a violation would mean
+        // a corrupted manifest or a `WeightFile::parse_manifest` bug.
+        // We cross-check by recomputing the offset for a *second*
+        // tensor against the derived `mmap_base`; mismatch is a
+        // debug-build panic (release builds trust `WeightFile::open`'s
+        // bounds check at load time).
         let base_ptr = wf
             .iter()
             .next()
@@ -89,6 +97,26 @@ impl MtlWeightBuf {
                 let off = info.offset as usize;
                 // bytes.as_ptr() points at mmap[off]; back off to mmap[0]
                 let mmap_base = unsafe { bytes.as_ptr().sub(off) };
+                // Cross-check the derived `mmap_base` against a
+                // second tensor — `mmap_base + info2.offset` must
+                // equal `tensor_bytes(name2).as_ptr()`. The first
+                // tensor's derivation is structurally circular
+                // (mmap_base = ptr - off ⇒ mmap_base + off = ptr); a
+                // second tensor's offset is independent evidence that
+                // the manifest and the mmap agree. Skipped if the
+                // manifest has only one entry.
+                if let Some((name2, info2)) =
+                    wf.iter().find(|(n, _)| *n != name)
+                {
+                    if let Some(bytes2) = wf.tensor_bytes(name2) {
+                        debug_assert_eq!(
+                            bytes2.as_ptr() as usize,
+                            mmap_base as usize + info2.offset as usize,
+                            "WeightFile manifest offset disagrees with tensor_bytes for '{}'",
+                            name2,
+                        );
+                    }
+                }
                 NonNull::new(mmap_base as *mut u8)
             })
             .expect("WeightFile is non-empty");

@@ -32,6 +32,11 @@ rayon       = "1.10"
 libc        = "0.2"
 # POD reinterpret casts (&[f32] <-> &[u8]) for state snapshot I/O.
 bytemuck    = "1"
+# Compile-time POD layout assertions next to `unsafe` casts and
+# transmutes. Already used the same way in drama_llama; pulled in here
+# to back the same discipline for the Metal-buffer view boundary and
+# the `align_to`-based bf16/f32 readers.
+static_assertions = "1.1"
 # Direct Objective-C messaging for surfacing `cmdbuf.error()` detail —
 # metal-rs defines `MTLCommandBufferError` but exposes no accessor for
 # the NSError on a failed command buffer. Already a transitive dep of
