@@ -128,26 +128,33 @@ But 6.5× is well above noise; this is real.
 Trial spreads on vB are ~0.3% (e.g. 122.139 / 122.253 / 122.481 for
 M=8192/8192). Tight enough that the gap to vA isn't noise.
 
-Confirmed. **vB is the new production candidate.** Next step is the
-slot-rotate: vB body becomes vA, the old vA moves to the (now empty)
-vB slot, and `MOEFLUX_SDPA_VB` flips to default-on or gets retired.
+Confirmed. **vB is now the production default** (commit `1cc2163`).
 
-Production caveat for the rotation: today's host gate forces
-`vb = false` when `fold > 1` because vB GQA fold isn't implemented.
-The slot swap inherits that — promotion must either land the vB GQA
-fold first, or keep the GQA path on the *new* vB (old vA's
-`_gqa2_va`).
+## Promotion (2026-05-22, later same day)
+
+The initial gate flip (`MOEFLUX_SDPA_VB` default ON) showed **no
+change** — still 370 tok/s. Root cause: `fold == 1` guard. The a3b
+model has `heads_per_kv=8` (even) → `fold=2` → vB never fired.
+
+Fix: force `fold=1` when vB is active. Unfolded doubles threadgroups
+(8 vs 4 for fold=2) but the 7× kernel win dwarfs the fold loss.
+
+Engine-level prefill (a3b, ~15k tokens, max_tokens=1, n=3):
+- **Before (vA, fold=2):** 370 tok/s
+- **After (vB, fold=1):** 684-686 tok/s — **+85%**
+- **llama.cpp baseline:** 810-820 tok/s
+- **Remaining gap:** ~1.19× (down from ~2.2×)
 
 ## Follow-ups
 
-1. If vB wins on M=8192 shapes (where staging dominates most): clean
-   reboot A/B → promote (slot swap) → flip `MOEFLUX_SDPA_VB` default.
-2. vB GQA-fold (G≥2). For prefill at heads_per_kv=8, the fold reuses
-   K/V across 2-8 query heads. Same trick still applies under
-   direct-device — just hoist the head loop inside the c0 loop.
-3. Bigger VB_C (128 or 256)? More compute per direct-device fetch,
+1. vB GQA-fold (G≥2). For prefill at heads_per_kv=8, the fold reuses
+   K/V across 2-8 query heads. Same trick applies under direct-device
+   — just hoist the head loop inside the c0 loop. This would reclaim
+   the 2× threadgroup overhead and likely close most of the remaining
+   ~1.2× gap to llama.cpp.
+2. Bigger VB_C (128 or 256)? More compute per direct-device fetch,
    but each block needs `min(VB_C, kv_len - c0)` valid → fewer total
-   c0 iterations. Worth measuring once vB G=1 baseline is solid.
-4. Mask predicate cost at large kv_len. `needs_mask` fires for
+   c0 iterations. Worth measuring once vB GQA baseline is solid.
+3. Mask predicate cost at large kv_len. `needs_mask` fires for
    `O(M/64)` blocks per q-tile (the causal boundary). Bounded but
    nonzero; profile if it shows up.
