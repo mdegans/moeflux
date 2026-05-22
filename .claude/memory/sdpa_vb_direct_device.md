@@ -113,6 +113,31 @@ multiplicative compounding wasn't.
 Clean rebooted A/B still pending — Mike said he'll run it when home.
 But 6.5× is well above noise; this is real.
 
+## Clean rebooted A/B — 2026-05-22 (post-cold-boot)
+
+```
+[sdpa] heads=16 kv_heads=2 head_dim=256 kv_dim=512
+  vA sdpa M=1536  kv_len=1536    33.12 ms   584 GFLOP/s
+  vB sdpa M=1536  kv_len=1536     4.55 ms  4249 GFLOP/s   7.28× speedup
+  vA sdpa M=8192  kv_len=8192   821.51 ms   669 GFLOP/s
+  vB sdpa M=8192  kv_len=8192   122.25 ms  4497 GFLOP/s   6.72× speedup
+  vA sdpa M=8192  kv_len=32768 5707.10 ms   674 GFLOP/s
+  vB sdpa M=8192  kv_len=32768  840.24 ms  4580 GFLOP/s   6.79× speedup
+```
+
+Trial spreads on vB are ~0.3% (e.g. 122.139 / 122.253 / 122.481 for
+M=8192/8192). Tight enough that the gap to vA isn't noise.
+
+Confirmed. **vB is the new production candidate.** Next step is the
+slot-rotate: vB body becomes vA, the old vA moves to the (now empty)
+vB slot, and `MOEFLUX_SDPA_VB` flips to default-on or gets retired.
+
+Production caveat for the rotation: today's host gate forces
+`vb = false` when `fold > 1` because vB GQA fold isn't implemented.
+The slot swap inherits that — promotion must either land the vB GQA
+fold first, or keep the GQA path on the *new* vB (old vA's
+`_gqa2_va`).
+
 ## Follow-ups
 
 1. If vB wins on M=8192 shapes (where staging dominates most): clean
