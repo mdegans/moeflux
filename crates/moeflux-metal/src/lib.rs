@@ -189,19 +189,24 @@ pub fn set_gather_tile_variant_override(v: Option<GatherTileVariant>) {
     OVERRIDE.store(val, Ordering::Relaxed);
 }
 
-/// The FA2 batched-prefill causal SDPA kernel (`sdpa.metal`).
-const SDPA: &str = "attn_sdpa_causal_flash";
-/// The GQA-folded SDPA kernel — one threadgroup per `(q_tile, head-pair)`,
+/// FA2 batched-prefill causal SDPA — **slot vA**: the current
+/// production kernel (`sdpa.metal`). The vA/vB scheme keeps two
+/// kernel slots indefinitely; new designs overwrite whichever slot
+/// is older. See `attn_sdpa_causal_flash_vb` for the experimental
+/// slot.
+const SDPA_VA: &str = "attn_sdpa_causal_flash_va";
+/// GQA-folded vA SDPA — one threadgroup per `(q_tile, head-pair)`,
 /// staging each K/V block once for both query-heads. Used when
 /// `SdpaCall::fold == 2`.
-const SDPA_GQA2: &str = "attn_sdpa_causal_flash_gqa2";
-/// v2 of the unfolded SDPA — replaces v1's scalar QK^T / P·V loops with
-/// `simdgroup_multiply_accumulate` on 8×8 simdgroup matrix tiles. Same
-/// dispatch shape and buffer signature as `SDPA`. Selected when
-/// `SdpaCall::v2 && SdpaCall::fold == 1`.
+const SDPA_GQA2_VA: &str = "attn_sdpa_causal_flash_gqa2_va";
+/// vB SDPA — the experimental slot. v2 of the unfolded SDPA: replaces
+/// vA's scalar QK^T / P·V loops with `simdgroup_multiply_accumulate`
+/// on 8×8 simdgroup matrix tiles. Same dispatch shape and buffer
+/// signature as `SDPA_VA`. Selected when `SdpaCall::v2 &&
+/// SdpaCall::fold == 1`.
 const SDPA_V2: &str = "attn_sdpa_causal_flash_v2";
-/// v2 of the GQA-folded SDPA. Same simdgroup-MMA conversion, plus the
-/// FA_GROUP=2 K/V-co-stage reuse from `SDPA_GQA2`. Selected when
+/// vB GQA-folded SDPA. Same simdgroup-MMA conversion, plus the
+/// FA_GROUP=2 K/V-co-stage reuse from `SDPA_GQA2_VA`. Selected when
 /// `SdpaCall::v2 && SdpaCall::fold == 2`.
 const SDPA_GQA2_V2: &str = "attn_sdpa_causal_flash_gqa2_v2";
 /// SDPA query-tile size — must match `FA_BR` in `sdpa.metal`.
@@ -416,12 +421,12 @@ pub struct SdpaCall<'a> {
     pub softmax_scale: f32,
     /// GQA-fold factor — query-heads folded into one threadgroup so each
     /// K/V block is staged once and reused. `1` = unfolded
-    /// (`attn_sdpa_causal_flash`); `2` = the folded kernel
-    /// (`attn_sdpa_causal_flash_gqa2`). Must divide both `num_heads` and
-    /// `heads_per_kv`.
+    /// (`attn_sdpa_causal_flash_va`); `2` = the folded kernel
+    /// (`attn_sdpa_causal_flash_gqa2_va`). Must divide both `num_heads`
+    /// and `heads_per_kv`.
     pub fold: u32,
-    /// Route through the v2 simdgroup-MMA kernels
-    /// (`attn_sdpa_causal_flash_v2` / `_gqa2_v2`) instead of v1.
+    /// Route through the vB experimental kernel
+    /// (`attn_sdpa_causal_flash_v2` / `_gqa2_v2`) instead of vA.
     /// Default `false` for safe landing; flipped by
     /// `MOEFLUX_SDPA_V2` at the engine layer.
     pub v2: bool,
@@ -463,13 +468,15 @@ pub struct Kernels {
     /// BM=16 / WM=2 variant of the gather kernel — same alignment-PSO
     /// matrix shape as `gather`.
     gather_bm16: [ComputePipelineState; 8],
-    /// FA2 batched-prefill causal SDPA (`attn_sdpa_causal_flash`).
-    sdpa: ComputePipelineState,
-    /// GQA-folded SDPA (`attn_sdpa_causal_flash_gqa2`) — `SdpaCall::fold == 2`.
-    sdpa_gqa2: ComputePipelineState,
-    /// v2 unfolded SDPA — simdgroup-MMA port. `SdpaCall::v2 && fold == 1`.
+    /// FA2 batched-prefill causal SDPA — vA slot
+    /// (`attn_sdpa_causal_flash_va`).
+    sdpa_va: ComputePipelineState,
+    /// GQA-folded vA SDPA (`attn_sdpa_causal_flash_gqa2_va`) —
+    /// `SdpaCall::fold == 2 && !v2`.
+    sdpa_gqa2_va: ComputePipelineState,
+    /// vB unfolded SDPA — simdgroup-MMA port. `SdpaCall::v2 && fold == 1`.
     sdpa_v2: ComputePipelineState,
-    /// v2 GQA-folded SDPA — simdgroup-MMA port. `SdpaCall::v2 && fold == 2`.
+    /// vB GQA-folded SDPA — simdgroup-MMA port. `SdpaCall::v2 && fold == 2`.
     sdpa_gqa2_v2: ComputePipelineState,
     /// MoE map0 pre-pass — `htpe[]` + `hids[][]` from per-token expert
     /// indices. Top-k = 8 instantiation (`moeflux_mm_id_map0_k8`).
@@ -589,8 +596,8 @@ impl Kernels {
             gather,
             gather_bm64,
             gather_bm16,
-            sdpa: build(SDPA)?,
-            sdpa_gqa2: build(SDPA_GQA2)?,
+            sdpa_va: build(SDPA_VA)?,
+            sdpa_gqa2_va: build(SDPA_GQA2_VA)?,
             sdpa_v2: build(SDPA_V2)?,
             sdpa_gqa2_v2: build(SDPA_GQA2_V2)?,
             moe_mm_id_map0_k8,
@@ -732,7 +739,7 @@ impl KernelCall for SdpaCall<'_> {
         }
         assert_eq!(
             self.head_dim, 256,
-            "attn_sdpa_causal_flash is compiled for head_dim == 256"
+            "attn_sdpa_causal_flash_va is compiled for head_dim == 256"
         );
 
         debug_assert!(
@@ -750,8 +757,8 @@ impl KernelCall for SdpaCall<'_> {
         // fold == 2 is GQA-folded; v2 routes either through the
         // simdgroup-MMA port.
         let pso = match (self.fold > 1, self.v2) {
-            (false, false) => &kernels.sdpa,
-            (true, false) => &kernels.sdpa_gqa2,
+            (false, false) => &kernels.sdpa_va,
+            (true, false) => &kernels.sdpa_gqa2_va,
             (false, true) => &kernels.sdpa_v2,
             (true, true) => &kernels.sdpa_gqa2_v2,
         };

@@ -628,7 +628,7 @@ fn run_batched_sdpa_flash(
     read_buf_f32(&out_buf, out_total)
 }
 
-/// Diff `attn_sdpa_causal_flash` for `n_tokens` queries starting at
+/// Diff `attn_sdpa_causal_flash_va` for `n_tokens` queries starting at
 /// absolute position `start_pos` against a per-token `sdpa_cpu` oracle
 /// (each query `q` attends to `KV[0 .. start_pos+q+1]`). Per-token
 /// cosine must clear `COSINE_FLOOR`.
@@ -755,7 +755,7 @@ fn sdpa_causal_flash_m1500_deep_chunk() {
     flash_diff_tokenwise(1500, 4096, 0x5DA0_F1A5_0000_0005, 1, false);
 }
 
-// GQA-folded kernel (`attn_sdpa_causal_flash_gqa2`, fold=2) — same five
+// GQA-folded kernel (`attn_sdpa_causal_flash_gqa2_va`, fold=2) — same five
 // shapes, diffed against the same per-token `sdpa_cpu` oracle. fold=2
 // divides a3b's heads_per_kv=8.
 

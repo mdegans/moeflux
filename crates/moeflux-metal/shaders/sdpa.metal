@@ -83,7 +83,7 @@ static inline void stage_kv_block(
     }
 }
 
-kernel void attn_sdpa_causal_flash(
+kernel void attn_sdpa_causal_flash_va(
     device const float* Q             [[buffer(0)]],  // [M, num_heads, head_dim]
     device const float* K_cache       [[buffer(1)]],  // [kv_len, kv_dim]
     device const float* V_cache       [[buffer(2)]],  // [kv_len, kv_dim]
@@ -107,6 +107,12 @@ kernel void attn_sdpa_causal_flash(
 
     uint simd_id = lid / 32;   // 0..7
     uint lane    = lid % 32;   // 0..31
+
+    // Pre-fold log2(e) into the softmax scale so the per-block scoring
+    // and online softmax can use the cheaper `fast::exp2` instead of
+    // `exp`. exp(x) == exp2(x * log2(e)); folding it into the scale
+    // means scores, m, and corr all live in log2 domain consistently.
+    const float log2_scale = softmax_scale * M_LOG2E_F;
 
     // float4-backed so the VEC4_STAGE ablation path has a 16-byte-aligned
     // staging buffer; `kv_stage` aliases it for the scalar QK / P·V phases.
@@ -171,7 +177,7 @@ kernel void attn_sdpa_causal_flash(
                             (needs_mask &&
                              kv_pos >= start_pos + q0 + trow + 1);
                         scores[trow * FA_BC + c] =
-                            masked ? -INFINITY : dot * softmax_scale;
+                            masked ? -INFINITY : dot * log2_scale;
                     }
                 }
             }
@@ -196,12 +202,13 @@ kernel void attn_sdpa_causal_flash(
             float m_old = row_m[row];
             float m_new = max(m_old, blk_max);
             bool  active = (m_new != -INFINITY);
-            float corr = (m_old == -INFINITY) ? 0.0f : exp(m_old - m_new);
+            float corr = (m_old == -INFINITY) ? 0.0f
+                                              : fast::exp2(m_old - m_new);
 
             float ls = 0.0f;
             for (uint c = sub; c < FA_BC; c += FA_TPR) {
                 float p = active
-                    ? exp(scores[row * FA_BC + c] - m_new)
+                    ? fast::exp2(scores[row * FA_BC + c] - m_new)
                     : 0.0f;
                 scores[row * FA_BC + c] = p;
                 ls += p;
@@ -330,6 +337,10 @@ static void sdpa_gqa_impl(
     uint simd_id = lid / 32;
     uint lane    = lid % 32;
 
+    // Pre-fold log2(e) into the softmax scale — see the unfolded
+    // kernel for the rationale. Same trick, same per-thread cost.
+    const float log2_scale = softmax_scale * M_LOG2E_F;
+
     // K | V co-staged: kv_K4 = [0, FA_GQA_BC*FA_HD), kv_V4 = the rest.
     threadgroup float*  kv_K  = (threadgroup float*)kv_stage4;
     threadgroup float*  kv_V  = kv_K + FA_GQA_BC * FA_HD;
@@ -390,7 +401,7 @@ static void sdpa_gqa_impl(
                             (needs_mask &&
                              kv_pos >= start_pos + q0 + trow + 1);
                         scores[trow * FA_GQA_BC + c] =
-                            masked ? -INFINITY : dot * softmax_scale;
+                            masked ? -INFINITY : dot * log2_scale;
                     }
                 }
             }
@@ -412,12 +423,13 @@ static void sdpa_gqa_impl(
                 float m_old = row_m[g * FA_BR + row];
                 float m_new = max(m_old, blk_max);
                 bool  active = (m_new != -INFINITY);
-                float corr = (m_old == -INFINITY) ? 0.0f : exp(m_old - m_new);
+                float corr = (m_old == -INFINITY) ? 0.0f
+                                                  : fast::exp2(m_old - m_new);
 
                 float ls = 0.0f;
                 for (uint c = sub; c < FA_GQA_BC; c += FA_TPR) {
                     float p = active
-                        ? exp(scores[row * FA_GQA_BC + c] - m_new)
+                        ? fast::exp2(scores[row * FA_GQA_BC + c] - m_new)
                         : 0.0f;
                     scores[row * FA_GQA_BC + c] = p;
                     ls += p;
@@ -496,9 +508,9 @@ kernel void NAME(                                                          \
         kv_stage4, scores, row_m, row_l, row_corr, tg_idx, lid);            \
 }
 
-SDPA_GQA_ENTRY(attn_sdpa_causal_flash_gqa2, 2)
-SDPA_GQA_ENTRY(attn_sdpa_causal_flash_gqa4, 4)
-SDPA_GQA_ENTRY(attn_sdpa_causal_flash_gqa8, 8)
+SDPA_GQA_ENTRY(attn_sdpa_causal_flash_gqa2_va, 2)
+SDPA_GQA_ENTRY(attn_sdpa_causal_flash_gqa4_va, 4)
+SDPA_GQA_ENTRY(attn_sdpa_causal_flash_gqa8_va, 8)
 
 // ============================================================================
 // FlashAttention-2 causal SDPA v2 — simdgroup-matrix port (2026-05-21).

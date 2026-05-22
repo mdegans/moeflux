@@ -1104,7 +1104,7 @@ impl Backend for MetalBackend {
                 ..
             } => {
                 // GQA-fold: even `heads_per_kv` → two query-heads
-                // share a threadgroup (`attn_sdpa_causal_flash_gqa2`);
+                // share a threadgroup (`attn_sdpa_causal_flash_gqa2_va`);
                 // odd falls back to the unfolded kernel. Same rule as
                 // the imperative path (`full_attn_forward.rs`).
                 let fold = if *heads_per_kv % 2 == 0 { 2 } else { 1 };

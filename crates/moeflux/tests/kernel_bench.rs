@@ -228,7 +228,7 @@ fn bench(
 // ---------------------------------------------------------------------------
 // SDPA ablation — Phase 0 bound analysis (session 13).
 //
-// Builds `attn_sdpa_causal_flash` with the `ABLATE_*` phase-skip /
+// Builds `attn_sdpa_causal_flash_va` with the `ABLATE_*` phase-skip /
 // vec4-stage function constants (see `sdpa.metal`) and times each
 // variant. The dominant cost (staging / QK / softmax / P·V /
 // loop+barrier floor) falls out by difference: `A − skip(X) = cost(X)`.
@@ -323,7 +323,7 @@ fn build_sdpa_psos(metal: &MetalContext) -> Vec<SdpaPso> {
             .new_compute_pipeline_state_with_function(&function)
             .unwrap_or_else(|e| panic!("build {name} pso: {e}"))
     };
-    const UNFOLDED: &str = "attn_sdpa_causal_flash";
+    const UNFOLDED: &str = "attn_sdpa_causal_flash_va";
     let mk = |label, pso, fold| SdpaPso { label, pso, fold };
     vec![
         mk("A baseline", build(UNFOLDED, &[]), 1),
@@ -339,9 +339,9 @@ fn build_sdpa_psos(metal: &MetalContext) -> Vec<SdpaPso> {
             ),
             1,
         ),
-        mk("G gqa-fold G=2", build("attn_sdpa_causal_flash_gqa2", &[]), 2),
-        mk("H gqa-fold G=4", build("attn_sdpa_causal_flash_gqa4", &[]), 4),
-        mk("I gqa-fold G=8", build("attn_sdpa_causal_flash_gqa8", &[]), 8),
+        mk("G gqa-fold G=2", build("attn_sdpa_causal_flash_gqa2_va", &[]), 2),
+        mk("H gqa-fold G=4", build("attn_sdpa_causal_flash_gqa4_va", &[]), 4),
+        mk("I gqa-fold G=8", build("attn_sdpa_causal_flash_gqa8_va", &[]), 8),
     ]
 }
 
