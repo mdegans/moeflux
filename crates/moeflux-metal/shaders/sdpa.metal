@@ -742,3 +742,231 @@ kernel void attn_sdpa_causal_flash_va(
         }
     }
 }
+
+// ============================================================================
+// FlashAttention-2 causal SDPA — GQA-folded, direct-device.
+// ============================================================================
+//
+// Same direct-device design as vA but processes G query-heads per
+// threadgroup. K/V hit L2 cache on heads 1..G-1 (same KV head for the
+// whole group). Q is reloaded from device per head per block (~6%
+// overhead vs ~50% K/V savings at G=2).
+//
+// TG memory: sq (8 KB) + so (8·G KB) + ss (2 KB).
+// 32 KB Apple Silicon TG limit ⇒ G ≤ 2 at VB_Q=8.
+
+template<uint G>
+static void sdpa_dd_gqa_impl(
+    device const float* Q,
+    device const float* K_cache,
+    device const float* V_cache,
+    device float*       out,
+    uint n_tokens, uint num_heads, uint heads_per_kv,
+    uint kv_dim, uint start_pos, uint kv_len, float softmax_scale,
+    threadgroup float* sq,
+    threadgroup float* so,
+    threadgroup float* ss,
+    uint tg_idx, uint lid
+) {
+    uint num_groups = num_heads / G;
+    uint q_tile = tg_idx / num_groups;
+    uint hg     = tg_idx % num_groups;
+    uint h_base = hg * G;
+    uint q0     = q_tile * VB_Q;
+    if (q0 >= n_tokens) return;
+    uint br_valid = min(VB_Q, n_tokens - q0);
+    uint kv_h     = h_base / heads_per_kv;
+
+    uint simd_id = lid / 32;
+    uint lane    = lid % 32;
+
+    const float log2_scale = softmax_scale * M_LOG2E_F;
+
+    for (uint i = lid; i < G * VB_Q * FA_HD; i += FA_THREADS) {
+        so[i] = 0.0f;
+    }
+
+    float M_h[G], S_h[G];
+    for (uint g = 0; g < G; ++g) {
+        M_h[g] = -INFINITY;
+        S_h[g] = 0.0f;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint kv_max_last  = start_pos + q0 + br_valid;
+    uint kv_max_first = start_pos + q0 + 1;
+
+    for (uint c0 = 0; c0 < kv_max_last; c0 += VB_C) {
+        uint bc_valid   = min(VB_C, kv_len - c0);
+        bool needs_mask = (c0 + VB_C) > kv_max_first;
+
+        for (uint g = 0; g < G; ++g) {
+            uint h = h_base + g;
+
+            // -- Reload Q[h] from device into sq --
+            {
+                uint trow = simd_id;
+                if (trow < br_valid) {
+                    device const float* qsrc =
+                        Q + ((size_t)(q0 + trow) * num_heads + h) * FA_HD;
+                    for (uint k = 0; k < FA_HD / 32; ++k) {
+                        sq[trow * FA_HD + lane + k * 32] =
+                            qsrc[lane + k * 32];
+                    }
+                } else {
+                    for (uint k = 0; k < FA_HD / 32; ++k) {
+                        sq[trow * FA_HD + lane + k * 32] = 0.0f;
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // -- QK^T --
+            {
+                simdgroup_float8x8 mqk = simdgroup_float8x8(0.0f);
+                for (uint k_pair = 0; k_pair < VB_D8 / 2; ++k_pair) {
+                    simdgroup_float8x8 mq0, mq1, mk0, mk1;
+                    uint k_off = k_pair * 16;
+                    simdgroup_load(mq0, sq + k_off + 0, FA_HD);
+                    simdgroup_load(mq1, sq + k_off + 8, FA_HD);
+                    device const float* pk =
+                        K_cache
+                        + (size_t)(c0 + simd_id * 8) * kv_dim
+                        + kv_h * FA_HD + k_off;
+                    simdgroup_load(mk0, pk + 0, kv_dim,
+                                   ulong2(0, 0), true);
+                    simdgroup_load(mk1, pk + 8, kv_dim,
+                                   ulong2(0, 0), true);
+                    simdgroup_multiply_accumulate(mqk, mq0, mk0, mqk);
+                    simdgroup_multiply_accumulate(mqk, mq1, mk1, mqk);
+                }
+                simdgroup_store(mqk, ss + simd_id * 8, VB_C,
+                                ulong2(0, 0), false);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // -- Softmax + rescale so[g] --
+            {
+                uint trow = simd_id;
+                uint kv_row_max = start_pos + q0 + trow + 1;
+
+                float s0 = ss[trow * VB_C + lane]      * log2_scale;
+                float s1 = ss[trow * VB_C + lane + 32] * log2_scale;
+                if (bc_valid < VB_C || needs_mask) {
+                    uint kv_pos0 = c0 + lane;
+                    uint kv_pos1 = c0 + lane + 32;
+                    if (lane      >= bc_valid
+                        || (needs_mask && kv_pos0 >= kv_row_max)) {
+                        s0 = -INFINITY;
+                    }
+                    if (lane + 32 >= bc_valid
+                        || (needs_mask && kv_pos1 >= kv_row_max)) {
+                        s1 = -INFINITY;
+                    }
+                }
+
+                float blk_max = simd_max(max(s0, s1));
+                float m_old = M_h[g];
+                float m_new = max(m_old, blk_max);
+                bool  active = (m_new != -INFINITY);
+                float corr = (m_old == -INFINITY) ? 0.0f
+                    : fast::exp2(m_old - m_new);
+
+                float p0 = active ? fast::exp2(s0 - m_new) : 0.0f;
+                float p1 = active ? fast::exp2(s1 - m_new) : 0.0f;
+                ss[trow * VB_C + lane]      = p0;
+                ss[trow * VB_C + lane + 32] = p1;
+
+                float l_block = simd_sum(p0 + p1);
+                S_h[g] = S_h[g] * corr + l_block;
+                M_h[g] = m_new;
+
+                if (corr != 1.0f && corr != 0.0f) {
+                    uint so_base = g * VB_Q * FA_HD;
+                    for (uint k = 0; k < FA_HD / 32; ++k) {
+                        so[so_base + trow * FA_HD + lane + k * 32]
+                            *= corr;
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // -- PV: O += P · V --
+            {
+                uint so_base = g * VB_Q * FA_HD;
+                simdgroup_float8x8 lo[VB_NO];
+                for (uint ii = 0; ii < VB_NO; ++ii) {
+                    uint d_off = simd_id * 8 + ii * 8 * VB_NSG;
+                    simdgroup_load(lo[ii], so + so_base + d_off,
+                                   FA_HD, ulong2(0, 0), false);
+                }
+                for (uint cc = 0; cc < VB_C8; ++cc) {
+                    simdgroup_float8x8 vs;
+                    simdgroup_load(vs, ss + cc * 8, VB_C,
+                                   ulong2(0, 0), false);
+                    for (uint ii = 0; ii < VB_NO; ++ii) {
+                        simdgroup_float8x8 mv;
+                        uint d_off = simd_id * 8 + ii * 8 * VB_NSG;
+                        device const float* pv =
+                            V_cache
+                            + (size_t)(c0 + cc * 8) * kv_dim
+                            + kv_h * FA_HD + d_off;
+                        simdgroup_load(mv, pv, kv_dim,
+                                       ulong2(0, 0), false);
+                        simdgroup_multiply_accumulate(
+                            lo[ii], vs, mv, lo[ii]);
+                    }
+                }
+                for (uint ii = 0; ii < VB_NO; ++ii) {
+                    uint d_off = simd_id * 8 + ii * 8 * VB_NSG;
+                    simdgroup_store(lo[ii], so + so_base + d_off,
+                                    FA_HD, ulong2(0, 0), false);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    // -- Finalize: write so / S to device out, per head. --
+    for (uint g = 0; g < G; ++g) {
+        uint h = h_base + g;
+        uint trow = simd_id;
+        if (trow < br_valid) {
+            float inv = (S_h[g] > 0.0f) ? (1.0f / S_h[g]) : 0.0f;
+            uint so_base = g * VB_Q * FA_HD;
+            device float* osrc =
+                out + ((size_t)(q0 + trow) * num_heads + h) * FA_HD;
+            for (uint k = 0; k < FA_HD / 32; ++k) {
+                osrc[lane + k * 32] =
+                    so[so_base + trow * FA_HD + lane + k * 32] * inv;
+            }
+        }
+    }
+}
+
+#define SDPA_DD_GQA_ENTRY(NAME, G)                                         \
+kernel void NAME(                                                          \
+    device const float* Q             [[buffer(0)]],                       \
+    device const float* K_cache       [[buffer(1)]],                       \
+    device const float* V_cache       [[buffer(2)]],                       \
+    device float*       out           [[buffer(3)]],                       \
+    constant uint&      n_tokens      [[buffer(4)]],                       \
+    constant uint&      num_heads     [[buffer(5)]],                       \
+    constant uint&      heads_per_kv  [[buffer(6)]],                       \
+    constant uint&      kv_dim        [[buffer(7)]],                       \
+    constant uint&      start_pos     [[buffer(8)]],                       \
+    constant uint&      kv_len        [[buffer(9)]],                       \
+    constant float&     softmax_scale [[buffer(10)]],                      \
+    uint tg_idx [[threadgroup_position_in_grid]],                          \
+    uint lid    [[thread_position_in_threadgroup]]                         \
+) {                                                                        \
+    threadgroup float sq[VB_Q * FA_HD];               /* 8 KB */           \
+    threadgroup float so[(G) * VB_Q * FA_HD];         /* 8·G KB */         \
+    threadgroup float ss[VB_Q * VB_C];                /* 2 KB */           \
+    sdpa_dd_gqa_impl<G>(Q, K_cache, V_cache, out, n_tokens, num_heads,    \
+        heads_per_kv, kv_dim, start_pos, kv_len, softmax_scale,           \
+        sq, so, ss, tg_idx, lid);                                         \
+}
+
+SDPA_DD_GQA_ENTRY(attn_sdpa_causal_flash_gqa2_dd, 2)

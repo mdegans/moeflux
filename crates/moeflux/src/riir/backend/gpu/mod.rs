@@ -1104,9 +1104,9 @@ impl Backend for MetalBackend {
                 ..
             } => {
                 let vb = crate::riir::attn::linear_attn_forward::sdpa_vb_enabled();
-                // vA (direct-device, production) has no GQA fold → fold=1.
-                // vB (staging, opt-in) can fold when heads_per_kv is even.
-                let fold = if vb && *heads_per_kv % 2 == 0 { 2 } else { 1 };
+                let gqa = crate::riir::attn::linear_attn_forward::sdpa_gqa_enabled();
+                // GQA fold=2 for even heads_per_kv, gated by MOEFLUX_SDPA_GQA.
+                let fold = if gqa && *heads_per_kv % 2 == 0 { 2 } else { 1 };
                 self.metal.kernels().encode(
                     cmd,
                     &SdpaCall {

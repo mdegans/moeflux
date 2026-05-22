@@ -791,6 +791,41 @@ fn sdpa_gqa2_causal_flash_m1500_deep_chunk() {
 }
 
 // ---------------------------------------------------------------------------
+// Direct-device GQA fold (`attn_sdpa_causal_flash_gqa2_dd`, fold=2,
+// vb=false) — same five shapes, diffed against the same `sdpa_cpu` oracle.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "long-running GPU test"]
+fn sdpa_gqa2_dd_causal_flash_n1_single_block() {
+    flash_diff_tokenwise(1, 63, 0x5DA0_F1A5_0000_0001, 2, false);
+}
+
+#[test]
+#[ignore = "long-running GPU test"]
+fn sdpa_gqa2_dd_causal_flash_n1_multi_block() {
+    flash_diff_tokenwise(1, 4999, 0x5DA0_F1A5_0000_0002, 2, false);
+}
+
+#[test]
+#[ignore = "long-running GPU test"]
+fn sdpa_gqa2_dd_causal_flash_n4_tokenwise() {
+    flash_diff_tokenwise(4, 4, 0x5DA0_F1A5_0000_0003, 2, false);
+}
+
+#[test]
+#[ignore = "long-running GPU test"]
+fn sdpa_gqa2_dd_causal_flash_m512_square_causal() {
+    flash_diff_tokenwise(512, 0, 0x5DA0_F1A5_0000_0004, 2, false);
+}
+
+#[test]
+#[ignore = "long-running GPU test"]
+fn sdpa_gqa2_dd_causal_flash_m1500_deep_chunk() {
+    flash_diff_tokenwise(1500, 4096, 0x5DA0_F1A5_0000_0005, 2, false);
+}
+
+// ---------------------------------------------------------------------------
 // vB staging kernel (`attn_sdpa_causal_flash_vb`) — the former production
 // kernel, now kept as the experimental slot. Same five shapes diffed
 // against the same `sdpa_cpu` oracle, identical `COSINE_FLOOR = 0.9999`.

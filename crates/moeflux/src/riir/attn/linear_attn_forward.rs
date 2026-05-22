@@ -68,14 +68,33 @@ fn moe_gather_id_enabled() -> bool {
 /// production kernel. Opt-in only — kept for diff-oracle and A/B work.
 ///
 /// **Default: OFF.** Set `MOEFLUX_SDPA_VB=1` / `true` / `on` to use
-/// the staging kernel. vB supports GQA fold (fold=2 for even
-/// heads_per_kv); vA does not.
+/// the staging kernel.
 pub(in crate::riir) fn sdpa_vb_enabled() -> bool {
     use std::sync::OnceLock;
     static CACHED: OnceLock<bool> = OnceLock::new();
     *CACHED.get_or_init(|| {
         matches!(
             std::env::var("MOEFLUX_SDPA_VB").as_deref(),
+            Ok("1") | Ok("true") | Ok("on")
+        )
+    })
+}
+
+/// Process-wide cache for `MOEFLUX_SDPA_GQA`. Controls GQA fold (fold=2)
+/// for even `heads_per_kv`.
+///
+/// **Default: OFF.** Dirty A/B (2026-05-22) showed GQA fold is ~3%
+/// slower than unfolded vA on a3b — serializing heads inside each TG
+/// costs more in parallelism than it saves in L2 cache reuse. The
+/// direct-device kernel isn't bandwidth-bound at the fold boundary.
+///
+/// Set `MOEFLUX_SDPA_GQA=1` / `true` / `on` to opt into fold=2.
+pub(in crate::riir) fn sdpa_gqa_enabled() -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        matches!(
+            std::env::var("MOEFLUX_SDPA_GQA").as_deref(),
             Ok("1") | Ok("true") | Ok("on")
         )
     })
