@@ -755,45 +755,45 @@ fn sdpa_va_causal_flash_m1500_deep_chunk() {
     flash_diff_tokenwise(1500, 4096, 0x5DA0_F1A5_0000_0005, 1, false);
 }
 
-// GQA-folded vA kernel (`attn_sdpa_causal_flash_gqa2_va`, fold=2) —
+// GQA-folded staging kernel (`attn_sdpa_causal_flash_gqa2_va`, fold=2) —
 // same five shapes, diffed against the same per-token `sdpa_cpu`
-// oracle. fold=2 divides a3b's heads_per_kv=8.
+// oracle. fold=2 divides a3b's heads_per_kv=8. Dispatched via the vB
+// staging path (vb=true) since vA (direct-device) has no GQA fold yet.
 
 #[test]
 #[ignore = "long-running GPU test"]
-fn sdpa_va_causal_flash_gqa2_n1_single_block() {
-    flash_diff_tokenwise(1, 63, 0x5DA0_F1A5_0000_0001, 2, false);
+fn sdpa_gqa2_causal_flash_n1_single_block() {
+    flash_diff_tokenwise(1, 63, 0x5DA0_F1A5_0000_0001, 2, true);
 }
 
 #[test]
 #[ignore = "long-running GPU test"]
-fn sdpa_va_causal_flash_gqa2_n1_multi_block() {
-    flash_diff_tokenwise(1, 4999, 0x5DA0_F1A5_0000_0002, 2, false);
+fn sdpa_gqa2_causal_flash_n1_multi_block() {
+    flash_diff_tokenwise(1, 4999, 0x5DA0_F1A5_0000_0002, 2, true);
 }
 
 #[test]
 #[ignore = "long-running GPU test"]
-fn sdpa_va_causal_flash_gqa2_n4_tokenwise() {
-    flash_diff_tokenwise(4, 4, 0x5DA0_F1A5_0000_0003, 2, false);
+fn sdpa_gqa2_causal_flash_n4_tokenwise() {
+    flash_diff_tokenwise(4, 4, 0x5DA0_F1A5_0000_0003, 2, true);
 }
 
 #[test]
 #[ignore = "long-running GPU test"]
-fn sdpa_va_causal_flash_gqa2_m512_square_causal() {
-    flash_diff_tokenwise(512, 0, 0x5DA0_F1A5_0000_0004, 2, false);
+fn sdpa_gqa2_causal_flash_m512_square_causal() {
+    flash_diff_tokenwise(512, 0, 0x5DA0_F1A5_0000_0004, 2, true);
 }
 
 #[test]
 #[ignore = "long-running GPU test"]
-fn sdpa_va_causal_flash_gqa2_m1500_deep_chunk() {
-    flash_diff_tokenwise(1500, 4096, 0x5DA0_F1A5_0000_0005, 2, false);
+fn sdpa_gqa2_causal_flash_m1500_deep_chunk() {
+    flash_diff_tokenwise(1500, 4096, 0x5DA0_F1A5_0000_0005, 2, true);
 }
 
 // ---------------------------------------------------------------------------
-// vB experimental kernel (`attn_sdpa_causal_flash_vb`) — direct-device,
-// llama.cpp-style. Same five shapes diffed against the same `sdpa_cpu`
-// oracle as vA, identical `COSINE_FLOOR = 0.9999`. vB GQA fold is not
-// implemented yet, so only the unfolded path has tests.
+// vB staging kernel (`attn_sdpa_causal_flash_vb`) — the former production
+// kernel, now kept as the experimental slot. Same five shapes diffed
+// against the same `sdpa_cpu` oracle, identical `COSINE_FLOOR = 0.9999`.
 // ---------------------------------------------------------------------------
 
 #[test]

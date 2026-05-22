@@ -189,26 +189,24 @@ pub fn set_gather_tile_variant_override(v: Option<GatherTileVariant>) {
     OVERRIDE.store(val, Ordering::Relaxed);
 }
 
-/// FA2 batched-prefill causal SDPA — **slot vA**: the current
-/// production kernel (`sdpa.metal`). The vA/vB scheme keeps two
-/// kernel slots indefinitely; new designs overwrite whichever slot
-/// is older. See `attn_sdpa_causal_flash_vb` for the experimental
-/// slot.
+/// FA2 batched-prefill causal SDPA — **slot vA** (production):
+/// direct-device design, reads K/V from device memory. Query tile
+/// size `VB_TILE_Q` (8). The vA/vB scheme keeps two kernel slots;
+/// new designs land in vB, promote to vA when they win on rebooted
+/// A/B.
 const SDPA_VA: &str = "attn_sdpa_causal_flash_va";
-/// GQA-folded vA SDPA — one threadgroup per `(q_tile, head-pair)`,
-/// staging each K/V block once for both query-heads. Used when
-/// `SdpaCall::fold == 2`.
+/// GQA-folded SDPA — staging-based, one threadgroup per `(q_tile,
+/// head-pair)`. Used when `SdpaCall::fold == 2`. Separate from the
+/// vA/vB slot system; retained until a direct-device GQA variant
+/// lands.
 const SDPA_GQA2_VA: &str = "attn_sdpa_causal_flash_gqa2_va";
-/// vB SDPA — the experimental slot. Currently the direct-device,
-/// llama.cpp-style design: Q and O in threadgroup memory, K and V read
-/// direct from device per block, per-thread scalar M/S. Different
-/// dispatch geometry from vA (smaller per-TG query tile — see
-/// `VB_TILE_Q`). Selected when `SdpaCall::vb && SdpaCall::fold == 1`.
-/// vB GQA-fold is not implemented yet; `vb && fold == 2` asserts.
+/// **Slot vB** (experimental): staging-based design, the former
+/// production kernel. Query tile size `FA_BR` (64). Opt-in via
+/// `MOEFLUX_SDPA_VB=1`. Retained for diff-oracle and A/B work.
 const SDPA_VB: &str = "attn_sdpa_causal_flash_vb";
-/// vA query-tile size — must match `FA_BR` in `sdpa.metal`.
+/// Staging-kernel query-tile size — must match `FA_BR` in `sdpa.metal`.
 const FA_BR: u32 = 64;
-/// vB query-tile size — must match `VB_Q` in `sdpa.metal`.
+/// Direct-device kernel query-tile size — must match `VB_Q` in `sdpa.metal`.
 const VB_TILE_Q: u32 = 8;
 /// SDPA threads per threadgroup — must match `FA_THREADS` in `sdpa.metal`.
 /// Same for both slots.
@@ -425,10 +423,9 @@ pub struct SdpaCall<'a> {
     /// (`attn_sdpa_causal_flash_gqa2_va`). Must divide both `num_heads`
     /// and `heads_per_kv`.
     pub fold: u32,
-    /// Route through the vB experimental kernel
-    /// (`attn_sdpa_causal_flash_vb`) instead of vA. Default `false` for
-    /// safe landing; flipped by `MOEFLUX_SDPA_VB` at the engine layer.
-    /// vB GQA fold is not yet implemented — `vb && fold > 1` asserts.
+    /// Route through the vB staging kernel instead of vA direct-device.
+    /// Default `false` (production = vA). Set by `MOEFLUX_SDPA_VB` at
+    /// the engine layer. vA has no GQA fold — `!vb && fold > 1` asserts.
     pub vb: bool,
 }
 
@@ -468,14 +465,11 @@ pub struct Kernels {
     /// BM=16 / WM=2 variant of the gather kernel — same alignment-PSO
     /// matrix shape as `gather`.
     gather_bm16: [ComputePipelineState; 8],
-    /// FA2 batched-prefill causal SDPA — vA slot
-    /// (`attn_sdpa_causal_flash_va`).
+    /// Slot vA (production) — direct-device SDPA.
     sdpa_va: ComputePipelineState,
-    /// GQA-folded vA SDPA (`attn_sdpa_causal_flash_gqa2_va`) —
-    /// `SdpaCall::fold == 2 && !v2`.
+    /// GQA-folded SDPA (staging-based) — `fold == 2`.
     sdpa_gqa2_va: ComputePipelineState,
-    /// vB unfolded SDPA — direct-device, small-tile design.
-    /// `SdpaCall::vb && fold == 1`. No GQA-folded vB yet.
+    /// Slot vB (experimental) — staging-based SDPA.
     sdpa_vb: ComputePipelineState,
     /// MoE map0 pre-pass — `htpe[]` + `hids[][]` from per-token expert
     /// indices. Top-k = 8 instantiation (`moeflux_mm_id_map0_k8`).
@@ -751,20 +745,20 @@ impl KernelCall for SdpaCall<'_> {
             "fold must divide num_heads"
         );
         debug_assert!(
-            !(self.vb && self.fold > 1),
-            "vB GQA fold not yet implemented; \
-             use `vb: false` for fold > 1"
+            self.vb || self.fold == 1,
+            "vA (direct-device) has no GQA fold; \
+             engine must set fold=1 when vb=false"
         );
 
-        // Slot × fold dispatch. vA is the production kernel (unfolded
-        // and `_gqa2_va`); vB is the experimental slot (unfolded only
-        // so far). Each slot has its own query-tile size, so the grid
-        // sizing has to branch.
+        // Slot × fold dispatch. vA is the direct-device production
+        // kernel (unfolded only); vB is the staging-based experimental
+        // slot (unfolded + GQA-folded). Each slot has its own query-
+        // tile size.
         let (pso, tile_q) = match (self.fold > 1, self.vb) {
-            (false, false) => (&kernels.sdpa_va, FA_BR),
-            (true, false) => (&kernels.sdpa_gqa2_va, FA_BR),
-            (false, true) => (&kernels.sdpa_vb, VB_TILE_Q),
-            (true, true) => unreachable!("vB GQA — guarded by debug_assert"),
+            (false, false) => (&kernels.sdpa_va, VB_TILE_Q),
+            (false, true) => (&kernels.sdpa_vb, FA_BR),
+            (true, true) => (&kernels.sdpa_gqa2_va, FA_BR),
+            (true, false) => unreachable!("vA GQA — guarded by debug_assert"),
         };
         let num_q_tiles = self.n_tokens.div_ceil(tile_q);
         let total_tgs = num_q_tiles * (self.num_heads / self.fold);

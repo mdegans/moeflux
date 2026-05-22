@@ -4,28 +4,21 @@
 // `mlx::steel::MMATile`.
 
 // ============================================================================
-// FlashAttention-2 causal SDPA — batched prefill.
+// FlashAttention-2 causal SDPA — slot vB (staging-based, kept for A/B).
 // ============================================================================
 //
-// One threadgroup owns a tile of FA_BR query tokens for one head, and runs
-// the whole online-softmax loop over all KV blocks internally — no init /
-// finalize dispatches, no global running-state scratch.
+// Original staging-based design; replaced as the production kernel by the
+// direct-device vA (below) after a 7× speedup on rebooted A/B. Kept in
+// the vB experimental slot for diff-oracle and future comparison.
 //
-// Residency (the point of the rewrite — both Q and K/V read from global
-// exactly once):
-//   - The Q tile is register-resident for the threadgroup's lifetime.
-//     Simdgroup g owns rows [g*FA_RPS, (g+1)*FA_RPS); each lane holds 8 of
-//     a row's 256 head_dim values (lane, lane+32, ..., lane+224).
-//   - Each KV block is staged once into threadgroup `kv_stage` and reused
-//     across the whole query tile (K, then time-multiplexed for V).
-//   - The output accumulator is register-resident, same lane partition.
+// One threadgroup owns a tile of FA_BR query tokens for one head, and runs
+// the whole online-softmax loop over all KV blocks internally.
+//
+// Residency: Q tile + O accumulator are register-resident (128 floats/thread).
+// Each KV block is staged once into threadgroup memory and reused.
 //
 // head_dim is fixed to FA_HD=256 (a3b); the threadgroup arrays are sized
 // at compile time. The encoder asserts head_dim == 256.
-//
-// Diff target: per-token cosine >= 0.9999 vs sdpa_cpu. Follow-up levers
-// (own arcs): simdgroup_matrix QK^T/AV; GQA-fold (one TG per (q_tile,kv_h),
-// K/V block reused across the 8 shared query-heads).
 
 constant uint FA_BR      = 64;   // query tile
 constant uint FA_BC      = 16;   // KV block
@@ -83,7 +76,7 @@ static inline void stage_kv_block(
     }
 }
 
-kernel void attn_sdpa_causal_flash_va(
+kernel void attn_sdpa_causal_flash_vb(
     device const float* Q             [[buffer(0)]],  // [M, num_heads, head_dim]
     device const float* K_cache       [[buffer(1)]],  // [kv_len, kv_dim]
     device const float* V_cache       [[buffer(2)]],  // [kv_len, kv_dim]
@@ -513,16 +506,13 @@ SDPA_GQA_ENTRY(attn_sdpa_causal_flash_gqa4_va, 4)
 SDPA_GQA_ENTRY(attn_sdpa_causal_flash_gqa8_va, 8)
 
 // ============================================================================
-// FlashAttention-2 causal SDPA — slot vB (direct-device, llama.cpp-style).
+// FlashAttention-2 causal SDPA — slot vA (direct-device, production).
 // ============================================================================
 //
-// Replaces the simdgroup-MMA port (2026-05-21) that was measured neutral
-// to ~10% slower than vA. The 2026-05-22 ablation found *staging* is
-// 96.5% of vA's wall time (stage_kv_block dominates); vB eliminates
-// threadgroup staging entirely by reading K and V direct from device
-// memory inside the QK^T and PV phases. Apple's MPP guide explicitly
-// recommends this on Apple silicon when occupancy is high; llama.cpp's
-// `kernel_flash_attn_ext_impl` ships the same design.
+// llama.cpp-style direct-device design: reads K/V direct from device memory
+// inside QK^T and PV phases, eliminating the threadgroup staging that was
+// 96.5% of the old kernel's wall time. Apple's MPP guide recommends this
+// pattern on Apple silicon when occupancy is high.
 //
 // Geometry (matches llama.cpp at Q=8, C=64, NSG=8):
 //   VB_Q  = 8   queries per threadgroup
@@ -531,25 +521,12 @@ SDPA_GQA_ENTRY(attn_sdpa_causal_flash_gqa8_va, 8)
 //   VB_NQ  = VB_Q / VB_NSG = 1  query row owned per simdgroup
 //   VB_NO  = (FA_HD / 8) / VB_NSG = 4  O column-tiles per simdgroup
 //
-// 8× more threadgroups than vA, but the per-TG memory footprint drops
-// to ~18 KB total: Q tile (8 KB) + O accumulator (8 KB) + scores (2 KB).
+// Per-TG footprint: ~18 KB (Q 8 KB + O 8 KB + scores 2 KB).
+// Per-lane registers: ~50 B (vs ~512 B for the staging kernel).
 //
-// Persistent register footprint per lane: ~50 bytes (M + S + transient
-// simdgroup matrices). vA was ~512 B/lane; vB should hit max occupancy,
-// which is what enables the direct-device reads to overlap with compute
-// "naturally" — exactly the regime Apple's MPP guide describes.
-//
-// Online softmax follows llama.cpp's pattern:
-//   - per-thread scalar M, S (running max/denom), replicated across the
-//     32 lanes of the simdgroup via `simd_max` / `simd_sum`
-//   - scalar `so[trow*FA_HD + d] *= corr` for the O rescale (no diag-MMA
-//     trick — that turned out to be unique to our old v2)
-//   - `fast::exp2` with `log2(e)` pre-folded into the scale
-//
-// Diff target: per-token cosine >= 0.9999 vs sdpa_cpu (same as vA).
-//
-// GQA-fold (G>=2): NOT in this kernel. For `SdpaCall::v2 && fold == 2`,
-// host dispatch falls through to vA's `_gqa2_va` until a folded vB lands.
+// Diff target: per-token cosine >= 0.9999 vs sdpa_cpu.
+// GQA-fold (G>=2): NOT in this kernel yet. fold > 1 dispatches to
+// the staging-based `_gqa2_va` / `_gqa4_va` / `_gqa8_va` entries.
 
 constant uint VB_Q   = 8;                       // queries per TG
 constant uint VB_C   = 64;                      // KV cols per block
@@ -558,7 +535,7 @@ constant uint VB_D8  = FA_HD / 8;               // head_dim tiles of 8 (= 32)
 constant uint VB_C8  = VB_C / 8;                // KV chunks of 8 in a block (= 8)
 constant uint VB_NO  = VB_D8 / VB_NSG;          // O column-tiles per simdgroup (= 4)
 
-kernel void attn_sdpa_causal_flash_vb(
+kernel void attn_sdpa_causal_flash_va(
     device const float* Q             [[buffer(0)]],
     device const float* K_cache       [[buffer(1)]],
     device const float* V_cache       [[buffer(2)]],

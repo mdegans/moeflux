@@ -323,18 +323,19 @@ fn build_sdpa_psos(metal: &MetalContext) -> Vec<SdpaPso> {
             .new_compute_pipeline_state_with_function(&function)
             .unwrap_or_else(|e| panic!("build {name} pso: {e}"))
     };
-    const UNFOLDED: &str = "attn_sdpa_causal_flash_va";
+    // Ablation hooks (ABLATE_SKIP_*) live in the staging kernel (vB slot).
+    const STAGING: &str = "attn_sdpa_causal_flash_vb";
     let mk = |label, pso, fold| SdpaPso { label, pso, fold };
     vec![
-        mk("A baseline", build(UNFOLDED, &[]), 1),
-        mk("B skip-QK", build(UNFOLDED, &[FC_SKIP_QK]), 1),
-        mk("C skip-softmax", build(UNFOLDED, &[FC_SKIP_SOFTMAX]), 1),
-        mk("D skip-PV", build(UNFOLDED, &[FC_SKIP_PV]), 1),
-        mk("E skip-stage", build(UNFOLDED, &[FC_SKIP_STAGE]), 1),
+        mk("A baseline", build(STAGING, &[]), 1),
+        mk("B skip-QK", build(STAGING, &[FC_SKIP_QK]), 1),
+        mk("C skip-softmax", build(STAGING, &[FC_SKIP_SOFTMAX]), 1),
+        mk("D skip-PV", build(STAGING, &[FC_SKIP_PV]), 1),
+        mk("E skip-stage", build(STAGING, &[FC_SKIP_STAGE]), 1),
         mk(
             "F floor",
             build(
-                UNFOLDED,
+                STAGING,
                 &[FC_SKIP_QK, FC_SKIP_SOFTMAX, FC_SKIP_PV, FC_SKIP_STAGE],
             ),
             1,

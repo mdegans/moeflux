@@ -64,27 +64,20 @@ fn moe_gather_id_enabled() -> bool {
 }
 
 /// Process-wide cache for `MOEFLUX_SDPA_VB`. Routes the full-attn SDPA
-/// dispatch through the vB direct-device kernel
-/// (`attn_sdpa_causal_flash_vb`) instead of vA's staging-based kernel.
+/// dispatch through the vB staging kernel instead of the vA direct-device
+/// production kernel. Opt-in only — kept for diff-oracle and A/B work.
 ///
-/// **Default: ON.** Set `MOEFLUX_SDPA_VB=0` / `false` / `off` to
-/// force the old path (kept for diff-oracle and A/B work).
-///
-/// 2026-05-22: flipped to ON-by-default after clean rebooted A/B
-/// confirmed **6.7-7.3× speedup** across all three bench shapes
-/// (diff oracle 15/15 green, cosine 1.000000000).
-///
-/// Note: vB GQA fold is not implemented yet; this gate only changes
-/// the `fold == 1` dispatch. The folded path stays on vA's
-/// `_gqa2_va` regardless.
+/// **Default: OFF.** Set `MOEFLUX_SDPA_VB=1` / `true` / `on` to use
+/// the staging kernel. vB supports GQA fold (fold=2 for even
+/// heads_per_kv); vA does not.
 pub(in crate::riir) fn sdpa_vb_enabled() -> bool {
     use std::sync::OnceLock;
     static CACHED: OnceLock<bool> = OnceLock::new();
     *CACHED.get_or_init(|| {
-        match std::env::var("MOEFLUX_SDPA_VB").as_deref() {
-            Ok("0") | Ok("false") | Ok("off") => false,
-            _ => true,
-        }
+        matches!(
+            std::env::var("MOEFLUX_SDPA_VB").as_deref(),
+            Ok("1") | Ok("true") | Ok("on")
+        )
     })
 }
 
