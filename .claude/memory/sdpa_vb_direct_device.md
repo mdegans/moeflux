@@ -145,16 +145,32 @@ Engine-level prefill (a3b, ~15k tokens, max_tokens=1, n=3):
 - **llama.cpp baseline:** 810-820 tok/s
 - **Remaining gap:** ~1.19× (down from ~2.2×)
 
-## Follow-ups
+## Slot rotation (commit `a023cf1`)
 
-1. vB GQA-fold (G≥2). For prefill at heads_per_kv=8, the fold reuses
-   K/V across 2-8 query heads. Same trick applies under direct-device
-   — just hoist the head loop inside the c0 loop. This would reclaim
-   the 2× threadgroup overhead and likely close most of the remaining
-   ~1.2× gap to llama.cpp.
-2. Bigger VB_C (128 or 256)? More compute per direct-device fetch,
-   but each block needs `min(VB_C, kv_len - c0)` valid → fewer total
-   c0 iterations. Worth measuring once vB GQA baseline is solid.
-3. Mask predicate cost at large kv_len. `needs_mask` fires for
-   `O(M/64)` blocks per q-tile (the causal boundary). Bounded but
-   nonzero; profile if it shows up.
+Entry point names swapped in sdpa.metal so vA = production =
+direct-device, vB = experimental = old staging. `MOEFLUX_SDPA_VB`
+gate back to default OFF (opts into old staging path).
+
+## GQA fold experiment (commit `77417d1`)
+
+Direct-device GQA fold kernel (`attn_sdpa_causal_flash_gqa2_dd`,
+G=2): processes 2 query-heads per TG, Q reloaded from device per
+head per block. Diff oracle 5/5 green.
+
+Dirty A/B result: **GQA fold is ~3% slower** (652-671 vs 685-690
+tok/s). The direct-device kernel is compute-bound, not bandwidth-
+bound, so serializing heads inside each TG costs more in parallelism
+than it saves in L2 cache reuse. Default OFF via `MOEFLUX_SDPA_GQA`.
+
+## Where the remaining gap lives
+
+Amdahl's law: SDPA was 61% of GPU time pre-improvement. After 7×
+speedup, SDPA is now ~9% of total. The remaining 91% is MoE (was
+11%), matmul projections (was 28%), and overhead. The ~1.19× gap
+to llama.cpp (685 vs 815 tok/s, ~3.6 s difference on 15k tokens)
+is spread across non-SDPA ops. Further SDPA micro-optimization has
+deeply diminishing returns.
+
+**Next step:** GPU capture with the improved kernel to identify the
+new bottleneck. Likely candidates: qmm_t (4-bit batched matmul for
+projections), gather_mm_id (MoE), or fixed per-layer overhead.
