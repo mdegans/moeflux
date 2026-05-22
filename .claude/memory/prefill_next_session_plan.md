@@ -1,67 +1,69 @@
-# Prefill arc — next session plan (updated 2026-05-22)
+# Prefill arc — next session plan (updated 2026-05-22, session 2)
 
 ## Current state
 
-- **moeflux prefill:** 685 tok/s (a3b, ~15k tokens, direct-device vA)
+- **moeflux prefill:** 775 tok/s (a3b, ~15k tokens, sequential vB)
 - **llama.cpp prefill:** 810-820 tok/s (same prompt, same model)
-- **Gap:** ~1.19× (~3.6 s on 15k tokens)
+- **Gap:** ~1.05× (~0.8 s on 15k tokens)
 
-## Where the gap lives (Amdahl's law post-SDPA-7× win)
+## Where the gap lives (post-delta-net-sequential GPU capture)
 
-| Category | Est. % of GPU time | Notes |
-|----------|-------------------|-------|
-| Matmul projections | ~58% | qkv, o_proj, shared-expert FFN (qmm_t) |
-| MoE dispatch | ~24% | gather_mm_id |
-| SDPA | ~9% | direct-device vA — diminishing returns |
-| Other (norms, etc) | ~9% | rms_norm, residual, router |
+| Category | % of GPU time | Notes |
+|----------|--------------|-------|
+| `gated_delta_net_chunkwise` | 33% | → sequential vB: +15% e2e |
+| `affine_qmm_t_float` | 29% | 4-bit matmul projections |
+| `moeflux_mm_id` | 22% | MoE dispatch |
+| SDPA + other | ~16% | Already optimized (7× last session) |
 
-These are estimates from pre-improvement GPU capture + Amdahl scaling.
-**Step 1 is to validate with a fresh capture.**
+These % are from the pre-sequential-improvement capture. The sequential
+kernel's 15% e2e win means delta-net dropped to roughly ~20% of GPU
+time. **qmm_t (29%) is now the #1 target.**
 
-## Step 1: GPU capture (Mike runs from terminal)
+## Step 1: promote sequential kernel to vA
 
-Get a Metal capture with the improved SDPA kernel to identify the
-actual dominant op. The 2026-05-21 capture showed SDPA at 61% — that
-has changed dramatically. We need updated numbers.
+The sequential kernel is correct (diff oracle cosine 1.000000000) and
+15% faster. Slot rotation: rename entry points so vA = sequential,
+vB = chunkwise. Same procedure as the SDPA promotion.
 
-## Step 2: attack the dominant op
+## Step 2: fresh GPU capture
 
-### If qmm_t (batched 4-bit matmul) dominates:
+Need updated % breakdown with the sequential kernel active. The
+Amdahl estimates above are approximations — a real capture will show
+whether qmm_t or mm_id moved.
+
+## Step 3: attack qmm_t
+
+If `affine_qmm_t_float` dominates:
 - Compare our MLX-vendored `affine_qmm_rhs` against llama.cpp's
-  `kernel_mul_mat` for the same shapes
+  `kernel_mul_mat` for the same shapes (projections: [n_tokens, dim])
 - Tile-size sweep (BM/BN/BK)
 - Q4_K_S format comparison — llama.cpp's sub-block scaling may be
-  cheaper to decode. Measure before porting.
+  cheaper to decode
 
-### If gather_mm_id (MoE) dominates:
+If `moeflux_mm_id` dominates:
 - Already ported from llama.cpp — should be near parity
-- Check capture for dispatch differences (barriers, grid sizing)
-
-### If fixed per-layer overhead dominates:
-- Command buffer submission frequency
-- CPU-side router work between dispatches
-- cmdbuf consolidation
+- Check for dispatch differences (barriers, grid sizing)
 
 ## Dead ends (don't revisit)
 
-- **GQA fold on direct-device SDPA:** 3% slower (2026-05-22 dirty
-  A/B). Compute-bound, not bandwidth-bound. Serializing heads inside
-  each TG loses parallelism.
-- **SDPA staging kernel (vB):** 7× slower. Diff-oracle reference only.
-- **LTO + codegen-units=1:** neutral at 9× build time (2026-04-28).
+- **GQA fold on direct-device SDPA:** 3% slower (2026-05-22 session 1).
+- **SDPA staging kernel (vB):** 7× slower.
+- **Chunkwise delta-net:** 15% slower than sequential (2026-05-22
+  session 2). Barrier + TG memory overhead outweighs chunkwise
+  parallelism for this state size.
+- **LTO + codegen-units=1:** neutral at 9× build time.
 
 ## Env var cheat sheet
 
 | Var | Default | Effect |
 |-----|---------|--------|
 | `MOEFLUX_SDPA_VB` | OFF | Use old staging SDPA kernel |
-| `MOEFLUX_SDPA_GQA` | OFF | GQA fold (G=2) on direct-device |
+| `MOEFLUX_SDPA_GQA` | OFF | GQA fold on direct-device |
+| `MOEFLUX_DELTA_NET_VB` | OFF | Use sequential delta-net kernel |
 | `MOEFLUX_MOE_GATHER_ID` | ON | Use gather_mm_id MoE kernel |
 
 ## Cross-references
 
-- [[sdpa_vb_direct_device]] — full SDPA arc history + promotion
-- [[sdpa_session_learnings]] — what worked, what didn't, numerical
-  precision notes
-- [[prefill_sdpa_dominant_finding]] — pre-improvement GPU capture
-  (SDPA 61%, MoE 11%)
+- [[sdpa_vb_direct_device]] — SDPA arc history
+- [[sdpa_session_learnings]] — SDPA what worked / didn't
+- [[delta_net_sequential_session]] — this session's findings
