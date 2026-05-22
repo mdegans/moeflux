@@ -268,7 +268,7 @@ pub fn state_save(
         v.kv_lora_rank as u32,
         v.qk_rope_head_dim as u32,
     ];
-    for word in header.iter() {
+    for &word in header.iter() {
         buf[off..off + 4].copy_from_slice(&word.to_le_bytes());
         off += 4;
     }
