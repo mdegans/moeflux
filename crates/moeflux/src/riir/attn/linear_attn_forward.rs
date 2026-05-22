@@ -100,6 +100,24 @@ pub(in crate::riir) fn sdpa_gqa_enabled() -> bool {
     })
 }
 
+/// Process-wide cache for `MOEFLUX_DELTA_NET_VB`. Routes the batched
+/// delta-net dispatch through the sequential-recurrent kernel (vB)
+/// instead of the chunkwise-parallel production kernel (vA).
+///
+/// **Default: OFF.** Set `MOEFLUX_DELTA_NET_VB=1` / `true` / `on` to
+/// use the sequential kernel (llama.cpp-style: register-only state,
+/// zero barriers, zero TG memory).
+pub(in crate::riir) fn delta_net_vb_enabled() -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        matches!(
+            std::env::var("MOEFLUX_DELTA_NET_VB").as_deref(),
+            Ok("1") | Ok("true") | Ok("on")
+        )
+    })
+}
+
 use crate::riir::backend::buftype::{
     AlphaStackBuf, AttnInputBuf, AttnOutBuf, BetaGateBuf, BetaStackBuf,
     BucketActBuf, BucketGateBuf, BucketInputBuf, BucketOutBuf,

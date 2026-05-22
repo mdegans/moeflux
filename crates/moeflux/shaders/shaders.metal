@@ -1841,6 +1841,102 @@ kernel void gated_delta_net_chunkwise(
 
 
 // ============================================================================
+// Kernel 10c: Gated DeltaNet — sequential-recurrent (llama.cpp-style vB)
+// ============================================================================
+//
+// Replaces the chunkwise kernel for prefill: zero TG memory, zero
+// barriers, state lives in registers for the full token loop. Each
+// simdgroup (32 lanes × SEQ_NSG elements = 128 key-dim elements)
+// owns one output-dimension row of the state matrix; the 128-wide
+// key dimension is distributed across the simdgroup for parallel
+// dot products via simd_sum.
+//
+// Dispatch:
+//   grid: (128 / SEQ_NSG, num_v_heads, 1) = (32, 64, 1)
+//   TG:   (32, SEQ_NSG, 1) = (32, 4, 1) — 128 threads per TG
+//
+// Compare chunkwise vA: 64 TGs × 128 threads, 6-phase × ~937
+// chunks with barriers. This: 2048 TGs × 128 threads, simple
+// loop, no barriers, no TG memory.
+
+#define SEQ_NSG 4
+
+kernel void gated_delta_net_sequential(
+    device float *state,             // [num_v_heads * 128 * 128]
+    device const float *conv_out,    // [n_tokens * conv_per_token]
+    device const float *g_decay,     // [n_tokens * num_v_heads]
+    device const float *beta_gate,   // [n_tokens * num_v_heads]
+    device float *output,            // [n_tokens * num_v_heads * 128]
+    constant uint &k_heads_per_v,
+    constant uint &n_tokens,
+    constant uint &key_total,
+    constant uint &num_v_heads,
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint3 tpitg [[thread_position_in_threadgroup]]
+) {
+    const uint tx = tpitg.x;                       // lane (0..31)
+    const uint ty = tpitg.y;                        // simdgroup (0..SEQ_NSG-1)
+    const uint head_id = tgpig.y;                   // v_head
+    const uint i20 = tgpig.x * SEQ_NSG + ty;       // output dim (0..127)
+
+    const uint kh = head_id / k_heads_per_v;
+    const uint value_total = num_v_heads * 128;
+    const uint conv_per_token = 2 * key_total + value_total;
+    const uint k_off = kh * 128;
+    const uint state_row = head_id * 128 * 128 + i20 * 128;
+
+    // Load full state row into registers — stays here for all tokens.
+    float ls[SEQ_NSG];
+    for (short j = 0; j < SEQ_NSG; j++) {
+        ls[j] = state[state_row + tx * SEQ_NSG + j];
+    }
+
+    for (uint t = 0; t < n_tokens; t++) {
+        const float g = g_decay[t * num_v_heads + head_id];
+        const float beta = beta_gate[t * num_v_heads + head_id];
+        device const float *k_ptr = conv_out + t * conv_per_token
+                                    + key_total + k_off;
+        const float v_val = conv_out[t * conv_per_token
+                                     + 2 * key_total
+                                     + head_id * 128 + i20];
+
+        // 1. Decay state + dot(state_row, k)
+        float s_k = 0.0f;
+        for (short j = 0; j < SEQ_NSG; j++) {
+            ls[j] *= g;
+            s_k += ls[j] * k_ptr[tx * SEQ_NSG + j];
+        }
+        s_k = simd_sum(s_k);
+
+        // 2. State update: s += k * delta
+        const float d = (v_val - s_k) * beta;
+        for (short j = 0; j < SEQ_NSG; j++) {
+            ls[j] += k_ptr[tx * SEQ_NSG + j] * d;
+        }
+
+        // 3. Output = dot(state_row, q)
+        device const float *q_ptr = conv_out + t * conv_per_token + k_off;
+        float y = 0.0f;
+        for (short j = 0; j < SEQ_NSG; j++) {
+            y += ls[j] * q_ptr[tx * SEQ_NSG + j];
+        }
+        y = simd_sum(y);
+
+        if (tx == 0) {
+            output[t * value_total + head_id * 128 + i20] = y;
+        }
+    }
+
+    // Write state back to device memory.
+    for (short j = 0; j < SEQ_NSG; j++) {
+        state[state_row + tx * SEQ_NSG + j] = ls[j];
+    }
+}
+
+#undef SEQ_NSG
+
+
+// ============================================================================
 // Kernel 11: Conv1d depthwise step — batched compute (causal depthwise conv)
 // ============================================================================
 //

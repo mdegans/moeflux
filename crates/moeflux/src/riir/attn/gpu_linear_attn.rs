@@ -36,6 +36,7 @@ pipeline_bundle! {
         compute_decay_beta => "compute_decay_beta",
         delta_net_step => "gated_delta_net_step",
         delta_net_chunkwise => "gated_delta_net_chunkwise",
+        delta_net_sequential => "gated_delta_net_sequential",
         gated_rms_norm => "gated_rms_norm",
     }
 }

@@ -1373,17 +1373,6 @@ impl Backend for MetalBackend {
                 chunk_size,
                 ..
             } => {
-                // Chunkwise-parallel variant of GatedDeltaNetStepNTokens
-                // above — same buffer/arg signature and same dispatch
-                // (`num_v_heads` threadgroups × `value_dim` threads).
-                // The kernel loops inner chunks of `CW_C` internally;
-                // `CW_C` is a compile-time constant in the shader, so
-                // the Op's `chunk_size` must match it.
-                debug_assert_eq!(
-                    *chunk_size, 16,
-                    "gated_delta_net_chunkwise kernel is built with \
-                     CW_C=16; Op chunk_size must match"
-                );
                 let nvh = *num_v_heads;
                 let vd = *value_dim;
                 let kpv = *k_heads_per_v;
@@ -1395,23 +1384,55 @@ impl Backend for MetalBackend {
                 let g_buf = self.pool.handle(*g_decay);
                 let bg_buf = self.pool.handle(*beta_gate);
                 let out_buf = self.pool.handle(*output);
+
+                let vb = crate::riir::attn::linear_attn_forward
+                    ::delta_net_vb_enabled();
+
                 let enc = cmd.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(
-                    &self.linear_attn_pipes.delta_net_chunkwise,
-                );
-                enc.set_buffer(0, Some(state_buf), 0);
-                enc.set_buffer(1, Some(conv_buf), 0);
-                enc.set_buffer(2, Some(g_buf), 0);
-                enc.set_buffer(3, Some(bg_buf), 0);
-                enc.set_buffer(4, Some(out_buf), 0);
-                enc.set_bytes(5, 4, (&kpv as *const u32).cast());
-                enc.set_bytes(6, 4, (&n_tokens_arg as *const u32).cast());
-                enc.set_bytes(7, 4, (&key_total as *const u32).cast());
-                enc.set_bytes(8, 4, (&nvh as *const u32).cast());
-                enc.dispatch_thread_groups(
-                    MTLSize::new(nvh as NSUInteger, 1, 1),
-                    MTLSize::new(vd as NSUInteger, 1, 1),
-                );
+                if vb {
+                    // Sequential-recurrent vB: register-only state,
+                    // simd_sum dot products, zero barriers.
+                    // Grid: (vd/4, nvh, 1), TG: (32, 4, 1).
+                    enc.set_compute_pipeline_state(
+                        &self.linear_attn_pipes.delta_net_sequential,
+                    );
+                    enc.set_buffer(0, Some(state_buf), 0);
+                    enc.set_buffer(1, Some(conv_buf), 0);
+                    enc.set_buffer(2, Some(g_buf), 0);
+                    enc.set_buffer(3, Some(bg_buf), 0);
+                    enc.set_buffer(4, Some(out_buf), 0);
+                    enc.set_bytes(5, 4, (&kpv as *const u32).cast());
+                    enc.set_bytes(6, 4, (&n_tokens_arg as *const u32).cast());
+                    enc.set_bytes(7, 4, (&key_total as *const u32).cast());
+                    enc.set_bytes(8, 4, (&nvh as *const u32).cast());
+                    enc.dispatch_thread_groups(
+                        MTLSize::new((vd / 4) as NSUInteger, nvh as NSUInteger, 1),
+                        MTLSize::new(32, 4, 1),
+                    );
+                } else {
+                    // Chunkwise-parallel vA: simdgroup GEMM, 6-phase.
+                    debug_assert_eq!(
+                        *chunk_size, 16,
+                        "gated_delta_net_chunkwise kernel is built with \
+                         CW_C=16; Op chunk_size must match"
+                    );
+                    enc.set_compute_pipeline_state(
+                        &self.linear_attn_pipes.delta_net_chunkwise,
+                    );
+                    enc.set_buffer(0, Some(state_buf), 0);
+                    enc.set_buffer(1, Some(conv_buf), 0);
+                    enc.set_buffer(2, Some(g_buf), 0);
+                    enc.set_buffer(3, Some(bg_buf), 0);
+                    enc.set_buffer(4, Some(out_buf), 0);
+                    enc.set_bytes(5, 4, (&kpv as *const u32).cast());
+                    enc.set_bytes(6, 4, (&n_tokens_arg as *const u32).cast());
+                    enc.set_bytes(7, 4, (&key_total as *const u32).cast());
+                    enc.set_bytes(8, 4, (&nvh as *const u32).cast());
+                    enc.dispatch_thread_groups(
+                        MTLSize::new(nvh as NSUInteger, 1, 1),
+                        MTLSize::new(vd as NSUInteger, 1, 1),
+                    );
+                }
                 enc.end_encoding();
             }
             Op::GatedRmsNormNTokens {
