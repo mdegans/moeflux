@@ -1103,11 +1103,14 @@ impl Backend for MetalBackend {
                 softmax_scale,
                 ..
             } => {
+                let vb = crate::riir::attn::linear_attn_forward::sdpa_vb_enabled();
                 // GQA-fold: even `heads_per_kv` → two query-heads
                 // share a threadgroup (`attn_sdpa_causal_flash_gqa2_va`);
-                // odd falls back to the unfolded kernel. Same rule as
-                // the imperative path (`full_attn_forward.rs`).
-                let fold = if *heads_per_kv % 2 == 0 { 2 } else { 1 };
+                // odd falls back to the unfolded kernel. vB doesn't
+                // have a GQA-folded variant yet, so force fold=1 when
+                // vB is active (unfolded is always correct, just 2×
+                // more threadgroups — but the 7× kernel win dwarfs it).
+                let fold = if !vb && *heads_per_kv % 2 == 0 { 2 } else { 1 };
                 self.metal.kernels().encode(
                     cmd,
                     &SdpaCall {
@@ -1124,9 +1127,7 @@ impl Backend for MetalBackend {
                         kv_len: *kv_len_total,
                         softmax_scale: *softmax_scale,
                         fold,
-                        // vB is only viable when fold == 1 (no folded vB yet).
-                        vb: fold == 1
-                            && crate::riir::attn::linear_attn_forward::sdpa_vb_enabled(),
+                        vb,
                     },
                 );
             }
