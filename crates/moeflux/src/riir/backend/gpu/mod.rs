@@ -1124,7 +1124,9 @@ impl Backend for MetalBackend {
                         kv_len: *kv_len_total,
                         softmax_scale: *softmax_scale,
                         fold,
-                        v2: crate::riir::attn::linear_attn_forward::sdpa_v2_enabled(),
+                        // vB is only viable when fold == 1 (no folded vB yet).
+                        vb: fold == 1
+                            && crate::riir::attn::linear_attn_forward::sdpa_vb_enabled(),
                     },
                 );
             }

@@ -63,25 +63,27 @@ fn moe_gather_id_enabled() -> bool {
     })
 }
 
-/// Process-wide cache for `MOEFLUX_SDPA_V2`. Routes the full-attn SDPA
-/// dispatch through the v2 simdgroup-MMA kernels
-/// (`attn_sdpa_causal_flash_v2` / `_gqa2_v2`) instead of v1's scalar-FMA
-/// loops.
+/// Process-wide cache for `MOEFLUX_SDPA_VB`. Routes the full-attn SDPA
+/// dispatch through the vB experimental kernel
+/// (`attn_sdpa_causal_flash_vb`) instead of vA's production kernel.
 ///
-/// **Default: OFF** during landing — v1 stays the production path. The
-/// 2026-05-21 capture identified v1 SDPA at 60.97% of GPU time (18.7%
-/// occupancy, register-pressure-bound); v2 replaces the QK^T and P·V
-/// scalar reductions with `simdgroup_multiply_accumulate` on 8×8
-/// `simdgroup_float8x8` tiles. Engine-level A/B + coherence check
+/// **Default: OFF** — vA stays the production path. The 2026-05-22
+/// ablation identified staging as 96.5% of vA's wall time; vB
+/// eliminates threadgroup staging by reading K/V direct from device
+/// memory (llama.cpp-style). Engine-level A/B and coherence check
 /// pending. The default will flip in a follow-up commit if green.
 ///
-/// Set `MOEFLUX_SDPA_V2=1` / `true` / `on` to opt into v2.
-pub(in crate::riir) fn sdpa_v2_enabled() -> bool {
+/// Note: vB GQA fold is not implemented yet; opting in only changes
+/// the `fold == 1` dispatch (the odd-`heads_per_kv` path). The folded
+/// path stays on vA's `_gqa2_va` regardless.
+///
+/// Set `MOEFLUX_SDPA_VB=1` / `true` / `on` to opt into vB.
+pub(in crate::riir) fn sdpa_vb_enabled() -> bool {
     use std::sync::OnceLock;
     static CACHED: OnceLock<bool> = OnceLock::new();
     *CACHED.get_or_init(|| {
         matches!(
-            std::env::var("MOEFLUX_SDPA_V2").as_deref(),
+            std::env::var("MOEFLUX_SDPA_VB").as_deref(),
             Ok("1") | Ok("true") | Ok("on")
         )
     })

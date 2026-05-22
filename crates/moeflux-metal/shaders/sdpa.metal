@@ -513,77 +513,52 @@ SDPA_GQA_ENTRY(attn_sdpa_causal_flash_gqa4_va, 4)
 SDPA_GQA_ENTRY(attn_sdpa_causal_flash_gqa8_va, 8)
 
 // ============================================================================
-// FlashAttention-2 causal SDPA v2 — simdgroup-matrix port (2026-05-21).
+// FlashAttention-2 causal SDPA — slot vB (direct-device, llama.cpp-style).
 // ============================================================================
 //
-// The 2026-05-21 Metal capture showed `attn_sdpa_causal_flash_gqa2` at
-// 60.97% of GPU time in a representative window, with 18.7% theoretical
-// occupancy (1024 bytes/thread of register state, 1.05 KB spilled). The
-// scalar `fma` + `simd_sum` reductions in v1's QK^T (lines 157-178) and
-// P·V (lines 229-243) saturate the ALU and don't tap Apple's dedicated
-// matrix pipes.
+// Replaces the simdgroup-MMA port (2026-05-21) that was measured neutral
+// to ~10% slower than vA. The 2026-05-22 ablation found *staging* is
+// 96.5% of vA's wall time (stage_kv_block dominates); vB eliminates
+// threadgroup staging entirely by reading K and V direct from device
+// memory inside the QK^T and PV phases. Apple's MPP guide explicitly
+// recommends this on Apple silicon when occupancy is high; llama.cpp's
+// `kernel_flash_attn_ext_impl` ships the same design.
 //
-// v2 replaces both matmuls with `simdgroup_multiply_accumulate` on
-// `simdgroup_float8x8` tiles — matrix pipes are ~5-8× per-FLOP vs ALU
-// and execute concurrently with memory loads. The online-softmax rescale
-// (FA-2's `O = diag(corr) * O`) uses llama.cpp's diagonal-matrix trick:
-// write per-row correction factors to the diagonal of a Q×Q matrix in
-// threadgroup mem, then `simdgroup_multiply(lo[k], mm, lo[k])` scales
-// each output column tile by the per-row factors.
+// Geometry (matches llama.cpp at Q=8, C=64, NSG=8):
+//   VB_Q  = 8   queries per threadgroup
+//   VB_C  = 64  KV cols per block
+//   VB_NSG = 8  simdgroups per TG (= FA_SIMDS)
+//   VB_NQ  = VB_Q / VB_NSG = 1  query row owned per simdgroup
+//   VB_NO  = (FA_HD / 8) / VB_NSG = 4  O column-tiles per simdgroup
 //
-// Geometry is identical to v1 — FA_BR=64, FA_BC=16 (G=1) / FA_GQA_BC=8
-// (G>=2), FA_HD=256, FA_THREADS=256, FA_SIMDS=8 — so the host dispatch
-// (gpu/mod.rs:1110) and the `FA_BR`/`FA_THREADS` asserts in
-// `moeflux-metal/src/lib.rs` are untouched. Same 11-buffer signature.
+// 8× more threadgroups than vA, but the per-TG memory footprint drops
+// to ~18 KB total: Q tile (8 KB) + O accumulator (8 KB) + scores (2 KB).
 //
-// Per-simdgroup persistent register state:
-//   - mq[D8=32] simdgroup matrices (Q tile): 32 × 2 floats/lane = 64 fl/lane
-//   - lo[D8=32] simdgroup matrices (O accumulator): 64 fl/lane
-//   - For G>=2, doubled per head (mq[G][32], lo[G][32]).
+// Persistent register footprint per lane: ~50 bytes (M + S + transient
+// simdgroup matrices). vA was ~512 B/lane; vB should hit max occupancy,
+// which is what enables the direct-device reads to overlap with compute
+// "naturally" — exactly the regime Apple's MPP guide describes.
 //
-// Diff target: per-token cosine >= 0.9999 vs sdpa_cpu (same as v1).
+// Online softmax follows llama.cpp's pattern:
+//   - per-thread scalar M, S (running max/denom), replicated across the
+//     32 lanes of the simdgroup via `simd_max` / `simd_sum`
+//   - scalar `so[trow*FA_HD + d] *= corr` for the O rescale (no diag-MMA
+//     trick — that turned out to be unique to our old v2)
+//   - `fast::exp2` with `log2(e)` pre-folded into the scale
+//
+// Diff target: per-token cosine >= 0.9999 vs sdpa_cpu (same as vA).
+//
+// GQA-fold (G>=2): NOT in this kernel. For `SdpaCall::v2 && fold == 2`,
+// host dispatch falls through to vA's `_gqa2_va` until a folded vB lands.
 
-constant uint FA_D8     = FA_HD / 8;   // head_dim tiles of 8 = 32
-constant uint FA_BC8    = FA_BC / 8;   // KV chunks of 8 in unfolded = 2
-constant uint FA_GQABC8 = FA_GQA_BC / 8; // KV chunks of 8 in GQA = 1
+constant uint VB_Q   = 8;                       // queries per TG
+constant uint VB_C   = 64;                      // KV cols per block
+constant uint VB_NSG = FA_SIMDS;                // simdgroups per TG (= 8)
+constant uint VB_D8  = FA_HD / 8;               // head_dim tiles of 8 (= 32)
+constant uint VB_C8  = VB_C / 8;                // KV chunks of 8 in a block (= 8)
+constant uint VB_NO  = VB_D8 / VB_NSG;          // O column-tiles per simdgroup (= 4)
 
-// v2 ablation function constants — same semantics as v1's ABLATE_*,
-// separate indices so v1 and v2 PSOs can be ablated independently.
-constant bool ABLATE_V2_SKIP_QK_       [[function_constant(110)]];
-constant bool ABLATE_V2_SKIP_SOFTMAX_  [[function_constant(111)]];
-constant bool ABLATE_V2_SKIP_PV_       [[function_constant(112)]];
-constant bool ABLATE_V2_SKIP_STAGE_    [[function_constant(113)]];
-constant bool ABLATE_V2_SKIP_QK =
-    is_function_constant_defined(ABLATE_V2_SKIP_QK_)      ? ABLATE_V2_SKIP_QK_      : false;
-constant bool ABLATE_V2_SKIP_SOFTMAX =
-    is_function_constant_defined(ABLATE_V2_SKIP_SOFTMAX_) ? ABLATE_V2_SKIP_SOFTMAX_ : false;
-constant bool ABLATE_V2_SKIP_PV =
-    is_function_constant_defined(ABLATE_V2_SKIP_PV_)      ? ABLATE_V2_SKIP_PV_      : false;
-constant bool ABLATE_V2_SKIP_STAGE =
-    is_function_constant_defined(ABLATE_V2_SKIP_STAGE_)   ? ABLATE_V2_SKIP_STAGE_   : false;
-
-// Write `row_corr[simd_id*8 + i]` to position [i,i] of an 8x8 matrix
-// (zero elsewhere) so a subsequent `simdgroup_load` + `simdgroup_multiply`
-// performs the FA-2 online-softmax rescale of the O accumulator. Each
-// simdgroup writes its own slot. Caller barriers afterwards.
-static inline void write_diag_rescale(
-    threadgroup float* diag_rc,
-    threadgroup const float* row_corr,
-    uint simd_id, uint lane, uint row_offset
-) {
-    threadgroup float* my_diag = diag_rc + simd_id * 64;
-    if (lane < 8) {
-        // Lane `i` writes the i-th row of the 8x8.
-        for (uint j = 0; j < 8; ++j) {
-            my_diag[lane * 8 + j] =
-                (j == lane) ? row_corr[row_offset + lane] : 0.0f;
-        }
-    }
-}
-
-// --- v2 G=1 (unfolded) -------------------------------------------------
-
-kernel void attn_sdpa_causal_flash_v2(
+kernel void attn_sdpa_causal_flash_vb(
     device const float* Q             [[buffer(0)]],
     device const float* K_cache       [[buffer(1)]],
     device const float* V_cache       [[buffer(2)]],
@@ -595,555 +570,198 @@ kernel void attn_sdpa_causal_flash_v2(
     constant uint&      start_pos     [[buffer(8)]],
     constant uint&      kv_len        [[buffer(9)]],
     constant float&     softmax_scale [[buffer(10)]],
-    uint tg_idx [[threadgroup_position_in_grid]],
+    uint tg_idx [[threadgroup_position_in_grid]],   // q_tile * num_heads + h
     uint lid    [[thread_position_in_threadgroup]]
 ) {
     uint q_tile = tg_idx / num_heads;
     uint h      = tg_idx % num_heads;
-    uint q0     = q_tile * FA_BR;
+    uint q0     = q_tile * VB_Q;
     if (q0 >= n_tokens) return;
-    uint br_valid = min(FA_BR, n_tokens - q0);
+    uint br_valid = min(VB_Q, n_tokens - q0);
     uint kv_h     = h / heads_per_kv;
 
-    uint simd_id = lid / 32;
-    uint lane    = lid % 32;
+    uint simd_id = lid / 32;   // 0..VB_NSG-1 (= 0..7)
+    uint lane    = lid % 32;   // 0..31
 
-    // Same threadgroup layout as v1 plus the diag-rescale scratch.
-    threadgroup float4 kv_stage4[FA_BC * FA_HD / 4];      // 16 KB — K, then V
-    threadgroup float* kv_stage = (threadgroup float*)kv_stage4;
-    threadgroup float  scores[FA_BR * FA_BC];              // 4 KB
-    threadgroup float  row_m[FA_BR];
-    threadgroup float  row_l[FA_BR];
-    threadgroup float  row_corr[FA_BR];
-    threadgroup float  diag_rc[FA_SIMDS * 64];             // 2 KB
+    // Pre-fold log2(e) so the per-block scoring and online softmax can
+    // use `fast::exp2` consistently — same trick as vA.
+    const float log2_scale = softmax_scale * M_LOG2E_F;
 
-    // Persistent matrix state: Q tile + O accumulator. Loaded once from
-    // device, lives in simdgroup matrix registers (lane-distributed SRAM,
-    // not the scalar GP register file — that's the occupancy lever).
-    simdgroup_float8x8 mq[FA_D8];
-    simdgroup_float8x8 lo[FA_D8];
-    for (uint k = 0; k < FA_D8; ++k) {
-        lo[k] = simdgroup_float8x8(0.0f);
-    }
+    // Threadgroup memory (~18 KB total).
+    threadgroup float sq[VB_Q * FA_HD];     //  8 KB  Q tile
+    threadgroup float so[VB_Q * FA_HD];     //  8 KB  O accumulator (unnormalized)
+    threadgroup float ss[VB_Q * VB_C];      //  2 KB  scores → P matrix
 
-    // Load Q into mq matrices. Each simdgroup owns rows
-    // [simd_id*8, simd_id*8+8) — 8 query rows of FA_HD=256 head_dim
-    // partitioned into 32 column-tiles of 8.
+    // Load Q tile into sq. With VB_Q == VB_NSG, each simdgroup owns one
+    // query row of FA_HD floats. Lane i covers head_dim positions
+    // [i, i+32, ..., i+224] — 8 stores/lane.
     {
-        uint row_base = q0 + simd_id * 8;
-        device const float* q_base =
-            Q + (size_t)row_base * num_heads * FA_HD + h * FA_HD;
-        // Row stride between consecutive queries.
-        ulong q_stride = (ulong)num_heads * FA_HD;
-        // Tail-guard: if br_valid < FA_BR and our simdgroup straddles the
-        // tail, we still issue the load. The unused rows read potentially
-        // garbage values but their accumulators write back nothing (the
-        // finalize loop guards on trow >= br_valid). For tighter safety,
-        // we could memset Q's tail in TG mem — defer until measured.
-        for (uint k = 0; k < FA_D8; ++k) {
-            simdgroup_load(mq[k], q_base + k * 8, q_stride);
+        uint trow = simd_id;
+        if (trow < br_valid) {
+            device const float* qsrc =
+                Q + ((size_t)(q0 + trow) * num_heads + h) * FA_HD;
+            for (uint k = 0; k < FA_HD / 32; ++k) {
+                sq[trow * FA_HD + lane + k * 32] = qsrc[lane + k * 32];
+            }
+        } else {
+            for (uint k = 0; k < FA_HD / 32; ++k) {
+                sq[trow * FA_HD + lane + k * 32] = 0.0f;
+            }
         }
     }
 
-    for (uint r = lid; r < FA_BR; r += FA_THREADS) {
-        row_m[r] = -INFINITY;
-        row_l[r] = 0.0f;
+    // Zero so. 256 threads each clear VB_Q*FA_HD / FA_THREADS = 8 elements.
+    for (uint i = lid; i < VB_Q * FA_HD; i += FA_THREADS) {
+        so[i] = 0.0f;
     }
+
+    // Per-thread running max/denom. Each simdgroup owns one query row
+    // (trow == simd_id); within a simdgroup the 32 lanes hold the same
+    // M and S value (kept consistent by simd_max / simd_sum reductions).
+    float M = -INFINITY;
+    float S = 0.0f;
+
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    uint kv_max_last  = start_pos + q0 + br_valid;
-    uint kv_max_first = start_pos + q0 + 1;
+    // Causal extent — same math as vA.
+    uint kv_max_last  = start_pos + q0 + br_valid;  // exclusive, last row
+    uint kv_max_first = start_pos + q0 + 1;         // exclusive, row 0
 
-    for (uint c0 = 0; c0 < kv_max_last; c0 += FA_BC) {
-        uint bc_valid   = min(FA_BC, kv_len - c0);
-        bool needs_mask = (c0 + FA_BC) > kv_max_first;
+    for (uint c0 = 0; c0 < kv_max_last; c0 += VB_C) {
+        uint bc_valid   = min(VB_C, kv_len - c0);
+        bool needs_mask = (c0 + VB_C) > kv_max_first;
 
-        // -- Phase 1: stage K --
-        if (!ABLATE_V2_SKIP_STAGE) {
-            stage_kv_block(kv_stage4, K_cache, c0, kv_dim, kv_h,
-                           bc_valid, lid);
+        // -- QK^T: each simdgroup computes one 8x8 mqk tile = 8 query
+        //    rows × 8 KV cols. Simdgroup s owns KV cols
+        //    [c0 + s*8, c0 + (s+1)*8). K read DIRECT from device with
+        //    `transpose=true` on the simdgroup_load. --
+        {
+            uint trow = simd_id;
+            (void)trow;
+            simdgroup_float8x8 mqk = simdgroup_float8x8(0.0f);
+            // Walk head_dim in pairs of 8-step k-tiles (16 floats/iter),
+            // matching llama.cpp's ILP-packing pattern.
+            for (uint k_pair = 0; k_pair < VB_D8 / 2; ++k_pair) {
+                simdgroup_float8x8 mq0, mq1, mk0, mk1;
+                uint k_off = k_pair * 16;
+                simdgroup_load(mq0, sq + k_off + 0, FA_HD);
+                simdgroup_load(mq1, sq + k_off + 8, FA_HD);
+                device const float* pk =
+                    K_cache + (size_t)(c0 + simd_id * 8) * kv_dim
+                            + kv_h * FA_HD + k_off;
+                simdgroup_load(mk0, pk + 0, kv_dim, ulong2(0, 0), true);
+                simdgroup_load(mk1, pk + 8, kv_dim, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(mqk, mq0, mk0, mqk);
+                simdgroup_multiply_accumulate(mqk, mq1, mk1, mqk);
+            }
+            // Store mqk to ss at simdgroup s's slot (cols [s*8, s*8+8)).
+            simdgroup_store(mqk, ss + simd_id * 8, VB_C,
+                            ulong2(0, 0), false);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // -- Phase 2: QK^T via simdgroup MMA --
-        // For each KV chunk c_tile in [0, FA_BC8), accumulate
-        // mscore[c_tile] = sum_k mq[k] * K^T[k][c_tile-chunk].
-        if (!ABLATE_V2_SKIP_QK) {
-            simdgroup_float8x8 mscore[FA_BC8];
-            for (uint c_tile = 0; c_tile < FA_BC8; ++c_tile) {
-                mscore[c_tile] = simdgroup_float8x8(0.0f);
-            }
-            for (uint k_tile = 0; k_tile < FA_D8; ++k_tile) {
-                for (uint c_tile = 0; c_tile < FA_BC8; ++c_tile) {
-                    simdgroup_float8x8 mk;
-                    // K^T fragment loaded from kv_stage with transpose=true.
-                    // kv_stage layout: [c=0..FA_BC][d=0..FA_HD] row-major.
-                    threadgroup const float* pk =
-                        kv_stage + c_tile * 8 * FA_HD + k_tile * 8;
-                    simdgroup_load(mk, pk, FA_HD, ulong2(0, 0), true);
-                    simdgroup_multiply_accumulate(
-                        mscore[c_tile], mq[k_tile], mk, mscore[c_tile]);
+        // -- Softmax + mask + O rescale.
+        //    Each simdgroup owns ONE row (trow = simd_id, 0..7). M and
+        //    S live in per-thread scalars, replicated across the 32
+        //    lanes — simd_max / simd_sum reductions keep them in sync.
+        {
+            uint trow = simd_id;
+            uint kv_row_max = start_pos + q0 + trow + 1;
+
+            // Each lane reads 2 cols of the row's scores (32 lanes × 2 = 64).
+            float s0 = ss[trow * VB_C + lane]      * log2_scale;
+            float s1 = ss[trow * VB_C + lane + 32] * log2_scale;
+            if (bc_valid < VB_C || needs_mask) {
+                uint kv_pos0 = c0 + lane;
+                uint kv_pos1 = c0 + lane + 32;
+                if (lane      >= bc_valid
+                    || (needs_mask && kv_pos0 >= kv_row_max)) {
+                    s0 = -INFINITY;
+                }
+                if (lane + 32 >= bc_valid
+                    || (needs_mask && kv_pos1 >= kv_row_max)) {
+                    s1 = -INFINITY;
                 }
             }
-            // Store score tiles to threadgroup `scores`.
-            for (uint c_tile = 0; c_tile < FA_BC8; ++c_tile) {
-                threadgroup float* ps =
-                    scores + simd_id * 8 * FA_BC + c_tile * 8;
-                simdgroup_store(mscore[c_tile], ps, FA_BC, ulong2(0, 0), false);
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // -- Phase 2b: apply softmax-scale + causal mask --
-        // Same FA_TPR threads-per-row layout as v1's softmax phase.
-        if (!ABLATE_V2_SKIP_QK) {
-            uint row = lid / FA_TPR;
-            uint sub = lid % FA_TPR;
-            uint trow = row;
-            for (uint c = sub; c < FA_BC; c += FA_TPR) {
-                uint kv_pos = c0 + c;
-                bool masked = (c >= bc_valid) ||
-                    (needs_mask && kv_pos >= start_pos + q0 + trow + 1);
-                float v = scores[row * FA_BC + c];
-                scores[row * FA_BC + c] =
-                    masked ? -INFINITY : v * softmax_scale;
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // -- Phase 3: per-row online softmax (unchanged from v1) --
-        if (!ABLATE_V2_SKIP_SOFTMAX) {
-            uint row = lid / FA_TPR;
-            uint sub = lid % FA_TPR;
-            float lm = -INFINITY;
-            for (uint c = sub; c < FA_BC; c += FA_TPR) {
-                lm = max(lm, scores[row * FA_BC + c]);
-            }
-            for (uint s = 1; s < FA_TPR; s <<= 1) {
-                lm = max(lm, simd_shuffle_xor(lm, s));
-            }
-            float blk_max = lm;
-
-            float m_old = row_m[row];
+            float blk_max = simd_max(max(s0, s1));
+            float m_old = M;
             float m_new = max(m_old, blk_max);
             bool  active = (m_new != -INFINITY);
-            float corr = (m_old == -INFINITY) ? 0.0f : exp(m_old - m_new);
+            float corr = (m_old == -INFINITY) ? 0.0f
+                                              : fast::exp2(m_old - m_new);
 
-            float ls = 0.0f;
-            for (uint c = sub; c < FA_BC; c += FA_TPR) {
-                float p = active
-                    ? exp(scores[row * FA_BC + c] - m_new)
-                    : 0.0f;
-                scores[row * FA_BC + c] = p;
-                ls += p;
-            }
-            for (uint s = 1; s < FA_TPR; s <<= 1) {
-                ls += simd_shuffle_xor(ls, s);
-            }
+            float p0 = active ? fast::exp2(s0 - m_new) : 0.0f;
+            float p1 = active ? fast::exp2(s1 - m_new) : 0.0f;
+            ss[trow * VB_C + lane]      = p0;
+            ss[trow * VB_C + lane + 32] = p1;
 
-            if (sub == 0) {
-                row_m[row]    = m_new;
-                row_corr[row] = corr;
-                row_l[row]    = row_l[row] * corr + ls;
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+            float l_block = simd_sum(p0 + p1);
+            S = S * corr + l_block;
+            M = m_new;
 
-        // -- Phase 3b: build per-simdgroup diag(row_corr) matrix --
-        write_diag_rescale(diag_rc, row_corr, simd_id, lane, simd_id * 8);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // -- Phase 4: stage V (K now dead, reuse kv_stage) --
-        if (!ABLATE_V2_SKIP_STAGE) {
-            stage_kv_block(kv_stage4, V_cache, c0, kv_dim, kv_h,
-                           bc_valid, lid);
-        }
-
-        // -- Phase 5: O = diag(corr) * O + P * V via simdgroup MMA --
-        if (!ABLATE_V2_SKIP_PV) {
-            // Rescale lo[] by the per-row diag matrix.
-            simdgroup_float8x8 mm;
-            simdgroup_load(mm, diag_rc + simd_id * 64, 8);
-            for (uint k = 0; k < FA_D8; ++k) {
-                simdgroup_multiply(lo[k], mm, lo[k]);
-            }
-
-            // Wait for V stage to complete (barrier above flushed K's
-            // dependents; we need V's stores visible before reading).
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            // Accumulate P * V into lo[]. mp[c_tile] is loaded fresh from
-            // the (softmax-overwritten) `scores` buffer.
-            simdgroup_float8x8 mp[FA_BC8];
-            for (uint c_tile = 0; c_tile < FA_BC8; ++c_tile) {
-                threadgroup const float* ps =
-                    scores + simd_id * 8 * FA_BC + c_tile * 8;
-                simdgroup_load(mp[c_tile], ps, FA_BC);
-            }
-            for (uint k_tile = 0; k_tile < FA_D8; ++k_tile) {
-                for (uint c_tile = 0; c_tile < FA_BC8; ++c_tile) {
-                    simdgroup_float8x8 mv;
-                    threadgroup const float* pv =
-                        kv_stage + c_tile * 8 * FA_HD + k_tile * 8;
-                    simdgroup_load(mv, pv, FA_HD);
-                    simdgroup_multiply_accumulate(
-                        lo[k_tile], mp[c_tile], mv, lo[k_tile]);
+            // Rescale this row of so by corr. Skip when corr == 1 (M
+            // unchanged this block) — covers the common steady-state
+            // path. When corr == 0 (first valid block, m_old was
+            // -INFINITY), so is still all zeros from init, so the
+            // multiply is also a no-op; we'd only enter the loop for
+            // 0 < corr < 1 (m grew).
+            if (corr != 1.0f && corr != 0.0f) {
+                for (uint k = 0; k < FA_HD / 32; ++k) {
+                    so[trow * FA_HD + lane + k * 32] *= corr;
                 }
             }
-        } else {
-            // Even when ablated, we need a barrier to mirror v1's structure.
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // -- PV: O += P · V.
+        //    Each simdgroup handles VB_NO (= 4) output column-tiles,
+        //    striped across the head_dim. Simdgroup s owns d-cols
+        //      [s*8 + ii*8*VB_NSG  ..  +8)  for ii in [0, VB_NO).
+        //    lo[ii] is 8x8 (8 query rows × 8 d-cols); P (vs) is 8x8 at
+        //    the current cc-chunk of ss; V (mv) is read direct from
+        //    device. --
+        {
+            simdgroup_float8x8 lo[VB_NO];
+            for (uint ii = 0; ii < VB_NO; ++ii) {
+                uint d_off = simd_id * 8 + ii * 8 * VB_NSG;
+                simdgroup_load(lo[ii], so + d_off, FA_HD,
+                               ulong2(0, 0), false);
+            }
+            for (uint cc = 0; cc < VB_C8; ++cc) {
+                simdgroup_float8x8 vs;
+                simdgroup_load(vs, ss + cc * 8, VB_C,
+                               ulong2(0, 0), false);
+                for (uint ii = 0; ii < VB_NO; ++ii) {
+                    simdgroup_float8x8 mv;
+                    uint d_off = simd_id * 8 + ii * 8 * VB_NSG;
+                    device const float* pv =
+                        V_cache + (size_t)(c0 + cc * 8) * kv_dim
+                                + kv_h * FA_HD + d_off;
+                    simdgroup_load(mv, pv, kv_dim,
+                                   ulong2(0, 0), false);
+                    simdgroup_multiply_accumulate(lo[ii], vs, mv, lo[ii]);
+                }
+            }
+            for (uint ii = 0; ii < VB_NO; ++ii) {
+                uint d_off = simd_id * 8 + ii * 8 * VB_NSG;
+                simdgroup_store(lo[ii], so + d_off, FA_HD,
+                                ulong2(0, 0), false);
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // Finalize: rescale lo by 1/row_l, then write to device.
-    //
-    // Fast path (br_valid == FA_BR, the common case in prefill):
-    //   - Build 1/row_l diag matrix per simdgroup (reuse diag_rc slot)
-    //   - simdgroup_multiply lo[k] by inv_diag — in-place rescale
-    //   - simdgroup_store lo[k] directly to device output
-    //   - All 8 simdgroups write in parallel, zero barriers
-    //
-    // Slow path (br_valid < FA_BR, last tile of a prefill):
-    //   - Same rescale, then stage per-simdgroup to TG mem and scalar
-    //     write only valid rows. Per-simdgroup serialization for
-    //     correctness, cost amortized because only the last tile is
-    //     partial.
+    // -- Finalize: write so / S to device out.
+    //    Each simdgroup writes one query row of FA_HD floats. --
     {
-        threadgroup float* my_diag = diag_rc + simd_id * 64;
-        if (lane < 8) {
-            uint row = simd_id * 8 + lane;
-            float denom = (row < br_valid) ? row_l[row] : 0.0f;
-            float inv = (denom > 0.0f) ? 1.0f / denom : 0.0f;
-            for (uint j = 0; j < 8; ++j) {
-                my_diag[lane * 8 + j] = (j == lane) ? inv : 0.0f;
-            }
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    {
-        simdgroup_float8x8 inv_diag;
-        simdgroup_load(inv_diag, diag_rc + simd_id * 64, 8);
-        for (uint k = 0; k < FA_D8; ++k) {
-            simdgroup_multiply(lo[k], inv_diag, lo[k]);
-        }
-    }
-
-    if (br_valid == FA_BR) {
-        // Fast path: direct device write, all simdgroups in parallel.
+        uint trow = simd_id;
+        if (trow >= br_valid) return;
+        float inv = (S > 0.0f) ? (1.0f / S) : 0.0f;
         device float* osrc =
-            out + ((size_t)(q0 + simd_id * 8) * num_heads + h) * FA_HD;
-        ulong out_stride = (ulong)num_heads * FA_HD;
-        for (uint k = 0; k < FA_D8; ++k) {
-            simdgroup_store(lo[k], osrc + k * 8, out_stride);
-        }
-    } else {
-        // Slow path: per-simdgroup staged finalize with tail guard.
-        // lo was already rescaled by inv_rl above; scalar write copies
-        // straight to device without further divide.
-        threadgroup float* sg_stage = (threadgroup float*)kv_stage4;
-        for (uint active_sg = 0; active_sg < FA_SIMDS; ++active_sg) {
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (simd_id == active_sg) {
-                for (uint k = 0; k < FA_D8; ++k) {
-                    simdgroup_store(lo[k], sg_stage + k * 8, FA_HD);
-                }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            uint sg_first_row = active_sg * 8;
-            if (sg_first_row >= br_valid) {
-                continue;
-            }
-            uint sg_valid_rows = min((uint)8, br_valid - sg_first_row);
-
-            for (uint i = lid; i < sg_valid_rows * FA_HD; i += FA_THREADS) {
-                uint r_local = i / FA_HD;
-                uint d = i % FA_HD;
-                uint r_abs = sg_first_row + r_local;
-                out[((size_t)(q0 + r_abs) * num_heads + h) * FA_HD + d]
-                    = sg_stage[r_local * FA_HD + d];
-            }
+            out + ((size_t)(q0 + trow) * num_heads + h) * FA_HD;
+        for (uint k = 0; k < FA_HD / 32; ++k) {
+            osrc[lane + k * 32] = so[trow * FA_HD + lane + k * 32] * inv;
         }
     }
 }
-
-// --- v2 GQA-folded (G>=2) -----------------------------------------------
-//
-// Same architecture as `sdpa_gqa_impl<G>` but matmuls run through
-// simdgroup MMA. Co-stages K and V into one 16 KB threadgroup buffer
-// (FA_GQA_BC=8), reused across `FA_GROUP` query-heads.
-
-template<uint FA_GROUP>
-static void sdpa_v2_gqa_impl(
-    device const float* Q,
-    device const float* K_cache,
-    device const float* V_cache,
-    device float*       out,
-    uint n_tokens, uint num_heads, uint heads_per_kv,
-    uint kv_dim, uint start_pos, uint kv_len, float softmax_scale,
-    threadgroup float4* kv_stage4,
-    threadgroup float*  scores,
-    threadgroup float*  row_m,
-    threadgroup float*  row_l,
-    threadgroup float*  row_corr,
-    threadgroup float*  diag_rc,
-    uint tg_idx, uint lid
-) {
-    uint num_groups = num_heads / FA_GROUP;
-    uint q_tile = tg_idx / num_groups;
-    uint hg     = tg_idx % num_groups;
-    uint h_base = hg * FA_GROUP;
-    uint q0     = q_tile * FA_BR;
-    if (q0 >= n_tokens) return;
-    uint br_valid = min(FA_BR, n_tokens - q0);
-    uint kv_h     = h_base / heads_per_kv;
-
-    uint simd_id = lid / 32;
-    uint lane    = lid % 32;
-
-    threadgroup float*  kv_K  = (threadgroup float*)kv_stage4;
-    threadgroup float*  kv_V  = kv_K + FA_GQA_BC * FA_HD;
-    threadgroup float4* kv_K4 = kv_stage4;
-    threadgroup float4* kv_V4 = kv_stage4 + FA_GQA_BC * FA_HD / 4;
-
-    // Per-head Q tile + O accumulator. Doubles register footprint vs
-    // unfolded — the cost of GQA folding's KV-stage reuse.
-    simdgroup_float8x8 mq[FA_GROUP][FA_D8];
-    simdgroup_float8x8 lo[FA_GROUP][FA_D8];
-    for (uint g = 0; g < FA_GROUP; ++g) {
-        uint h = h_base + g;
-        uint row_base = q0 + simd_id * 8;
-        device const float* q_base =
-            Q + (size_t)row_base * num_heads * FA_HD + h * FA_HD;
-        ulong q_stride = (ulong)num_heads * FA_HD;
-        for (uint k = 0; k < FA_D8; ++k) {
-            simdgroup_load(mq[g][k], q_base + k * 8, q_stride);
-            lo[g][k] = simdgroup_float8x8(0.0f);
-        }
-    }
-
-    for (uint r = lid; r < FA_GROUP * FA_BR; r += FA_THREADS) {
-        row_m[r] = -INFINITY;
-        row_l[r] = 0.0f;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    uint kv_max_last  = start_pos + q0 + br_valid;
-    uint kv_max_first = start_pos + q0 + 1;
-
-    for (uint c0 = 0; c0 < kv_max_last; c0 += FA_GQA_BC) {
-        uint bc_valid   = min(FA_GQA_BC, kv_len - c0);
-        bool needs_mask = (c0 + FA_GQA_BC) > kv_max_first;
-
-        // Stage K and V once (shared across heads).
-        if (!ABLATE_V2_SKIP_STAGE) {
-            stage_gqa_block(kv_K4, K_cache, c0, kv_dim, kv_h, bc_valid, lid);
-            stage_gqa_block(kv_V4, V_cache, c0, kv_dim, kv_h, bc_valid, lid);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (uint g = 0; g < FA_GROUP; ++g) {
-            // -- QK^T via simdgroup MMA --
-            if (!ABLATE_V2_SKIP_QK) {
-                // FA_GQABC8 = 1 — one 8x8 score fragment per simdgroup
-                // per head.
-                simdgroup_float8x8 mscore = simdgroup_float8x8(0.0f);
-                for (uint k_tile = 0; k_tile < FA_D8; ++k_tile) {
-                    simdgroup_float8x8 mk;
-                    threadgroup const float* pk =
-                        kv_K + k_tile * 8;  // c_tile=0 only at FA_GQA_BC=8
-                    simdgroup_load(mk, pk, FA_HD, ulong2(0, 0), true);
-                    simdgroup_multiply_accumulate(
-                        mscore, mq[g][k_tile], mk, mscore);
-                }
-                threadgroup float* ps =
-                    scores + simd_id * 8 * FA_GQA_BC;
-                simdgroup_store(mscore, ps, FA_GQA_BC);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            // -- Apply softmax-scale + causal mask --
-            if (!ABLATE_V2_SKIP_QK) {
-                uint row = lid / FA_TPR;
-                uint sub = lid % FA_TPR;
-                uint trow = row;
-                for (uint c = sub; c < FA_GQA_BC; c += FA_TPR) {
-                    uint kv_pos = c0 + c;
-                    bool masked = (c >= bc_valid) ||
-                        (needs_mask && kv_pos >= start_pos + q0 + trow + 1);
-                    float v = scores[row * FA_GQA_BC + c];
-                    scores[row * FA_GQA_BC + c] =
-                        masked ? -INFINITY : v * softmax_scale;
-                }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            // -- online softmax (same as v1 GQA) --
-            if (!ABLATE_V2_SKIP_SOFTMAX) {
-                uint row = lid / FA_TPR;
-                uint sub = lid % FA_TPR;
-                float lm = -INFINITY;
-                for (uint c = sub; c < FA_GQA_BC; c += FA_TPR) {
-                    lm = max(lm, scores[row * FA_GQA_BC + c]);
-                }
-                for (uint s = 1; s < FA_TPR; s <<= 1) {
-                    lm = max(lm, simd_shuffle_xor(lm, s));
-                }
-                float blk_max = lm;
-
-                float m_old = row_m[g * FA_BR + row];
-                float m_new = max(m_old, blk_max);
-                bool  active = (m_new != -INFINITY);
-                float corr = (m_old == -INFINITY) ? 0.0f : exp(m_old - m_new);
-
-                float ls = 0.0f;
-                for (uint c = sub; c < FA_GQA_BC; c += FA_TPR) {
-                    float p = active
-                        ? exp(scores[row * FA_GQA_BC + c] - m_new)
-                        : 0.0f;
-                    scores[row * FA_GQA_BC + c] = p;
-                    ls += p;
-                }
-                for (uint s = 1; s < FA_TPR; s <<= 1) {
-                    ls += simd_shuffle_xor(ls, s);
-                }
-
-                if (sub == 0) {
-                    uint idx = g * FA_BR + row;
-                    row_m[idx]    = m_new;
-                    row_corr[idx] = corr;
-                    row_l[idx]    = row_l[idx] * corr + ls;
-                }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            // -- diag rescale for head g --
-            write_diag_rescale(
-                diag_rc, row_corr, simd_id, lane,
-                g * FA_BR + simd_id * 8);
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            // -- P·V for head g: O = diag(corr)*O + P*V --
-            if (!ABLATE_V2_SKIP_PV) {
-                simdgroup_float8x8 mm;
-                simdgroup_load(mm, diag_rc + simd_id * 64, 8);
-                for (uint k = 0; k < FA_D8; ++k) {
-                    simdgroup_multiply(lo[g][k], mm, lo[g][k]);
-                }
-
-                // Load P fragment (only 1 chunk at FA_GQA_BC=8).
-                simdgroup_float8x8 mp;
-                threadgroup const float* ps =
-                    scores + simd_id * 8 * FA_GQA_BC;
-                simdgroup_load(mp, ps, FA_GQA_BC);
-
-                for (uint k_tile = 0; k_tile < FA_D8; ++k_tile) {
-                    simdgroup_float8x8 mv;
-                    threadgroup const float* pv =
-                        kv_V + k_tile * 8;
-                    simdgroup_load(mv, pv, FA_HD);
-                    simdgroup_multiply_accumulate(
-                        lo[g][k_tile], mp, mv, lo[g][k_tile]);
-                }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-    }
-
-    // Finalize per head — same fast/slow split as v2 G=1, applied per
-    // head g. Fast path (br_valid == FA_BR): per-simdgroup direct
-    // device write after diag-rescale. Slow path: per-simdgroup
-    // serialized stage + scalar copy.
-    for (uint g = 0; g < FA_GROUP; ++g) {
-        uint h = h_base + g;
-
-        // Build 1/row_l diag for head g.
-        {
-            threadgroup float* my_diag = diag_rc + simd_id * 64;
-            if (lane < 8) {
-                uint row = simd_id * 8 + lane;
-                float denom = (row < br_valid)
-                    ? row_l[g * FA_BR + row] : 0.0f;
-                float inv = (denom > 0.0f) ? (1.0f / denom) : 0.0f;
-                for (uint j = 0; j < 8; ++j) {
-                    my_diag[lane * 8 + j] = (j == lane) ? inv : 0.0f;
-                }
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        {
-            simdgroup_float8x8 inv_diag;
-            simdgroup_load(inv_diag, diag_rc + simd_id * 64, 8);
-            for (uint k = 0; k < FA_D8; ++k) {
-                simdgroup_multiply(lo[g][k], inv_diag, lo[g][k]);
-            }
-        }
-
-        if (br_valid == FA_BR) {
-            device float* osrc =
-                out + ((size_t)(q0 + simd_id * 8) * num_heads + h) * FA_HD;
-            ulong out_stride = (ulong)num_heads * FA_HD;
-            for (uint k = 0; k < FA_D8; ++k) {
-                simdgroup_store(lo[g][k], osrc + k * 8, out_stride);
-            }
-        } else {
-            threadgroup float* sg_stage = kv_K;
-            for (uint active_sg = 0; active_sg < FA_SIMDS; ++active_sg) {
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                if (simd_id == active_sg) {
-                    for (uint k = 0; k < FA_D8; ++k) {
-                        simdgroup_store(lo[g][k], sg_stage + k * 8, FA_HD);
-                    }
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-
-                uint sg_first_row = active_sg * 8;
-                if (sg_first_row >= br_valid) {
-                    continue;
-                }
-                uint sg_valid_rows = min((uint)8, br_valid - sg_first_row);
-
-                for (uint i = lid; i < sg_valid_rows * FA_HD; i += FA_THREADS) {
-                    uint r_local = i / FA_HD;
-                    uint d = i % FA_HD;
-                    uint r_abs = sg_first_row + r_local;
-                    out[((size_t)(q0 + r_abs) * num_heads + h) * FA_HD + d]
-                        = sg_stage[r_local * FA_HD + d];
-                }
-            }
-        }
-        // Barrier before next head's diag build (we reuse diag_rc).
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-}
-
-#define SDPA_GQA_ENTRY_V2(NAME, G)                                         \
-kernel void NAME(                                                          \
-    device const float* Q             [[buffer(0)]],                       \
-    device const float* K_cache       [[buffer(1)]],                       \
-    device const float* V_cache       [[buffer(2)]],                       \
-    device float*       out           [[buffer(3)]],                       \
-    constant uint&      n_tokens      [[buffer(4)]],                       \
-    constant uint&      num_heads     [[buffer(5)]],                       \
-    constant uint&      heads_per_kv  [[buffer(6)]],                       \
-    constant uint&      kv_dim        [[buffer(7)]],                       \
-    constant uint&      start_pos     [[buffer(8)]],                       \
-    constant uint&      kv_len        [[buffer(9)]],                       \
-    constant float&     softmax_scale [[buffer(10)]],                      \
-    uint tg_idx [[threadgroup_position_in_grid]],                          \
-    uint lid    [[thread_position_in_threadgroup]]                         \
-) {                                                                        \
-    threadgroup float4 kv_stage4[FA_GQA_BC * FA_HD * 2 / 4];   /* 16 KB */  \
-    threadgroup float  scores[FA_BR * FA_GQA_BC];                           \
-    threadgroup float  row_m[(G) * FA_BR];                                  \
-    threadgroup float  row_l[(G) * FA_BR];                                  \
-    threadgroup float  row_corr[(G) * FA_BR];                               \
-    threadgroup float  diag_rc[FA_SIMDS * 64];                              \
-    sdpa_v2_gqa_impl<G>(Q, K_cache, V_cache, out, n_tokens, num_heads,      \
-        heads_per_kv, kv_dim, start_pos, kv_len, softmax_scale,             \
-        kv_stage4, scores, row_m, row_l, row_corr, diag_rc, tg_idx, lid);   \
-}
-
-SDPA_GQA_ENTRY_V2(attn_sdpa_causal_flash_gqa2_v2, 2)

@@ -531,7 +531,7 @@ fn bench_sdpa(metal: &mut MetalContext) {
             num_heads as u64,
             head_dim as u64,
         );
-        let encode_flash = |cmd: &CommandBufferRef| {
+        let encode_va = |cmd: &CommandBufferRef| {
             kernels.encode(
                 cmd,
                 &SdpaCall {
@@ -548,15 +548,42 @@ fn bench_sdpa(metal: &mut MetalContext) {
                     kv_len,
                     softmax_scale: scale,
                     fold: 1,
-                    v2: false,
+                    vb: false,
+                },
+            );
+        };
+        let encode_vb = |cmd: &CommandBufferRef| {
+            kernels.encode(
+                cmd,
+                &SdpaCall {
+                    q: &q_buf,
+                    k_cache: &k_buf,
+                    v_cache: &v_buf,
+                    out: &out_buf,
+                    n_tokens: m,
+                    num_heads,
+                    heads_per_kv,
+                    head_dim,
+                    kv_dim,
+                    start_pos,
+                    kv_len,
+                    softmax_scale: scale,
+                    fold: 1,
+                    vb: true,
                 },
             );
         };
         bench(
             metal,
-            &format!("sdpa M={m} kv_len={kv_len}"),
+            &format!("vA sdpa M={m} kv_len={kv_len}"),
             flops,
-            &encode_flash,
+            &encode_va,
+        );
+        bench(
+            metal,
+            &format!("vB sdpa M={m} kv_len={kv_len}"),
+            flops,
+            &encode_vb,
         );
     }
 }
