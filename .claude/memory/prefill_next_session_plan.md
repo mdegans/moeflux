@@ -1,69 +1,64 @@
-# Prefill arc — next session plan (updated 2026-05-22, session 2)
+# Perf arc — next session plan (updated 2026-05-22, end of session 2)
 
 ## Current state
 
-- **moeflux prefill:** 775 tok/s (a3b, ~15k tokens, sequential vB)
-- **llama.cpp prefill:** 810-820 tok/s (same prompt, same model)
-- **Gap:** ~1.05× (~0.8 s on 15k tokens)
+### Prefill (~closed)
+- **moeflux:** 775 tok/s (a3b, ~15k tokens)
+- **llama.cpp:** 810-820 tok/s
+- **Gap:** ~1.05× — diminishing returns
 
-## Where the gap lives (post-delta-net-sequential GPU capture)
+### Generation (next focus)
+- **moeflux:** ~11.5 tok/s (a3b)
+- **llama.cpp:** unknown — measure first
+- Decode is bandwidth-bound (matvec), not compute-bound (matmul).
+  Bottleneck profile will look completely different from prefill.
 
-| Category | % of GPU time | Notes |
-|----------|--------------|-------|
-| `gated_delta_net_chunkwise` | 33% | → sequential vB: +15% e2e |
-| `affine_qmm_t_float` | 29% | 4-bit matmul projections |
-| `moeflux_mm_id` | 22% | MoE dispatch |
-| SDPA + other | ~16% | Already optimized (7× last session) |
+## Step 1: llama.cpp generation baseline
 
-These % are from the pre-sequential-improvement capture. The sequential
-kernel's 15% e2e win means delta-net dropped to roughly ~20% of GPU
-time. **qmm_t (29%) is now the #1 target.**
+Measure llama.cpp decode tok/s on the same model + prompt for
+the gap size.
 
-## Step 1: promote sequential kernel to vA
+## Step 2: Metal capture on decode
 
-The sequential kernel is correct (diff oracle cosine 1.000000000) and
-15% faster. Slot rotation: rename entry points so vA = sequential,
-vB = chunkwise. Same procedure as the SDPA promotion.
+Single-layer capture during decode (not prefill). Key ops to watch:
+- `dequant_matvec_4bit*` — weight dequant + matvec (likely dominant)
+- `gated_delta_net_step` — single-token delta-net recurrence
+- MoE routing + expert dispatch
+- KV cache append (SDPA layers)
+- Norms, residuals, overhead
 
-## Step 2: fresh GPU capture
+## Step 3: attack the dominant op
 
-Need updated % breakdown with the sequential kernel active. The
-Amdahl estimates above are approximations — a real capture will show
-whether qmm_t or mm_id moved.
+Decode optimization levers are different from prefill:
+- Memory bandwidth utilization (are we near the ~400 GB/s ceiling?)
+- Weight layout / dequant efficiency
+- Command buffer batching (per-layer overhead matters more at 1 tok)
+- CPU-side dispatch latency
 
-## Step 3: attack qmm_t
+## Prefill remaining work (lower priority)
 
-If `affine_qmm_t_float` dominates:
-- Compare our MLX-vendored `affine_qmm_rhs` against llama.cpp's
-  `kernel_mul_mat` for the same shapes (projections: [n_tokens, dim])
-- Tile-size sweep (BM/BN/BK)
-- Q4_K_S format comparison — llama.cpp's sub-block scaling may be
-  cheaper to decode
-
-If `moeflux_mm_id` dominates:
-- Already ported from llama.cpp — should be near parity
-- Check for dispatch differences (barriers, grid sizing)
+- Promote sequential delta-net to vA (slot rotation)
+- qmm_t tile-size sweep (was 29% of prefill GPU time)
+- Fresh prefill GPU capture with sequential kernel
 
 ## Dead ends (don't revisit)
 
-- **GQA fold on direct-device SDPA:** 3% slower (2026-05-22 session 1).
-- **SDPA staging kernel (vB):** 7× slower.
-- **Chunkwise delta-net:** 15% slower than sequential (2026-05-22
-  session 2). Barrier + TG memory overhead outweighs chunkwise
-  parallelism for this state size.
-- **LTO + codegen-units=1:** neutral at 9× build time.
+- GQA fold on direct-device SDPA: 3% slower
+- SDPA staging kernel: 7× slower
+- Chunkwise delta-net: 15% slower than sequential
+- LTO + codegen-units=1: neutral at 9× build time
 
 ## Env var cheat sheet
 
 | Var | Default | Effect |
 |-----|---------|--------|
-| `MOEFLUX_SDPA_VB` | OFF | Use old staging SDPA kernel |
+| `MOEFLUX_SDPA_VB` | OFF | Staging SDPA kernel |
 | `MOEFLUX_SDPA_GQA` | OFF | GQA fold on direct-device |
-| `MOEFLUX_DELTA_NET_VB` | OFF | Use sequential delta-net kernel |
-| `MOEFLUX_MOE_GATHER_ID` | ON | Use gather_mm_id MoE kernel |
+| `MOEFLUX_DELTA_NET_VB` | OFF | Sequential delta-net kernel |
+| `MOEFLUX_MOE_GATHER_ID` | ON | gather_mm_id MoE kernel |
 
 ## Cross-references
 
 - [[sdpa_vb_direct_device]] — SDPA arc history
+- [[delta_net_sequential_session]] — delta-net sequential findings
 - [[sdpa_session_learnings]] — SDPA what worked / didn't
-- [[delta_net_sequential_session]] — this session's findings
