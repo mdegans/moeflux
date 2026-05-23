@@ -2547,6 +2547,7 @@ impl RsCtx<MetalBackend> {
         // 5d-8) so the drained N-2 dispatch is always chained — no
         // host readback needed during the loop.
         let mut prev_layer_chained = false;
+        gpu_capture::decode_begin_token();
         for layer_idx in 0..v.num_layers {
             if let Some(cfg) = gpu_capture::config() {
                 if cfg.decode_start(layer_idx) {

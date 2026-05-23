@@ -14,24 +14,27 @@
 //! MOEFLUX_GPU_CAPTURE_CHUNK=0                    # which prefill chunk (default 0)
 //! MOEFLUX_GPU_CAPTURE_N_LAYERS=2                 # window size in layers (default 2)
 //!
-//! # decode always captures exactly 1 layer (Xcode hangs on more).
+//! # decode-only:
+//! MOEFLUX_GPU_CAPTURE_TOKEN=10                   # which decode token to capture (default 10)
 //! ```
 //!
 //! In prefill mode, capture starts just before `begin_layer` fires for
 //! `(chunk, layer)` and stops at `(chunk, layer + n_layers)`.
 //!
-//! In decode mode, capture starts at layer `layer` in the per-token
-//! oracle loop and stops one layer later.
+//! In decode mode, capture waits for the Nth token (countdown from
+//! `MOEFLUX_GPU_CAPTURE_TOKEN`), then captures exactly 1 layer.
+//! Defaulting to token 10 lets the GPU warm up before tracing.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use metal::{CaptureDescriptor, CaptureManager, Device, MTLCaptureDestination};
 
-/// Set by [`stop()`] — once a capture window completes, no further
-/// captures fire for the lifetime of the process.
-static CAPTURE_DONE: AtomicBool = AtomicBool::new(false);
+/// Set by [`decode_begin_token()`] when the countdown reaches zero;
+/// cleared by [`stop()`]. Guards [`decode_start`] / [`decode_stop`]
+/// so the layer-level checks only fire on the target token.
+static DECODE_ARMED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone)]
 pub enum CaptureMode {
@@ -42,6 +45,7 @@ pub enum CaptureMode {
     },
     Decode {
         at_layer: usize,
+        at_token: usize,
     },
 }
 
@@ -74,22 +78,62 @@ impl GpuCaptureConfig {
         }
     }
 
-    /// Decode (per-token oracle) path: should capture start here?
+    /// Decode path: should capture start at this layer?
+    /// Only returns true when [`DECODE_ARMED`] is set (by
+    /// [`decode_begin_token`]).
     pub fn decode_start(&self, layer_idx: usize) -> bool {
         match &self.mode {
-            CaptureMode::Decode { at_layer } => layer_idx == *at_layer,
+            CaptureMode::Decode { at_layer, .. } => {
+                DECODE_ARMED.load(Ordering::Relaxed) && layer_idx == *at_layer
+            }
             CaptureMode::Prefill { .. } => false,
         }
     }
 
-    /// Decode (per-token oracle) path: should capture stop here?
+    /// Decode path: should capture stop at this layer?
     pub fn decode_stop(&self, layer_idx: usize) -> bool {
         match &self.mode {
-            CaptureMode::Decode { at_layer } => {
-                layer_idx == at_layer.saturating_add(1)
+            CaptureMode::Decode { at_layer, .. } => {
+                DECODE_ARMED.load(Ordering::Relaxed)
+                    && layer_idx == at_layer.saturating_add(1)
             }
             CaptureMode::Prefill { .. } => false,
         }
+    }
+}
+
+/// Call once per decode token, **before** the layer loop. Counts
+/// down from `at_token`; returns `true` exactly once — on the
+/// target token — and arms [`DECODE_ARMED`] for that token's
+/// layer pass.
+pub fn decode_begin_token() -> bool {
+    static COUNTDOWN: OnceLock<AtomicUsize> = OnceLock::new();
+    let counter = COUNTDOWN.get_or_init(|| {
+        let n = config()
+            .and_then(|cfg| match &cfg.mode {
+                CaptureMode::Decode { at_token, .. } => Some(*at_token),
+                _ => None,
+            })
+            .unwrap_or(0);
+        AtomicUsize::new(n)
+    });
+
+    // fetch_sub wraps on underflow — fine, the value will never
+    // be 0 again (would take usize::MAX more calls).
+    let prev = counter.fetch_sub(1, Ordering::Relaxed);
+    if prev == 0 {
+        DECODE_ARMED.store(true, Ordering::Relaxed);
+        if let Some(cfg) = config() {
+            if let CaptureMode::Decode { at_layer, at_token } = &cfg.mode {
+                eprintln!(
+                    "[gpu_capture] token {at_token} reached, \
+                     arming capture at layer {at_layer}",
+                );
+            }
+        }
+        true
+    } else {
+        false
     }
 }
 
@@ -135,7 +179,11 @@ pub fn config() -> Option<&'static GpuCaptureConfig> {
                     .ok()
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(0usize);
-                CaptureMode::Decode { at_layer }
+                let at_token = std::env::var("MOEFLUX_GPU_CAPTURE_TOKEN")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(10usize);
+                CaptureMode::Decode { at_layer, at_token }
             }
             other => {
                 eprintln!(
@@ -158,9 +206,6 @@ pub fn config() -> Option<&'static GpuCaptureConfig> {
 /// `.gputrace` bundle. Removes any pre-existing path so Metal's
 /// "output URL already exists" error doesn't fire on repeat runs.
 pub fn start(device: &Device, cfg: &GpuCaptureConfig) {
-    if CAPTURE_DONE.load(Ordering::Relaxed) {
-        return;
-    }
     let manager = CaptureManager::shared();
     if manager.is_capturing() {
         eprintln!("[gpu_capture] already capturing; skipping start");
@@ -183,7 +228,7 @@ pub fn start(device: &Device, cfg: &GpuCaptureConfig) {
                         at_layer + n_layers,
                     )
                 }
-                CaptureMode::Decode { at_layer } => {
+                CaptureMode::Decode { at_layer, .. } => {
                     format!("decode layer={at_layer}")
                 }
             };
@@ -202,6 +247,6 @@ pub fn stop() {
         return;
     }
     manager.stop_capture();
-    CAPTURE_DONE.store(true, Ordering::Relaxed);
+    DECODE_ARMED.store(false, Ordering::Relaxed);
     eprintln!("[gpu_capture] stopped");
 }
