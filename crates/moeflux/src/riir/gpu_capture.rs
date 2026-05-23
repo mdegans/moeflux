@@ -25,8 +25,13 @@
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use metal::{CaptureDescriptor, CaptureManager, Device, MTLCaptureDestination};
+
+/// Set by [`stop()`] — once a capture window completes, no further
+/// captures fire for the lifetime of the process.
+static CAPTURE_DONE: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone)]
 pub enum CaptureMode {
@@ -153,6 +158,9 @@ pub fn config() -> Option<&'static GpuCaptureConfig> {
 /// `.gputrace` bundle. Removes any pre-existing path so Metal's
 /// "output URL already exists" error doesn't fire on repeat runs.
 pub fn start(device: &Device, cfg: &GpuCaptureConfig) {
+    if CAPTURE_DONE.load(Ordering::Relaxed) {
+        return;
+    }
     let manager = CaptureManager::shared();
     if manager.is_capturing() {
         eprintln!("[gpu_capture] already capturing; skipping start");
@@ -194,5 +202,6 @@ pub fn stop() {
         return;
     }
     manager.stop_capture();
+    CAPTURE_DONE.store(true, Ordering::Relaxed);
     eprintln!("[gpu_capture] stopped");
 }
