@@ -673,9 +673,9 @@ impl Backend for MetalBackend {
         let Some(cfg) = crate::riir::gpu_capture::config() else {
             return;
         };
-        if cfg.start_at(chunk_idx, layer_idx) {
+        if cfg.prefill_start(chunk_idx, layer_idx) {
             crate::riir::gpu_capture::start(self.metal.device(), cfg);
-        } else if cfg.stop_at(chunk_idx, layer_idx) {
+        } else if cfg.prefill_stop(chunk_idx, layer_idx) {
             crate::riir::gpu_capture::stop();
         }
     }

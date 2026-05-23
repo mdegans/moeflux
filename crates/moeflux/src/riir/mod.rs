@@ -2548,6 +2548,14 @@ impl RsCtx<MetalBackend> {
         // host readback needed during the loop.
         let mut prev_layer_chained = false;
         for layer_idx in 0..v.num_layers {
+            if let Some(cfg) = gpu_capture::config() {
+                if cfg.decode_start(layer_idx) {
+                    gpu_capture::start(metal.device(), cfg);
+                } else if cfg.decode_stop(layer_idx) {
+                    gpu_capture::stop();
+                }
+            }
+
             if deferred.is_full() {
                 moe::deferred::complete_deferred_experts_chained(deferred)
                     .map_err(|_| RsError::EvalFailed)?;
@@ -2653,6 +2661,10 @@ impl RsCtx<MetalBackend> {
                 .map_err(|_| RsError::EvalFailed)?;
             }
             prev_layer_chained = chain_next;
+        }
+
+        if gpu_capture::config().is_some() {
+            gpu_capture::stop();
         }
 
         // Slice 5d-9 post-loop drain. With the depth-2 ring, the
