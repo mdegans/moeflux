@@ -1097,6 +1097,22 @@ fn emit_batched_experts(
     // Batched path: all K experts per projection in one dispatch.
     // Requires hidden_dim ≤ 4096 (v3 x_shared limit) and k ≤ 8
     // (kernel buffer slots). Falls through to per-expert loop otherwise.
+    {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static LOGGED: AtomicBool = AtomicBool::new(false);
+        if !LOGGED.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "[moe] expert dispatch: hidden_dim={} k={} v3_experts={} combine_flat={} → {}",
+                v.hidden_dim, k,
+                v3_experts.is_some(), combine_flat.is_some(),
+                if v.hidden_dim <= 4096 && k <= 8 && v3_experts.is_some() && combine_flat.is_some() {
+                    "batched"
+                } else {
+                    "per-expert (fallback)"
+                },
+            );
+        }
+    }
     let use_batched = v.hidden_dim <= 4096
         && k <= 8
         && v3_experts.is_some()
