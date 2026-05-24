@@ -50,6 +50,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver};
 
 use crate::riir::moe::expert_forward::MAX_K;
+use crate::riir::io::expert_io_mode::ExpertIoMode;
 use crate::riir::io::expert_io::{ExpertFiles, ExpertIoError};
 
 /// Per-slot decision: which buffer the K-expert encoder reads from.
@@ -95,6 +96,13 @@ pub struct PrefetchState {
     /// for a different layer, prediction didn't match, or the slot
     /// index ran past the prefetch's K). Same lifecycle as `hits`.
     misses: AtomicU64,
+    /// Which expert-IO path the K-expert dispatch uses — picked once
+    /// at [`crate::riir::RsCtx::open`] by
+    /// [`crate::riir::io::expert_io_mode::select`]. The orchestrator
+    /// loop and `moe_dispatch_per_token` both consult this so the
+    /// firing side and the consuming side agree on whether prefetch
+    /// I/O is happening at all.
+    mode: ExpertIoMode,
 }
 
 #[derive(Debug)]
@@ -211,13 +219,19 @@ impl ExpertFilesPtr {
 
 impl PrefetchState {
     /// Create a fresh state with `num_layers` slots, all unprimed.
-    pub fn new(num_layers: usize) -> Self {
+    pub fn new(num_layers: usize, mode: ExpertIoMode) -> Self {
         Self {
             last_token_indices: vec![None; num_layers],
             in_flight: None,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
+            mode,
         }
+    }
+
+    /// Expert-IO mode for this run. See [`ExpertIoMode`].
+    pub fn mode(&self) -> ExpertIoMode {
+        self.mode
     }
 
     /// Record a per-layer outcome: how many of the K slots were
@@ -389,7 +403,7 @@ mod tests {
 
     #[test]
     fn predict_for_returns_none_until_recorded() {
-        let mut st = PrefetchState::new(8);
+        let mut st = PrefetchState::new(8, ExpertIoMode::Pread);
         assert_eq!(st.predict_for(3), None);
         let actual = [0i32; MAX_K];
         st.record_actual(3, actual);
@@ -400,7 +414,7 @@ mod tests {
 
     #[test]
     fn predict_for_out_of_range_layer_is_none() {
-        let st = PrefetchState::new(2);
+        let st = PrefetchState::new(2, ExpertIoMode::Pread);
         assert_eq!(st.predict_for(99), None);
     }
 }

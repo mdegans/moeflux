@@ -127,25 +127,23 @@ pub enum ExpertIoError {
     },
 }
 
-// Expert I/O is always mmap. The previous `ExpertIoMode::Pread` mode
-// staged each layer's experts into a single GPU buffer via a tight
-// synchronous `pread` + `pool.upload_at` loop on the calling thread
-// (see git history for the deleted code). On 2026-05-20 we measured
-// that path against mmap on a 15692-token prefill: same wall-clock
-// (74.5s vs 73.8s, within noise), but pread mode burned ~36% more
-// main-thread CPU on a workload that was already GPU-bound at the
-// MLX `affine_gather_qmm_rhs` kernel's 20.83% register-pressure
-// occupancy ceiling. The OS page cache + readahead does the work
-// pread mode was meant to manage, and unified-memory Metal can read
-// the mmap'd region directly with no staging copy.
+// Prefill always uses the mmap path — the 2026-05-20 measurement
+// (see `.claude/memory/pread_teardown_landed.md`) showed mmap-direct
+// matched pread on wall-clock at 36% less main-thread CPU on a
+// workload that was already GPU-bound. The synchronous `pread +
+// pool.upload_at` loop the old `ExpertIoMode::Pread` mode used at
+// prefill is dead and should not be revived.
 //
-// If you are tempted to add a pread fallback back: don't. The path
-// it was solving (low-RAM hardware where the expert working set
-// can't fit in the page cache) has never been hit on supported
-// devices and would benefit more from `madvise(MADV_RANDOM)` or
-// `MADV_DONTNEED` on the mmap than from re-introducing serial pread
-// on the GPU's critical path. See
-// `.claude/memory/pread_teardown_landed.md` for the full rationale.
+// Decode is a different story: on variants whose expert working set
+// is larger than the page cache (Qwen3-A17B's 60 layers × 512 experts
+// don't fit in M2 Max's 96 GB), mmap-direct stalls the GPU on
+// demand-fault VM activity. The decode-time pread+prefetch path is
+// gated runtime by [`crate::riir::io::expert_io_mode::select`] —
+// `auto` (the default) flips to pread when
+// `expert_bytes > 0.75 * physical_ram`; `MOEFLUX_DECODE_IO=mmap|pread`
+// forces a choice. The state machine lives in [`super::prefetch`];
+// the dispatch lives in
+// `attn::linear_attn_forward::moe_dispatch_per_token`.
 
 /// Per-layer file handles for the active variant. Slot `i` is `None`
 /// if `experts_dir/packed_experts/layer_<i>.bin` was missing at
@@ -200,20 +198,13 @@ impl ExpertFiles {
     /// Mirrors the C loop at `metal_infer/infer.m:7580..7605`. Each
     /// opened layer file is mmap'd unconditionally; the matching
     /// Metal buffer is built lazily by [`Self::attach_to_device`]
-    /// once the Metal backend exists. The `MOEFLUX_EXPERT_IO` env
-    /// var is now inert — set to anything other than `mmap` and it
-    /// emits a friendly "ignored" warning, then proceeds with mmap.
+    /// once the Metal backend exists. The mmap is always built
+    /// because prefill always reads through it; the per-token
+    /// decode path additionally pread-stages experts when the
+    /// runtime gate picks pread mode (see
+    /// [`crate::riir::io::expert_io_mode::select`]).
     pub fn open(experts_dir: &Path) -> Result<Self, ExpertIoError> {
         let v: Variant = VARIANT;
-        if let Ok(val) = std::env::var("MOEFLUX_EXPERT_IO") {
-            if val != "mmap" {
-                eprintln!(
-                    "[experts] MOEFLUX_EXPERT_IO={val:?} ignored; \
-                     expert I/O is always mmap (pread mode was removed \
-                     2026-05-20 — see expert_io.rs comment)."
-                );
-            }
-        }
         let subdir = experts_dir.join("packed_experts");
         let mut layers = Vec::with_capacity(v.num_layers);
         let mut mmap_layers: Vec<Option<Mmap>> =
@@ -277,7 +268,22 @@ impl ExpertFiles {
     /// `mmap_buffers` (existing `&Buffer` accessor still works) AND
     /// `mmap_buf_ids` (new `BufId` accessor for graph-mode `Op`s);
     /// they share an NSObject-refcounted clone of the same backing.
-    pub fn attach_to_device(&mut self, pool: &mut MetalBufferPool) {
+    pub fn attach_to_device(
+        &mut self,
+        pool: &mut MetalBufferPool,
+        mode: super::expert_io_mode::ExpertIoMode,
+    ) {
+        // Pread mode never has the GPU read from the per-layer mmap —
+        // the prefill gather kernel and the decode batched-expert
+        // dispatch both read from staging buffers populated by `pread`
+        // (see `expert_io_mode.rs` for the rationale). Skipping the
+        // `newBufferWithBytesNoCopy` + residency-pin keeps the GPU
+        // off the giant working set; for a17b that's ~245 GB of
+        // layer files which can't be pinned on M2 Max's 96 GB UMA
+        // anyway, and trying to does measurable harm.
+        if mode.is_pread() {
+            return;
+        }
         // Lazy-init the residency set on the first attach call. The
         // capacity hint is the layer count — a slight over-estimate
         // when some layers are missing, but it's a hint, not a cap.

@@ -476,6 +476,16 @@ pub struct MoeGraphScratch {
     /// MoE permute-fuse scatter accumulator. `Op::ZeroBuffer` clears
     /// it each layer before `Op::MoeBatchedPermuteFuse` accumulates.
     pub out_sum: BufId<MoeOutSumBuf>,
+    /// Pread-mode prefill staging — every expert's 4-bit block packed
+    /// contiguously at `expert_size_4bit()` stride, the gather GEMM's
+    /// `expert_base`. The producer `read_expert`s each layer's hit
+    /// experts into their `expert_id * expert_size` offset before
+    /// dispatching the layer's `graph2`. `None` in mmap mode, which
+    /// addresses the layer's mmap buffer directly via
+    /// `ExpertFiles::mmap_id_for_expert`. The slot is registered as
+    /// `BufId<ExpertBaseBuf>` to match the `Op::MoeGatherIdFuse` /
+    /// `Op::MoeBatchedPermuteFuse` field type.
+    pub expert_base: Option<BufId<ExpertBaseBuf>>,
     /// Per-assignment-row expert slot table (`u32`), `chunk *
     /// k_active` wide — the gather kernel's `indices`. Filled per
     /// layer from `buckets`.
@@ -507,10 +517,14 @@ impl MoeGraphScratch {
     /// FFN intermediates are `persistent = false` (the first MoE block
     /// call `commit_plan`s + pins them); the boundary buffers +
     /// host-uploaded inputs are `persistent = true`. `k_active` sizes
-    /// the bucket-flat buffers.
+    /// the bucket-flat buffers. `mode == Pread` additionally allocates
+    /// the `num_experts * expert_size_4bit()` staging buffer that the
+    /// prefill gather kernel reads from (mmap mode addresses the
+    /// per-layer mmap buffer directly instead).
     pub fn new(
         pool: &mut MetalBufferPool,
         k_active: usize,
+        mode: crate::riir::io::expert_io_mode::ExpertIoMode,
     ) -> Self {
         let v = VARIANT;
         let chunk = crate::riir::BATCHED_CHUNK_SIZE;
@@ -584,6 +598,25 @@ impl MoeGraphScratch {
                 true,
             )
             .expect("MoeGraphScratch::new pool alloc");
+        // One staging buffer holding every expert's block at
+        // `expert_size_4bit()` stride. Allocated only in `Pread` mode
+        // (the prefill gather GEMM reads from here instead of the
+        // layer mmap); `Mmap` mode addresses the per-layer mmap
+        // buffer directly. Persistent so the layer loop can rewrite
+        // its hit experts in place without `commit_plan` coloring
+        // them under us.
+        let expert_base: Option<BufId<ExpertBaseBuf>> = if mode.is_pread() {
+            Some(
+                pool.alloc(
+                    v.num_experts * v.expert_size_4bit(),
+                    "mgs.expert_base",
+                    true,
+                )
+                .expect("MoeGraphScratch::new pool alloc (expert_base)"),
+            )
+        } else {
+            None
+        };
         // `Op::MoeGatherIdFuse` scratch — sized for the max chunk
         // width. Persistent because the new kernel's map0 + matmul
         // dispatches assume these buffers don't get colored under
@@ -619,6 +652,7 @@ impl MoeGraphScratch {
             bucket_weights,
             out_sum,
             expert_indices,
+            expert_base,
             htpe,
             hids,
             commit_planned: std::cell::Cell::new(false),
@@ -1958,9 +1992,9 @@ pub(in crate::riir) fn moe_dispatch_per_token(
     deferred: &mut crate::riir::moe::deferred::DeferredRing,
     layer_idx: usize,
     expert_files: &ExpertFiles,
-    _pool: &rayon::ThreadPool,
-    _prefetch: &mut crate::riir::io::prefetch::PrefetchState,
-    _prefetch_set: usize,
+    pool: &rayon::ThreadPool,
+    prefetch: &mut crate::riir::io::prefetch::PrefetchState,
+    prefetch_set: usize,
     intermediates: &PostAttnIntermediates,
     gpu_combine: bool,
     chain_next_norm_off: Option<u64>,
@@ -1991,15 +2025,106 @@ pub(in crate::riir) fn moe_dispatch_per_token(
     let k = indices.len();
 
     if gpu_combine {
-        // Direct mmap path: GPU reads expert weights from mmap'd Metal
-        // buffers. No pread, no prefetch, no staging.
-        let bindings: Vec<(&metal::Buffer, u64)> = indices.iter()
-            .map(|&idx| {
-                expert_files
-                    .mmap_buffer_for_expert(layer_idx, idx as u32)
-                    .expect("mmap buffer missing for expert")
-            })
-            .collect();
+        // Bindings layout: one `(&Buffer, byte_offset)` per active
+        // expert slot — the K-expert kernel reads its expert weights
+        // from those buffers. Two paths, chosen by the run-time gate:
+        //
+        // - **Mmap** (a3b and other variants whose expert working set
+        //   fits ≤ 75% of physical RAM): bind directly to the per-
+        //   layer mmap'd Metal buffer at `expert_idx * expert_size`
+        //   offset. Zero host I/O on the per-token critical path.
+        // - **Pread** (a17b — working set larger than the page cache
+        //   can keep warm): run the speculative-prefetch state
+        //   machine. Each slot binds to `data_prefetch[set][buf_idx]`
+        //   on a hit (already loaded by the previous layer's
+        //   prefetch) or `data_synced[slot]` on a miss (sync-pread
+        //   here). See `expert_io_mode::select` for the gate, and
+        //   `prefetch.rs` for the state machine.
+        let bindings_synced; // backing storage for the pread arm
+        let bindings: Vec<(&metal::Buffer, u64)> = if prefetch.mode().is_mmap() {
+            indices.iter()
+                .map(|&idx| {
+                    expert_files
+                        .mmap_buffer_for_expert(layer_idx, idx as u32)
+                        .expect("mmap buffer missing for expert")
+                })
+                .collect()
+        } else {
+            use crate::riir::io::prefetch::SlotSource;
+            use rayon::prelude::*;
+            const MAX_K: usize = crate::riir::moe::expert_forward::MAX_K;
+
+            // 1. Drain any in-flight prefetch and check whether it
+            //    targeted THIS layer.
+            let prefetch_status = prefetch.wait_for(layer_idx);
+
+            // 2. Per-slot hit/miss decision. Set-based, not
+            //    position-locked: the actual expert at slot `s` may
+            //    have been prefetched into a different buf_idx than
+            //    `s`. We record the buf_idx on hit so the encoder
+            //    binds the correct prefetch slot.
+            let mut data_set_per_slot: [SlotSource; MAX_K] =
+                [SlotSource::Synced; MAX_K];
+            let mut hit_count: u64 = 0;
+            if let Some(status) = prefetch_status {
+                for slot in 0..k {
+                    let actual = indices[slot];
+                    for buf_idx in 0..status.k {
+                        if status.loaded_indices[buf_idx] == actual {
+                            data_set_per_slot[slot] =
+                                SlotSource::Prefetched(buf_idx);
+                            hit_count += 1;
+                            break;
+                        }
+                    }
+                }
+            }
+            prefetch.record_outcome(hit_count, k as u64 - hit_count);
+
+            // 3. Parallel sync-pread the misses into data_synced.
+            //    Hoist disjoint-slice array outside the rayon closure
+            //    so the closure captures `[&mut [u8]; MAX_K]` (Send)
+            //    instead of `&mut MoeBuffers` (which it can't).
+            let mut dsts = moe.data_synced_slots_mut_array(buffer_pool);
+            pool.install(|| -> Result<(), crate::riir::io::expert_io::ExpertIoError> {
+                dsts[..k]
+                    .par_iter_mut()
+                    .enumerate()
+                    .try_for_each(|(slot, dst)| {
+                        if data_set_per_slot[slot] == SlotSource::Synced {
+                            let expert_idx = indices[slot] as usize;
+                            expert_files.read_expert(layer_idx, expert_idx, *dst)
+                        } else {
+                            Ok(())
+                        }
+                    })
+            })?;
+
+            // 4. Record actuals as the prediction for the next
+            //    token's same-layer prefetch. Done before dispatch
+            //    so it's independent of dispatch success.
+            let mut actuals: [i32; MAX_K] = [0; MAX_K];
+            actuals[..k].copy_from_slice(&indices[..k]);
+            prefetch.record_actual(layer_idx, actuals);
+
+            // 5. Build per-slot bindings — hits read from
+            //    `data_prefetch[set][buf_idx]`, misses from
+            //    `data_synced[slot]`. Both buffers hold ONE expert
+            //    each, so the byte offset is always 0 (unlike the
+            //    mmap path, where the buffer holds the whole layer).
+            bindings_synced = (0..k)
+                .map(|slot| match data_set_per_slot[slot] {
+                    SlotSource::Synced => moe.data_synced_id(slot),
+                    SlotSource::Prefetched(buf_idx) => {
+                        moe.data_prefetch_id(prefetch_set, buf_idx)
+                    }
+                })
+                .collect::<Vec<_>>();
+            bindings_synced
+                .iter()
+                .map(|id| (buffer_pool.handle(*id), 0u64))
+                .collect()
+        };
 
         let chain_rms_pipes = if chain_next_norm_off.is_some() {
             Some(crate::riir::backend::gpu::gpu_norm::RmsNormBf16Pipelines {
@@ -2757,22 +2882,43 @@ where
         );
     }
 
-    // 2026-05-20 pread teardown: the staging-blob path (per-bucket
-    // `read_expert` + `pool.upload_at`) was deleted. Expert weights
-    // are read by the gather GEMM straight from the layer's mmap'd
-    // buffer — zero copy, OS page cache manages the working set.
-    // The `prefetch` env is also unused on the batched path
-    // (the orchestrator never fires prefetch dispatch here); the
-    // `Option<PrefetchEnv>` arg stays in the signature for the
-    // per-token oracle caller but is always `None` from prefill.
-    // Both `prefetch` and `moe_buffers` will become removable
-    // once task-7 confirms decode prefetch isn't load-bearing.
-    let _ = prefetch;
+    // Expert-weight resolution. `Mmap` mode points the gather GEMM
+    // straight at the per-layer mmap buffer (`num_experts` blocks at
+    // `expert_size` stride). `Pread` mode reads each bucketed
+    // expert from disk into the run-lifetime `moe.expert_base`
+    // staging buffer at `expert_id * expert_size` offset; the kernel
+    // reads from there. The pread path was torn out on 2026-05-20
+    // when measurements on a3b showed mmap matched it within noise
+    // — but a17b regressed because its working set far exceeds page-
+    // cache capacity. The runtime gate at
+    // `io::expert_io_mode::select` picks the path per session.
+    //
+    // `prefetch` is decode-only and never active here (the batched
+    // orchestrator never fires `prefetch.dispatch`); the param stays
+    // for the per-token oracle's `record_actual` write at the end of
+    // this function. `moe_buffers` is similarly decode-only.
     let _ = moe_buffers;
-    let expert_base_id: BufId<ExpertBaseBuf> = expert_files
-        .mmap_id_for_expert(layer_idx, 0)
-        .expect("mmap layer present (expert I/O is always mmap)")
-        .0;
+    let expert_base_id: BufId<ExpertBaseBuf> = match moe.expert_base {
+        None => expert_files
+            .mmap_id_for_expert(layer_idx, 0)
+            .expect("mmap layer present in Mmap mode")
+            .0,
+        Some(base_id) => {
+            let expert_size = v.expert_size_4bit();
+            let mut blob_scratch = vec![0u8; expert_size];
+            let pool = backend.pool_mut();
+            for &expert_id in buckets.expert_ids.iter() {
+                expert_files.read_expert(
+                    layer_idx,
+                    expert_id as usize,
+                    &mut blob_scratch,
+                )?;
+                let off = expert_id as usize * expert_size;
+                pool.upload_at(base_id, off, &blob_scratch)?;
+            }
+            base_id
+        }
+    };
 
     // `expert_slots[bi]` is the block index of `buckets.expert_ids[bi]`
     // within the layer's mmap buffer (`num_experts` blocks at

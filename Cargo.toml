@@ -42,6 +42,11 @@ static_assertions = "1.1"
 # the NSError on a failed command buffer. Already a transitive dep of
 # `metal`; declaring direct so we can use `msg_send!`.
 objc        = "0.2"
+# Total physical RAM detection for the decode-IO mode gate. We only
+# call `System::new().total_memory()` once at `RsCtx::open` — minimal
+# surface, but `sysinfo` is the well-known crate for this so we don't
+# hand-roll a `libc::sysctl` for one fact.
+sysinfo     = { version = "0.32", default-features = false, features = ["system"] }
 
 [profile.release]
 opt-level = 3

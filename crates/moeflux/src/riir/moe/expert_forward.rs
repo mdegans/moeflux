@@ -1009,13 +1009,17 @@ fn emit_batched_experts(
         use std::sync::atomic::{AtomicBool, Ordering};
         static LOGGED: AtomicBool = AtomicBool::new(false);
         if !LOGGED.swap(true, Ordering::Relaxed) {
+            // The buffer the kernel reads from is whatever the caller
+            // bound (mmap layer slice in Mmap mode, `data_synced` /
+            // `data_prefetch` slot in Pread mode); this log line is
+            // about the dispatch *shape*, not the IO source.
             eprintln!(
                 "[moe] expert dispatch: hidden_dim={} k={} v3_experts={} → {}",
                 v.hidden_dim, k, v3_experts.is_some(),
                 if v.hidden_dim <= 4096 && k <= 8 && v3_experts.is_some() {
-                    "batched mmap"
+                    "batched"
                 } else {
-                    "per-expert mmap (fallback)"
+                    "per-expert (fallback)"
                 },
             );
         }

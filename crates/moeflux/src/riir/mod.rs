@@ -347,6 +347,14 @@ pub struct RsCtx<B: Backend = MetalBackend> {
     /// pipeline for the GPU residual stream. Same kernel the
     /// linear-attn path uses internally.
     residual_add_pipe: Option<::metal::ComputePipelineState>,
+    /// Picked at [`Self::open`] by
+    /// [`io::expert_io_mode::select`]; consulted by `attach_to_device`
+    /// (skip residency-pin in pread mode), `MoeGraphScratch::new`
+    /// (allocate the prefill staging buffer in pread mode),
+    /// `moe_block_forward` (prefill branch), and
+    /// `moe_dispatch_per_token` (decode branch). Constant for the
+    /// session.
+    expert_io_mode: io::expert_io_mode::ExpertIoMode,
     // Future phases populate: vocab.
 }
 
@@ -467,7 +475,8 @@ impl RsCtx<MetalBackend> {
             .thread_name(|i| format!("moeflux-io-{}", i))
             .build()
             .map_err(|_| RsError::InitFailed)?;
-        let prefetch = PrefetchState::new(VARIANT.num_layers);
+        let expert_io_mode = io::expert_io_mode::select();
+        let prefetch = PrefetchState::new(VARIANT.num_layers, expert_io_mode);
         Ok(Self {
             wf,
             backend: None,
@@ -499,6 +508,7 @@ impl RsCtx<MetalBackend> {
             mla_residual_scratch: None,
             mla_norm_pipes: None,
             residual_add_pipe: None,
+            expert_io_mode,
         })
     }
 
@@ -1402,9 +1412,10 @@ impl RsCtx<MetalBackend> {
         // call). Expert I/O is unconditionally mmap as of
         // `pread_teardown_landed.md` (2026-05-20).
         {
+            let mode = self.expert_io_mode;
             let pool =
                 self.backend.as_mut().expect("just-set").pool_mut();
-            self.experts.attach_to_device(pool);
+            self.experts.attach_to_device(pool, mode);
         }
         // Prefill arc Phase 0b: register the GPU-resident KV cache for
         // every full-attn (GQA) layer into the pool, once, up front.
@@ -1463,11 +1474,12 @@ impl RsCtx<MetalBackend> {
         }
         if self.moe_graph_scratch.is_none() {
             let k_active = self.k_active;
+            let mode = self.expert_io_mode;
             let pool =
                 self.backend.as_mut().expect("just-set").pool_mut();
             self.moe_graph_scratch = Some(
                 attn::linear_attn_forward::MoeGraphScratch::new(
-                    pool, k_active,
+                    pool, k_active, mode,
                 ),
             );
         }
@@ -2578,17 +2590,25 @@ impl RsCtx<MetalBackend> {
             // N's GPU read of set `N % 2`. The encoder for layer N
             // reads from the same set this prefetch wrote to.
             let prefetch_set = layer_idx % 2;
-            if let Some(predicted) = prefetch.predict_for(layer_idx) {
-                let data_prefetch = moe_buffers
-                    .data_prefetch_slots_mut_array(buffer_pool, prefetch_set);
-                prefetch.dispatch(
-                    layer_idx,
-                    predicted,
-                    k_active,
-                    data_prefetch,
-                    io_pool,
-                    experts,
-                );
+            // Mmap mode skips the prefetch fire — the OS page cache +
+            // demand-fault already cover what the prefetch would pump,
+            // and a synchronous pread on top is wasted main-thread CPU
+            // (the original 2026-05-20 tearout finding). Pread mode
+            // (low-RAM variants whose working set exceeds page-cache
+            // capacity) fires it as before.
+            if prefetch.mode().is_pread() {
+                if let Some(predicted) = prefetch.predict_for(layer_idx) {
+                    let data_prefetch = moe_buffers
+                        .data_prefetch_slots_mut_array(buffer_pool, prefetch_set);
+                    prefetch.dispatch(
+                        layer_idx,
+                        predicted,
+                        k_active,
+                        data_prefetch,
+                        io_pool,
+                        experts,
+                    );
+                }
             }
 
             // Slice 5d-8: chain enabled for every non-last layer
