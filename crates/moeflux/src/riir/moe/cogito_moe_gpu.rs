@@ -41,10 +41,10 @@ use crate::riir::backend::gpu::dense_mlp_gpu::{
 };
 use crate::riir::io::embedding::bf16_to_f32;
 use crate::riir::moe::expert_forward::{
-    ExpertForwardError, MAX_K, MoeBuffers, gpu_batched_experts_encode_pre_staged,
+    ExpertForwardError, MoeBuffers, gpu_batched_experts_encode_mmap,
 };
 use crate::riir::io::expert_io::{ExpertFiles, ExpertIoError};
-use crate::riir::backend::MetalBufferPool;
+use crate::riir::backend::{BufferPool, MetalBufferPool};
 use crate::riir::backend::gpu::gpu_matvec::{BfMatvecPipelines, encode_bf16_matvec};
 use crate::riir::backend::gpu::metal::MetalContext;
 use crate::riir::moe::moe_router::{MoeRouterError, noaux_tc_router_cpu};
@@ -350,14 +350,12 @@ fn cogito_moe_layer_forward_gpu_inner(
     // `h_mid + moe + shared` produces exactly the residual
     // contribution. shared_gate_score is bound for the kernel
     // signature but the unscaled kernel ignores it.
-    let data_set_per_slot: [crate::riir::io::prefetch::SlotSource; MAX_K] = [crate::riir::io::prefetch::SlotSource::Synced; MAX_K];
-    // Borrow split: clone the &Buffer references (Metal buffers are
-    // Arc-like, clone is cheap retain) so the &mut bufs borrow into
-    // the pre-staged encoder doesn't conflict with the input refs.
-    // Pass the caller's input_buf directly (replaces bufs.input clone).
+    let bindings: Vec<(&metal::Buffer, u64)> = (0..k)
+        .map(|slot| (buffer_pool.handle(bufs.data_synced_id(slot)), 0u64))
+        .collect();
     let h_mid_clone: Buffer = bufs.h_mid_buffer(buffer_pool).clone();
     let shared_clone: Buffer = bufs.shared_out_buffer(buffer_pool).clone();
-    let cmdbuf = gpu_batched_experts_encode_pre_staged(
+    let cmdbuf = gpu_batched_experts_encode_mmap(
         metal,
         bufs,
         buffer_pool,
@@ -367,8 +365,7 @@ fn cogito_moe_layer_forward_gpu_inner(
         &shared_clone,
         &weights,
         /* shared_gate_score = */ 0.0,
-        &data_set_per_slot,
-        /* prefetch_set = */ 0,
+        &bindings,
         /* chain = */ None,
     )?;
     cmdbuf.commit();

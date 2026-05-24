@@ -45,7 +45,7 @@ use std::collections::VecDeque;
 
 use crate::riir::moe::expert_forward::{
     ChainToNormed, ExpertForwardError, ExpertPayload, MoeBuffers,
-    gpu_batched_experts_encode, gpu_batched_experts_encode_pre_staged,
+    gpu_batched_experts_encode, gpu_batched_experts_encode_mmap,
 };
 use crate::riir::backend::gpu::metal::{buffer_as_slice, MetalContext};
 use crate::riir::variants::VARIANT;
@@ -280,7 +280,7 @@ pub(crate) fn gpu_batched_experts_begin(
 /// finalize pass; if a caller needs that, it routes through the
 /// host-slice variant ([`gpu_batched_experts_begin`]).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn gpu_batched_experts_begin_pre_staged(
+pub(crate) fn gpu_batched_experts_begin_mmap(
     metal: &mut MetalContext,
     bufs: &mut MoeBuffers,
     buffer_pool: &MetalBufferPool,
@@ -292,14 +292,13 @@ pub(crate) fn gpu_batched_experts_begin_pre_staged(
     expert_weights: &[f32],
     shared_gate_score: f32,
     layer_idx: i32,
-    data_set_per_slot: &[crate::riir::io::prefetch::SlotSource; crate::riir::MAX_K],
-    prefetch_set: usize,
+    expert_bindings: &[(&metal::Buffer, u64)],
     chain: Option<ChainToNormed<'_>>,
 ) -> Result<(), DeferredError> {
     if ring.is_full() {
         return Err(DeferredError::RingFull);
     }
-    let cmd_buffer = gpu_batched_experts_encode_pre_staged(
+    let cmd_buffer = gpu_batched_experts_encode_mmap(
         metal,
         bufs,
         buffer_pool,
@@ -309,8 +308,7 @@ pub(crate) fn gpu_batched_experts_begin_pre_staged(
         shared_out,
         expert_weights,
         shared_gate_score,
-        data_set_per_slot,
-        prefetch_set,
+        expert_bindings,
         chain,
     )?;
     cmd_buffer.commit();

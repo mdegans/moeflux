@@ -131,7 +131,7 @@ use crate::riir::backend::buftype::{
 };
 use crate::riir::backend::{Backend, BufId, BufferPool, MetalBufferPool};
 use crate::riir::moe::deferred::{
-    gpu_batched_experts_begin, gpu_batched_experts_begin_pre_staged,
+    gpu_batched_experts_begin, gpu_batched_experts_begin_mmap,
     DeferredError,
 };
 use crate::riir::moe::expert_forward::{ChainToNormed, ExpertPayload, MoeBuffers};
@@ -1958,9 +1958,9 @@ pub(in crate::riir) fn moe_dispatch_per_token(
     deferred: &mut crate::riir::moe::deferred::DeferredRing,
     layer_idx: usize,
     expert_files: &ExpertFiles,
-    pool: &rayon::ThreadPool,
-    prefetch: &mut crate::riir::io::prefetch::PrefetchState,
-    prefetch_set: usize,
+    _pool: &rayon::ThreadPool,
+    _prefetch: &mut crate::riir::io::prefetch::PrefetchState,
+    _prefetch_set: usize,
     intermediates: &PostAttnIntermediates,
     gpu_combine: bool,
     chain_next_norm_off: Option<u64>,
@@ -1991,93 +1991,16 @@ pub(in crate::riir) fn moe_dispatch_per_token(
     let k = indices.len();
 
     if gpu_combine {
-        // Slice 5d-6b: speculative-prefetch state machine.
-        //
-        // 1. Wait for any in-flight prefetch targeting THIS layer.
-        // 2. For each slot, decide if the prefetch hit (read from
-        //    `data_prefetch[slot]`) or missed (need a sync pread
-        //    into `data_synced[slot]`).
-        // 3. Parallel sync-pread the missed slots via the io_pool.
-        // 4. Encode K-expert dispatch with per-slot SlotSource.
-        // 5. Record this layer's actual indices as the prediction
-        //    for the next token's same layer.
-        // 6. If not the last layer, fire async prefetch for layer
-        //    N+1 using the prediction we have for it.
-        use rayon::prelude::*;
-        use crate::riir::io::prefetch::SlotSource;
-        const MAX_K: usize = crate::riir::moe::expert_forward::MAX_K;
+        // Direct mmap path: GPU reads expert weights from mmap'd Metal
+        // buffers. No pread, no prefetch, no staging.
+        let bindings: Vec<(&metal::Buffer, u64)> = indices.iter()
+            .map(|&idx| {
+                expert_files
+                    .mmap_buffer_for_expert(layer_idx, idx as u32)
+                    .expect("mmap buffer missing for expert")
+            })
+            .collect();
 
-        // Step 1: drain any in-flight prefetch and check whether it
-        // was for this layer.
-        let prefetch_status = prefetch.wait_for(layer_idx);
-
-        // Step 2: per-slot hit/miss decision. Set-based, not
-        // position-locked — for each actual expert at slot `s`, scan
-        // the prefetched indices for a match and record the buffer
-        // index where it landed. The K active experts are picked by
-        // the router with no canonical ordering, so a position-locked
-        // match would fail even when the SET overlaps perfectly with
-        // last-token's experts.
-        let mut data_set_per_slot: [SlotSource; MAX_K] =
-            [SlotSource::Synced; MAX_K];
-        let mut hit_count: u64 = 0;
-        if let Some(status) = prefetch_status {
-            for slot in 0..k {
-                let actual = indices[slot];
-                for buf_idx in 0..status.k {
-                    if status.loaded_indices[buf_idx] == actual {
-                        data_set_per_slot[slot] =
-                            SlotSource::Prefetched(buf_idx);
-                        hit_count += 1;
-                        break;
-                    }
-                }
-            }
-        }
-        prefetch.record_outcome(hit_count, k as u64 - hit_count);
-
-        // Step 3: parallel sync-pread the misses into data_synced.
-        let mut dsts = moe.data_synced_slots_mut_array(buffer_pool);
-        let active = &mut dsts[..k];
-        pool.install(|| -> Result<(), crate::riir::io::expert_io::ExpertIoError> {
-            active
-                .par_iter_mut()
-                .enumerate()
-                .try_for_each(|(slot, dst)| {
-                    if data_set_per_slot[slot] == SlotSource::Synced {
-                        let expert_idx = indices[slot] as usize;
-                        expert_files
-                            .read_expert(layer_idx, expert_idx, *dst)
-                    } else {
-                        Ok(())
-                    }
-                })
-        })?;
-
-        // Step 5: record actuals (the prediction for the next
-        // token's same layer). Done before dispatch so it doesn't
-        // depend on the dispatch's success/failure path.
-        let mut actuals: [i32; MAX_K] = [0; MAX_K];
-        actuals[..k].copy_from_slice(&indices[..k]);
-        prefetch.record_actual(layer_idx, actuals);
-
-        // Step 4: encode K-expert dispatch with the per-slot mix.
-        // The prefetch for the *next* layer is NOT fired here — it
-        // lives in the per-layer loop in `step_internal`, after the
-        // drain of THIS layer's deferred dispatch. That ordering is
-        // load-bearing: firing the prefetch here would race with
-        // the in-flight GPU read of data_prefetch[slot] for the
-        // current layer's hits.
-        //
-        // Slice 5d-8 chain: when `chain_next_norm_off` is `Some`, the
-        // K-expert cmdbuf rebinds combine output to `buffers.input` and
-        // appends rms_norm_sum_sq + rms_norm_apply_bf16, leaving the
-        // next layer's normed input in `buffers.normed`. Allocated only
-        // when the chain is active so the borrow doesn't outlive the
-        // call. Pipelines are re-fetched here (cheap HashMap lookup +
-        // PSO clone); the original fused tail held them in locals from
-        // the pre-MoE cmdbuf encode, which is no longer in scope after
-        // the split.
         let chain_rms_pipes = if chain_next_norm_off.is_some() {
             Some(crate::riir::backend::gpu::gpu_norm::RmsNormBf16Pipelines {
                 sum: metal.pipeline("rms_norm_sum_sq")?.clone(),
@@ -2097,20 +2020,19 @@ pub(in crate::riir) fn moe_dispatch_per_token(
                 eps: RMS_NORM_EPS,
             })
         });
-        gpu_batched_experts_begin_pre_staged(
+        gpu_batched_experts_begin_mmap(
             metal,
             moe,
             buffer_pool,
             deferred,
             k as i32,
-            buffer_pool.handle(buffers.normed),     // h_post (post-attn-norm input)
-            buffer_pool.handle(buffers.h_mid),      // residual hidden (combine input)
-            buffer_pool.handle(buffers.shared_out), // shared FFN output (combine input)
+            buffer_pool.handle(buffers.normed),
+            buffer_pool.handle(buffers.h_mid),
+            buffer_pool.handle(buffers.shared_out),
             weights,
             shared_gate_score,
             layer_idx as i32,
-            &data_set_per_slot,
-            prefetch_set,
+            &bindings,
             chain,
         )?;
     } else {
