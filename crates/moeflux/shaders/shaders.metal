@@ -995,6 +995,146 @@ kernel void dequant_matvec_4bit_batched(
 
 
 // ============================================================================
+// Multi-expert batched matvec — separate buffers per expert
+//
+// Like dequant_matvec_4bit_v3 but processes K experts in a single
+// dispatch.  Each expert's weight blob is a separate Metal buffer
+// (mmap'd expert files).  Grid: num_row_tiles × k_active TGs.
+//
+// input_stride controls broadcast vs per-expert input:
+//   stride = 0:      all experts read x[0..in_dim]  (gate/up — shared input)
+//   stride = in_dim: expert k reads x[k*in_dim..]   (down — per-expert act)
+// ============================================================================
+
+kernel void dequant_matvec_4bit_v3_experts(
+    device const char* blob0   [[buffer(0)]],
+    device const char* blob1   [[buffer(1)]],
+    device const char* blob2   [[buffer(2)]],
+    device const char* blob3   [[buffer(3)]],
+    device const char* blob4   [[buffer(4)]],
+    device const char* blob5   [[buffer(5)]],
+    device const char* blob6   [[buffer(6)]],
+    device const char* blob7   [[buffer(7)]],
+    device const float* x      [[buffer(8)]],
+    device float*       out    [[buffer(9)]],
+    constant uint& out_dim       [[buffer(10)]],
+    constant uint& in_dim        [[buffer(11)]],
+    constant uint& group_size    [[buffer(12)]],
+    constant uint& w_byte_off    [[buffer(13)]],
+    constant uint& s_byte_off    [[buffer(14)]],
+    constant uint& b_byte_off    [[buffer(15)]],
+    constant uint& num_row_tiles [[buffer(16)]],
+    constant uint& k_active      [[buffer(17)]],
+    constant uint& input_stride  [[buffer(18)]],
+    uint tgid_flat  [[threadgroup_position_in_grid]],
+    uint lid        [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint expert_k = tgid_flat / num_row_tiles;
+    if (expert_k >= k_active) return;
+    uint row_tile = tgid_flat % num_row_tiles;
+    uint row = row_tile * ROWS_PER_TG + simd_group;
+    if (row >= out_dim) return;
+
+    // Select this expert's blob
+    device const char* blob;
+    switch (expert_k) {
+        case 0: blob = blob0; break;
+        case 1: blob = blob1; break;
+        case 2: blob = blob2; break;
+        case 3: blob = blob3; break;
+        case 4: blob = blob4; break;
+        case 5: blob = blob5; break;
+        case 6: blob = blob6; break;
+        default: blob = blob7; break;
+    }
+
+    uint packed_cols = in_dim / 8;
+    uint num_groups  = in_dim / group_size;
+
+    // Cache this expert's input slice
+    threadgroup float x_shared[4096];
+    device const float* x_k = x + expert_k * input_stride;
+    for (uint i = lid; i < in_dim; i += 256) {
+        x_shared[i] = x_k[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Point to this expert's weights for the requested projection
+    device const uint32_t* w_row =
+        (device const uint32_t*)(blob + w_byte_off) + row * packed_cols;
+    device const uint16_t* s_row =
+        (device const uint16_t*)(blob + s_byte_off) + row * num_groups;
+    device const uint16_t* b_row =
+        (device const uint16_t*)(blob + b_byte_off) + row * num_groups;
+
+    float acc = 0.0f;
+
+    for (uint col = simd_lane; col < packed_cols; col += 32) {
+        uint g = col / (group_size / 8);
+        float scale = bf16_to_f32(s_row[g]);
+        float bias  = bf16_to_f32(b_row[g]);
+
+        uint32_t packed = w_row[col];
+        uint x_base = col * 8;
+
+        float sx0 = scale * x_shared[x_base + 0];  float bx0 = bias * x_shared[x_base + 0];
+        float sx1 = scale * x_shared[x_base + 1];  float bx1 = bias * x_shared[x_base + 1];
+        float sx2 = scale * x_shared[x_base + 2];  float bx2 = bias * x_shared[x_base + 2];
+        float sx3 = scale * x_shared[x_base + 3];  float bx3 = bias * x_shared[x_base + 3];
+        float sx4 = scale * x_shared[x_base + 4];  float bx4 = bias * x_shared[x_base + 4];
+        float sx5 = scale * x_shared[x_base + 5];  float bx5 = bias * x_shared[x_base + 5];
+        float sx6 = scale * x_shared[x_base + 6];  float bx6 = bias * x_shared[x_base + 6];
+        float sx7 = scale * x_shared[x_base + 7];  float bx7 = bias * x_shared[x_base + 7];
+
+        acc += fma(float((packed >>  0) & 0xF), sx0, bx0);
+        acc += fma(float((packed >>  4) & 0xF), sx1, bx1);
+        acc += fma(float((packed >>  8) & 0xF), sx2, bx2);
+        acc += fma(float((packed >> 12) & 0xF), sx3, bx3);
+        acc += fma(float((packed >> 16) & 0xF), sx4, bx4);
+        acc += fma(float((packed >> 20) & 0xF), sx5, bx5);
+        acc += fma(float((packed >> 24) & 0xF), sx6, bx6);
+        acc += fma(float((packed >> 28) & 0xF), sx7, bx7);
+    }
+
+    float sum = simd_sum(acc);
+    if (simd_lane == 0) {
+        out[expert_k * out_dim + row] = sum;
+    }
+}
+
+
+// ============================================================================
+// Flat-buffer variant of moe_combine_residual
+//
+// Reads K expert outputs from a contiguous [K, dim] buffer instead of
+// 16 individually-bound per-slot buffers.
+// ============================================================================
+
+kernel void moe_combine_residual_flat(
+    device const float* h_mid       [[buffer(0)]],
+    device const float* shared_out  [[buffer(1)]],
+    device float*       hidden_out  [[buffer(2)]],
+    device const float* expert_out  [[buffer(3)]],
+    device const float* params      [[buffer(4)]],
+    constant uint&      dim         [[buffer(5)]],
+    constant uint&      K           [[buffer(6)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= dim) return;
+
+    float moe = 0.0f;
+    for (uint k = 0; k < K; k++) {
+        moe += params[k] * expert_out[k * dim + tid];
+    }
+
+    float shared_gate = 1.0f / (1.0f + exp(-params[16]));
+    hidden_out[tid] = h_mid[tid] + moe + shared_gate * shared_out[tid];
+}
+
+
+// ============================================================================
 // Kernel 2: SwiGLU activation
 // ============================================================================
 

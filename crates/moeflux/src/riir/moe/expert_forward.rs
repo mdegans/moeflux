@@ -374,6 +374,12 @@ pub struct MoeBuffers {
     up: [BufId<DeprecatedCogitoBuf>; MAX_K],
     act: [BufId<DeprecatedCogitoBuf>; MAX_K],
     out: [BufId<DeprecatedCogitoBuf>; MAX_K],
+    /// Flat [k_active, moe_intermediate] buffers for batched expert dispatch.
+    gate_flat: BufId<DeprecatedCogitoBuf>,
+    up_flat: BufId<DeprecatedCogitoBuf>,
+    act_flat: BufId<DeprecatedCogitoBuf>,
+    /// Flat [k_active, hidden_dim] buffer for batched expert down output.
+    out_flat: BufId<DeprecatedCogitoBuf>,
     input: BufId<DeprecatedCogitoBuf>,
     h_mid: BufId<DeprecatedCogitoBuf>,
     shared_out: BufId<DeprecatedCogitoBuf>,
@@ -469,6 +475,19 @@ impl MoeBuffers {
                     .expect("pool.alloc moe.out")
             },
         );
+        let k_max = v.num_experts_per_tok;
+        let gate_flat = pool
+            .alloc(k_max * v.moe_intermediate * f32_size, "moe.gate_flat", true)
+            .expect("pool.alloc moe.gate_flat");
+        let up_flat = pool
+            .alloc(k_max * v.moe_intermediate * f32_size, "moe.up_flat", true)
+            .expect("pool.alloc moe.up_flat");
+        let act_flat = pool
+            .alloc(k_max * v.moe_intermediate * f32_size, "moe.act_flat", true)
+            .expect("pool.alloc moe.act_flat");
+        let out_flat = pool
+            .alloc(k_max * v.hidden_dim * f32_size, "moe.out_flat", true)
+            .expect("pool.alloc moe.out_flat");
         let input: BufId<DeprecatedCogitoBuf> = pool
             .alloc(v.hidden_dim * f32_size, "moe.input", true)
             .expect("pool.alloc moe.input");
@@ -498,6 +517,10 @@ impl MoeBuffers {
             up,
             act,
             out,
+            gate_flat,
+            up_flat,
+            act_flat,
+            out_flat,
             input,
             h_mid,
             shared_out,
@@ -548,6 +571,21 @@ impl MoeBuffers {
         debug_assert!(slot < MAX_K);
         self.data_prefetch[set][slot]
     }
+    // -------- Flat buffer accessors (batched expert dispatch) --------
+
+    pub(crate) fn gate_flat_id(&self) -> BufId<DeprecatedCogitoBuf> {
+        self.gate_flat
+    }
+    pub(crate) fn up_flat_id(&self) -> BufId<DeprecatedCogitoBuf> {
+        self.up_flat
+    }
+    pub(crate) fn act_flat_id(&self) -> BufId<DeprecatedCogitoBuf> {
+        self.act_flat
+    }
+    pub(crate) fn out_flat_id(&self) -> BufId<DeprecatedCogitoBuf> {
+        self.out_flat
+    }
+
     // -------- &Buffer accessors via pool (imperative encoders) --------
 
     /// All per-slot data_synced buffers as disjoint `&mut [u8]` views
@@ -820,6 +858,8 @@ pub(crate) fn gpu_batched_experts_encode(
     } else {
         None
     };
+    let v3_experts = metal.pipeline("dequant_matvec_4bit_v3_experts").ok().cloned();
+    let combine_flat = metal.pipeline("moe_combine_residual_flat").ok().cloned();
 
     // Stage K expert blobs, the 18-float combine params, and host
     // inputs into bufs' own input/h_mid/shared_out — production skips
@@ -878,6 +918,8 @@ pub(crate) fn gpu_batched_experts_encode(
         &matvec,
         &swiglu,
         combine.as_ref(),
+        v3_experts.as_ref(),
+        combine_flat.as_ref(),
         bufs,
         buffer_pool,
         &input_buf,
@@ -940,15 +982,11 @@ pub(crate) fn gpu_batched_experts_encode_pre_staged(
     let matvec = MatvecPipelines::fetch(metal)?;
     let swiglu = metal.pipeline("swiglu_fused")?.clone();
     let combine = metal.pipeline(combine_kernel_name())?.clone();
+    let v3_experts = metal.pipeline("dequant_matvec_4bit_v3_experts").ok().cloned();
+    let combine_flat = metal.pipeline("moe_combine_residual_flat").ok().cloned();
 
-    // Only stage the 18-float combine params — bufs' data buffers are
-    // the caller's responsibility (data_synced via 5d-6a's parallel
-    // pread, data_prefetch via 5d-6b's async prefetch).
     {
         let buf = buffer_pool.handle(bufs.combine_params_id());
-        // SAFETY: same drain-before-stage discipline as the buf
-        // variant above — caller has waited on the previous layer's
-        // experts. Forwards to `buffer_as_mut_slice`.
         let params: &mut [f32] =
             unsafe { buffer_as_mut_slice::<f32>(buf, 18) };
         params.fill(0.0);
@@ -962,6 +1000,8 @@ pub(crate) fn gpu_batched_experts_encode_pre_staged(
         &matvec,
         &swiglu,
         Some(&combine),
+        v3_experts.as_ref(),
+        combine_flat.as_ref(),
         bufs,
         buffer_pool,
         input,
@@ -1029,6 +1069,8 @@ fn emit_batched_experts(
     matvec: &MatvecPipelines,
     swiglu: &ComputePipelineState,
     combine: Option<&ComputePipelineState>,
+    v3_experts: Option<&ComputePipelineState>,
+    combine_flat: Option<&ComputePipelineState>,
     bufs: &MoeBuffers,
     buffer_pool: &MetalBufferPool,
     input: &BufferRef,
@@ -1041,10 +1083,7 @@ fn emit_batched_experts(
     chain: Option<ChainToNormed<'_>>,
 ) {
     debug_assert!(prefetch_set < 2, "prefetch set index must be 0 or 1");
-    // Per-expert: Encoder A (gate+up — both read the shared `input`),
-    // Encoder B (SwiGLU then down). Two encoders per expert exposes
-    // GPU parallelism across slots; within an encoder the dispatches
-    // serialize by Metal's encoder-internal ordering.
+
     let pick = |slot: usize| -> &Buffer {
         let id = match data_set_per_slot[slot] {
             crate::riir::io::prefetch::SlotSource::Synced => bufs.data_synced_id(slot),
@@ -1054,82 +1093,136 @@ fn emit_batched_experts(
         };
         buffer_pool.handle(id)
     };
+
+    // Batched path: all K experts per projection in one dispatch.
+    // Requires hidden_dim ≤ 4096 (v3 x_shared limit) and k ≤ 8
+    // (kernel buffer slots). Falls through to per-expert loop otherwise.
+    let use_batched = v.hidden_dim <= 4096
+        && k <= 8
+        && v3_experts.is_some()
+        && combine_flat.is_some();
+
+    if use_batched {
+        let v3e = v3_experts.unwrap();
+        let expert_bufs: Vec<&Buffer> =
+            (0..k).map(|slot| pick(slot)).collect();
+        let gate_flat = buffer_pool.handle(bufs.gate_flat_id());
+        let up_flat = buffer_pool.handle(bufs.up_flat_id());
+        let act_flat = buffer_pool.handle(bufs.act_flat_id());
+        let out_flat = buffer_pool.handle(bufs.out_flat_id());
+        let group_size = GROUP_SIZE as u32;
+        let k_u32 = k as u32;
+
+        // Encoder 1: gate + up (shared input, two dispatches)
+        {
+            let enc = cmdbuf.new_compute_command_encoder();
+            encode_matvec_experts(
+                enc, v3e, &expert_bufs, input, gate_flat,
+                v.moe_intermediate as u32, v.hidden_dim as u32, group_size,
+                v.gate_w_off_4bit() as u32,
+                v.gate_s_off_4bit() as u32,
+                v.gate_b_off_4bit() as u32,
+                k_u32, 0,
+            );
+            encode_matvec_experts(
+                enc, v3e, &expert_bufs, input, up_flat,
+                v.moe_intermediate as u32, v.hidden_dim as u32, group_size,
+                v.up_w_off_4bit() as u32,
+                v.up_s_off_4bit() as u32,
+                v.up_b_off_4bit() as u32,
+                k_u32, 0,
+            );
+            enc.end_encoding();
+        }
+
+        // Encoder 2: SwiGLU over all K experts
+        {
+            let enc = cmdbuf.new_compute_command_encoder();
+            encode_swiglu_into_buf(
+                enc, swiglu, gate_flat, up_flat, act_flat,
+                k_u32 * v.moe_intermediate as u32,
+            );
+            enc.end_encoding();
+        }
+
+        // Encoder 3: down (per-expert input from act_flat) + combine
+        {
+            let enc = cmdbuf.new_compute_command_encoder();
+            encode_matvec_experts(
+                enc, v3e, &expert_bufs, act_flat, out_flat,
+                v.hidden_dim as u32, v.moe_intermediate as u32, group_size,
+                v.down_w_off_4bit() as u32,
+                v.down_s_off_4bit() as u32,
+                v.down_b_off_4bit() as u32,
+                k_u32, v.moe_intermediate as u32,
+            );
+            enc.end_encoding();
+        }
+
+        // Combine: flat variant
+        if let Some(cf) = combine_flat {
+            let moe_hidden_buf = buffer_pool.handle(bufs.moe_hidden_id());
+            let combine_out: &BufferRef = match chain.as_ref() {
+                Some(c) => c.combine_out,
+                None => moe_hidden_buf,
+            };
+            let combine_params_buf =
+                buffer_pool.handle(bufs.combine_params_id());
+            let enc = cmdbuf.new_compute_command_encoder();
+            encode_combine_flat(
+                enc, cf, h_mid, shared_out, combine_out,
+                out_flat, combine_params_buf,
+                v.hidden_dim as u32, k_u32,
+            );
+            enc.end_encoding();
+
+            if let Some(c) = chain {
+                encode_rms_norm_bf16_into(
+                    cmdbuf, c.pipes, c.combine_out, c.wf_buf,
+                    c.next_norm_off, c.chain_sum_sq, c.chain_normed,
+                    v.hidden_dim as u32, c.eps,
+                );
+            }
+        }
+        return;
+    }
+
+    // Fallback: per-expert loop (hidden_dim > 4096 or k > 8)
     for slot in 0..k {
         let weights_buf = pick(slot);
         let gate_buf = buffer_pool.handle(bufs.gate_id(slot));
         let up_buf = buffer_pool.handle(bufs.up_id(slot));
         let act_buf = buffer_pool.handle(bufs.act_id(slot));
         let out_buf = buffer_pool.handle(bufs.out_id(slot));
-        // Encoder A — gate + up
         {
             let enc = cmdbuf.new_compute_command_encoder();
-            // gate
             encode_matvec_into(
-                enc,
-                matvec,
-                weights_buf,
-                v.gate_w_off_4bit(),
-                v.gate_s_off_4bit(),
-                v.gate_b_off_4bit(),
-                input,
-                gate_buf,
-                v.moe_intermediate as u32,
-                v.hidden_dim as u32,
+                enc, matvec, weights_buf,
+                v.gate_w_off_4bit(), v.gate_s_off_4bit(), v.gate_b_off_4bit(),
+                input, gate_buf, v.moe_intermediate as u32, v.hidden_dim as u32,
             );
-            // up — same encoder, serialized after gate
             encode_matvec_into(
-                enc,
-                matvec,
-                weights_buf,
-                v.up_w_off_4bit(),
-                v.up_s_off_4bit(),
-                v.up_b_off_4bit(),
-                input,
-                up_buf,
-                v.moe_intermediate as u32,
-                v.hidden_dim as u32,
+                enc, matvec, weights_buf,
+                v.up_w_off_4bit(), v.up_s_off_4bit(), v.up_b_off_4bit(),
+                input, up_buf, v.moe_intermediate as u32, v.hidden_dim as u32,
             );
             enc.end_encoding();
         }
-
-        // Encoder B — SwiGLU + down
         {
             let enc = cmdbuf.new_compute_command_encoder();
             encode_swiglu_into_buf(
-                enc,
-                swiglu,
-                gate_buf,
-                up_buf,
-                act_buf,
+                enc, swiglu, gate_buf, up_buf, act_buf,
                 v.moe_intermediate as u32,
             );
             encode_matvec_into(
-                enc,
-                matvec,
-                weights_buf,
-                v.down_w_off_4bit(),
-                v.down_s_off_4bit(),
-                v.down_b_off_4bit(),
-                act_buf,
-                out_buf,
-                v.hidden_dim as u32,
-                v.moe_intermediate as u32,
+                enc, matvec, weights_buf,
+                v.down_w_off_4bit(), v.down_s_off_4bit(), v.down_b_off_4bit(),
+                act_buf, out_buf, v.hidden_dim as u32, v.moe_intermediate as u32,
             );
             enc.end_encoding();
         }
     }
 
-    // moe_combine_residual: 16 expert-output bindings regardless of K
-    // (kernel branches on K, unused slots have weight=0). Bind all
-    // MAX_K out buffers, weights via the params buffer. Skipped when
-    // `gpu_combine == false` — caller will run the equivalent on the
-    // CPU side after wait.
-    //
-    // Slice 5d-8: when `chain.is_some()`, the combine writes directly
-    // into the next layer's input buffer (`chain.combine_out`) instead
-    // of `bufs.moe_hidden`, and two more dispatches are appended to
-    // produce the next layer's normalized input (`chain.chain_normed`).
-    // Mirrors C's gpu_combine fast path (`infer.m:5677..5750`).
     if let Some(combine) = combine {
         let moe_hidden_buf = buffer_pool.handle(bufs.moe_hidden_id());
         let combine_out: &BufferRef = match chain.as_ref() {
@@ -1255,6 +1348,85 @@ fn encode_swiglu_into_buf(
     let num_tgs = (dim + 255) / 256;
     enc.dispatch_thread_groups(
         MTLSize::new(num_tgs as NSUInteger, 1, 1),
+        MTLSize::new(256, 1, 1),
+    );
+}
+
+/// Encode a multi-expert matvec into the given encoder.
+///
+/// All `k` experts' projection (gate, up, or down) in a single dispatch.
+/// Each expert reads from its own blob buffer; the projection within the
+/// blob is selected by `(w_byte_off, s_byte_off, b_byte_off)`.
+///
+/// `input_stride`:
+///   - 0: all experts share the same input (gate/up — broadcast)
+///   - in_dim: expert k reads `input[k * in_dim..]` (down — per-expert)
+fn encode_matvec_experts(
+    enc: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    expert_bufs: &[&Buffer],
+    input: &BufferRef,
+    output: &Buffer,
+    out_dim: u32,
+    in_dim: u32,
+    group_size: u32,
+    w_byte_off: u32,
+    s_byte_off: u32,
+    b_byte_off: u32,
+    k: u32,
+    input_stride: u32,
+) {
+    enc.set_compute_pipeline_state(pipeline);
+    for i in 0..8usize {
+        let buf = if i < expert_bufs.len() {
+            expert_bufs[i]
+        } else {
+            expert_bufs[0]
+        };
+        enc.set_buffer(i as NSUInteger, Some(buf), 0);
+    }
+    enc.set_buffer(8, Some(input), 0);
+    enc.set_buffer(9, Some(output), 0);
+    enc.set_bytes(10, 4, (&out_dim as *const u32).cast());
+    enc.set_bytes(11, 4, (&in_dim as *const u32).cast());
+    enc.set_bytes(12, 4, (&group_size as *const u32).cast());
+    enc.set_bytes(13, 4, (&w_byte_off as *const u32).cast());
+    enc.set_bytes(14, 4, (&s_byte_off as *const u32).cast());
+    enc.set_bytes(15, 4, (&b_byte_off as *const u32).cast());
+    let num_row_tiles = (out_dim + 7) / 8;
+    enc.set_bytes(16, 4, (&num_row_tiles as *const u32).cast());
+    enc.set_bytes(17, 4, (&k as *const u32).cast());
+    enc.set_bytes(18, 4, (&input_stride as *const u32).cast());
+    let total_tgs = num_row_tiles * k;
+    enc.dispatch_thread_groups(
+        MTLSize::new(total_tgs as NSUInteger, 1, 1),
+        MTLSize::new(256, 1, 1),
+    );
+}
+
+/// Encode the flat-buffer variant of moe_combine_residual.
+fn encode_combine_flat(
+    enc: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    h_mid: &BufferRef,
+    shared_out: &BufferRef,
+    hidden_out: &BufferRef,
+    expert_out_flat: &Buffer,
+    params: &Buffer,
+    dim: u32,
+    k: u32,
+) {
+    enc.set_compute_pipeline_state(pipeline);
+    enc.set_buffer(0, Some(h_mid), 0);
+    enc.set_buffer(1, Some(shared_out), 0);
+    enc.set_buffer(2, Some(hidden_out), 0);
+    enc.set_buffer(3, Some(expert_out_flat), 0);
+    enc.set_buffer(4, Some(params), 0);
+    enc.set_bytes(5, 4, (&dim as *const u32).cast());
+    enc.set_bytes(6, 4, (&k as *const u32).cast());
+    let tgs = (dim + 255) / 256;
+    enc.dispatch_thread_groups(
+        MTLSize::new(tgs as NSUInteger, 1, 1),
         MTLSize::new(256, 1, 1),
     );
 }
