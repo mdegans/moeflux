@@ -19,12 +19,10 @@
 //! All five live in this module because they're only used by the
 //! linear-attn forward and have no other consumers in the port.
 
-use metal::{
-    Buffer, CommandBufferRef, ComputePipelineState, MTLSize, NSUInteger,
-};
+use metal::{Buffer, CommandBufferRef, ComputePipelineState, MTLSize, NSUInteger};
 
 use crate::riir::backend::gpu::encoder::pipeline_bundle;
-use crate::riir::variants::{Variant, VARIANT};
+use crate::riir::variants::{VARIANT, Variant};
 
 pipeline_bundle! {
     /// All linear-attn pipelines pre-fetched. Used by the layer-forward

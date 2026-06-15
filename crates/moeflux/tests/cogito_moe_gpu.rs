@@ -20,21 +20,18 @@
 
 use std::path::Path;
 
-use moeflux::riir::moe::cogito_moe_gpu::{
-    cogito_moe_layer_forward_gpu, SharedExpertBuffers,
-};
-use moeflux::riir::backend::gpu::dense_mlp_gpu::DenseMlpPipelines;
-use moeflux::riir::MoeBuffers;
 use moeflux::riir::ExpertFiles;
-use moeflux::riir::backend::gpu::gpu_matvec::BfMatvecPipelines;
 use moeflux::riir::MetalContext;
-use moeflux::riir::moe::moe_cpu::deepseek_moe_cpu;
+use moeflux::riir::MoeBuffers;
 use moeflux::riir::MtlWeightBuf;
-use moeflux::riir::variants::VARIANT;
 use moeflux::riir::WeightFile;
+use moeflux::riir::backend::gpu::dense_mlp_gpu::DenseMlpPipelines;
+use moeflux::riir::backend::gpu::gpu_matvec::BfMatvecPipelines;
+use moeflux::riir::moe::cogito_moe_gpu::{SharedExpertBuffers, cogito_moe_layer_forward_gpu};
+use moeflux::riir::moe::moe_cpu::deepseek_moe_cpu;
+use moeflux::riir::variants::VARIANT;
 
-const ROOT: &str =
-    "/Volumes/Temp Backup/models/blallama/cogito-v2-671b";
+const ROOT: &str = "/Volumes/Temp Backup/models/blallama/cogito-v2-671b";
 
 #[test]
 #[ignore = "needs Cogito-V2 weights and packed_experts/ on /Volumes/Temp Backup"]
@@ -55,10 +52,8 @@ fn cogito_moe_layer3_gpu_matches_cpu() {
     let device = metal.device().clone();
     let mut bufs = MoeBuffers::new(&device);
     let shared_bufs = SharedExpertBuffers::new(&device);
-    let dense_pipes =
-        DenseMlpPipelines::fetch(&mut metal).expect("fetch DenseMlpPipelines");
-    let bf_pipes =
-        BfMatvecPipelines::fetch(&mut metal).expect("fetch BfMatvecPipelines");
+    let dense_pipes = DenseMlpPipelines::fetch(&mut metal).expect("fetch DenseMlpPipelines");
+    let bf_pipes = BfMatvecPipelines::fetch(&mut metal).expect("fetch BfMatvecPipelines");
     let wf_buf = MtlWeightBuf::wrap(&wf, &device);
 
     // ---- Synthetic input (sin pattern; same as moe_layer3_smoke) ----
@@ -70,8 +65,7 @@ fn cogito_moe_layer3_gpu_matches_cpu() {
     // ---- CPU oracle ----
     let mut out_cpu = vec![0.0f32; hidden_dim];
     let t0 = std::time::Instant::now();
-    deepseek_moe_cpu(&wf, &ef, layer_idx, &hidden, &mut out_cpu)
-        .expect("deepseek_moe_cpu");
+    deepseek_moe_cpu(&wf, &ef, layer_idx, &hidden, &mut out_cpu).expect("deepseek_moe_cpu");
     eprintln!(
         "[cogito-moe-gpu] CPU oracle in {:.3}s",
         t0.elapsed().as_secs_f64()
@@ -135,8 +129,11 @@ fn cogito_moe_layer3_gpu_matches_cpu() {
 
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len());
-    let dot: f64 =
-        a.iter().zip(b.iter()).map(|(&x, &y)| x as f64 * y as f64).sum();
+    let dot: f64 = a
+        .iter()
+        .zip(b.iter())
+        .map(|(&x, &y)| x as f64 * y as f64)
+        .sum();
     let na: f64 = a.iter().map(|&x| (x as f64).powi(2)).sum();
     let nb: f64 = b.iter().map(|&x| (x as f64).powi(2)).sum();
     (dot / (na.sqrt() * nb.sqrt())) as f32

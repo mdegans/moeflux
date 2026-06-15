@@ -32,15 +32,11 @@
 use std::fs;
 use std::path::PathBuf;
 
-use moeflux::riir::backend::buftype::{
-    BufId, HiddenBuf, OProjOutBuf, ResidualBuf,
-};
-use moeflux::riir::backend::{
-    Backend, BufferPool, CpuBackend, Graph, MetalBackend, Op, WeightRef,
-};
 use moeflux::riir::MetalContext;
 use moeflux::riir::MtlWeightBuf;
 use moeflux::riir::WeightFile;
+use moeflux::riir::backend::buftype::{BufId, HiddenBuf, OProjOutBuf, ResidualBuf};
+use moeflux::riir::backend::{Backend, BufferPool, CpuBackend, Graph, MetalBackend, Op, WeightRef};
 
 /// Cosine-similarity floor for Op-level diffs. Same as
 /// `batched_diff_oracle.rs`'s COSINE_FLOOR.
@@ -98,11 +94,8 @@ impl SyntheticWf {
     /// in order with no padding; manifest offsets are computed
     /// automatically.
     fn build(test_name: &str, tensors: &[(&str, &str, i32, Vec<usize>, Vec<u8>)]) -> Self {
-        let dir = std::env::temp_dir().join(format!(
-            "moeflux-s7-{}-{}",
-            test_name,
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("moeflux-s7-{}-{}", test_name, std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("mkdir tempdir");
         let bin_path = dir.join("model_weights.bin");
@@ -161,13 +154,7 @@ fn dummy_weight_file(test_name: &str) -> SyntheticWf {
     let dummy_bf16_bytes = vec![0u8; 64]; // 32 bf16 elements
     SyntheticWf::build(
         test_name,
-        &[(
-            "dummy.weight",
-            "BF16",
-            0,
-            vec![32],
-            dummy_bf16_bytes,
-        )],
+        &[("dummy.weight", "BF16", 0, vec![32], dummy_bf16_bytes)],
     )
 }
 
@@ -273,8 +260,7 @@ fn graph_metal_matches_cpu_rope_n_tokens() {
     let total = (n_tokens * num_heads * head_dim) as usize;
 
     let mut rng = Rng::new(0xA3B_C0DE);
-    let x_data: Vec<f32> =
-        (0..total).map(|_| rng.next_f32_unit()).collect();
+    let x_data: Vec<f32> = (0..total).map(|_| rng.next_f32_unit()).collect();
 
     // Vanilla RoPE frequency table: inv_freq[i] = 1/theta^(2i/rotary_dim).
     // theta = variants::ROPE_THETA for the a3b variant (1e7).
@@ -287,8 +273,7 @@ fn graph_metal_matches_cpu_rope_n_tokens() {
     let mut cpu_wf = dummy_weight_file("rope_cpu");
     let mut cpu = CpuBackend::new(cpu_wf.take());
     let cpu_x = cpu.pool_mut().alloc(total * 4, "x", false).unwrap();
-    let cpu_freq =
-        cpu.pool_mut().alloc(half * 4, "inv_freq", false).unwrap();
+    let cpu_freq = cpu.pool_mut().alloc(half * 4, "inv_freq", false).unwrap();
     cpu.pool_mut().upload(cpu_x, bytes_of_f32(&x_data)).unwrap();
     cpu.pool_mut()
         .upload(cpu_freq, bytes_of_f32(&inv_freq))
@@ -315,11 +300,9 @@ fn graph_metal_matches_cpu_rope_n_tokens() {
     let wf_ref = gpu_wf.wf.as_ref().unwrap();
     let wf_buf = MtlWeightBuf::wrap(wf_ref, metal_ctx.device());
     let _ = gpu_wf.take();
-    let mut gpu =
-        MetalBackend::new(metal_ctx, wf_buf).expect("MetalBackend::new");
+    let mut gpu = MetalBackend::new(metal_ctx, wf_buf).expect("MetalBackend::new");
     let gpu_x = gpu.pool_mut().alloc(total * 4, "x", false).unwrap();
-    let gpu_freq =
-        gpu.pool_mut().alloc(half * 4, "inv_freq", false).unwrap();
+    let gpu_freq = gpu.pool_mut().alloc(half * 4, "inv_freq", false).unwrap();
     gpu.pool_mut().upload(gpu_x, bytes_of_f32(&x_data)).unwrap();
     gpu.pool_mut()
         .upload(gpu_freq, bytes_of_f32(&inv_freq))
@@ -364,13 +347,10 @@ fn graph_metal_matches_cpu_rope_n_tokens() {
     let mut tail_max_diff = 0.0f32;
     for t in 0..n_tokens as usize {
         for h in 0..num_heads as usize {
-            let base = t * num_heads as usize * head_dim as usize
-                + h * head_dim as usize;
+            let base = t * num_heads as usize * head_dim as usize + h * head_dim as usize;
             for c in rotary_dim as usize..head_dim as usize {
-                let d_cpu =
-                    (cpu_out_f32[base + c] - x_data[base + c]).abs();
-                let d_gpu =
-                    (gpu_out_f32[base + c] - x_data[base + c]).abs();
+                let d_cpu = (cpu_out_f32[base + c] - x_data[base + c]).abs();
+                let d_gpu = (gpu_out_f32[base + c] - x_data[base + c]).abs();
                 tail_max_diff = tail_max_diff.max(d_cpu).max(d_gpu);
             }
         }
@@ -437,12 +417,9 @@ fn check_sdpa_causal_tiled(heads_per_kv: u32) {
     let softmax_scale = 1.0f32 / (head_dim as f32).sqrt();
 
     let mut rng = Rng::new(0x5D9A_0000 + heads_per_kv as u64);
-    let q_data: Vec<f32> =
-        (0..q_total).map(|_| rng.next_f32_unit()).collect();
-    let k_data: Vec<f32> =
-        (0..kv_total).map(|_| rng.next_f32_unit()).collect();
-    let v_data: Vec<f32> =
-        (0..kv_total).map(|_| rng.next_f32_unit()).collect();
+    let q_data: Vec<f32> = (0..q_total).map(|_| rng.next_f32_unit()).collect();
+    let k_data: Vec<f32> = (0..kv_total).map(|_| rng.next_f32_unit()).collect();
+    let v_data: Vec<f32> = (0..kv_total).map(|_| rng.next_f32_unit()).collect();
 
     let build = |op_q, op_k, op_v, op_out| Op::SdpaCausalTiled {
         label: "test_sdpa",
@@ -466,8 +443,7 @@ fn check_sdpa_causal_tiled(heads_per_kv: u32) {
     let cpu_q = cpu.pool_mut().alloc(q_total * 4, "q", false).unwrap();
     let cpu_k = cpu.pool_mut().alloc(kv_total * 4, "k", false).unwrap();
     let cpu_v = cpu.pool_mut().alloc(kv_total * 4, "v", false).unwrap();
-    let cpu_out =
-        cpu.pool_mut().alloc(q_total * 4, "out", false).unwrap();
+    let cpu_out = cpu.pool_mut().alloc(q_total * 4, "out", false).unwrap();
     cpu.pool_mut().upload(cpu_q, bytes_of_f32(&q_data)).unwrap();
     cpu.pool_mut().upload(cpu_k, bytes_of_f32(&k_data)).unwrap();
     cpu.pool_mut().upload(cpu_v, bytes_of_f32(&v_data)).unwrap();
@@ -484,13 +460,11 @@ fn check_sdpa_causal_tiled(heads_per_kv: u32) {
     let wf_ref = gpu_wf.wf.as_ref().unwrap();
     let wf_buf = MtlWeightBuf::wrap(wf_ref, metal_ctx.device());
     let _ = gpu_wf.take();
-    let mut gpu =
-        MetalBackend::new(metal_ctx, wf_buf).expect("MetalBackend::new");
+    let mut gpu = MetalBackend::new(metal_ctx, wf_buf).expect("MetalBackend::new");
     let gpu_q = gpu.pool_mut().alloc(q_total * 4, "q", false).unwrap();
     let gpu_k = gpu.pool_mut().alloc(kv_total * 4, "k", false).unwrap();
     let gpu_v = gpu.pool_mut().alloc(kv_total * 4, "v", false).unwrap();
-    let gpu_out =
-        gpu.pool_mut().alloc(q_total * 4, "out", false).unwrap();
+    let gpu_out = gpu.pool_mut().alloc(q_total * 4, "out", false).unwrap();
     gpu.pool_mut().upload(gpu_q, bytes_of_f32(&q_data)).unwrap();
     gpu.pool_mut().upload(gpu_k, bytes_of_f32(&k_data)).unwrap();
     gpu.pool_mut().upload(gpu_v, bytes_of_f32(&v_data)).unwrap();
@@ -551,17 +525,14 @@ fn graph_metal_matches_cpu_sigmoid_gate_n_tokens() {
     let total = (n_tokens * dim) as usize;
 
     let mut rng = Rng::new(0x516_0A7E);
-    let x_data: Vec<f32> =
-        (0..total).map(|_| rng.next_f32_unit()).collect();
-    let gate_data: Vec<f32> =
-        (0..total).map(|_| rng.next_f32_unit()).collect();
+    let x_data: Vec<f32> = (0..total).map(|_| rng.next_f32_unit()).collect();
+    let gate_data: Vec<f32> = (0..total).map(|_| rng.next_f32_unit()).collect();
 
     // CPU path
     let mut cpu_wf = dummy_weight_file("sigmoid_gate_cpu");
     let mut cpu = CpuBackend::new(cpu_wf.take());
     let cpu_x = cpu.pool_mut().alloc(total * 4, "x", false).unwrap();
-    let cpu_gate =
-        cpu.pool_mut().alloc(total * 4, "gate", false).unwrap();
+    let cpu_gate = cpu.pool_mut().alloc(total * 4, "gate", false).unwrap();
     cpu.pool_mut().upload(cpu_x, bytes_of_f32(&x_data)).unwrap();
     cpu.pool_mut()
         .upload(cpu_gate, bytes_of_f32(&gate_data))
@@ -585,11 +556,9 @@ fn graph_metal_matches_cpu_sigmoid_gate_n_tokens() {
     let wf_ref = gpu_wf.wf.as_ref().unwrap();
     let wf_buf = MtlWeightBuf::wrap(wf_ref, metal_ctx.device());
     let _ = gpu_wf.take();
-    let mut gpu =
-        MetalBackend::new(metal_ctx, wf_buf).expect("MetalBackend::new");
+    let mut gpu = MetalBackend::new(metal_ctx, wf_buf).expect("MetalBackend::new");
     let gpu_x = gpu.pool_mut().alloc(total * 4, "x", false).unwrap();
-    let gpu_gate =
-        gpu.pool_mut().alloc(total * 4, "gate", false).unwrap();
+    let gpu_gate = gpu.pool_mut().alloc(total * 4, "gate", false).unwrap();
     gpu.pool_mut().upload(gpu_x, bytes_of_f32(&x_data)).unwrap();
     gpu.pool_mut()
         .upload(gpu_gate, bytes_of_f32(&gate_data))
@@ -651,13 +620,11 @@ fn graph_metal_matches_cpu_split_q_gate() {
     let n_tokens: u32 = 8;
     let num_heads: u32 = 16;
     let head_dim: u32 = 256;
-    let q_proj_total =
-        (n_tokens * num_heads * 2 * head_dim) as usize;
+    let q_proj_total = (n_tokens * num_heads * 2 * head_dim) as usize;
     let out_total = (n_tokens * num_heads * head_dim) as usize;
 
     let mut rng = Rng::new(0x59_6A7E);
-    let q_proj_data: Vec<f32> =
-        (0..q_proj_total).map(|_| rng.next_f32_unit()).collect();
+    let q_proj_data: Vec<f32> = (0..q_proj_total).map(|_| rng.next_f32_unit()).collect();
 
     let build = |qp, qo, go| Op::SplitQGate {
         label: "test_split_q_gate",
@@ -676,8 +643,7 @@ fn graph_metal_matches_cpu_split_q_gate() {
         .pool_mut()
         .alloc(q_proj_total * 4, "q_proj", false)
         .unwrap();
-    let cpu_qo =
-        cpu.pool_mut().alloc(out_total * 4, "q_out", false).unwrap();
+    let cpu_qo = cpu.pool_mut().alloc(out_total * 4, "q_out", false).unwrap();
     let cpu_go = cpu
         .pool_mut()
         .alloc(out_total * 4, "gate_out", false)
@@ -701,14 +667,12 @@ fn graph_metal_matches_cpu_split_q_gate() {
     let wf_ref = gpu_wf.wf.as_ref().unwrap();
     let wf_buf = MtlWeightBuf::wrap(wf_ref, metal_ctx.device());
     let _ = gpu_wf.take();
-    let mut gpu =
-        MetalBackend::new(metal_ctx, wf_buf).expect("MetalBackend::new");
+    let mut gpu = MetalBackend::new(metal_ctx, wf_buf).expect("MetalBackend::new");
     let gpu_qp = gpu
         .pool_mut()
         .alloc(q_proj_total * 4, "q_proj", false)
         .unwrap();
-    let gpu_qo =
-        gpu.pool_mut().alloc(out_total * 4, "q_out", false).unwrap();
+    let gpu_qo = gpu.pool_mut().alloc(out_total * 4, "q_out", false).unwrap();
     let gpu_go = gpu
         .pool_mut()
         .alloc(out_total * 4, "gate_out", false)
@@ -787,8 +751,7 @@ fn check_rms_norm_per_head(num_heads: u32) {
     let total = (n_tokens * num_heads * head_dim) as usize;
 
     let mut rng = Rng::new(0x12_4D ^ num_heads as u64);
-    let x_data: Vec<f32> =
-        (0..total).map(|_| rng.next_f32_unit()).collect();
+    let x_data: Vec<f32> = (0..total).map(|_| rng.next_f32_unit()).collect();
     // bf16 weight, head_dim long, ~1.0 (avoid NaN/inf exponents).
     let mut weight_bytes = vec![0u8; head_dim as usize * 2];
     for chunk in weight_bytes.chunks_exact_mut(2) {
@@ -815,8 +778,7 @@ fn check_rms_norm_per_head(num_heads: u32) {
     };
 
     // CPU path
-    let mut cpu_wf =
-        SyntheticWf::build("rms_norm_per_head_cpu", tensors);
+    let mut cpu_wf = SyntheticWf::build("rms_norm_per_head_cpu", tensors);
     let weight_off = {
         let wf = cpu_wf.wf.as_ref().unwrap();
         wf.tensor_info("q_norm.weight").unwrap().offset as u64
@@ -833,14 +795,12 @@ fn check_rms_norm_per_head(num_heads: u32) {
     let cpu_out_f32 = f32_of_bytes(&cpu_out_bytes);
 
     // GPU path
-    let mut gpu_wf =
-        SyntheticWf::build("rms_norm_per_head_gpu", tensors);
+    let mut gpu_wf = SyntheticWf::build("rms_norm_per_head_gpu", tensors);
     let metal_ctx = MetalContext::new().expect("MetalContext::new");
     let wf_ref = gpu_wf.wf.as_ref().unwrap();
     let wf_buf = MtlWeightBuf::wrap(wf_ref, metal_ctx.device());
     let _ = gpu_wf.take();
-    let mut gpu =
-        MetalBackend::new(metal_ctx, wf_buf).expect("MetalBackend::new");
+    let mut gpu = MetalBackend::new(metal_ctx, wf_buf).expect("MetalBackend::new");
     let gpu_x = gpu.pool_mut().alloc(total * 4, "x", false).unwrap();
     gpu.pool_mut().upload(gpu_x, bytes_of_f32(&x_data)).unwrap();
     let mut g_gpu = Graph::new();
@@ -897,14 +857,11 @@ fn graph_metal_matches_cpu_kv_cache_append() {
     let cache_rows: u32 = 16;
     let src_total = (n_tokens * kv_dim) as usize;
     let cache_total = (cache_rows * kv_dim) as usize;
-    let win = (kv_start * kv_dim) as usize
-        ..((kv_start + n_tokens) * kv_dim) as usize;
+    let win = (kv_start * kv_dim) as usize..((kv_start + n_tokens) * kv_dim) as usize;
 
     let mut rng = Rng::new(0x6CA_C7E);
-    let k_data: Vec<f32> =
-        (0..src_total).map(|_| rng.next_f32_unit()).collect();
-    let v_data: Vec<f32> =
-        (0..src_total).map(|_| rng.next_f32_unit()).collect();
+    let k_data: Vec<f32> = (0..src_total).map(|_| rng.next_f32_unit()).collect();
+    let v_data: Vec<f32> = (0..src_total).map(|_| rng.next_f32_unit()).collect();
 
     let build = |ks, vs, kc, vc| Op::KvCacheAppendNTokens {
         label: "test_kv_append",
@@ -920,10 +877,8 @@ fn graph_metal_matches_cpu_kv_cache_append() {
     // CPU path — cache buffers start zeroed (pool.alloc zero-fills).
     let mut cpu_wf = dummy_weight_file("kv_append_cpu");
     let mut cpu = CpuBackend::new(cpu_wf.take());
-    let cpu_ks =
-        cpu.pool_mut().alloc(src_total * 4, "k_src", false).unwrap();
-    let cpu_vs =
-        cpu.pool_mut().alloc(src_total * 4, "v_src", false).unwrap();
+    let cpu_ks = cpu.pool_mut().alloc(src_total * 4, "k_src", false).unwrap();
+    let cpu_vs = cpu.pool_mut().alloc(src_total * 4, "v_src", false).unwrap();
     let cpu_kc = cpu
         .pool_mut()
         .alloc(cache_total * 4, "k_cache", false)
@@ -932,8 +887,12 @@ fn graph_metal_matches_cpu_kv_cache_append() {
         .pool_mut()
         .alloc(cache_total * 4, "v_cache", false)
         .unwrap();
-    cpu.pool_mut().upload(cpu_ks, bytes_of_f32(&k_data)).unwrap();
-    cpu.pool_mut().upload(cpu_vs, bytes_of_f32(&v_data)).unwrap();
+    cpu.pool_mut()
+        .upload(cpu_ks, bytes_of_f32(&k_data))
+        .unwrap();
+    cpu.pool_mut()
+        .upload(cpu_vs, bytes_of_f32(&v_data))
+        .unwrap();
     let mut g_cpu = Graph::new();
     g_cpu.push(build(cpu_ks, cpu_vs, cpu_kc, cpu_vc));
     cpu.execute(&g_cpu, "diff_oracle").unwrap();
@@ -950,12 +909,9 @@ fn graph_metal_matches_cpu_kv_cache_append() {
     let wf_ref = gpu_wf.wf.as_ref().unwrap();
     let wf_buf = MtlWeightBuf::wrap(wf_ref, metal_ctx.device());
     let _ = gpu_wf.take();
-    let mut gpu =
-        MetalBackend::new(metal_ctx, wf_buf).expect("MetalBackend::new");
-    let gpu_ks =
-        gpu.pool_mut().alloc(src_total * 4, "k_src", false).unwrap();
-    let gpu_vs =
-        gpu.pool_mut().alloc(src_total * 4, "v_src", false).unwrap();
+    let mut gpu = MetalBackend::new(metal_ctx, wf_buf).expect("MetalBackend::new");
+    let gpu_ks = gpu.pool_mut().alloc(src_total * 4, "k_src", false).unwrap();
+    let gpu_vs = gpu.pool_mut().alloc(src_total * 4, "v_src", false).unwrap();
     let gpu_kc = gpu
         .pool_mut()
         .alloc(cache_total * 4, "k_cache", false)
@@ -964,8 +920,12 @@ fn graph_metal_matches_cpu_kv_cache_append() {
         .pool_mut()
         .alloc(cache_total * 4, "v_cache", false)
         .unwrap();
-    gpu.pool_mut().upload(gpu_ks, bytes_of_f32(&k_data)).unwrap();
-    gpu.pool_mut().upload(gpu_vs, bytes_of_f32(&v_data)).unwrap();
+    gpu.pool_mut()
+        .upload(gpu_ks, bytes_of_f32(&k_data))
+        .unwrap();
+    gpu.pool_mut()
+        .upload(gpu_vs, bytes_of_f32(&v_data))
+        .unwrap();
     let mut g_gpu = Graph::new();
     g_gpu.push(build(gpu_ks, gpu_vs, gpu_kc, gpu_vc));
     gpu.execute(&g_gpu, "diff_oracle").unwrap();
@@ -1022,11 +982,24 @@ fn graph_metal_matches_cpu_swiglu() {
     // CPU
     let mut cpu_wf = dummy_weight_file("swiglu_cpu");
     let mut cpu = CpuBackend::new(cpu_wf.take());
-    let cpu_gate = cpu.pool_mut().alloc(total as usize * 4, "gate", false).unwrap();
-    let cpu_up = cpu.pool_mut().alloc(total as usize * 4, "up", false).unwrap();
-    let cpu_out = cpu.pool_mut().alloc(total as usize * 4, "out", false).unwrap();
-    cpu.pool_mut().upload(cpu_gate, bytes_of_f32(&gate_data)).unwrap();
-    cpu.pool_mut().upload(cpu_up, bytes_of_f32(&up_data)).unwrap();
+    let cpu_gate = cpu
+        .pool_mut()
+        .alloc(total as usize * 4, "gate", false)
+        .unwrap();
+    let cpu_up = cpu
+        .pool_mut()
+        .alloc(total as usize * 4, "up", false)
+        .unwrap();
+    let cpu_out = cpu
+        .pool_mut()
+        .alloc(total as usize * 4, "out", false)
+        .unwrap();
+    cpu.pool_mut()
+        .upload(cpu_gate, bytes_of_f32(&gate_data))
+        .unwrap();
+    cpu.pool_mut()
+        .upload(cpu_up, bytes_of_f32(&up_data))
+        .unwrap();
     let mut g_cpu = Graph::new();
     g_cpu.push(Op::SwigluFusedBatched {
         label: "test_swiglu",
@@ -1047,11 +1020,24 @@ fn graph_metal_matches_cpu_swiglu() {
     let wf_buf = MtlWeightBuf::wrap(wf_ref, metal_ctx.device());
     let _ = gpu_wf.take();
     let mut gpu = MetalBackend::new(metal_ctx, wf_buf).expect("MetalBackend::new");
-    let gpu_gate = gpu.pool_mut().alloc(total as usize * 4, "gate", false).unwrap();
-    let gpu_up = gpu.pool_mut().alloc(total as usize * 4, "up", false).unwrap();
-    let gpu_out = gpu.pool_mut().alloc(total as usize * 4, "out", false).unwrap();
-    gpu.pool_mut().upload(gpu_gate, bytes_of_f32(&gate_data)).unwrap();
-    gpu.pool_mut().upload(gpu_up, bytes_of_f32(&up_data)).unwrap();
+    let gpu_gate = gpu
+        .pool_mut()
+        .alloc(total as usize * 4, "gate", false)
+        .unwrap();
+    let gpu_up = gpu
+        .pool_mut()
+        .alloc(total as usize * 4, "up", false)
+        .unwrap();
+    let gpu_out = gpu
+        .pool_mut()
+        .alloc(total as usize * 4, "out", false)
+        .unwrap();
+    gpu.pool_mut()
+        .upload(gpu_gate, bytes_of_f32(&gate_data))
+        .unwrap();
+    gpu.pool_mut()
+        .upload(gpu_up, bytes_of_f32(&up_data))
+        .unwrap();
     let mut g_gpu = Graph::new();
     g_gpu.push(Op::SwigluFusedBatched {
         label: "test_swiglu",
@@ -1102,10 +1088,21 @@ fn graph_metal_matches_cpu_moe_router_normalize() {
     // CPU
     let mut cpu_wf = dummy_weight_file("router_cpu");
     let mut cpu = CpuBackend::new(cpu_wf.take());
-    let cpu_l = cpu.pool_mut().alloc(logits_data.len() * 4, "logits", false).unwrap();
-    let cpu_i = cpu.pool_mut().alloc((n_tokens * k) as usize * 4, "idx", false).unwrap();
-    let cpu_w_buf = cpu.pool_mut().alloc((n_tokens * k) as usize * 4, "w", false).unwrap();
-    cpu.pool_mut().upload(cpu_l, bytes_of_f32(&logits_data)).unwrap();
+    let cpu_l = cpu
+        .pool_mut()
+        .alloc(logits_data.len() * 4, "logits", false)
+        .unwrap();
+    let cpu_i = cpu
+        .pool_mut()
+        .alloc((n_tokens * k) as usize * 4, "idx", false)
+        .unwrap();
+    let cpu_w_buf = cpu
+        .pool_mut()
+        .alloc((n_tokens * k) as usize * 4, "w", false)
+        .unwrap();
+    cpu.pool_mut()
+        .upload(cpu_l, bytes_of_f32(&logits_data))
+        .unwrap();
     let mut g_cpu = Graph::new();
     g_cpu.push(Op::MoeSoftmaxTopK {
         label: "topk",
@@ -1139,10 +1136,21 @@ fn graph_metal_matches_cpu_moe_router_normalize() {
     let wf_buf = MtlWeightBuf::wrap(gpu_wf.wf.as_ref().unwrap(), metal_ctx.device());
     let _ = gpu_wf.take();
     let mut gpu = MetalBackend::new(metal_ctx, wf_buf).unwrap();
-    let gpu_l = gpu.pool_mut().alloc(logits_data.len() * 4, "logits", false).unwrap();
-    let gpu_i = gpu.pool_mut().alloc((n_tokens * k) as usize * 4, "idx", false).unwrap();
-    let gpu_w_buf = gpu.pool_mut().alloc((n_tokens * k) as usize * 4, "w", false).unwrap();
-    gpu.pool_mut().upload(gpu_l, bytes_of_f32(&logits_data)).unwrap();
+    let gpu_l = gpu
+        .pool_mut()
+        .alloc(logits_data.len() * 4, "logits", false)
+        .unwrap();
+    let gpu_i = gpu
+        .pool_mut()
+        .alloc((n_tokens * k) as usize * 4, "idx", false)
+        .unwrap();
+    let gpu_w_buf = gpu
+        .pool_mut()
+        .alloc((n_tokens * k) as usize * 4, "w", false)
+        .unwrap();
+    gpu.pool_mut()
+        .upload(gpu_l, bytes_of_f32(&logits_data))
+        .unwrap();
     let mut g_gpu = Graph::new();
     g_gpu.push(Op::MoeSoftmaxTopK {
         label: "topk",
@@ -1239,8 +1247,7 @@ fn graph_metal_matches_cpu_moe_combine() {
     let mut rng = Rng::new(0xA3B_C0FFEE);
     let h_mid_data: Vec<f32> = (0..total).map(|_| rng.next_f32_unit()).collect();
     let moe_sum_data: Vec<f32> = (0..total).map(|_| rng.next_f32_unit()).collect();
-    let shared_out_data: Vec<f32> =
-        (0..total).map(|_| rng.next_f32_unit()).collect();
+    let shared_out_data: Vec<f32> = (0..total).map(|_| rng.next_f32_unit()).collect();
     // Spread the gate across the sigmoid's interesting range.
     let shared_gate_data: Vec<f32> = (0..n_tokens as usize)
         .map(|_| rng.next_f32_unit() * 4.0)
@@ -1266,15 +1273,24 @@ fn graph_metal_matches_cpu_moe_combine() {
     let mut cpu = CpuBackend::new(cpu_wf.take());
     let cpu_h_mid = cpu.pool_mut().alloc(total * 4, "h_mid", false).unwrap();
     let cpu_moe_sum = cpu.pool_mut().alloc(total * 4, "moe_sum", false).unwrap();
-    let cpu_shared_out =
-        cpu.pool_mut().alloc(total * 4, "shared_out", false).unwrap();
+    let cpu_shared_out = cpu
+        .pool_mut()
+        .alloc(total * 4, "shared_out", false)
+        .unwrap();
     let cpu_shared_gate = cpu
         .pool_mut()
         .alloc(n_tokens as usize * 4, "shared_gate", false)
         .unwrap();
-    let cpu_out = cpu.pool_mut().alloc(total * 4, "hidden_out", false).unwrap();
-    cpu.pool_mut().upload(cpu_h_mid, bytes_of_f32(&h_mid_data)).unwrap();
-    cpu.pool_mut().upload(cpu_moe_sum, bytes_of_f32(&moe_sum_data)).unwrap();
+    let cpu_out = cpu
+        .pool_mut()
+        .alloc(total * 4, "hidden_out", false)
+        .unwrap();
+    cpu.pool_mut()
+        .upload(cpu_h_mid, bytes_of_f32(&h_mid_data))
+        .unwrap();
+    cpu.pool_mut()
+        .upload(cpu_moe_sum, bytes_of_f32(&moe_sum_data))
+        .unwrap();
     cpu.pool_mut()
         .upload(cpu_shared_out, bytes_of_f32(&shared_out_data))
         .unwrap();
@@ -1282,7 +1298,11 @@ fn graph_metal_matches_cpu_moe_combine() {
         .upload(cpu_shared_gate, bytes_of_f32(&shared_gate_data))
         .unwrap();
     let g_cpu = build_graph(
-        cpu_h_mid, cpu_moe_sum, cpu_shared_out, cpu_shared_gate, cpu_out,
+        cpu_h_mid,
+        cpu_moe_sum,
+        cpu_shared_out,
+        cpu_shared_gate,
+        cpu_out,
     );
     cpu.execute(&g_cpu, "diff_oracle").unwrap();
     let mut cpu_out_bytes = vec![0u8; total * 4];
@@ -1297,15 +1317,24 @@ fn graph_metal_matches_cpu_moe_combine() {
     let mut gpu = MetalBackend::new(metal_ctx, wf_buf).expect("MetalBackend::new");
     let gpu_h_mid = gpu.pool_mut().alloc(total * 4, "h_mid", false).unwrap();
     let gpu_moe_sum = gpu.pool_mut().alloc(total * 4, "moe_sum", false).unwrap();
-    let gpu_shared_out =
-        gpu.pool_mut().alloc(total * 4, "shared_out", false).unwrap();
+    let gpu_shared_out = gpu
+        .pool_mut()
+        .alloc(total * 4, "shared_out", false)
+        .unwrap();
     let gpu_shared_gate = gpu
         .pool_mut()
         .alloc(n_tokens as usize * 4, "shared_gate", false)
         .unwrap();
-    let gpu_out = gpu.pool_mut().alloc(total * 4, "hidden_out", false).unwrap();
-    gpu.pool_mut().upload(gpu_h_mid, bytes_of_f32(&h_mid_data)).unwrap();
-    gpu.pool_mut().upload(gpu_moe_sum, bytes_of_f32(&moe_sum_data)).unwrap();
+    let gpu_out = gpu
+        .pool_mut()
+        .alloc(total * 4, "hidden_out", false)
+        .unwrap();
+    gpu.pool_mut()
+        .upload(gpu_h_mid, bytes_of_f32(&h_mid_data))
+        .unwrap();
+    gpu.pool_mut()
+        .upload(gpu_moe_sum, bytes_of_f32(&moe_sum_data))
+        .unwrap();
     gpu.pool_mut()
         .upload(gpu_shared_out, bytes_of_f32(&shared_out_data))
         .unwrap();
@@ -1313,7 +1342,11 @@ fn graph_metal_matches_cpu_moe_combine() {
         .upload(gpu_shared_gate, bytes_of_f32(&shared_gate_data))
         .unwrap();
     let g_gpu = build_graph(
-        gpu_h_mid, gpu_moe_sum, gpu_shared_out, gpu_shared_gate, gpu_out,
+        gpu_h_mid,
+        gpu_moe_sum,
+        gpu_shared_out,
+        gpu_shared_gate,
+        gpu_out,
     );
     gpu.execute(&g_gpu, "diff_oracle").unwrap();
     let mut gpu_out_bytes = vec![0u8; total * 4];
@@ -1383,41 +1416,36 @@ fn graph_metal_matches_cpu_colored() {
     // threaded through the `b` slot. Live ranges are still
     // single-write / single-read per intermediate, so coloring's
     // structure is the same as a `tmp = tmp + b` chain.
-    let build_graph =
-        |a: BufId<OProjOutBuf>,
-         b: BufId<HiddenBuf>,
-         tmps: &[BufId<ResidualBuf>]| {
-            let mut g = Graph::new();
-            // op 0: tmp_0 = a + b (HiddenBuf → RmsNormIn).
+    let build_graph = |a: BufId<OProjOutBuf>, b: BufId<HiddenBuf>, tmps: &[BufId<ResidualBuf>]| {
+        let mut g = Graph::new();
+        // op 0: tmp_0 = a + b (HiddenBuf → RmsNormIn).
+        g.push(Op::ResidualAddNTokens {
+            label: "tmp_0",
+            a,
+            b: b.into(),
+            out: tmps[0],
+            n_tokens,
+            dim,
+        });
+        // op i: tmp_i = a + tmp_{i-1} (ResidualBuf → RmsNormIn).
+        for i in 1..(n_intermediates as usize) {
             g.push(Op::ResidualAddNTokens {
-                label: "tmp_0",
+                label: "tmp_i",
                 a,
-                b: b.into(),
-                out: tmps[0],
+                b: tmps[i - 1].into(),
+                out: tmps[i],
                 n_tokens,
                 dim,
             });
-            // op i: tmp_i = a + tmp_{i-1} (ResidualBuf → RmsNormIn).
-            for i in 1..(n_intermediates as usize) {
-                g.push(Op::ResidualAddNTokens {
-                    label: "tmp_i",
-                    a,
-                    b: tmps[i - 1].into(),
-                    out: tmps[i],
-                    n_tokens,
-                    dim,
-                });
-            }
-            g
-        };
+        }
+        g
+    };
 
     // CPU path
     let mut cpu_wf = dummy_weight_file("colored_cpu");
     let mut cpu = CpuBackend::new(cpu_wf.take());
-    let cpu_a: BufId<OProjOutBuf> =
-        cpu.pool_mut().alloc(total * 4, "a", false).unwrap();
-    let cpu_b: BufId<HiddenBuf> =
-        cpu.pool_mut().alloc(total * 4, "b", false).unwrap();
+    let cpu_a: BufId<OProjOutBuf> = cpu.pool_mut().alloc(total * 4, "a", false).unwrap();
+    let cpu_b: BufId<HiddenBuf> = cpu.pool_mut().alloc(total * 4, "b", false).unwrap();
     let mut cpu_tmps: Vec<BufId<ResidualBuf>> = Vec::new();
     for _ in 0..n_intermediates {
         cpu_tmps.push(cpu.pool_mut().alloc(total * 4, "tmp", false).unwrap());
@@ -1442,10 +1470,8 @@ fn graph_metal_matches_cpu_colored() {
     let wf_buf = MtlWeightBuf::wrap(wf_ref, metal_ctx.device());
     let _ = gpu_wf.take();
     let mut gpu = MetalBackend::new(metal_ctx, wf_buf).expect("MetalBackend::new");
-    let gpu_a: BufId<OProjOutBuf> =
-        gpu.pool_mut().alloc(total * 4, "a", false).unwrap();
-    let gpu_b: BufId<HiddenBuf> =
-        gpu.pool_mut().alloc(total * 4, "b", false).unwrap();
+    let gpu_a: BufId<OProjOutBuf> = gpu.pool_mut().alloc(total * 4, "a", false).unwrap();
+    let gpu_b: BufId<HiddenBuf> = gpu.pool_mut().alloc(total * 4, "b", false).unwrap();
     let mut gpu_tmps: Vec<BufId<ResidualBuf>> = Vec::new();
     for _ in 0..n_intermediates {
         gpu_tmps.push(gpu.pool_mut().alloc(total * 4, "tmp", false).unwrap());
@@ -1470,14 +1496,7 @@ fn graph_metal_matches_cpu_colored() {
         .fold(0.0f32, f32::max);
     eprintln!(
         "[s7-5 colored] N={} dim={} chain={} bufid_count={} cpu_phys={} gpu_phys={} cos={:.9} max_abs={:.3e}",
-        n_tokens,
-        dim,
-        n_intermediates,
-        bufid_count,
-        cpu_phys,
-        gpu_phys,
-        cos,
-        max_abs
+        n_tokens, dim, n_intermediates, bufid_count, cpu_phys, gpu_phys, cos, max_abs
     );
 
     // Correctness: CPU and Metal agree on the final tmp.
@@ -1522,8 +1541,7 @@ fn graph_metal_matches_cpu_rms_norm_qk() {
     let key_dim: u32 = 32;
     // No gap between q and k (key_offset_per_token == q region size).
     let key_offset_per_token: u32 = num_k_heads * key_dim;
-    let per_token_elems =
-        (key_offset_per_token + num_k_heads * key_dim) as usize;
+    let per_token_elems = (key_offset_per_token + num_k_heads * key_dim) as usize;
     let total = n_tokens as usize * per_token_elems;
     let mut rng = Rng::new(0xA3B_BB01);
     let x_data: Vec<f32> = (0..total).map(|_| rng.next_f32_unit()).collect();
@@ -1606,8 +1624,7 @@ fn graph_metal_matches_cpu_gated_rms_norm() {
     let per_token = (num_v_heads * value_dim) as usize;
     let total = n_tokens as usize * per_token;
     let mut rng = Rng::new(0xA3B_BB02);
-    let values_data: Vec<f32> =
-        (0..total).map(|_| rng.next_f32_unit()).collect();
+    let values_data: Vec<f32> = (0..total).map(|_| rng.next_f32_unit()).collect();
     let z_data: Vec<f32> = (0..total).map(|_| rng.next_f32_unit()).collect();
     // Weight = value_dim bf16. Construct random finite bf16 around
     // ~1.0 (avoid NaN/inf exponents from raw random u16).
@@ -1636,7 +1653,9 @@ fn graph_metal_matches_cpu_gated_rms_norm() {
     let cpu_values = cpu.pool_mut().alloc(total * 4, "values", false).unwrap();
     let cpu_z = cpu.pool_mut().alloc(total * 4, "z", false).unwrap();
     let cpu_out = cpu.pool_mut().alloc(total * 4, "out", false).unwrap();
-    cpu.pool_mut().upload(cpu_values, bytes_of_f32(&values_data)).unwrap();
+    cpu.pool_mut()
+        .upload(cpu_values, bytes_of_f32(&values_data))
+        .unwrap();
     cpu.pool_mut().upload(cpu_z, bytes_of_f32(&z_data)).unwrap();
     let mut g_cpu = Graph::new();
     g_cpu.push(Op::GatedRmsNormNTokens {
@@ -1665,7 +1684,9 @@ fn graph_metal_matches_cpu_gated_rms_norm() {
     let gpu_values = gpu.pool_mut().alloc(total * 4, "values", false).unwrap();
     let gpu_z = gpu.pool_mut().alloc(total * 4, "z", false).unwrap();
     let gpu_out = gpu.pool_mut().alloc(total * 4, "out", false).unwrap();
-    gpu.pool_mut().upload(gpu_values, bytes_of_f32(&values_data)).unwrap();
+    gpu.pool_mut()
+        .upload(gpu_values, bytes_of_f32(&values_data))
+        .unwrap();
     gpu.pool_mut().upload(gpu_z, bytes_of_f32(&z_data)).unwrap();
     let mut g_gpu = Graph::new();
     g_gpu.push(Op::GatedRmsNormNTokens {
@@ -1715,17 +1736,13 @@ fn graph_metal_matches_cpu_compute_decay_beta() {
     let per_token = num_v_heads as usize;
     let total = n_tokens as usize * per_token;
     let mut rng = Rng::new(0xA3B_BB03);
-    let alpha_data: Vec<f32> =
-        (0..total).map(|_| rng.next_f32_unit()).collect();
-    let beta_data: Vec<f32> =
-        (0..total).map(|_| rng.next_f32_unit()).collect();
+    let alpha_data: Vec<f32> = (0..total).map(|_| rng.next_f32_unit()).collect();
+    let beta_data: Vec<f32> = (0..total).map(|_| rng.next_f32_unit()).collect();
     // a_log is f32[num_v_heads]. dt_bias is bf16[num_v_heads].
-    let a_log_data: Vec<f32> =
-        (0..num_v_heads as usize).map(|_| rng.next_f32_unit() * 0.1 - 1.0).collect();
-    let a_log_bytes: Vec<u8> = a_log_data
-        .iter()
-        .flat_map(|f| f.to_le_bytes())
+    let a_log_data: Vec<f32> = (0..num_v_heads as usize)
+        .map(|_| rng.next_f32_unit() * 0.1 - 1.0)
         .collect();
+    let a_log_bytes: Vec<u8> = a_log_data.iter().flat_map(|f| f.to_le_bytes()).collect();
     let mut dt_bias_bytes = vec![0u8; (num_v_heads as usize) * 2];
     for chunk in dt_bias_bytes.chunks_exact_mut(2) {
         let f = rng.next_f32_unit() * 0.25;
@@ -1764,8 +1781,12 @@ fn graph_metal_matches_cpu_compute_decay_beta() {
     let cpu_beta = cpu.pool_mut().alloc(total * 4, "beta", false).unwrap();
     let cpu_g = cpu.pool_mut().alloc(total * 4, "g", false).unwrap();
     let cpu_bg = cpu.pool_mut().alloc(total * 4, "bg", false).unwrap();
-    cpu.pool_mut().upload(cpu_alpha, bytes_of_f32(&alpha_data)).unwrap();
-    cpu.pool_mut().upload(cpu_beta, bytes_of_f32(&beta_data)).unwrap();
+    cpu.pool_mut()
+        .upload(cpu_alpha, bytes_of_f32(&alpha_data))
+        .unwrap();
+    cpu.pool_mut()
+        .upload(cpu_beta, bytes_of_f32(&beta_data))
+        .unwrap();
     let mut g_cpu = Graph::new();
     g_cpu.push(Op::ComputeDecayBetaNTokens {
         label: "test_compute_decay_beta",
@@ -1797,8 +1818,12 @@ fn graph_metal_matches_cpu_compute_decay_beta() {
     let gpu_beta = gpu.pool_mut().alloc(total * 4, "beta", false).unwrap();
     let gpu_g = gpu.pool_mut().alloc(total * 4, "g", false).unwrap();
     let gpu_bg = gpu.pool_mut().alloc(total * 4, "bg", false).unwrap();
-    gpu.pool_mut().upload(gpu_alpha, bytes_of_f32(&alpha_data)).unwrap();
-    gpu.pool_mut().upload(gpu_beta, bytes_of_f32(&beta_data)).unwrap();
+    gpu.pool_mut()
+        .upload(gpu_alpha, bytes_of_f32(&alpha_data))
+        .unwrap();
+    gpu.pool_mut()
+        .upload(gpu_beta, bytes_of_f32(&beta_data))
+        .unwrap();
     let mut g_gpu = Graph::new();
     g_gpu.push(Op::ComputeDecayBetaNTokens {
         label: "test_compute_decay_beta",
@@ -1835,8 +1860,18 @@ fn graph_metal_matches_cpu_compute_decay_beta() {
         "[s7-6b compute_decay_beta] N={} h={}: g_decay cos={:.9} max_abs={:.3e}; beta_gate cos={:.9} max_abs={:.3e}",
         n_tokens, num_v_heads, cos_g, max_abs_g, cos_bg, max_abs_bg
     );
-    assert!(cos_g >= COSINE_FLOOR, "g_decay cosine {} max_abs={}", cos_g, max_abs_g);
-    assert!(cos_bg >= COSINE_FLOOR, "beta_gate cosine {} max_abs={}", cos_bg, max_abs_bg);
+    assert!(
+        cos_g >= COSINE_FLOOR,
+        "g_decay cosine {} max_abs={}",
+        cos_g,
+        max_abs_g
+    );
+    assert!(
+        cos_bg >= COSINE_FLOOR,
+        "beta_gate cosine {} max_abs={}",
+        cos_bg,
+        max_abs_bg
+    );
 }
 
 // ============================================================================
@@ -1861,10 +1896,8 @@ fn check_conv1d_step(n_tokens: u32) {
     let in_total = n_tokens as usize * conv_dim as usize;
     let out_total = in_total;
     let mut rng = Rng::new(0xA3B_BB04);
-    let initial_state: Vec<f32> =
-        (0..state_floats).map(|_| rng.next_f32_unit()).collect();
-    let qkv_data: Vec<f32> =
-        (0..in_total).map(|_| rng.next_f32_unit()).collect();
+    let initial_state: Vec<f32> = (0..state_floats).map(|_| rng.next_f32_unit()).collect();
+    let qkv_data: Vec<f32> = (0..in_total).map(|_| rng.next_f32_unit()).collect();
     // Conv weight: conv_dim * kernel_size bf16. Random finite.
     let mut weight_bytes = vec![0u8; conv_dim as usize * kernel_size * 2];
     for chunk in weight_bytes.chunks_exact_mut(2) {
@@ -1889,11 +1922,17 @@ fn check_conv1d_step(n_tokens: u32) {
     };
     let mut cpu = CpuBackend::new(cpu_wf.take());
     let cpu_qkv = cpu.pool_mut().alloc(in_total * 4, "qkv", false).unwrap();
-    let cpu_state =
-        cpu.pool_mut().alloc(state_floats * 4, "state", true).unwrap();
+    let cpu_state = cpu
+        .pool_mut()
+        .alloc(state_floats * 4, "state", true)
+        .unwrap();
     let cpu_out = cpu.pool_mut().alloc(out_total * 4, "out", false).unwrap();
-    cpu.pool_mut().upload(cpu_qkv, bytes_of_f32(&qkv_data)).unwrap();
-    cpu.pool_mut().upload(cpu_state, bytes_of_f32(&initial_state)).unwrap();
+    cpu.pool_mut()
+        .upload(cpu_qkv, bytes_of_f32(&qkv_data))
+        .unwrap();
+    cpu.pool_mut()
+        .upload(cpu_state, bytes_of_f32(&initial_state))
+        .unwrap();
     let mut g_cpu = Graph::new();
     g_cpu.push(Op::Conv1dStepNTokens {
         label: "test_conv1d_step",
@@ -1909,7 +1948,9 @@ fn check_conv1d_step(n_tokens: u32) {
     cpu.pool().download(cpu_out, &mut cpu_out_bytes).unwrap();
     let cpu_out_f32 = f32_of_bytes(&cpu_out_bytes);
     let mut cpu_state_bytes = vec![0u8; state_floats * 4];
-    cpu.pool().download(cpu_state, &mut cpu_state_bytes).unwrap();
+    cpu.pool()
+        .download(cpu_state, &mut cpu_state_bytes)
+        .unwrap();
     let cpu_state_f32 = f32_of_bytes(&cpu_state_bytes);
 
     // GPU path
@@ -1920,11 +1961,17 @@ fn check_conv1d_step(n_tokens: u32) {
     let _ = gpu_wf.take();
     let mut gpu = MetalBackend::new(metal_ctx, wf_buf).expect("MetalBackend::new");
     let gpu_qkv = gpu.pool_mut().alloc(in_total * 4, "qkv", false).unwrap();
-    let gpu_state =
-        gpu.pool_mut().alloc(state_floats * 4, "state", true).unwrap();
+    let gpu_state = gpu
+        .pool_mut()
+        .alloc(state_floats * 4, "state", true)
+        .unwrap();
     let gpu_out = gpu.pool_mut().alloc(out_total * 4, "out", false).unwrap();
-    gpu.pool_mut().upload(gpu_qkv, bytes_of_f32(&qkv_data)).unwrap();
-    gpu.pool_mut().upload(gpu_state, bytes_of_f32(&initial_state)).unwrap();
+    gpu.pool_mut()
+        .upload(gpu_qkv, bytes_of_f32(&qkv_data))
+        .unwrap();
+    gpu.pool_mut()
+        .upload(gpu_state, bytes_of_f32(&initial_state))
+        .unwrap();
     let mut g_gpu = Graph::new();
     g_gpu.push(Op::Conv1dStepNTokens {
         label: "test_conv1d_step",
@@ -1940,7 +1987,9 @@ fn check_conv1d_step(n_tokens: u32) {
     gpu.pool().download(gpu_out, &mut gpu_out_bytes).unwrap();
     let gpu_out_f32 = f32_of_bytes(&gpu_out_bytes);
     let mut gpu_state_bytes = vec![0u8; state_floats * 4];
-    gpu.pool().download(gpu_state, &mut gpu_state_bytes).unwrap();
+    gpu.pool()
+        .download(gpu_state, &mut gpu_state_bytes)
+        .unwrap();
     let gpu_state_f32 = f32_of_bytes(&gpu_state_bytes);
 
     let cos_out = cosine_sim(&cpu_out_f32, &gpu_out_f32);
@@ -1959,8 +2008,18 @@ fn check_conv1d_step(n_tokens: u32) {
         "[s7-6b conv1d_step] N={} cd={}: out cos={:.9} max_abs={:.3e}; state cos={:.9} max_abs={:.3e}",
         n_tokens, conv_dim, cos_out, max_abs_out, cos_state, max_abs_state
     );
-    assert!(cos_out >= COSINE_FLOOR, "out cosine {} max_abs={}", cos_out, max_abs_out);
-    assert!(cos_state >= COSINE_FLOOR, "state cosine {} max_abs={}", cos_state, max_abs_state);
+    assert!(
+        cos_out >= COSINE_FLOOR,
+        "out cosine {} max_abs={}",
+        cos_out,
+        max_abs_out
+    );
+    assert!(
+        cos_state >= COSINE_FLOOR,
+        "state cosine {} max_abs={}",
+        cos_state,
+        max_abs_state
+    );
 }
 
 // ============================================================================
@@ -1989,19 +2048,16 @@ fn check_gated_delta_net_step(n_tokens: u32) {
     let key_dim: usize = 128;
     let num_k_heads: usize = 16;
     let key_total = num_k_heads * key_dim; // 2048
-    let value_total =
-        num_v_heads as usize * value_dim as usize; // 8192
+    let value_total = num_v_heads as usize * value_dim as usize; // 8192
     let conv_per_token = 2 * key_total + value_total;
     let conv_total = n_tokens as usize * conv_per_token;
     let gdb_per_token = num_v_heads as usize;
     let gdb_total = n_tokens as usize * gdb_per_token;
     let out_per_token = (num_v_heads * value_dim) as usize;
     let out_total = n_tokens as usize * out_per_token;
-    let state_floats =
-        num_v_heads as usize * value_dim as usize * key_dim;
+    let state_floats = num_v_heads as usize * value_dim as usize * key_dim;
     let mut rng = Rng::new(0xA3B_BB05);
-    let conv_data: Vec<f32> =
-        (0..conv_total).map(|_| rng.next_f32_unit() * 0.5).collect();
+    let conv_data: Vec<f32> = (0..conv_total).map(|_| rng.next_f32_unit() * 0.5).collect();
     let g_data: Vec<f32> = (0..gdb_total)
         .map(|_| 0.9 + rng.next_f32_unit() * 0.05) // ~[0.85, 0.95], realistic decay
         .collect();
@@ -2013,22 +2069,30 @@ fn check_gated_delta_net_step(n_tokens: u32) {
         .collect();
 
     let tensors: &[(&str, &str, i32, Vec<usize>, Vec<u8>)] = &[];
-    let mut cpu_wf = SyntheticWf::build("gated_delta_net_step_cpu", &[(
-        "dummy", "BF16", 0, vec![32], vec![0u8; 64],
-    )]);
+    let mut cpu_wf = SyntheticWf::build(
+        "gated_delta_net_step_cpu",
+        &[("dummy", "BF16", 0, vec![32], vec![0u8; 64])],
+    );
     let mut cpu = CpuBackend::new(cpu_wf.take());
     let _ = tensors;
-    let cpu_state =
-        cpu.pool_mut().alloc(state_floats * 4, "state", true).unwrap();
-    let cpu_conv =
-        cpu.pool_mut().alloc(conv_total * 4, "conv", false).unwrap();
+    let cpu_state = cpu
+        .pool_mut()
+        .alloc(state_floats * 4, "state", true)
+        .unwrap();
+    let cpu_conv = cpu.pool_mut().alloc(conv_total * 4, "conv", false).unwrap();
     let cpu_g = cpu.pool_mut().alloc(gdb_total * 4, "g", false).unwrap();
     let cpu_bg = cpu.pool_mut().alloc(gdb_total * 4, "bg", false).unwrap();
     let cpu_out = cpu.pool_mut().alloc(out_total * 4, "out", false).unwrap();
-    cpu.pool_mut().upload(cpu_state, bytes_of_f32(&initial_state)).unwrap();
-    cpu.pool_mut().upload(cpu_conv, bytes_of_f32(&conv_data)).unwrap();
+    cpu.pool_mut()
+        .upload(cpu_state, bytes_of_f32(&initial_state))
+        .unwrap();
+    cpu.pool_mut()
+        .upload(cpu_conv, bytes_of_f32(&conv_data))
+        .unwrap();
     cpu.pool_mut().upload(cpu_g, bytes_of_f32(&g_data)).unwrap();
-    cpu.pool_mut().upload(cpu_bg, bytes_of_f32(&bg_data)).unwrap();
+    cpu.pool_mut()
+        .upload(cpu_bg, bytes_of_f32(&bg_data))
+        .unwrap();
     let mut g_cpu = Graph::new();
     g_cpu.push(Op::GatedDeltaNetStepNTokens {
         label: "test_gated_delta_net_step",
@@ -2047,28 +2111,38 @@ fn check_gated_delta_net_step(n_tokens: u32) {
     cpu.pool().download(cpu_out, &mut cpu_out_bytes).unwrap();
     let cpu_out_f32 = f32_of_bytes(&cpu_out_bytes);
     let mut cpu_state_bytes = vec![0u8; state_floats * 4];
-    cpu.pool().download(cpu_state, &mut cpu_state_bytes).unwrap();
+    cpu.pool()
+        .download(cpu_state, &mut cpu_state_bytes)
+        .unwrap();
     let cpu_state_f32 = f32_of_bytes(&cpu_state_bytes);
 
-    let mut gpu_wf = SyntheticWf::build("gated_delta_net_step_gpu", &[(
-        "dummy", "BF16", 0, vec![32], vec![0u8; 64],
-    )]);
+    let mut gpu_wf = SyntheticWf::build(
+        "gated_delta_net_step_gpu",
+        &[("dummy", "BF16", 0, vec![32], vec![0u8; 64])],
+    );
     let metal_ctx = MetalContext::new().expect("MetalContext::new");
     let wf_ref = gpu_wf.wf.as_ref().unwrap();
     let wf_buf = MtlWeightBuf::wrap(wf_ref, metal_ctx.device());
     let _ = gpu_wf.take();
     let mut gpu = MetalBackend::new(metal_ctx, wf_buf).expect("MetalBackend::new");
-    let gpu_state =
-        gpu.pool_mut().alloc(state_floats * 4, "state", true).unwrap();
-    let gpu_conv =
-        gpu.pool_mut().alloc(conv_total * 4, "conv", false).unwrap();
+    let gpu_state = gpu
+        .pool_mut()
+        .alloc(state_floats * 4, "state", true)
+        .unwrap();
+    let gpu_conv = gpu.pool_mut().alloc(conv_total * 4, "conv", false).unwrap();
     let gpu_g = gpu.pool_mut().alloc(gdb_total * 4, "g", false).unwrap();
     let gpu_bg = gpu.pool_mut().alloc(gdb_total * 4, "bg", false).unwrap();
     let gpu_out = gpu.pool_mut().alloc(out_total * 4, "out", false).unwrap();
-    gpu.pool_mut().upload(gpu_state, bytes_of_f32(&initial_state)).unwrap();
-    gpu.pool_mut().upload(gpu_conv, bytes_of_f32(&conv_data)).unwrap();
+    gpu.pool_mut()
+        .upload(gpu_state, bytes_of_f32(&initial_state))
+        .unwrap();
+    gpu.pool_mut()
+        .upload(gpu_conv, bytes_of_f32(&conv_data))
+        .unwrap();
     gpu.pool_mut().upload(gpu_g, bytes_of_f32(&g_data)).unwrap();
-    gpu.pool_mut().upload(gpu_bg, bytes_of_f32(&bg_data)).unwrap();
+    gpu.pool_mut()
+        .upload(gpu_bg, bytes_of_f32(&bg_data))
+        .unwrap();
     let mut g_gpu = Graph::new();
     g_gpu.push(Op::GatedDeltaNetStepNTokens {
         label: "test_gated_delta_net_step",
@@ -2087,7 +2161,9 @@ fn check_gated_delta_net_step(n_tokens: u32) {
     gpu.pool().download(gpu_out, &mut gpu_out_bytes).unwrap();
     let gpu_out_f32 = f32_of_bytes(&gpu_out_bytes);
     let mut gpu_state_bytes = vec![0u8; state_floats * 4];
-    gpu.pool().download(gpu_state, &mut gpu_state_bytes).unwrap();
+    gpu.pool()
+        .download(gpu_state, &mut gpu_state_bytes)
+        .unwrap();
     let gpu_state_f32 = f32_of_bytes(&gpu_state_bytes);
 
     let cos = cosine_sim(&cpu_out_f32, &gpu_out_f32);
@@ -2107,10 +2183,14 @@ fn check_gated_delta_net_step(n_tokens: u32) {
         .fold(0.0f32, f32::max);
     eprintln!(
         "[s7-6b gated_delta_net_step] N={} vh={} vd={} kpv={}: out cos={:.9} max_abs={:.3e}; state cos={:.9} max_abs={:.3e}",
-        n_tokens, num_v_heads, value_dim, k_heads_per_v, cos, max_abs,
-        cos_state, max_abs_state
+        n_tokens, num_v_heads, value_dim, k_heads_per_v, cos, max_abs, cos_state, max_abs_state
     );
-    assert!(cos >= COSINE_FLOOR, "out cosine {} max_abs={}", cos, max_abs);
+    assert!(
+        cos >= COSINE_FLOOR,
+        "out cosine {} max_abs={}",
+        cos,
+        max_abs
+    );
     assert!(
         cos_state >= COSINE_FLOOR,
         "state cosine {} max_abs={}",
@@ -2140,8 +2220,7 @@ fn cpu_chunkwise_matches_cpu_per_token_gated_delta() {
     let key_total = num_k_heads * key_dim;
     let value_total = num_v_heads as usize * value_dim as usize;
     let conv_per_token = 2 * key_total + value_total;
-    let state_floats =
-        num_v_heads as usize * value_dim as usize * key_dim;
+    let state_floats = num_v_heads as usize * value_dim as usize * key_dim;
 
     // n=1 is decode; 4/16/64 are prefill chunk shapes. C ∈ {8,16}
     // forces multi-chunk + ragged splits within those token counts.
@@ -2150,14 +2229,8 @@ fn cpu_chunkwise_matches_cpu_per_token_gated_delta() {
             let conv_total = n_tokens as usize * conv_per_token;
             let gdb_total = n_tokens as usize * num_v_heads as usize;
             let out_total = n_tokens as usize * value_total;
-            let mut rng = Rng::new(
-                0xC0FFEE
-                    ^ (n_tokens as u64)
-                    ^ ((chunk_size as u64) << 20),
-            );
-            let conv_data: Vec<f32> = (0..conv_total)
-                .map(|_| rng.next_f32_unit() * 0.5)
-                .collect();
+            let mut rng = Rng::new(0xC0FFEE ^ (n_tokens as u64) ^ ((chunk_size as u64) << 20));
+            let conv_data: Vec<f32> = (0..conv_total).map(|_| rng.next_f32_unit() * 0.5).collect();
             let mut g_data: Vec<f32> = (0..gdb_total)
                 .map(|_| 0.9 + rng.next_f32_unit() * 0.05)
                 .collect();
@@ -2188,32 +2261,16 @@ fn cpu_chunkwise_matches_cpu_per_token_gated_delta() {
                     .pool_mut()
                     .alloc(state_floats * 4, "state", true)
                     .unwrap();
-                let cv = cpu
-                    .pool_mut()
-                    .alloc(conv_total * 4, "conv", false)
-                    .unwrap();
-                let g = cpu
-                    .pool_mut()
-                    .alloc(gdb_total * 4, "g", false)
-                    .unwrap();
-                let bg = cpu
-                    .pool_mut()
-                    .alloc(gdb_total * 4, "bg", false)
-                    .unwrap();
-                let out = cpu
-                    .pool_mut()
-                    .alloc(out_total * 4, "out", false)
-                    .unwrap();
+                let cv = cpu.pool_mut().alloc(conv_total * 4, "conv", false).unwrap();
+                let g = cpu.pool_mut().alloc(gdb_total * 4, "g", false).unwrap();
+                let bg = cpu.pool_mut().alloc(gdb_total * 4, "bg", false).unwrap();
+                let out = cpu.pool_mut().alloc(out_total * 4, "out", false).unwrap();
                 cpu.pool_mut()
                     .upload(s, bytes_of_f32(&initial_state))
                     .unwrap();
-                cpu.pool_mut()
-                    .upload(cv, bytes_of_f32(&conv_data))
-                    .unwrap();
+                cpu.pool_mut().upload(cv, bytes_of_f32(&conv_data)).unwrap();
                 cpu.pool_mut().upload(g, bytes_of_f32(&g_data)).unwrap();
-                cpu.pool_mut()
-                    .upload(bg, bytes_of_f32(&bg_data))
-                    .unwrap();
+                cpu.pool_mut().upload(bg, bytes_of_f32(&bg_data)).unwrap();
                 let mut graph = Graph::new();
                 if chunkwise {
                     graph.push(Op::GatedDeltaNetChunkwise {
@@ -2299,14 +2356,12 @@ fn check_gated_delta_chunkwise(n_tokens: u32) {
     let conv_total = n_tokens as usize * conv_per_token;
     let gdb_total = n_tokens as usize * num_v_heads as usize;
     let out_total = n_tokens as usize * value_total;
-    let state_floats =
-        num_v_heads as usize * value_dim as usize * key_dim;
+    let state_floats = num_v_heads as usize * value_dim as usize * key_dim;
     // Must equal the shader's compile-time CW_C.
     let chunk_size: u32 = 16;
 
     let mut rng = Rng::new(0x0A3B_C04E ^ n_tokens as u64);
-    let conv_data: Vec<f32> =
-        (0..conv_total).map(|_| rng.next_f32_unit() * 0.5).collect();
+    let conv_data: Vec<f32> = (0..conv_total).map(|_| rng.next_f32_unit() * 0.5).collect();
     let mut g_data: Vec<f32> = (0..gdb_total)
         .map(|_| 0.9 + rng.next_f32_unit() * 0.05)
         .collect();
@@ -2327,20 +2382,18 @@ fn check_gated_delta_chunkwise(n_tokens: u32) {
         .map(|_| rng.next_f32_unit() * 0.01)
         .collect();
 
-    let make_op = |state, conv_out, g_decay, beta_gate, output| {
-        Op::GatedDeltaNetChunkwise {
-            label: "test_chunkwise",
-            state,
-            conv_out,
-            g_decay,
-            beta_gate,
-            output,
-            num_v_heads,
-            value_dim,
-            k_heads_per_v,
-            n_tokens,
-            chunk_size,
-        }
+    let make_op = |state, conv_out, g_decay, beta_gate, output| Op::GatedDeltaNetChunkwise {
+        label: "test_chunkwise",
+        state,
+        conv_out,
+        g_decay,
+        beta_gate,
+        output,
+        num_v_heads,
+        value_dim,
+        k_heads_per_v,
+        n_tokens,
+        chunk_size,
     };
 
     // --- CpuBackend (oracle — matches the per-token recurrence) ---
@@ -2349,14 +2402,17 @@ fn check_gated_delta_chunkwise(n_tokens: u32) {
         &[("dummy", "BF16", 0, vec![32], vec![0u8; 64])],
     );
     let mut cpu = CpuBackend::new(cpu_wf.take());
-    let cs =
-        cpu.pool_mut().alloc(state_floats * 4, "state", true).unwrap();
-    let cc =
-        cpu.pool_mut().alloc(conv_total * 4, "conv", false).unwrap();
+    let cs = cpu
+        .pool_mut()
+        .alloc(state_floats * 4, "state", true)
+        .unwrap();
+    let cc = cpu.pool_mut().alloc(conv_total * 4, "conv", false).unwrap();
     let cg = cpu.pool_mut().alloc(gdb_total * 4, "g", false).unwrap();
     let cb = cpu.pool_mut().alloc(gdb_total * 4, "bg", false).unwrap();
     let co = cpu.pool_mut().alloc(out_total * 4, "out", false).unwrap();
-    cpu.pool_mut().upload(cs, bytes_of_f32(&initial_state)).unwrap();
+    cpu.pool_mut()
+        .upload(cs, bytes_of_f32(&initial_state))
+        .unwrap();
     cpu.pool_mut().upload(cc, bytes_of_f32(&conv_data)).unwrap();
     cpu.pool_mut().upload(cg, bytes_of_f32(&g_data)).unwrap();
     cpu.pool_mut().upload(cb, bytes_of_f32(&bg_data)).unwrap();
@@ -2379,16 +2435,18 @@ fn check_gated_delta_chunkwise(n_tokens: u32) {
     let wf_ref = gpu_wf.wf.as_ref().unwrap();
     let wf_buf = MtlWeightBuf::wrap(wf_ref, metal_ctx.device());
     let _ = gpu_wf.take();
-    let mut gpu =
-        MetalBackend::new(metal_ctx, wf_buf).expect("MetalBackend::new");
-    let gs =
-        gpu.pool_mut().alloc(state_floats * 4, "state", true).unwrap();
-    let gc =
-        gpu.pool_mut().alloc(conv_total * 4, "conv", false).unwrap();
+    let mut gpu = MetalBackend::new(metal_ctx, wf_buf).expect("MetalBackend::new");
+    let gs = gpu
+        .pool_mut()
+        .alloc(state_floats * 4, "state", true)
+        .unwrap();
+    let gc = gpu.pool_mut().alloc(conv_total * 4, "conv", false).unwrap();
     let gg = gpu.pool_mut().alloc(gdb_total * 4, "g", false).unwrap();
     let gb = gpu.pool_mut().alloc(gdb_total * 4, "bg", false).unwrap();
     let go = gpu.pool_mut().alloc(out_total * 4, "out", false).unwrap();
-    gpu.pool_mut().upload(gs, bytes_of_f32(&initial_state)).unwrap();
+    gpu.pool_mut()
+        .upload(gs, bytes_of_f32(&initial_state))
+        .unwrap();
     gpu.pool_mut().upload(gc, bytes_of_f32(&conv_data)).unwrap();
     gpu.pool_mut().upload(gg, bytes_of_f32(&g_data)).unwrap();
     gpu.pool_mut().upload(gb, bytes_of_f32(&bg_data)).unwrap();
@@ -2470,8 +2528,7 @@ fn graph_metal_matches_cpu_embed_gather() {
     let token_ids: Vec<i32> = (0..n_tokens)
         .map(|_| (rng.next_u64() as usize % vocab) as i32)
         .collect();
-    let token_id_bytes: Vec<u8> =
-        token_ids.iter().flat_map(|t| t.to_le_bytes()).collect();
+    let token_id_bytes: Vec<u8> = token_ids.iter().flat_map(|t| t.to_le_bytes()).collect();
 
     let tensors: &[(&str, &str, i32, Vec<usize>, Vec<u8>)] = &[
         (
@@ -2507,7 +2564,12 @@ fn graph_metal_matches_cpu_embed_gather() {
             wf.tensor_info("model.embed_tokens.biases").unwrap().offset as u64,
         )
     };
-    let weight = WeightRef { w_off, s_off, b_off, bits: 4 };
+    let weight = WeightRef {
+        w_off,
+        s_off,
+        b_off,
+        bits: 4,
+    };
     let build = |token_ids, hidden_out| Op::EmbedGatherNTokens {
         label: "test_embed_gather",
         token_ids,
@@ -2518,8 +2580,10 @@ fn graph_metal_matches_cpu_embed_gather() {
     };
 
     let mut cpu = CpuBackend::new(cpu_wf.take());
-    let cpu_ids =
-        cpu.pool_mut().alloc(n_tokens as usize * 4, "ids", false).unwrap();
+    let cpu_ids = cpu
+        .pool_mut()
+        .alloc(n_tokens as usize * 4, "ids", false)
+        .unwrap();
     let cpu_out = cpu.pool_mut().alloc(out_len * 4, "out", false).unwrap();
     cpu.pool_mut().upload(cpu_ids, &token_id_bytes).unwrap();
     let mut g_cpu = Graph::new();
@@ -2535,10 +2599,11 @@ fn graph_metal_matches_cpu_embed_gather() {
     let wf_ref = gpu_wf.wf.as_ref().unwrap();
     let wf_buf = MtlWeightBuf::wrap(wf_ref, metal_ctx.device());
     let _ = gpu_wf.take();
-    let mut gpu =
-        MetalBackend::new(metal_ctx, wf_buf).expect("MetalBackend::new");
-    let gpu_ids =
-        gpu.pool_mut().alloc(n_tokens as usize * 4, "ids", false).unwrap();
+    let mut gpu = MetalBackend::new(metal_ctx, wf_buf).expect("MetalBackend::new");
+    let gpu_ids = gpu
+        .pool_mut()
+        .alloc(n_tokens as usize * 4, "ids", false)
+        .unwrap();
     let gpu_out = gpu.pool_mut().alloc(out_len * 4, "out", false).unwrap();
     gpu.pool_mut().upload(gpu_ids, &token_id_bytes).unwrap();
     let mut g_gpu = Graph::new();

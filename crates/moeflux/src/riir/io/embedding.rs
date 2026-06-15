@@ -21,8 +21,8 @@
 //! - `scales`:  `BF16`, shape `[vocab_size, hidden_dim / GROUP_SIZE]`.
 //! - `biases`:  `BF16`, shape `[vocab_size, hidden_dim / GROUP_SIZE]`.
 
-use crate::riir::variants::{GROUP_SIZE, VARIANT};
 use crate::riir::io::weight_file::WeightFile;
+use crate::riir::variants::{GROUP_SIZE, VARIANT};
 
 /// Errors specific to the embedding port.
 #[derive(Debug, thiserror::Error)]
@@ -31,9 +31,7 @@ pub enum EmbeddingError {
     TokenOutOfRange { token_id: i32, vocab_size: usize },
     #[error("embedding tensor '{name}' missing from manifest")]
     MissingTensor { name: &'static str },
-    #[error(
-        "embedding tensor '{name}' has unexpected shape {shape:?} (expected {expected:?})"
-    )]
+    #[error("embedding tensor '{name}' has unexpected shape {shape:?} (expected {expected:?})")]
     ShapeMismatch {
         name: &'static str,
         shape: Vec<usize>,
@@ -53,11 +51,7 @@ const BIASES_NAME: &str = "model.embed_tokens.biases";
 ///
 /// `out` is fully written on success; on error its contents are
 /// unspecified.
-pub fn embed_lookup(
-    wf: &WeightFile,
-    token_id: i32,
-    out: &mut [f32],
-) -> Result<(), EmbeddingError> {
+pub fn embed_lookup(wf: &WeightFile, token_id: i32, out: &mut [f32]) -> Result<(), EmbeddingError> {
     let hidden_dim = VARIANT.hidden_dim;
     let vocab_size = VARIANT.vocab_size;
 

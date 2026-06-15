@@ -14,20 +14,17 @@ pub mod cpu_ops;
 
 use std::cell::{Ref, RefCell, RefMut};
 
-use crate::riir::backend::cpu::cpu_matvec::{
-    dequant_matvec_4bit_cpu, dequant_matvec_8bit_v3_cpu,
+use crate::riir::attn::linear_attn::{
+    compute_decay_beta_cpu, conv1d_step, gated_delta_chunkwise, gated_delta_recurrence_supplied,
 };
+use crate::riir::backend::cpu::cpu_matvec::{dequant_matvec_4bit_cpu, dequant_matvec_8bit_v3_cpu};
 use crate::riir::backend::cpu::cpu_ops::{
     cpu_sigmoid_scalar, residual_add_n_tokens_cpu, rope_n_tokens_cpu,
 };
 use crate::riir::io::embedding::{bf16_to_f32, embed_lookup_at};
-use crate::riir::attn::linear_attn::{
-    compute_decay_beta_cpu, conv1d_step, gated_delta_chunkwise,
-    gated_delta_recurrence_supplied,
-};
+use crate::riir::io::weight_file::WeightFile;
 use crate::riir::moe::moe_cpu::moe_permute_fuse_cpu;
 use crate::riir::variants::{GROUP_SIZE, VARIANT};
-use crate::riir::io::weight_file::WeightFile;
 
 use super::buftype::Buf;
 use super::{Backend, BufId, BufferPool, Graph, GraphError, Op};
@@ -87,8 +84,7 @@ impl BufferPool for CpuBufferPool {
         label: &'static str,
         persistent: bool,
     ) -> Result<BufId<B>, GraphError> {
-        let id: BufId<B> =
-            BufId::from_raw(self.bufid_to_physical.len() as u32);
+        let id: BufId<B> = BufId::from_raw(self.bufid_to_physical.len() as u32);
         let physical = self.buffers.len() as u32;
         self.buffers.push(RefCell::new(vec![0u8; bytes]));
         self.labels.push(label);
@@ -103,16 +99,9 @@ impl BufferPool for CpuBufferPool {
         &self.buffers[physical]
     }
 
-    fn upload<B: Buf>(
-        &mut self,
-        id: BufId<B>,
-        host: &[u8],
-    ) -> Result<(), GraphError> {
+    fn upload<B: Buf>(&mut self, id: BufId<B>, host: &[u8]) -> Result<(), GraphError> {
         let idx = id.raw() as usize;
-        let label = *self
-            .labels
-            .get(idx)
-            .ok_or(GraphError::BadBufId(id.raw()))?;
+        let label = *self.labels.get(idx).ok_or(GraphError::BadBufId(id.raw()))?;
         let expected = self.byte_sizes[idx];
         // Prefix semantics: `host` may be shorter than the buffer
         // (once-per-run buffers are sized at max chunk width; a
@@ -137,10 +126,7 @@ impl BufferPool for CpuBufferPool {
         host: &[u8],
     ) -> Result<(), GraphError> {
         let idx = id.raw() as usize;
-        let label = *self
-            .labels
-            .get(idx)
-            .ok_or(GraphError::BadBufId(id.raw()))?;
+        let label = *self.labels.get(idx).ok_or(GraphError::BadBufId(id.raw()))?;
         let expected = self.byte_sizes[idx];
         if offset + host.len() > expected {
             return Err(GraphError::SizeMismatch {
@@ -155,16 +141,9 @@ impl BufferPool for CpuBufferPool {
         Ok(())
     }
 
-    fn download<B: Buf>(
-        &self,
-        id: BufId<B>,
-        host: &mut [u8],
-    ) -> Result<(), GraphError> {
+    fn download<B: Buf>(&self, id: BufId<B>, host: &mut [u8]) -> Result<(), GraphError> {
         let idx = id.raw() as usize;
-        let label = *self
-            .labels
-            .get(idx)
-            .ok_or(GraphError::BadBufId(id.raw()))?;
+        let label = *self.labels.get(idx).ok_or(GraphError::BadBufId(id.raw()))?;
         let expected = self.byte_sizes[idx];
         // Prefix semantics: see `upload`.
         if host.len() > expected {
@@ -220,7 +199,7 @@ impl BufferPool for CpuBufferPool {
     }
 
     fn commit_plan(&mut self, graph: &Graph) {
-        use super::lifetime::{analyze_lifetimes, greedy_color, ColorId};
+        use super::lifetime::{ColorId, analyze_lifetimes, greedy_color};
         use std::collections::HashMap;
 
         let lifetimes = analyze_lifetimes(graph);
@@ -257,10 +236,8 @@ impl BufferPool for CpuBufferPool {
             }
             let old_physical = self.bufid_to_physical[bufid_idx] as usize;
             let new_phys = *old_to_new.entry(old_physical).or_insert_with(|| {
-                let old_buf = std::mem::replace(
-                    &mut self.buffers[old_physical],
-                    RefCell::new(Vec::new()),
-                );
+                let old_buf =
+                    std::mem::replace(&mut self.buffers[old_physical], RefCell::new(Vec::new()));
                 let np = new_buffers.len() as u32;
                 new_buffers.push(old_buf);
                 np
@@ -430,10 +407,7 @@ fn rms_norm_bf16_n_tokens_cpu(
         }
         let inv_rms = 1.0f32 / (sum_sq / dim as f32 + eps).sqrt();
         for i in 0..dim {
-            let w_bits = u16::from_le_bytes([
-                weight_bf16[i * 2],
-                weight_bf16[i * 2 + 1],
-            ]);
+            let w_bits = u16::from_le_bytes([weight_bf16[i * 2], weight_bf16[i * 2 + 1]]);
             let w = bf16_to_f32(w_bits);
             ot[i] = xt[i] * inv_rms * w;
         }
@@ -463,13 +437,9 @@ fn rms_norm_per_head_n_tokens_cpu(
             for &xi in xh.iter() {
                 sum_sq += xi * xi;
             }
-            let inv_rms =
-                1.0f32 / (sum_sq / head_dim as f32 + eps).sqrt();
+            let inv_rms = 1.0f32 / (sum_sq / head_dim as f32 + eps).sqrt();
             for i in 0..head_dim {
-                let w_bits = u16::from_le_bytes([
-                    weight_bf16[i * 2],
-                    weight_bf16[i * 2 + 1],
-                ]);
+                let w_bits = u16::from_le_bytes([weight_bf16[i * 2], weight_bf16[i * 2 + 1]]);
                 let w = bf16_to_f32(w_bits);
                 xh[i] = xh[i] * inv_rms * w;
             }
@@ -550,16 +520,12 @@ fn gated_rms_norm_n_tokens_cpu(
             for &vi in v.iter() {
                 sum_sq += vi * vi;
             }
-            let inv_rms =
-                1.0f32 / (sum_sq / value_dim as f32 + eps).sqrt();
+            let inv_rms = 1.0f32 / (sum_sq / value_dim as f32 + eps).sqrt();
             for i in 0..value_dim {
                 let normed = v[i] * inv_rms;
                 let zval = zr[i];
                 let gate = zval / (1.0 + (-zval).exp()); // SiLU
-                let w_bits = u16::from_le_bytes([
-                    weight_bf16[i * 2],
-                    weight_bf16[i * 2 + 1],
-                ]);
+                let w_bits = u16::from_le_bytes([weight_bf16[i * 2], weight_bf16[i * 2 + 1]]);
                 let w = bf16_to_f32(w_bits);
                 o[i] = normed * gate * w;
             }
@@ -593,11 +559,9 @@ fn split_q_gate_cpu(
         for h in 0..num_heads {
             let src = t * num_heads * 2 * head_dim + h * 2 * head_dim;
             let dst = t * num_heads * head_dim + h * head_dim;
-            q_out[dst..dst + head_dim]
-                .copy_from_slice(&q_proj[src..src + head_dim]);
-            gate_out[dst..dst + head_dim].copy_from_slice(
-                &q_proj[src + head_dim..src + 2 * head_dim],
-            );
+            q_out[dst..dst + head_dim].copy_from_slice(&q_proj[src..src + head_dim]);
+            gate_out[dst..dst + head_dim]
+                .copy_from_slice(&q_proj[src + head_dim..src + 2 * head_dim]);
         }
     }
 }
@@ -790,11 +754,7 @@ impl Backend for CpuBackend {
         &mut self.pool
     }
     fn begin_encoding(&self) {}
-    fn submit_and_wait(
-        &self,
-        _: (),
-        _label: &'static str,
-    ) -> Result<(), GraphError> {
+    fn submit_and_wait(&self, _: (), _label: &'static str) -> Result<(), GraphError> {
         Ok(())
     }
 
@@ -817,9 +777,7 @@ impl Backend for CpuBackend {
                     .expect("weight_off out of mmap");
                 let x_buf = self.read_f32(*x);
                 let mut out_buf = self.write_f32(*out);
-                rms_norm_bf16_n_tokens_cpu(
-                    weight_bytes, &x_buf, dim, n_tokens, *eps, &mut out_buf,
-                );
+                rms_norm_bf16_n_tokens_cpu(weight_bytes, &x_buf, dim, n_tokens, *eps, &mut out_buf);
             }
             Op::RmsNormQkNTokens {
                 x,
@@ -887,14 +845,12 @@ impl Backend for CpuBackend {
                 {
                     let k_src_buf = self.read_f32(*k_src);
                     let mut k_cache_buf = self.write_f32(*k_cache);
-                    k_cache_buf[start..start + len]
-                        .copy_from_slice(&k_src_buf[..len]);
+                    k_cache_buf[start..start + len].copy_from_slice(&k_src_buf[..len]);
                 }
                 {
                     let v_src_buf = self.read_f32(*v_src);
                     let mut v_cache_buf = self.write_f32(*v_cache);
-                    v_cache_buf[start..start + len]
-                        .copy_from_slice(&v_src_buf[..len]);
+                    v_cache_buf[start..start + len].copy_from_slice(&v_src_buf[..len]);
                 }
             }
             Op::RopeNTokens {
@@ -960,10 +916,9 @@ impl Backend for CpuBackend {
                 let scales = bytes_as::<u16>(s_bytes);
                 let biases = bytes_as::<u16>(b_bytes);
                 for t in 0..n_tokens {
-                    let x_t =
-                        &input_buf[in_skip + t * in_dim..in_skip + (t + 1) * in_dim];
-                    let out_t = &mut output_buf
-                        [out_skip + t * out_dim..out_skip + (t + 1) * out_dim];
+                    let x_t = &input_buf[in_skip + t * in_dim..in_skip + (t + 1) * in_dim];
+                    let out_t =
+                        &mut output_buf[out_skip + t * out_dim..out_skip + (t + 1) * out_dim];
                     if bits == 4 {
                         dequant_matvec_4bit_cpu(
                             packed, scales, biases, in_dim, out_dim, x_t, out_t,
@@ -991,9 +946,7 @@ impl Backend for CpuBackend {
                 // is one flat region.
                 let gate_buf = self.read_f32(*gate);
                 let mut x_buf = self.write_f32(*x);
-                for (xv, gv) in
-                    x_buf.iter_mut().zip(gate_buf.iter())
-                {
+                for (xv, gv) in x_buf.iter_mut().zip(gate_buf.iter()) {
                     *xv *= 1.0f32 / (1.0f32 + (-*gv).exp());
                 }
             }
@@ -1072,14 +1025,13 @@ impl Backend for CpuBackend {
                 );
             }
             Op::MoeNormalizeWeights {
-                weights, n_tokens, k, ..
+                weights,
+                n_tokens,
+                k,
+                ..
             } => {
                 let mut w_buf = self.write_f32(*weights);
-                moe_normalize_weights_cpu(
-                    &mut w_buf,
-                    *n_tokens as usize,
-                    *k as usize,
-                );
+                moe_normalize_weights_cpu(&mut w_buf, *n_tokens as usize, *k as usize);
             }
             Op::MoeGatherIdFuse { label, .. } => {
                 // The kernel-level diff oracle in
@@ -1126,10 +1078,8 @@ impl Backend for CpuBackend {
                         &base[off..off + expert_size]
                     })
                     .collect();
-                moe_permute_fuse_cpu(
-                    &VARIANT, &blob_refs, &input_buf, buckets, &mut out_buf,
-                )
-                .expect("moe permute-fuse");
+                moe_permute_fuse_cpu(&VARIANT, &blob_refs, &input_buf, buckets, &mut out_buf)
+                    .expect("moe permute-fuse");
             }
             Op::MoeCombineResidualNTokens {
                 h_mid,
@@ -1181,8 +1131,7 @@ impl Backend for CpuBackend {
                 let mut conv_out_buf = self.write_f32(*conv_out);
                 let mut tmp_out = vec![0.0f32; conv_dim];
                 for t in 0..n_tokens {
-                    let input =
-                        &qkv_in_buf[t * conv_dim..(t + 1) * conv_dim];
+                    let input = &qkv_in_buf[t * conv_dim..(t + 1) * conv_dim];
                     conv1d_step(
                         &conv_state_buf,
                         input,
@@ -1192,8 +1141,7 @@ impl Backend for CpuBackend {
                         &mut tmp_out,
                     )
                     .expect("conv1d_step");
-                    conv_out_buf[t * conv_dim..(t + 1) * conv_dim]
-                        .copy_from_slice(&tmp_out);
+                    conv_out_buf[t * conv_dim..(t + 1) * conv_dim].copy_from_slice(&tmp_out);
                     // Shift state forward by one step: state =
                     // [state[channels..], input]
                     let cs_len = conv_state_buf.len();
@@ -1228,13 +1176,10 @@ impl Backend for CpuBackend {
                 let mut g_decay_buf = self.write_f32(*g_decay_out);
                 let mut beta_gate_buf = self.write_f32(*beta_gate_out);
                 for t in 0..n_tokens {
-                    let a =
-                        &alpha_buf[t * num_v_heads..(t + 1) * num_v_heads];
+                    let a = &alpha_buf[t * num_v_heads..(t + 1) * num_v_heads];
                     let b = &beta_buf[t * num_v_heads..(t + 1) * num_v_heads];
-                    let g = &mut g_decay_buf
-                        [t * num_v_heads..(t + 1) * num_v_heads];
-                    let bg = &mut beta_gate_buf
-                        [t * num_v_heads..(t + 1) * num_v_heads];
+                    let g = &mut g_decay_buf[t * num_v_heads..(t + 1) * num_v_heads];
+                    let bg = &mut beta_gate_buf[t * num_v_heads..(t + 1) * num_v_heads];
                     compute_decay_beta_cpu(a, b, a_log, dt_bias_bytes, g, bg)
                         .expect("compute_decay_beta");
                 }
@@ -1272,16 +1217,12 @@ impl Backend for CpuBackend {
                 // bindings without separate BufIds.
                 let per_token_conv = 2 * key_total + value_total;
                 for t in 0..n_tokens {
-                    let conv_t = &conv_out_buf
-                        [t * per_token_conv..(t + 1) * per_token_conv];
+                    let conv_t = &conv_out_buf[t * per_token_conv..(t + 1) * per_token_conv];
                     let q = &conv_t[0..key_total];
                     let k = &conv_t[key_total..2 * key_total];
-                    let v =
-                        &conv_t[2 * key_total..2 * key_total + value_total];
-                    let g = &g_decay_buf
-                        [t * v_heads..(t + 1) * v_heads];
-                    let bg = &beta_gate_buf
-                        [t * v_heads..(t + 1) * v_heads];
+                    let v = &conv_t[2 * key_total..2 * key_total + value_total];
+                    let g = &g_decay_buf[t * v_heads..(t + 1) * v_heads];
+                    let bg = &beta_gate_buf[t * v_heads..(t + 1) * v_heads];
                     let mut out_t = vec![0.0f32; value_total];
                     gated_delta_recurrence_supplied(
                         g,
@@ -1297,8 +1238,7 @@ impl Backend for CpuBackend {
                         &mut out_t,
                     )
                     .expect("delta net step");
-                    output_buf[t * value_total..(t + 1) * value_total]
-                        .copy_from_slice(&out_t);
+                    output_buf[t * value_total..(t + 1) * value_total].copy_from_slice(&out_t);
                 }
             }
             Op::GatedDeltaNetChunkwise {
@@ -1336,17 +1276,12 @@ impl Backend for CpuBackend {
                 let mut k = vec![0.0f32; n_tokens * key_total];
                 let mut v = vec![0.0f32; n_tokens * value_total];
                 for t in 0..n_tokens {
-                    let conv_t = &conv_out_buf
-                        [t * per_token_conv..(t + 1) * per_token_conv];
-                    q[t * key_total..(t + 1) * key_total]
-                        .copy_from_slice(&conv_t[0..key_total]);
+                    let conv_t = &conv_out_buf[t * per_token_conv..(t + 1) * per_token_conv];
+                    q[t * key_total..(t + 1) * key_total].copy_from_slice(&conv_t[0..key_total]);
                     k[t * key_total..(t + 1) * key_total]
                         .copy_from_slice(&conv_t[key_total..2 * key_total]);
                     v[t * value_total..(t + 1) * value_total]
-                        .copy_from_slice(
-                            &conv_t[2 * key_total
-                                ..2 * key_total + value_total],
-                        );
+                        .copy_from_slice(&conv_t[2 * key_total..2 * key_total + value_total]);
                 }
                 gated_delta_chunkwise(
                     &g_decay_buf,
@@ -1419,24 +1354,15 @@ impl Backend for CpuBackend {
                     let row = ids[t].max(0) as u64;
                     let w_row = self
                         .wf
-                        .bytes_at(
-                            weight.w_off + row * w_row_bytes as u64,
-                            w_row_bytes,
-                        )
+                        .bytes_at(weight.w_off + row * w_row_bytes as u64, w_row_bytes)
                         .expect("embed weight row out of mmap");
                     let s_row = self
                         .wf
-                        .bytes_at(
-                            weight.s_off + row * sb_row_bytes as u64,
-                            sb_row_bytes,
-                        )
+                        .bytes_at(weight.s_off + row * sb_row_bytes as u64, sb_row_bytes)
                         .expect("embed scales row out of mmap");
                     let b_row = self
                         .wf
-                        .bytes_at(
-                            weight.b_off + row * sb_row_bytes as u64,
-                            sb_row_bytes,
-                        )
+                        .bytes_at(weight.b_off + row * sb_row_bytes as u64, sb_row_bytes)
                         .expect("embed biases row out of mmap");
                     embed_lookup_at(
                         w_row,
@@ -1496,7 +1422,11 @@ mod tests {
         let id: BufId<MoeInputBuf> = p.alloc(16, "x", false).unwrap();
         let too_big = vec![0u8; 17];
         match p.upload(id, &too_big) {
-            Err(GraphError::SizeMismatch { label, expected, actual }) => {
+            Err(GraphError::SizeMismatch {
+                label,
+                expected,
+                actual,
+            }) => {
                 assert_eq!(label, "x");
                 assert_eq!(expected, 16);
                 assert_eq!(actual, 17);
@@ -1508,12 +1438,9 @@ mod tests {
     #[test]
     fn cpu_pool_reset_transient_keeps_persistent_prefix() {
         let mut p = CpuBufferPool::new();
-        let _persistent_a: BufId<HiddenBuf> =
-            p.alloc(64, "kv_a", true).unwrap();
-        let _persistent_b: BufId<HiddenBuf> =
-            p.alloc(64, "kv_b", true).unwrap();
-        let _transient: BufId<HiddenBuf> =
-            p.alloc(32, "intermed", false).unwrap();
+        let _persistent_a: BufId<HiddenBuf> = p.alloc(64, "kv_a", true).unwrap();
+        let _persistent_b: BufId<HiddenBuf> = p.alloc(64, "kv_b", true).unwrap();
+        let _transient: BufId<HiddenBuf> = p.alloc(32, "intermed", false).unwrap();
         assert_eq!(p.physical_buffer_count(), 3);
         p.reset_transient();
         assert_eq!(p.physical_buffer_count(), 2);

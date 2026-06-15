@@ -11,9 +11,9 @@
 //! cache), so it stays a separate parameter to keep the struct a
 //! cheap `Copy` of shared references.
 
+use crate::riir::attn::linear_attn_forward::LayerForwardBuffers;
 use crate::riir::backend::MetalBufferPool;
 use crate::riir::io::layer_weight_cache::LayerWeightCache;
-use crate::riir::attn::linear_attn_forward::LayerForwardBuffers;
 use crate::riir::io::mtl_weight_buf::MtlWeightBuf;
 use crate::riir::io::weight_file::WeightFile;
 

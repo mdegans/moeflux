@@ -55,17 +55,13 @@ use std::path::PathBuf;
 use moeflux::Ctx;
 
 fn model_root() -> PathBuf {
-    let default =
-        "/Volumes/Temp Backup/models/moeflux/qwen3-6-35b-a3b-root";
+    let default = "/Volumes/Temp Backup/models/moeflux/qwen3-6-35b-a3b-root";
     PathBuf::from(std::env::var("MOEFLUX_SMOKE_ROOT").unwrap_or(default.into()))
 }
 
 fn artifacts() -> PathBuf {
-    let default =
-        "/Volumes/Temp Backup/models/moeflux/qwen3-6-35b-a3b-artifacts";
-    PathBuf::from(
-        std::env::var("MOEFLUX_SMOKE_ARTIFACTS").unwrap_or(default.into()),
-    )
+    let default = "/Volumes/Temp Backup/models/moeflux/qwen3-6-35b-a3b-artifacts";
+    PathBuf::from(std::env::var("MOEFLUX_SMOKE_ARTIFACTS").unwrap_or(default.into()))
 }
 
 fn open_ctx() -> Ctx {
@@ -138,7 +134,8 @@ fn logits_summary(logits: &[f32]) -> String {
 /// steps).
 fn greedy(ctx: &mut Ctx, tokens: &[i32], n: usize) -> (Vec<i32>, Vec<f32>) {
     let mut logits = vec![0.0f32; ctx.n_vocab()];
-    ctx.eval_prompt(tokens, 0, 0, &mut logits).expect("eval_prompt");
+    ctx.eval_prompt(tokens, 0, 0, &mut logits)
+        .expect("eval_prompt");
     let prefill_logits = logits.clone();
 
     let mut out = Vec::with_capacity(n);
@@ -146,7 +143,8 @@ fn greedy(ctx: &mut Ctx, tokens: &[i32], n: usize) -> (Vec<i32>, Vec<f32>) {
     for step in 0..n {
         out.push(next);
         let pos = tokens.len() + step;
-        ctx.eval_token(next, pos, 0, &mut logits).expect("eval_token");
+        ctx.eval_token(next, pos, 0, &mut logits)
+            .expect("eval_token");
         next = argmax(&logits);
     }
     (out, prefill_logits)
@@ -172,7 +170,8 @@ fn greedy_resuming(
     for step in 0..n {
         out.push(next);
         let pos = start_pos + suffix.len() + step;
-        ctx.eval_token(next, pos, 0, &mut logits).expect("eval_token");
+        ctx.eval_token(next, pos, 0, &mut logits)
+            .expect("eval_token");
         next = argmax(&logits);
     }
     (out, prefill_logits)
@@ -240,8 +239,7 @@ fn memory_clear_after_dirty_decode_resets_for_different_prompt() {
     );
 
     // Baseline: clean Ctx, prompt 2 trajectory.
-    let (baseline_traj, baseline_logits) =
-        greedy(&mut ctx, PROMPT_2, N_DECODE);
+    let (baseline_traj, baseline_logits) = greedy(&mut ctx, PROMPT_2, N_DECODE);
     eprintln!("[dirty-decode] baseline traj: {baseline_traj:?}");
     eprintln!(
         "[dirty-decode] baseline logits: {}",
@@ -376,8 +374,7 @@ fn resuming_prefill_after_seq_rm_matches_full_prefill() {
         .chain(P2_SUFFIX.iter())
         .copied()
         .collect();
-    let (baseline_traj, baseline_logits) =
-        greedy(&mut ctx, &p2_full, N_DECODE);
+    let (baseline_traj, baseline_logits) = greedy(&mut ctx, &p2_full, N_DECODE);
     eprintln!("[resume] baseline traj: {baseline_traj:?}");
     eprintln!(
         "[resume] baseline logits: {}",
@@ -410,10 +407,7 @@ fn resuming_prefill_after_seq_rm_matches_full_prefill() {
     let (resume_traj, resume_logits) =
         greedy_resuming(&mut ctx, P2_SUFFIX, l_hit as usize, N_DECODE);
     eprintln!("[resume] resume traj:   {resume_traj:?}");
-    eprintln!(
-        "[resume] resume logits: {}",
-        logits_summary(&resume_logits)
-    );
+    eprintln!("[resume] resume logits: {}", logits_summary(&resume_logits));
 
     let baseline_top = topk(&baseline_logits, TOP_K);
     let resume_top = topk(&resume_logits, TOP_K);
@@ -423,9 +417,7 @@ fn resuming_prefill_after_seq_rm_matches_full_prefill() {
         .zip(resume_traj.iter())
         .filter(|(a, b)| a == b)
         .count();
-    eprintln!(
-        "[resume] top-{TOP_K} jaccard={overlap:.3} traj_match={traj_matches}/{N_DECODE}"
-    );
+    eprintln!("[resume] top-{TOP_K} jaccard={overlap:.3} traj_match={traj_matches}/{N_DECODE}");
 
     assert_eq!(
         argmax(&baseline_logits),

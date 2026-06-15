@@ -41,14 +41,10 @@
 
 use metal::{Buffer, Device};
 
+use crate::riir::attn::linear_attn_forward::{LayerForwardBuffers, linear_layer_idx_for};
 use crate::riir::moe::deferred;
-use crate::riir::attn::linear_attn_forward::{
-    full_attn_layer_idx_for, linear_layer_idx_for, LayerForwardBuffers,
-};
 use crate::riir::snapshot::state::{LayerState, MlaKvCacheGpu};
-use crate::riir::variants::{
-    AttnKind, LayerKind, Variant, GPU_KV_SEQ, MAX_SEQ_LEN, VARIANT,
-};
+use crate::riir::variants::{AttnKind, LayerKind, MAX_SEQ_LEN, VARIANT, Variant};
 
 /// `'MFLX'` little-endian. Wire-compatible with the C side's
 /// `MF_SNAPSHOT_MAGIC` (infer.m:8487).
@@ -95,9 +91,7 @@ pub enum StateSnapshotError {
     #[error("snapshot layer {layer} has negative KV length {len}")]
     NegativeLen { layer: usize, len: i32 },
     /// Per-layer length exceeds the architectural maximum.
-    #[error(
-        "snapshot layer {layer} KV length {len} exceeds MAX_SEQ_LEN={max}"
-    )]
+    #[error("snapshot layer {layer} KV length {len} exceeds MAX_SEQ_LEN={max}")]
     LenOverflow { layer: usize, len: i32, max: usize },
     /// Truncated payload (preflight failure during load).
     #[error("snapshot truncated at layer {layer}: need {need} more bytes, got {got}")]
@@ -125,9 +119,7 @@ fn full_attn_stride_bytes(v: &Variant) -> usize {
 
 #[inline]
 fn linear_conv_bytes(v: &Variant) -> usize {
-    (Variant::CONV_KERNEL_SIZE - 1)
-        * v.linear_conv_dim()
-        * std::mem::size_of::<f32>()
+    (Variant::CONV_KERNEL_SIZE - 1) * v.linear_conv_dim() * std::mem::size_of::<f32>()
 }
 
 #[inline]
@@ -155,11 +147,7 @@ fn read_buffer_bytes_n_f32(buf: &Buffer, dst: &mut [u8], n_f32: usize) {
     debug_assert_eq!(dst.len(), bytes);
     // SAFETY: shared-storage; caller honors the no-GPU-in-flight contract.
     unsafe {
-        std::ptr::copy_nonoverlapping(
-            buf.contents() as *const u8,
-            dst.as_mut_ptr(),
-            bytes,
-        );
+        std::ptr::copy_nonoverlapping(buf.contents() as *const u8, dst.as_mut_ptr(), bytes);
     }
 }
 
@@ -170,11 +158,7 @@ fn write_buffer_bytes_n_f32(buf: &Buffer, src: &[u8], n_f32: usize) {
     debug_assert_eq!(src.len(), bytes);
     // SAFETY: shared-storage; caller honors the no-GPU-in-flight contract.
     unsafe {
-        std::ptr::copy_nonoverlapping(
-            src.as_ptr(),
-            buf.contents() as *mut u8,
-            bytes,
-        );
+        std::ptr::copy_nonoverlapping(src.as_ptr(), buf.contents() as *mut u8, bytes);
     }
 }
 
@@ -212,8 +196,7 @@ pub fn state_size(layer_states: &[LayerState]) -> usize {
                         n += 2 * len * fa_stride;
                     }
                     AttnKind::Mla => {
-                        n += mla_latent_bytes(&v, len)
-                            + mla_rope_k_bytes(&v, len);
+                        n += mla_latent_bytes(&v, len) + mla_rope_k_bytes(&v, len);
                     }
                 }
             }
@@ -288,26 +271,12 @@ pub fn state_save(
                         // in the pool — resolve the BufId to its
                         // shared-storage buffer and read straight from
                         // it (mirrors the MLA branch below).
-                        let p = pool.ok_or(
-                            StateSnapshotError::BuffersNotReady,
-                        )?;
-                        let k_buf = p.handle(kv.k_id.ok_or(
-                            StateSnapshotError::BuffersNotReady,
-                        )?);
-                        read_buffer_bytes_n_f32(
-                            k_buf,
-                            &mut buf[off..off + bytes],
-                            n,
-                        );
+                        let p = pool.ok_or(StateSnapshotError::BuffersNotReady)?;
+                        let k_buf = p.handle(kv.k_id.ok_or(StateSnapshotError::BuffersNotReady)?);
+                        read_buffer_bytes_n_f32(k_buf, &mut buf[off..off + bytes], n);
                         off += bytes;
-                        let v_buf = p.handle(kv.v_id.ok_or(
-                            StateSnapshotError::BuffersNotReady,
-                        )?);
-                        read_buffer_bytes_n_f32(
-                            v_buf,
-                            &mut buf[off..off + bytes],
-                            n,
-                        );
+                        let v_buf = p.handle(kv.v_id.ok_or(StateSnapshotError::BuffersNotReady)?);
+                        read_buffer_bytes_n_f32(v_buf, &mut buf[off..off + bytes], n);
                         off += bytes;
                     }
                 }
@@ -317,27 +286,20 @@ pub fn state_save(
                     off += 4;
                     if len > 0 {
                         let lat_bytes = mla_latent_bytes(&v, len as usize);
-                        let rope_bytes =
-                            mla_rope_k_bytes(&v, len as usize);
-                        let lat_buf = cache.latent_cache.as_ref().ok_or(
-                            StateSnapshotError::BuffersNotReady,
-                        )?;
-                        let rope_buf = cache.rope_k_cache.as_ref().ok_or(
-                            StateSnapshotError::BuffersNotReady,
-                        )?;
+                        let rope_bytes = mla_rope_k_bytes(&v, len as usize);
+                        let lat_buf = cache
+                            .latent_cache
+                            .as_ref()
+                            .ok_or(StateSnapshotError::BuffersNotReady)?;
+                        let rope_buf = cache
+                            .rope_k_cache
+                            .as_ref()
+                            .ok_or(StateSnapshotError::BuffersNotReady)?;
                         let n_lat = (len as usize) * v.kv_lora_rank;
                         let n_rope = (len as usize) * v.qk_rope_head_dim;
-                        read_buffer_bytes_n_f32(
-                            lat_buf,
-                            &mut buf[off..off + lat_bytes],
-                            n_lat,
-                        );
+                        read_buffer_bytes_n_f32(lat_buf, &mut buf[off..off + lat_bytes], n_lat);
                         off += lat_bytes;
-                        read_buffer_bytes_n_f32(
-                            rope_buf,
-                            &mut buf[off..off + rope_bytes],
-                            n_rope,
-                        );
+                        read_buffer_bytes_n_f32(rope_buf, &mut buf[off..off + rope_bytes], n_rope);
                         off += rope_bytes;
                     }
                 }
@@ -350,12 +312,9 @@ pub fn state_save(
                 }
             },
             LayerKind::LinearAttn => {
-                let lb = linear_buffers
-                    .ok_or(StateSnapshotError::BuffersNotReady)?;
-                let p = pool
-                    .ok_or(StateSnapshotError::BuffersNotReady)?;
-                let linear_idx = linear_layer_idx_for(i)
-                    .expect("layer_kind says LinearAttn");
+                let lb = linear_buffers.ok_or(StateSnapshotError::BuffersNotReady)?;
+                let p = pool.ok_or(StateSnapshotError::BuffersNotReady)?;
+                let linear_idx = linear_layer_idx_for(i).expect("layer_kind says LinearAttn");
                 read_buffer_bytes(
                     p.handle(lb.conv_state[linear_idx]),
                     &mut buf[off..off + la_conv],
@@ -397,9 +356,8 @@ pub fn state_load(
             got: buf.len(),
         });
     }
-    let read_u32 = |off: usize| -> u32 {
-        u32::from_le_bytes(buf[off..off + 4].try_into().unwrap())
-    };
+    let read_u32 =
+        |off: usize| -> u32 { u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()) };
     let magic = read_u32(0);
     if magic != SNAPSHOT_MAGIC {
         return Err(StateSnapshotError::BadMagic {
@@ -474,15 +432,10 @@ pub fn state_load(
                             got: buf.len() - q,
                         });
                     }
-                    let len = i32::from_le_bytes(
-                        buf[q..q + 4].try_into().unwrap(),
-                    );
+                    let len = i32::from_le_bytes(buf[q..q + 4].try_into().unwrap());
                     q += 4;
                     if len < 0 {
-                        return Err(StateSnapshotError::NegativeLen {
-                            layer: i,
-                            len,
-                        });
+                        return Err(StateSnapshotError::NegativeLen { layer: i, len });
                     }
                     if (len as usize) > MAX_SEQ_LEN {
                         return Err(StateSnapshotError::LenOverflow {
@@ -494,8 +447,7 @@ pub fn state_load(
                     let bytes = match v.attn_kind {
                         AttnKind::Gqa => 2 * (len as usize) * fa_stride,
                         AttnKind::Mla => {
-                            mla_latent_bytes(&v, len as usize)
-                                + mla_rope_k_bytes(&v, len as usize)
+                            mla_latent_bytes(&v, len as usize) + mla_rope_k_bytes(&v, len as usize)
                         }
                     };
                     if buf.len() - q < bytes {
@@ -527,29 +479,24 @@ pub fn state_load(
     for i in 0..v.num_layers {
         match v.layer_kind(i) {
             LayerKind::FullAttn => {
-                let len = i32::from_le_bytes(
-                    buf[off..off + 4].try_into().unwrap(),
-                );
+                let len = i32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
                 off += 4;
                 // MLA path — populate latent + rope_k Metal buffers.
                 if v.attn_kind == AttnKind::Mla {
                     let cache = match &mut layer_states[i] {
                         LayerState::Mla(c) => c,
                         _ => {
-                            return Err(
-                                StateSnapshotError::ShapeMismatch {
-                                    field: "layer_state_kind",
-                                    got: 0,
-                                    want: 1,
-                                },
-                            );
+                            return Err(StateSnapshotError::ShapeMismatch {
+                                field: "layer_state_kind",
+                                got: 0,
+                                want: 1,
+                            });
                         }
                     };
                     ensure_mla_buffers(cache, device);
                     if len > 0 {
                         let lat_bytes = mla_latent_bytes(&v, len as usize);
-                        let rope_bytes =
-                            mla_rope_k_bytes(&v, len as usize);
+                        let rope_bytes = mla_rope_k_bytes(&v, len as usize);
                         let n_lat = (len as usize) * v.kv_lora_rank;
                         let n_rope = (len as usize) * v.qk_rope_head_dim;
                         let lat_buf = cache
@@ -560,17 +507,9 @@ pub fn state_load(
                             .rope_k_cache
                             .as_ref()
                             .expect("ensure_mla_buffers just ran");
-                        write_buffer_bytes_n_f32(
-                            lat_buf,
-                            &buf[off..off + lat_bytes],
-                            n_lat,
-                        );
+                        write_buffer_bytes_n_f32(lat_buf, &buf[off..off + lat_bytes], n_lat);
                         off += lat_bytes;
-                        write_buffer_bytes_n_f32(
-                            rope_buf,
-                            &buf[off..off + rope_bytes],
-                            n_rope,
-                        );
+                        write_buffer_bytes_n_f32(rope_buf, &buf[off..off + rope_bytes], n_rope);
                         off += rope_bytes;
                     }
                     cache.len = len;
@@ -598,83 +537,28 @@ pub fn state_load(
                 // row is overwritten before it is read (mirrors the
                 // MLA branch + `MlaKvCacheGpu`).
                 if len > 0 {
-                    let p = pool
-                        .ok_or(StateSnapshotError::BuffersNotReady)?;
+                    let p = pool.ok_or(StateSnapshotError::BuffersNotReady)?;
                     let bytes = (len as usize) * fa_stride;
                     let n = bytes / std::mem::size_of::<f32>();
-                    let k_buf = p.handle(kv.k_id.ok_or(
-                        StateSnapshotError::BuffersNotReady,
-                    )?);
-                    write_buffer_bytes_n_f32(
-                        k_buf,
-                        &buf[off..off + bytes],
-                        n,
-                    );
+                    let k_buf = p.handle(kv.k_id.ok_or(StateSnapshotError::BuffersNotReady)?);
+                    write_buffer_bytes_n_f32(k_buf, &buf[off..off + bytes], n);
                     off += bytes;
-                    let v_buf = p.handle(kv.v_id.ok_or(
-                        StateSnapshotError::BuffersNotReady,
-                    )?);
-                    write_buffer_bytes_n_f32(
-                        v_buf,
-                        &buf[off..off + bytes],
-                        n,
-                    );
+                    let v_buf = p.handle(kv.v_id.ok_or(StateSnapshotError::BuffersNotReady)?);
+                    write_buffer_bytes_n_f32(v_buf, &buf[off..off + bytes], n);
                     off += bytes;
                 }
-                let stride = v.num_kv_heads * v.head_dim;
                 kv.len = len;
-
-                // Slice 5d-7b — mirror restored host KV into the GPU
-                // KV mirrors so the GPU SDPA fast path sees the same
-                // prefix. Mirrors C `infer.m:6570..6577`. Capped at
-                // `GPU_KV_SEQ` (the persistent buffer's slot count);
-                // restored sequences past that fall back to CPU SDPA
-                // exactly as the C side does.
-                if let Some(fa_idx) = full_attn_layer_idx_for(i) {
-                    let mirror_len = (len as usize).min(GPU_KV_SEQ);
-                    if mirror_len > 0 {
-                        let lb = linear_buffers
-                            .as_deref_mut()
-                            .ok_or(StateSnapshotError::BuffersNotReady)?;
-                        let n = mirror_len * stride;
-                        // SAFETY: shared-storage GPU buffer; called at a
-                        // token boundary (per moeflux.h:481 contract +
-                        // the `discard_deferred_experts` guard at the
-                        // top of state_load callers), so no GPU work is
-                        // in flight on the mirror.
-                        let p = pool
-                            .ok_or(StateSnapshotError::BuffersNotReady)?;
-                        unsafe {
-                            let k_dst = p
-                                .handle(lb.gpu_kv_k[fa_idx])
-                                .contents()
-                                as *mut f32;
-                            let v_dst = p
-                                .handle(lb.gpu_kv_v[fa_idx])
-                                .contents()
-                                as *mut f32;
-                            std::ptr::copy_nonoverlapping(
-                                kv.k_slice(p, mirror_len).as_ptr(),
-                                k_dst,
-                                n,
-                            );
-                            std::ptr::copy_nonoverlapping(
-                                kv.v_slice(p, mirror_len).as_ptr(),
-                                v_dst,
-                                n,
-                            );
-                        }
-                    }
-                }
+                // The restored KV lives in the canonical pool buffers
+                // the oracle SDPA reads directly (#2 removed the GPU
+                // mirror), so the bytes copied above are all the GPU
+                // fast path needs — no separate mirror sync.
             }
             LayerKind::LinearAttn => {
                 let lb = linear_buffers
                     .as_deref_mut()
                     .ok_or(StateSnapshotError::BuffersNotReady)?;
-                let p = pool
-                    .ok_or(StateSnapshotError::BuffersNotReady)?;
-                let linear_idx = linear_layer_idx_for(i)
-                    .expect("layer_kind says LinearAttn");
+                let p = pool.ok_or(StateSnapshotError::BuffersNotReady)?;
+                let linear_idx = linear_layer_idx_for(i).expect("layer_kind says LinearAttn");
                 write_buffer_bytes(
                     p.handle(lb.conv_state[linear_idx]),
                     &buf[off..off + la_conv],

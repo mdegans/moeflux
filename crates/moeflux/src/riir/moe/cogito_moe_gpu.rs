@@ -39,18 +39,18 @@ use rayon::prelude::*;
 use crate::riir::backend::gpu::dense_mlp_gpu::{
     DenseMlpGpuError, DenseMlpPipelines, encode_swiglu_ffn_layer_forward_gpu,
 };
+use crate::riir::backend::gpu::gpu_matvec::{BfMatvecPipelines, encode_bf16_matvec};
+use crate::riir::backend::gpu::metal::MetalContext;
+use crate::riir::backend::{BufferPool, MetalBufferPool};
 use crate::riir::io::embedding::bf16_to_f32;
+use crate::riir::io::expert_io::{ExpertFiles, ExpertIoError};
+use crate::riir::io::mtl_weight_buf::MtlWeightBuf;
+use crate::riir::io::weight_file::WeightFile;
 use crate::riir::moe::expert_forward::{
     ExpertForwardError, MoeBuffers, gpu_batched_experts_encode_mmap,
 };
-use crate::riir::io::expert_io::{ExpertFiles, ExpertIoError};
-use crate::riir::backend::{BufferPool, MetalBufferPool};
-use crate::riir::backend::gpu::gpu_matvec::{BfMatvecPipelines, encode_bf16_matvec};
-use crate::riir::backend::gpu::metal::MetalContext;
 use crate::riir::moe::moe_router::{MoeRouterError, noaux_tc_router_cpu};
-use crate::riir::io::mtl_weight_buf::MtlWeightBuf;
 use crate::riir::variants::VARIANT;
-use crate::riir::io::weight_file::WeightFile;
 
 /// Errors specific to the GPU Cogito-V2 / DeepSeek-V3 MoE path.
 #[derive(Debug, thiserror::Error)]

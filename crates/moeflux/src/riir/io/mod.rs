@@ -1,6 +1,6 @@
 pub mod embedding;
-pub mod expert_io_mode;
 pub mod expert_io;
+pub mod expert_io_mode;
 pub mod gpu_lm_head;
 pub mod layer_weight_cache;
 pub mod lm_head;

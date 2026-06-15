@@ -23,9 +23,9 @@
 //! [`super::cpu_matvec::project_4bit_cpu`] inside, much less. Three
 //! dense layers per token is ~120ms warm — acceptable for first-run.
 
-use crate::riir::backend::cpu::cpu_matvec::{project_4bit_cpu, CpuMatvecError};
-use crate::riir::variants::VARIANT;
+use crate::riir::backend::cpu::cpu_matvec::{CpuMatvecError, project_4bit_cpu};
 use crate::riir::io::weight_file::WeightFile;
+use crate::riir::variants::VARIANT;
 
 /// Errors specific to the CPU MLP path.
 #[derive(Debug, thiserror::Error)]
@@ -140,8 +140,7 @@ mod tests {
         let mut hidden = vec![0.0f32; v.hidden_dim];
         hidden[42] = 1.0;
         let mut out = vec![0.0f32; v.hidden_dim];
-        dense_mlp_swiglu_cpu(&wf, 0, &hidden, &mut out)
-            .expect("dense MLP layer 0");
+        dense_mlp_swiglu_cpu(&wf, 0, &hidden, &mut out).expect("dense MLP layer 0");
         assert!(out.iter().all(|x| x.is_finite()));
         let max_abs = out.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
         assert!(max_abs > 0.0, "all-zero output — likely a wiring bug");

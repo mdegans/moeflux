@@ -26,21 +26,17 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use moeflux::riir::CmdbufStat;
 use moeflux::Ctx;
+use moeflux::riir::CmdbufStat;
 
 fn model_root() -> PathBuf {
-    let default =
-        "/Volumes/Temp Backup/models/moeflux/qwen3-6-35b-a3b-root";
+    let default = "/Volumes/Temp Backup/models/moeflux/qwen3-6-35b-a3b-root";
     PathBuf::from(std::env::var("MOEFLUX_SMOKE_ROOT").unwrap_or(default.into()))
 }
 
 fn artifacts() -> PathBuf {
-    let default =
-        "/Volumes/Temp Backup/models/moeflux/qwen3-6-35b-a3b-artifacts";
-    PathBuf::from(
-        std::env::var("MOEFLUX_SMOKE_ARTIFACTS").unwrap_or(default.into()),
-    )
+    let default = "/Volumes/Temp Backup/models/moeflux/qwen3-6-35b-a3b-artifacts";
+    PathBuf::from(std::env::var("MOEFLUX_SMOKE_ARTIFACTS").unwrap_or(default.into()))
 }
 
 /// Open the a3b Ctx. `experts_per_tok = 8` is the model's real

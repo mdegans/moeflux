@@ -35,17 +35,15 @@
 //! - `lm_head.biases`: `BF16`, shape `[vocab_size, hidden_dim / GROUP_SIZE]`.
 
 use crate::riir::io::embedding::bf16_to_f32;
-use crate::riir::variants::{GROUP_SIZE, VARIANT};
 use crate::riir::io::weight_file::WeightFile;
+use crate::riir::variants::{GROUP_SIZE, VARIANT};
 
 /// Errors specific to the LM head port.
 #[derive(Debug, thiserror::Error)]
 pub enum LmHeadError {
     #[error("LM head tensor '{name}' missing from manifest")]
     MissingTensor { name: &'static str },
-    #[error(
-        "LM head tensor '{name}' has unexpected shape {shape:?} (expected {expected:?})"
-    )]
+    #[error("LM head tensor '{name}' has unexpected shape {shape:?} (expected {expected:?})")]
     ShapeMismatch {
         name: &'static str,
         shape: Vec<usize>,
@@ -65,11 +63,7 @@ const BIASES_NAME: &str = "lm_head.biases";
 /// state) and write `VOCAB_SIZE` floats into `out`. Sequential
 /// reduction order matches `cpu_dequant_matvec`'s nested loops so the
 /// partial sums see the same operands in the same order as the C path.
-pub fn lm_head_cpu(
-    wf: &WeightFile,
-    x: &[f32],
-    out: &mut [f32],
-) -> Result<(), LmHeadError> {
+pub fn lm_head_cpu(wf: &WeightFile, x: &[f32], out: &mut [f32]) -> Result<(), LmHeadError> {
     let hidden_dim = VARIANT.hidden_dim;
     let vocab_size = VARIANT.vocab_size;
 
@@ -127,10 +121,7 @@ pub fn lm_head_cpu(
     Ok(())
 }
 
-fn tensor_or_missing<'a>(
-    wf: &'a WeightFile,
-    name: &'static str,
-) -> Result<&'a [u8], LmHeadError> {
+fn tensor_or_missing<'a>(wf: &'a WeightFile, name: &'static str) -> Result<&'a [u8], LmHeadError> {
     wf.tensor_bytes(name)
         .ok_or(LmHeadError::MissingTensor { name })
 }

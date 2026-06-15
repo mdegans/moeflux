@@ -76,7 +76,11 @@ pub fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
         nb += yf * yf;
     }
     let denom = (na * nb).sqrt();
-    if denom == 0.0 { 1.0 } else { (dot / denom) as f32 }
+    if denom == 0.0 {
+        1.0
+    } else {
+        (dot / denom) as f32
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -133,16 +137,12 @@ pub fn assert_logits_close(label: &str, c: &[f32], rs: &[f32]) {
 // ---------------------------------------------------------------------------
 
 pub fn artifacts_dir() -> PathBuf {
-    let default =
-        "/Volumes/Temp Backup/models/moeflux/qwen3-6-35b-a3b-artifacts";
-    PathBuf::from(
-        std::env::var("MOEFLUX_SMOKE_ARTIFACTS").unwrap_or(default.into()),
-    )
+    let default = "/Volumes/Temp Backup/models/moeflux/qwen3-6-35b-a3b-artifacts";
+    PathBuf::from(std::env::var("MOEFLUX_SMOKE_ARTIFACTS").unwrap_or(default.into()))
 }
 
 pub fn root_dir() -> PathBuf {
-    let default =
-        "/Volumes/Temp Backup/models/moeflux/qwen3-6-35b-a3b-root";
+    let default = "/Volumes/Temp Backup/models/moeflux/qwen3-6-35b-a3b-root";
     PathBuf::from(std::env::var("MOEFLUX_SMOKE_ROOT").unwrap_or(default.into()))
 }
 

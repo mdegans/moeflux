@@ -130,25 +130,20 @@ pub struct ColoringMap {
 /// running this on identical lifetimes therefore agree on the
 /// physical layout.
 pub fn greedy_color(lifetimes: &Lifetimes) -> ColoringMap {
-    let mut intervals: Vec<(u32, Interval)> = lifetimes
-        .intervals
-        .iter()
-        .map(|(b, i)| (*b, *i))
-        .collect();
+    let mut intervals: Vec<(u32, Interval)> =
+        lifetimes.intervals.iter().map(|(b, i)| (*b, *i)).collect();
     intervals.sort_by_key(|(b, i)| (i.first_write_op, *b));
 
     let mut active: Vec<(ColorId, u32)> = Vec::new();
     let mut next_color: ColorId = 0;
-    let mut bufid_to_color: HashMap<u32, ColorId> =
-        HashMap::with_capacity(intervals.len());
+    let mut bufid_to_color: HashMap<u32, ColorId> = HashMap::with_capacity(intervals.len());
 
     for (buf, interval) in &intervals {
         active.retain(|(_, last_read)| *last_read >= interval.first_write_op);
 
         // Find lowest free color. Scan active colors in ascending
         // order; first gap below `next_color` is reused.
-        let mut active_colors: Vec<ColorId> =
-            active.iter().map(|(c, _)| *c).collect();
+        let mut active_colors: Vec<ColorId> = active.iter().map(|(c, _)| *c).collect();
         active_colors.sort();
         let mut expected: ColorId = 0;
         let mut chosen: Option<ColorId> = None;
@@ -188,10 +183,8 @@ pub fn greedy_color(lifetimes: &Lifetimes) -> ColoringMap {
 
 #[cfg(test)]
 mod tests {
-    use super::super::buftype::{
-        Buf, BufId, ConvOutBuf, HiddenBuf, OProjOutBuf, ResidualBuf,
-    };
     use super::super::Op;
+    use super::super::buftype::{Buf, BufId, ConvOutBuf, HiddenBuf, OProjOutBuf, ResidualBuf};
     use super::*;
 
     /// Mint a typed `BufId<B>` from a raw index for fixtures.
@@ -238,7 +231,10 @@ mod tests {
         // just the write op.
         assert_eq!(
             lt.intervals[&2],
-            Interval { first_write_op: 0, last_read_op: 0 }
+            Interval {
+                first_write_op: 0,
+                last_read_op: 0
+            }
         );
     }
 
@@ -260,19 +256,31 @@ mod tests {
         assert_eq!(lt.intervals.len(), 4);
         assert_eq!(
             lt.intervals[&5],
-            Interval { first_write_op: 0, last_read_op: 1 }
+            Interval {
+                first_write_op: 0,
+                last_read_op: 1
+            }
         );
         assert_eq!(
             lt.intervals[&6],
-            Interval { first_write_op: 1, last_read_op: 2 }
+            Interval {
+                first_write_op: 1,
+                last_read_op: 2
+            }
         );
         assert_eq!(
             lt.intervals[&7],
-            Interval { first_write_op: 2, last_read_op: 3 }
+            Interval {
+                first_write_op: 2,
+                last_read_op: 3
+            }
         );
         assert_eq!(
             lt.intervals[&8],
-            Interval { first_write_op: 3, last_read_op: 3 }
+            Interval {
+                first_write_op: 3,
+                last_read_op: 3
+            }
         );
     }
 
@@ -293,7 +301,10 @@ mod tests {
         // x is written at op 0, read at op 0 → single-point.
         assert_eq!(
             lt.intervals[&0],
-            Interval { first_write_op: 0, last_read_op: 0 }
+            Interval {
+                first_write_op: 0,
+                last_read_op: 0
+            }
         );
     }
 
@@ -311,11 +322,17 @@ mod tests {
         let mut lt = Lifetimes::default();
         lt.intervals.insert(
             0,
-            Interval { first_write_op: 0, last_read_op: 1 },
+            Interval {
+                first_write_op: 0,
+                last_read_op: 1,
+            },
         );
         lt.intervals.insert(
             1,
-            Interval { first_write_op: 2, last_read_op: 3 },
+            Interval {
+                first_write_op: 2,
+                last_read_op: 3,
+            },
         );
         let cm = greedy_color(&lt);
         assert_eq!(cm.color_count, 1);
@@ -329,11 +346,17 @@ mod tests {
         let mut lt = Lifetimes::default();
         lt.intervals.insert(
             0,
-            Interval { first_write_op: 0, last_read_op: 2 },
+            Interval {
+                first_write_op: 0,
+                last_read_op: 2,
+            },
         );
         lt.intervals.insert(
             1,
-            Interval { first_write_op: 1, last_read_op: 3 },
+            Interval {
+                first_write_op: 1,
+                last_read_op: 3,
+            },
         );
         let cm = greedy_color(&lt);
         assert_eq!(cm.color_count, 2);
@@ -395,7 +418,10 @@ mod tests {
             for &(b, fw, lr) in order {
                 lt.intervals.insert(
                     b,
-                    Interval { first_write_op: fw, last_read_op: lr },
+                    Interval {
+                        first_write_op: fw,
+                        last_read_op: lr,
+                    },
                 );
             }
             lt

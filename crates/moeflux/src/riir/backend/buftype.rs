@@ -113,7 +113,10 @@ impl<B: Buf> BufId<B> {
     /// or through `From` impls.
     #[inline]
     pub(crate) fn from_raw(idx: u32) -> Self {
-        Self { idx, _tag: PhantomData }
+        Self {
+            idx,
+            _tag: PhantomData,
+        }
     }
 
     /// The raw `u32` index. Crate-internal only — pool impls and

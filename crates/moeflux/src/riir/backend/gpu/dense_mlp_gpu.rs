@@ -18,15 +18,14 @@
 //! `dense_*` buffers through; the standalone test allocates them ad-hoc.
 
 use metal::{
-    Buffer, CommandBufferRef, ComputePipelineState, Device, MTLResourceOptions,
-    MTLSize, NSUInteger,
+    Buffer, CommandBufferRef, ComputePipelineState, Device, MTLResourceOptions, MTLSize, NSUInteger,
 };
 
-use super::gpu_matvec::{encode_matvec, MatvecPipelines, MatvecSpec};
+use super::gpu_matvec::{MatvecPipelines, MatvecSpec, encode_matvec};
 use super::metal::{MetalContext, MetalError};
 use crate::riir::io::mtl_weight_buf::{MtlWeightBuf, MtlWeightBufError};
-use crate::riir::variants::VARIANT;
 use crate::riir::io::weight_file::WeightFile;
+use crate::riir::variants::VARIANT;
 
 /// Per-token GPU scratch for the dense MLP path. One set is reused
 /// across the (small number of) dense layers — `first_k_dense_replace`
@@ -53,11 +52,7 @@ impl DenseMlpBuffers {
             );
             // SAFETY: shared storage, no GPU work in flight on a fresh buffer.
             unsafe {
-                std::ptr::write_bytes(
-                    b.contents() as *mut u8,
-                    0,
-                    n * std::mem::size_of::<f32>(),
-                );
+                std::ptr::write_bytes(b.contents() as *mut u8, 0, n * std::mem::size_of::<f32>());
             }
             b
         };
@@ -253,22 +248,21 @@ pub fn encode_swiglu_ffn_layer_forward_gpu(
     let v = VARIANT;
     let hidden_dim = v.hidden_dim as u32;
 
-    let resolve_proj =
-        |name: &str| -> Result<(u64, u64, u64), DenseMlpGpuError> {
-            let w = format!("{name}.weight");
-            let s = format!("{name}.scales");
-            let b = format!("{name}.biases");
-            let w_off = wf_buf
-                .tensor_offset(wf, &w)?
-                .ok_or(DenseMlpGpuError::MissingTensor { name: w })?;
-            let s_off = wf_buf
-                .tensor_offset(wf, &s)?
-                .ok_or(DenseMlpGpuError::MissingTensor { name: s })?;
-            let b_off = wf_buf
-                .tensor_offset(wf, &b)?
-                .ok_or(DenseMlpGpuError::MissingTensor { name: b })?;
-            Ok((w_off, s_off, b_off))
-        };
+    let resolve_proj = |name: &str| -> Result<(u64, u64, u64), DenseMlpGpuError> {
+        let w = format!("{name}.weight");
+        let s = format!("{name}.scales");
+        let b = format!("{name}.biases");
+        let w_off = wf_buf
+            .tensor_offset(wf, &w)?
+            .ok_or(DenseMlpGpuError::MissingTensor { name: w })?;
+        let s_off = wf_buf
+            .tensor_offset(wf, &s)?
+            .ok_or(DenseMlpGpuError::MissingTensor { name: s })?;
+        let b_off = wf_buf
+            .tensor_offset(wf, &b)?
+            .ok_or(DenseMlpGpuError::MissingTensor { name: b })?;
+        Ok((w_off, s_off, b_off))
+    };
 
     let gate_off = resolve_proj(&format!("{tensor_prefix}.gate_proj"))?;
     let up_off = resolve_proj(&format!("{tensor_prefix}.up_proj"))?;

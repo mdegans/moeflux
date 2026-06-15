@@ -44,30 +44,27 @@
 
 use metal::NSUInteger;
 
-use crate::riir::moe::expert_forward::MoeBuffers;
-use crate::riir::backend::buftype::{
-    AttnInputBuf, AttnOutBuf, HiddenBuf, KProjOutBuf, OProjOutBuf, QBuf,
-    QGateBuf, QProjOutBuf, RopeInvFreqBuf, RouterLogitsBuf, VProjOutBuf,
-};
-use crate::riir::backend::{
-    Backend, BufId, BufferPool, MetalBufferPool,
-};
-use crate::riir::io::expert_io::ExpertFiles;
-use crate::riir::io::layer_weight_cache::LayerWeightCache;
-use crate::riir::io::weight_file::WeightFile;
-use crate::riir::backend::gpu::gpu_matvec::{encode_matvec, MatvecPipelines, MatvecSpec};
-use crate::riir::backend::gpu::gpu_norm::{encode_rms_norm_bf16_into, RmsNormBf16Pipelines};
-use crate::riir::backend::gpu::gpu_ctx::GpuLayerCtx;
 use crate::riir::attn::linear_attn_forward::{
-    bits_of, full_attn_layer_idx_for, moe_block_forward,
-    moe_dispatch_per_token, post_attention_pre_moe, read_buffer_to_vec,
-    GpuAttnEncodeArgs, LayerForwardError, MoeGraphScratch, OProj,
-    PostAttnIntermediates,
+    GpuAttnEncodeArgs, LayerForwardError, MoeGraphScratch, OProj, PostAttnIntermediates, bits_of,
+    full_attn_layer_idx_for, moe_block_forward, moe_dispatch_per_token, post_attention_pre_moe,
+    read_buffer_to_vec,
 };
-use crate::riir::backend::gpu::metal::MetalContext;
 use crate::riir::attn::rms_norm::rms_norm_per_head_cpu;
 use crate::riir::attn::rope::apply_rotary_emb;
 use crate::riir::attn::sdpa::sdpa_cpu;
+use crate::riir::backend::buftype::{
+    AttnInputBuf, AttnOutBuf, HiddenBuf, KProjOutBuf, OProjOutBuf, QBuf, QGateBuf, QProjOutBuf,
+    RopeInvFreqBuf, RouterLogitsBuf, VProjOutBuf,
+};
+use crate::riir::backend::gpu::gpu_ctx::GpuLayerCtx;
+use crate::riir::backend::gpu::gpu_matvec::{MatvecPipelines, MatvecSpec, encode_matvec};
+use crate::riir::backend::gpu::gpu_norm::{RmsNormBf16Pipelines, encode_rms_norm_bf16_into};
+use crate::riir::backend::gpu::metal::MetalContext;
+use crate::riir::backend::{Backend, BufId, BufferPool, MetalBufferPool};
+use crate::riir::io::expert_io::ExpertFiles;
+use crate::riir::io::layer_weight_cache::LayerWeightCache;
+use crate::riir::io::weight_file::WeightFile;
+use crate::riir::moe::expert_forward::MoeBuffers;
 use crate::riir::snapshot::state::KvCache;
 use crate::riir::variants::VARIANT;
 
@@ -168,9 +165,7 @@ impl FullAttnGraphScratch {
         let half = rotary_dim / 2;
         let theta = crate::riir::variants::ROPE_THETA;
         let inv_freq_host: Vec<f32> = (0..half)
-            .map(|i| {
-                1.0f32 / theta.powf((2 * i) as f32 / rotary_dim as f32)
-            })
+            .map(|i| 1.0f32 / theta.powf((2 * i) as f32 / rotary_dim as f32))
             .collect();
 
         // `inv_freq` is the sole persistent buffer — allocated last so
@@ -180,10 +175,7 @@ impl FullAttnGraphScratch {
             .alloc(half * f32_sz, "fags.inv_freq", true)
             .expect("FullAttnGraphScratch::new pool alloc");
         pool.upload(inv_freq, unsafe {
-            std::slice::from_raw_parts(
-                inv_freq_host.as_ptr() as *const u8,
-                half * f32_sz,
-            )
+            std::slice::from_raw_parts(inv_freq_host.as_ptr() as *const u8, half * f32_sz)
         })
         .expect("FullAttnGraphScratch::new inv_freq upload");
 
@@ -229,8 +221,13 @@ pub(in crate::riir) fn full_attn_pre_moe_layer_forward(
     // Slice 5d-8: see `linear_attn_layer_forward` for the contract.
     prev_layer_chained: bool,
 ) -> Result<PostAttnIntermediates, LayerForwardError> {
-    let GpuLayerCtx { wf, wf_buf, layer_cache, buffers, buffer_pool } =
-        *gpu;
+    let GpuLayerCtx {
+        wf,
+        wf_buf,
+        layer_cache,
+        buffers,
+        buffer_pool,
+    } = *gpu;
     let v = VARIANT;
 
     // Phase 0b (prefill arc): the KV cache is GPU-resident, registered
@@ -268,12 +265,13 @@ pub(in crate::riir) fn full_attn_pre_moe_layer_forward(
     // cache. Every slot is required at `LayerWeightCache::build` time
     // for full-attn layers, so this is a single match instead of a
     // require-ladder.
-    let attn = layer_cache.attn.full().ok_or(
-        LayerForwardError::MissingTensor {
+    let attn = layer_cache
+        .attn
+        .full()
+        .ok_or(LayerForwardError::MissingTensor {
             layer: layer_idx,
             tensor: "full_attn weights (called on linear-attn layer)",
-        },
-    )?;
+        })?;
     let q_w = attn.q_proj_w;
     let q_s = attn.q_proj_s;
     let q_b = attn.q_proj_b;
@@ -379,40 +377,24 @@ pub(in crate::riir) fn full_attn_pre_moe_layer_forward(
     for h in 0..v.num_attn_heads {
         let src_off = h * (2 * v.head_dim);
         let dst_off = h * v.head_dim;
-        q_host[dst_off..dst_off + v.head_dim].copy_from_slice(
-            &q_proj_host[src_off..src_off + v.head_dim],
-        );
-        q_gate_host[dst_off..dst_off + v.head_dim].copy_from_slice(
-            &q_proj_host[src_off + v.head_dim..src_off + 2 * v.head_dim],
-        );
+        q_host[dst_off..dst_off + v.head_dim]
+            .copy_from_slice(&q_proj_host[src_off..src_off + v.head_dim]);
+        q_gate_host[dst_off..dst_off + v.head_dim]
+            .copy_from_slice(&q_proj_host[src_off + v.head_dim..src_off + 2 * v.head_dim]);
     }
 
     // ── Per-head Q rms_norm ──────────────────────────────────────
-    let q_norm_name =
-        format!("model.layers.{layer_idx}.self_attn.q_norm.weight");
-    rms_norm_per_head_cpu(
-        wf,
-        &q_norm_name,
-        v.num_attn_heads,
-        v.head_dim,
-        &mut q_host,
-    )?;
+    let q_norm_name = format!("model.layers.{layer_idx}.self_attn.q_norm.weight");
+    rms_norm_per_head_cpu(wf, &q_norm_name, v.num_attn_heads, v.head_dim, &mut q_host)?;
 
     // ── Per-head K rms_norm ──────────────────────────────────────
-    let k_norm_name =
-        format!("model.layers.{layer_idx}.self_attn.k_norm.weight");
-    rms_norm_per_head_cpu(
-        wf,
-        &k_norm_name,
-        v.num_kv_heads,
-        v.head_dim,
-        &mut k_host,
-    )?;
+    let k_norm_name = format!("model.layers.{layer_idx}.self_attn.k_norm.weight");
+    rms_norm_per_head_cpu(wf, &k_norm_name, v.num_kv_heads, v.head_dim, &mut k_host)?;
 
     // ── RoPE on q + k ────────────────────────────────────────────
     apply_rotary_emb(pos, &mut q_host, &mut k_host)?;
 
-    // ── KV append: host-canonical + GPU mirror (slice 5d-7b) ─────
+    // ── KV append: canonical pool KV ─────────────────────────────
     let cache_pos = kv_state.len as usize;
     if cache_pos + 1 > crate::riir::variants::MAX_SEQ_LEN {
         return Err(LayerForwardError::MissingTensor {
@@ -433,36 +415,13 @@ pub(in crate::riir) fn full_attn_pre_moe_layer_forward(
     }
     kv_state.len += 1;
 
-    // GPU mirror of host KV — feeds the GPU SDPA fast path when the
-    // gate predicate fires below. Mirrors C `infer.m:4796..4802`. Only
-    // populated for full-attn layers; bounded by `GPU_KV_SEQ` to avoid
-    // overrunning the persistent buffer (above that, the C path also
-    // falls back to CPU SDPA).
+    // The oracle GPU SDPA fast path (below) reads the canonical pool
+    // KV directly — it is GPU-resident post-Phase-0b, so the old
+    // per-token GPU mirror copy is gone (#2: the mirror was never
+    // populated by batched prefill, so decode after a ≥32-token
+    // batched eval_prompt attended zeros over the prompt region).
+    // `fa_idx` still gates the fast path: only full-attn layers take it.
     let fa_idx = full_attn_layer_idx_for(layer_idx);
-    if let Some(fa_idx) = fa_idx {
-        if cache_pos < crate::riir::variants::GPU_KV_SEQ {
-            // SAFETY: shared-storage buffer; no GPU work in flight on
-            // gpu_kv_k/v at this point (no encode has been dispatched
-            // yet this layer; previous dispatch's CMD2 commit-wait
-            // happened in last layer's `complete_deferred_experts_into`
-            // drain at the top of this layer's eval call).
-            let row_start = cache_pos * kv_dim;
-            unsafe {
-                let k_dst = buffer_pool.handle(buffers.gpu_kv_k[fa_idx]).contents() as *mut f32;
-                let v_dst = buffer_pool.handle(buffers.gpu_kv_v[fa_idx]).contents() as *mut f32;
-                std::ptr::copy_nonoverlapping(
-                    k_host.as_ptr(),
-                    k_dst.add(row_start),
-                    kv_dim,
-                );
-                std::ptr::copy_nonoverlapping(
-                    v_host.as_ptr(),
-                    v_dst.add(row_start),
-                    kv_dim,
-                );
-            }
-        }
-    }
 
     // ── Decide between GPU SDPA fast path and CPU SDPA ──────────
     //
@@ -471,12 +430,10 @@ pub(in crate::riir) fn full_attn_pre_moe_layer_forward(
     // past the GPU dispatch break-even point (kv_len < 32 keeps
     // command-encoder overhead from dominating).
     let kv_len = kv_state.len;
-    let gpu_attn_ready = fa_idx.is_some()
-        && kv_len >= 32
-        && (kv_len as usize) < crate::riir::variants::GPU_KV_SEQ;
+    let gpu_attn_ready =
+        fa_idx.is_some() && kv_len >= 32 && (kv_len as usize) < crate::riir::variants::GPU_KV_SEQ;
 
     let gpu_attn_args = if gpu_attn_ready {
-        let fa_idx = fa_idx.expect("gpu_attn_ready ⇒ Some(fa_idx)");
         // Stage Q + q_gate (both post-norm + RoPE for q) into the
         // shared GPU scratch buffers. Read by Enc A1 (scores) and
         // Enc A4 (sigmoid gate). SAFETY: shared-storage; no GPU work
@@ -486,14 +443,11 @@ pub(in crate::riir) fn full_attn_pre_moe_layer_forward(
             let q_dst = buffer_pool.handle(buffers.gpu_attn_q).contents() as *mut f32;
             let g_dst = buffer_pool.handle(buffers.gpu_attn_gate).contents() as *mut f32;
             std::ptr::copy_nonoverlapping(q_host.as_ptr(), q_dst, q_dim);
-            std::ptr::copy_nonoverlapping(
-                q_gate_host.as_ptr(),
-                g_dst,
-                q_dim,
-            );
+            std::ptr::copy_nonoverlapping(q_gate_host.as_ptr(), g_dst, q_dim);
         }
         Some(GpuAttnEncodeArgs {
-            fa_idx,
+            k_cache: kv_state.k_id.expect("gpu_attn_ready ⇒ KV K allocated"),
+            v_cache: kv_state.v_id.expect("gpu_attn_ready ⇒ KV V allocated"),
             kv_len: kv_len as u32,
         })
     } else {
@@ -522,11 +476,7 @@ pub(in crate::riir) fn full_attn_pre_moe_layer_forward(
         // SAFETY: shared-storage; no GPU work in flight (CMD1
         // committed and waited above).
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                attn_out.as_ptr(),
-                dst,
-                q_dim,
-            );
+            std::ptr::copy_nonoverlapping(attn_out.as_ptr(), dst, q_dim);
         }
         debug_assert!(
             buffer_pool.handle(buffers.o_proj_stack).length() as usize
@@ -599,8 +549,13 @@ pub(in crate::riir) fn full_attn_layer_forward(
     prev_layer_chained: bool,
     chain_next_norm_off: Option<u64>,
 ) -> Result<(), LayerForwardError> {
-    let GpuLayerCtx { wf: _, wf_buf, layer_cache: _, buffers, buffer_pool } =
-        *gpu;
+    let GpuLayerCtx {
+        wf: _,
+        wf_buf,
+        layer_cache: _,
+        buffers,
+        buffer_pool,
+    } = *gpu;
     let intermediates = full_attn_pre_moe_layer_forward(
         metal,
         gpu,
@@ -681,8 +636,8 @@ where
     LayerForwardError: From<B::Error>,
     LayerForwardError: From<<B::Pool as BufferPool>::Error>,
 {
-    use crate::riir::moe::expert_forward::MAX_K;
     use crate::riir::backend::{Graph, Op, WeightRef};
+    use crate::riir::moe::expert_forward::MAX_K;
 
     let v = VARIANT;
     debug_assert!(k_active <= MAX_K);
@@ -714,12 +669,13 @@ where
         });
     }
 
-    let attn = layer_cache.attn.full().ok_or(
-        LayerForwardError::MissingTensor {
+    let attn = layer_cache
+        .attn
+        .full()
+        .ok_or(LayerForwardError::MissingTensor {
             layer: layer_idx,
             tensor: "full_attn weights (batched graph path)",
-        },
-    )?;
+        })?;
 
     // Per-tensor bit widths for the projection / router matvecs.
     let q_bits = bits_of(
@@ -738,8 +694,7 @@ where
         wf,
         &format!("model.layers.{layer_idx}.self_attn.o_proj.weight"),
     );
-    let gate_bits =
-        bits_of(wf, &format!("model.layers.{layer_idx}.mlp.gate.weight"));
+    let gate_bits = bits_of(wf, &format!("model.layers.{layer_idx}.mlp.gate.weight"));
     let seg_bits = bits_of(
         wf,
         &format!("model.layers.{layer_idx}.mlp.shared_expert_gate.weight"),

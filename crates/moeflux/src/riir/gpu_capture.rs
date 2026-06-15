@@ -60,9 +60,9 @@ impl GpuCaptureConfig {
     /// Prefill path: should capture start here?
     pub fn prefill_start(&self, chunk_idx: usize, layer_idx: usize) -> bool {
         match &self.mode {
-            CaptureMode::Prefill { at_chunk, at_layer, .. } => {
-                chunk_idx == *at_chunk && layer_idx == *at_layer
-            }
+            CaptureMode::Prefill {
+                at_chunk, at_layer, ..
+            } => chunk_idx == *at_chunk && layer_idx == *at_layer,
             CaptureMode::Decode { .. } => false,
         }
     }
@@ -70,10 +70,11 @@ impl GpuCaptureConfig {
     /// Prefill path: should capture stop here?
     pub fn prefill_stop(&self, chunk_idx: usize, layer_idx: usize) -> bool {
         match &self.mode {
-            CaptureMode::Prefill { at_chunk, at_layer, n_layers } => {
-                chunk_idx == *at_chunk
-                    && layer_idx == at_layer.saturating_add(*n_layers)
-            }
+            CaptureMode::Prefill {
+                at_chunk,
+                at_layer,
+                n_layers,
+            } => chunk_idx == *at_chunk && layer_idx == at_layer.saturating_add(*n_layers),
             CaptureMode::Decode { .. } => false,
         }
     }
@@ -94,8 +95,7 @@ impl GpuCaptureConfig {
     pub fn decode_stop(&self, layer_idx: usize) -> bool {
         match &self.mode {
             CaptureMode::Decode { at_layer, .. } => {
-                DECODE_ARMED.load(Ordering::Relaxed)
-                    && layer_idx == at_layer.saturating_add(1)
+                DECODE_ARMED.load(Ordering::Relaxed) && layer_idx == at_layer.saturating_add(1)
             }
             CaptureMode::Prefill { .. } => false,
         }
@@ -143,9 +143,7 @@ pub fn config() -> Option<&'static GpuCaptureConfig> {
     static CFG: OnceLock<Option<GpuCaptureConfig>> = OnceLock::new();
     CFG.get_or_init(|| {
         let path = std::env::var("MOEFLUX_GPU_CAPTURE_PATH").ok()?;
-        if std::env::var("METAL_CAPTURE_ENABLED").ok().as_deref()
-            != Some("1")
-        {
+        if std::env::var("METAL_CAPTURE_ENABLED").ok().as_deref() != Some("1") {
             eprintln!(
                 "[gpu_capture] MOEFLUX_GPU_CAPTURE_PATH is set but \
                  METAL_CAPTURE_ENABLED is not 1 — Metal will reject \
@@ -154,8 +152,8 @@ pub fn config() -> Option<&'static GpuCaptureConfig> {
             return None;
         }
 
-        let mode_str = std::env::var("MOEFLUX_GPU_CAPTURE_MODE")
-            .unwrap_or_else(|_| "prefill".into());
+        let mode_str =
+            std::env::var("MOEFLUX_GPU_CAPTURE_MODE").unwrap_or_else(|_| "prefill".into());
 
         let mode = match mode_str.as_str() {
             "prefill" => {
@@ -172,7 +170,11 @@ pub fn config() -> Option<&'static GpuCaptureConfig> {
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(2usize)
                     .max(1);
-                CaptureMode::Prefill { at_chunk, at_layer, n_layers }
+                CaptureMode::Prefill {
+                    at_chunk,
+                    at_layer,
+                    n_layers,
+                }
             }
             "decode" => {
                 let at_layer = std::env::var("MOEFLUX_GPU_CAPTURE_LAYER")
@@ -222,7 +224,11 @@ pub fn start(device: &Device, cfg: &GpuCaptureConfig) {
     match manager.start_capture(&desc) {
         Ok(()) => {
             let window = match &cfg.mode {
-                CaptureMode::Prefill { at_chunk, at_layer, n_layers } => {
+                CaptureMode::Prefill {
+                    at_chunk,
+                    at_layer,
+                    n_layers,
+                } => {
                     format!(
                         "prefill chunk={at_chunk} layers={at_layer}..{}",
                         at_layer + n_layers,
@@ -232,10 +238,7 @@ pub fn start(device: &Device, cfg: &GpuCaptureConfig) {
                     format!("decode layer={at_layer}")
                 }
             };
-            eprintln!(
-                "[gpu_capture] started → {} ({window})",
-                cfg.path.display(),
-            );
+            eprintln!("[gpu_capture] started → {} ({window})", cfg.path.display(),);
         }
         Err(e) => eprintln!("[gpu_capture] start_capture failed: {e}"),
     }

@@ -30,14 +30,12 @@
 //! inputs, looser than YaRN's `4 ULP` because the dot products
 //! span hundreds of terms).
 
-use metal::{
-    Buffer, CommandBufferRef, ComputePipelineState, MTLSize, NSUInteger,
-};
+use metal::{Buffer, CommandBufferRef, ComputePipelineState, MTLSize, NSUInteger};
 
 use crate::riir::backend::gpu::encoder::pipeline_bundle;
-use crate::riir::backend::gpu::metal::MetalError;
 #[cfg(test)]
 use crate::riir::backend::gpu::metal::MetalContext;
+use crate::riir::backend::gpu::metal::MetalError;
 
 /// Errors from the GPU MLA dispatchers.
 #[derive(Debug, thiserror::Error)]
@@ -324,8 +322,7 @@ mod tests {
         for r in 0..out_rows {
             for g in 0..num_groups {
                 let row_start = r * in_cols + g * group_size;
-                let group =
-                    &weights[row_start..row_start + group_size];
+                let group = &weights[row_start..row_start + group_size];
                 let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
                 for &x in group {
                     lo = lo.min(x);
@@ -333,11 +330,7 @@ mod tests {
                 }
                 // Affine quant: q ∈ [0, 15], x ≈ q * scale + bias
                 // with bias = lo and scale = (hi - lo) / 15.
-                let scale = if hi > lo {
-                    (hi - lo) / 15.0
-                } else {
-                    1.0
-                };
+                let scale = if hi > lo { (hi - lo) / 15.0 } else { 1.0 };
                 let bias = lo;
                 scales[r * num_groups + g] = f32_to_bf16(scale);
                 biases[r * num_groups + g] = f32_to_bf16(bias);
@@ -348,15 +341,13 @@ mod tests {
                         let idx = g * group_size + k * 8 + j;
                         let x = weights[r * in_cols + idx];
                         let q = if scale > 0.0 {
-                            ((x - bias) / scale).round().clamp(0.0, 15.0)
-                                as u32
+                            ((x - bias) / scale).round().clamp(0.0, 15.0) as u32
                         } else {
                             0
                         };
                         word |= q << (j * 4);
                     }
-                    packed[r * packed_cols + g * (group_size / 8) + k] =
-                        word;
+                    packed[r * packed_cols + g * (group_size / 8) + k] = word;
                 }
             }
         }
@@ -392,11 +383,9 @@ mod tests {
         for r in 0..out_rows {
             for c in 0..in_cols {
                 let g = c / group_size;
-                let scale =
-                    bf16_to_f32(scales[r * num_groups + g]);
+                let scale = bf16_to_f32(scales[r * num_groups + g]);
                 let bias = bf16_to_f32(biases[r * num_groups + g]);
-                let word =
-                    packed[r * packed_cols + (c / 8)];
+                let word = packed[r * packed_cols + (c / 8)];
                 let nib = ((word >> ((c % 8) * 4)) & 0xF) as f32;
                 out[r * in_cols + c] = nib * scale + bias;
             }
@@ -404,10 +393,7 @@ mod tests {
         out
     }
 
-    fn shared_buf_with_data<T: Copy>(
-        device: &metal::Device,
-        data: &[T],
-    ) -> Buffer {
+    fn shared_buf_with_data<T: Copy>(device: &metal::Device, data: &[T]) -> Buffer {
         device.new_buffer_with_data(
             data.as_ptr().cast(),
             (data.len() * std::mem::size_of::<T>()) as NSUInteger,
@@ -415,21 +401,11 @@ mod tests {
         )
     }
 
-    fn shared_buf_zeroed(
-        device: &metal::Device,
-        n_floats: usize,
-    ) -> Buffer {
+    fn shared_buf_zeroed(device: &metal::Device, n_floats: usize) -> Buffer {
         let bytes = (n_floats * std::mem::size_of::<f32>()) as NSUInteger;
-        let b = device.new_buffer(
-            bytes,
-            MTLResourceOptions::StorageModeShared,
-        );
+        let b = device.new_buffer(bytes, MTLResourceOptions::StorageModeShared);
         unsafe {
-            std::ptr::write_bytes(
-                b.contents() as *mut u8,
-                0,
-                bytes as usize,
-            );
+            std::ptr::write_bytes(b.contents() as *mut u8, 0, bytes as usize);
         }
         b
     }
@@ -472,12 +448,8 @@ mod tests {
             // Reproducible deterministic-ish values, range ~[-2, 2].
             *w = ((i % 41) as f32 * 0.1) - 2.0;
         }
-        let (packed, scales, biases) = pack_4bit_mlx(
-            &weights,
-            total_w_rows,
-            in_cols,
-            group_size as usize,
-        );
+        let (packed, scales, biases) =
+            pack_4bit_mlx(&weights, total_w_rows, in_cols, group_size as usize);
         let dq = dequant_4bit(
             &packed,
             &scales,
@@ -487,22 +459,19 @@ mod tests {
             group_size as usize,
         );
 
-        let mut q_nope =
-            vec![0.0f32; (num_heads * nope) as usize];
+        let mut q_nope = vec![0.0f32; (num_heads * nope) as usize];
         for (i, q) in q_nope.iter_mut().enumerate() {
             *q = ((i as f32) * 0.0137).sin();
         }
 
         // Host reference: q'[h, c] = Σ_i q_nope[h, i] * dq[h*kv_b_per_head + i, c].
-        let mut q_prime_ref =
-            vec![0.0f32; (num_heads * kv_lora_rank) as usize];
+        let mut q_prime_ref = vec![0.0f32; (num_heads * kv_lora_rank) as usize];
         for h in 0..num_heads as usize {
             for c in 0..kv_lora_rank as usize {
                 let mut acc = 0.0f32;
                 for i in 0..nope as usize {
                     let row = h * kv_b_per_head as usize + i;
-                    acc += q_nope[h * nope as usize + i]
-                        * dq[row * in_cols + c];
+                    acc += q_nope[h * nope as usize + i] * dq[row * in_cols + c];
                 }
                 q_prime_ref[h * kv_lora_rank as usize + c] = acc;
             }
@@ -514,10 +483,7 @@ mod tests {
         let buf_s = shared_buf_with_data(&device, &scales);
         let buf_b = shared_buf_with_data(&device, &biases);
         let buf_q = shared_buf_with_data(&device, &q_nope);
-        let buf_qp = shared_buf_zeroed(
-            &device,
-            (num_heads * kv_lora_rank) as usize,
-        );
+        let buf_qp = shared_buf_zeroed(&device, (num_heads * kv_lora_rank) as usize);
 
         let cmdbuf = metal.queue().new_command_buffer();
         encode_mla_q_prime_4bit(
@@ -540,17 +506,13 @@ mod tests {
         cmdbuf.commit();
         cmdbuf.wait_until_completed();
 
-        let q_prime_gpu =
-            read_back_f32(&buf_qp, q_prime_ref.len());
+        let q_prime_gpu = read_back_f32(&buf_qp, q_prime_ref.len());
         let max_drift = q_prime_gpu
             .iter()
             .zip(&q_prime_ref)
             .map(|(g, c)| (g - c).abs())
             .fold(0.0f32, f32::max);
-        assert!(
-            max_drift < 1e-3,
-            "GPU/host drift {max_drift} on q_prime"
-        );
+        assert!(max_drift < 1e-3, "GPU/host drift {max_drift} on q_prime");
     }
 
     /// Synthetic 3b check — small cache_len, two heads. Validates
@@ -572,23 +534,19 @@ mod tests {
         let cache_len: u32 = 8;
         let softmax_scale: f32 = 0.125;
 
-        let mut q_prime =
-            vec![0.0f32; (num_heads * kv_lora_rank) as usize];
+        let mut q_prime = vec![0.0f32; (num_heads * kv_lora_rank) as usize];
         for (i, q) in q_prime.iter_mut().enumerate() {
             *q = ((i as f32) * 0.011).cos();
         }
-        let mut q_pe =
-            vec![0.0f32; (num_heads * qk_rope_head_dim) as usize];
+        let mut q_pe = vec![0.0f32; (num_heads * qk_rope_head_dim) as usize];
         for (i, q) in q_pe.iter_mut().enumerate() {
             *q = ((i as f32) * 0.017).sin();
         }
-        let mut latent =
-            vec![0.0f32; (cache_len * kv_lora_rank) as usize];
+        let mut latent = vec![0.0f32; (cache_len * kv_lora_rank) as usize];
         for (i, x) in latent.iter_mut().enumerate() {
             *x = ((i as f32) * 0.013).sin();
         }
-        let mut rope_k =
-            vec![0.0f32; (cache_len * qk_rope_head_dim) as usize];
+        let mut rope_k = vec![0.0f32; (cache_len * qk_rope_head_dim) as usize];
         for (i, x) in rope_k.iter_mut().enumerate() {
             *x = ((i as f32) * 0.019).cos();
         }
@@ -596,8 +554,7 @@ mod tests {
         // Host reference per head:
         //   scores[t] = q'[h] · latent[t] + q_pe[h] · rope_k[t]
         //   scaled, softmaxed, then v_combine[h, c] = Σ_t scores[t] * latent[t, c]
-        let mut v_combine_ref =
-            vec![0.0f32; (num_heads * kv_lora_rank) as usize];
+        let mut v_combine_ref = vec![0.0f32; (num_heads * kv_lora_rank) as usize];
         for h in 0..num_heads as usize {
             let mut scores = vec![0.0f32; cache_len as usize];
             for t in 0..cache_len as usize {
@@ -624,8 +581,7 @@ mod tests {
             for c in 0..kv_lora_rank as usize {
                 let mut acc = 0.0f32;
                 for t in 0..cache_len as usize {
-                    acc += scores[t]
-                        * latent[t * kv_lora_rank as usize + c];
+                    acc += scores[t] * latent[t * kv_lora_rank as usize + c];
                 }
                 v_combine_ref[h * kv_lora_rank as usize + c] = acc;
             }
@@ -637,10 +593,7 @@ mod tests {
         let buf_qpe = shared_buf_with_data(&device, &q_pe);
         let buf_lat = shared_buf_with_data(&device, &latent);
         let buf_rk = shared_buf_with_data(&device, &rope_k);
-        let buf_vc = shared_buf_zeroed(
-            &device,
-            (num_heads * kv_lora_rank) as usize,
-        );
+        let buf_vc = shared_buf_zeroed(&device, (num_heads * kv_lora_rank) as usize);
 
         let cmdbuf = metal.queue().new_command_buffer();
         encode_mla_sdpa_folded(
@@ -661,17 +614,13 @@ mod tests {
         cmdbuf.commit();
         cmdbuf.wait_until_completed();
 
-        let v_combine_gpu =
-            read_back_f32(&buf_vc, v_combine_ref.len());
+        let v_combine_gpu = read_back_f32(&buf_vc, v_combine_ref.len());
         let max_drift = v_combine_gpu
             .iter()
             .zip(&v_combine_ref)
             .map(|(g, c)| (g - c).abs())
             .fold(0.0f32, f32::max);
-        assert!(
-            max_drift < 1e-5,
-            "GPU/host drift {max_drift} on v_combine"
-        );
+        assert!(max_drift < 1e-5, "GPU/host drift {max_drift} on v_combine");
     }
 
     /// Synthetic 3c check — same machinery as 3a, different stride.
@@ -698,12 +647,8 @@ mod tests {
         for (i, w) in weights.iter_mut().enumerate() {
             *w = ((i % 41) as f32 * 0.1) - 2.0;
         }
-        let (packed, scales, biases) = pack_4bit_mlx(
-            &weights,
-            total_w_rows,
-            in_cols,
-            group_size as usize,
-        );
+        let (packed, scales, biases) =
+            pack_4bit_mlx(&weights, total_w_rows, in_cols, group_size as usize);
         let dq = dequant_4bit(
             &packed,
             &scales,
@@ -713,23 +658,20 @@ mod tests {
             group_size as usize,
         );
 
-        let mut v_combine =
-            vec![0.0f32; (num_heads * kv_lora_rank) as usize];
+        let mut v_combine = vec![0.0f32; (num_heads * kv_lora_rank) as usize];
         for (i, x) in v_combine.iter_mut().enumerate() {
             *x = ((i as f32) * 0.0073).sin();
         }
 
         // Host reference: out[h, f] = Σ_c v_combine[h, c] *
         //                              dq[h*kv_b_per_head + nope + f, c]
-        let mut out_ref =
-            vec![0.0f32; (num_heads * v_head_dim) as usize];
+        let mut out_ref = vec![0.0f32; (num_heads * v_head_dim) as usize];
         for h in 0..num_heads as usize {
             for f in 0..v_head_dim as usize {
                 let row = h * kv_b_per_head as usize + nope as usize + f;
                 let mut acc = 0.0f32;
                 for c in 0..in_cols {
-                    acc += v_combine[h * kv_lora_rank as usize + c]
-                        * dq[row * in_cols + c];
+                    acc += v_combine[h * kv_lora_rank as usize + c] * dq[row * in_cols + c];
                 }
                 out_ref[h * v_head_dim as usize + f] = acc;
             }
@@ -741,10 +683,7 @@ mod tests {
         let buf_s = shared_buf_with_data(&device, &scales);
         let buf_b = shared_buf_with_data(&device, &biases);
         let buf_v = shared_buf_with_data(&device, &v_combine);
-        let buf_o = shared_buf_zeroed(
-            &device,
-            (num_heads * v_head_dim) as usize,
-        );
+        let buf_o = shared_buf_zeroed(&device, (num_heads * v_head_dim) as usize);
 
         let cmdbuf = metal.queue().new_command_buffer();
         encode_mla_out_per_head_4bit(
@@ -815,10 +754,7 @@ pub fn encode_mla_split_q_kv(
     enc.set_bytes(9, 4, (&kv_lora_rank as *const u32).cast());
     let q_nope_total = num_heads * qk_nope;
     let q_pe_total = num_heads * qk_rope;
-    let max_out = q_nope_total
-        .max(q_pe_total)
-        .max(kv_lora_rank)
-        .max(qk_rope);
+    let max_out = q_nope_total.max(q_pe_total).max(kv_lora_rank).max(qk_rope);
     let num_tgs = max_out.div_ceil(256);
     enc.dispatch_thread_groups(
         MTLSize::new(num_tgs as NSUInteger, 1, 1),

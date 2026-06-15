@@ -41,19 +41,14 @@
 
 #![cfg(all(
     target_os = "macos",
-    any(
-        feature = "model-qwen3-5-a17b",
-        feature = "model-qwen3-6-35b-a3b",
-    ),
+    any(feature = "model-qwen3-5-a17b", feature = "model-qwen3-6-35b-a3b",),
 ))]
 
 use std::path::Path;
 use std::time::Instant;
 
 mod common;
-use common::diff_helpers::{
-    argmax, artifacts_dir, cosine_sim, default_a3b_paths,
-};
+use common::diff_helpers::{argmax, artifacts_dir, cosine_sim, default_a3b_paths};
 use moeflux::riir::RsCtx;
 
 // ---------------------------------------------------------------------------
@@ -91,12 +86,7 @@ pub trait DiffBackend {
 
     /// Apply rotary position embedding to Q and K at `pos`. Returns
     /// `(q_out, k_out)`; inputs are not mutated.
-    fn apply_rotary_emb(
-        &self,
-        pos: i32,
-        q: &[f32],
-        k: &[f32],
-    ) -> (Vec<f32>, Vec<f32>);
+    fn apply_rotary_emb(&self, pos: i32, q: &[f32], k: &[f32]) -> (Vec<f32>, Vec<f32>);
 
     /// Per-head CPU RMSNorm against the bf16 weight tensor
     /// `weight_name` (length `head_dim`). Returns the
@@ -146,13 +136,7 @@ pub trait DiffBackend {
     fn rms_norm_bare_cpu(&self, eps: f32, x: &[f32]) -> Vec<f32>;
 
     /// CPU RMSNormGated. Returns `x.len()` floats.
-    fn rms_norm_gated_cpu(
-        &self,
-        weight_name: &str,
-        eps: f32,
-        x: &[f32],
-        z: &[f32],
-    ) -> Vec<f32>;
+    fn rms_norm_gated_cpu(&self, weight_name: &str, eps: f32, x: &[f32], z: &[f32]) -> Vec<f32>;
 
     /// Gated-delta-net recurrence step. Returns the post-step
     /// `(ssm_state, out_values)` pair — input state is consumed; the
@@ -181,22 +165,14 @@ pub trait DiffBackend {
     /// GPU RMSNorm with bf16 weights (slice 9e). `x` is HIDDEN_DIM
     /// floats; `weight_bf16` is HIDDEN_DIM × 2 bytes (typically the
     /// raw `model.norm.weight` mmap region). Returns HIDDEN_DIM floats.
-    fn gpu_rms_norm_fused(
-        &mut self,
-        x: &[f32],
-        weight_bf16: &[u8],
-    ) -> Vec<f32>;
+    fn gpu_rms_norm_fused(&mut self, x: &[f32], weight_bf16: &[u8]) -> Vec<f32>;
 
     /// Single-expert GPU FFN forward (slice 9a). `expert_data` is one
     /// expert's `EXPERT_SIZE`-byte 4-bit blob; `h_post` is HIDDEN_DIM
     /// floats. Returns the HIDDEN_DIM-float expert output. Takes
     /// `&mut self` because the Rust backend builds the Metal device
     /// lazily on first GPU call.
-    fn gpu_expert_forward(
-        &mut self,
-        expert_data: &[u8],
-        h_post: &[f32],
-    ) -> Vec<f32>;
+    fn gpu_expert_forward(&mut self, expert_data: &[u8], h_post: &[f32]) -> Vec<f32>;
 
     /// Batched K-expert FFN forward + GPU combine (slice 9b).
     /// `expert_data` is `actual_k * EXPERT_SIZE` bytes (K blobs in slot
@@ -230,12 +206,8 @@ pub trait DiffBackend {
     /// `attn_softmax_batched` (slice 5d-7a). Per-head softmax over
     /// `[0, seq_len)`. Input is `[num_heads * seq_len]` raw scores;
     /// output is the same shape, post-softmax.
-    fn attn_softmax_batched(
-        &mut self,
-        num_heads: u32,
-        seq_len: u32,
-        scores_in: &[f32],
-    ) -> Vec<f32>;
+    fn attn_softmax_batched(&mut self, num_heads: u32, seq_len: u32, scores_in: &[f32])
+    -> Vec<f32>;
 
     /// `attn_values_batched` (slice 5d-7a). Returns `[num_heads *
     /// head_dim]` per-head value aggregation.
@@ -254,12 +226,7 @@ pub trait DiffBackend {
     /// (`x_in[i] * sigmoid(gate[i])`). Caller passes the pre-gate
     /// values in `x_in`; the trait surface clones to the in/out buffer
     /// internally.
-    fn sigmoid_gate(
-        &mut self,
-        dim: u32,
-        gate: &[f32],
-        x_in: &[f32],
-    ) -> Vec<f32>;
+    fn sigmoid_gate(&mut self, dim: u32, gate: &[f32], x_in: &[f32]) -> Vec<f32>;
 
     /// Slice 4e — begin a deferred K-expert dispatch (commits async,
     /// no readback). Pair with [`Self::complete_deferred_experts`] or
@@ -295,12 +262,7 @@ pub trait DiffBackend {
     /// backends). Tests land in 4c (linear-attn) / 4d (full-attn);
     /// the trait method is here in 4b so both backend impls can be
     /// wired ahead of the kernel landing.
-    fn layer_forward_dump(
-        &mut self,
-        layer_idx: i32,
-        pos: i32,
-        hidden_in: &[f32],
-    ) -> Vec<f32>;
+    fn layer_forward_dump(&mut self, layer_idx: i32, pos: i32, hidden_in: &[f32]) -> Vec<f32>;
 
     /// Prefill `tokens` at `start_pos`. Returns the n_vocab-length
     /// logit vector for the position immediately after the last
@@ -369,12 +331,7 @@ impl DiffBackend for RsBackend {
         out
     }
 
-    fn apply_rotary_emb(
-        &self,
-        pos: i32,
-        q: &[f32],
-        k: &[f32],
-    ) -> (Vec<f32>, Vec<f32>) {
+    fn apply_rotary_emb(&self, pos: i32, q: &[f32], k: &[f32]) -> (Vec<f32>, Vec<f32>) {
         let mut q_out = q.to_vec();
         let mut k_out = k.to_vec();
         self.0
@@ -460,13 +417,7 @@ impl DiffBackend for RsBackend {
         out
     }
 
-    fn rms_norm_gated_cpu(
-        &self,
-        weight_name: &str,
-        eps: f32,
-        x: &[f32],
-        z: &[f32],
-    ) -> Vec<f32> {
+    fn rms_norm_gated_cpu(&self, weight_name: &str, eps: f32, x: &[f32], z: &[f32]) -> Vec<f32> {
         let mut out = vec![0.0f32; x.len()];
         self.0
             .rms_norm_gated_cpu(weight_name, eps, x, z, &mut out)
@@ -492,17 +443,7 @@ impl DiffBackend for RsBackend {
         let mut out = vec![0.0f32; v_heads * value_dim];
         self.0
             .gated_delta_recurrence_cpu(
-                layer_idx,
-                alpha,
-                beta,
-                q,
-                k,
-                v,
-                v_heads,
-                k_heads,
-                key_dim,
-                value_dim,
-                &mut state,
+                layer_idx, alpha, beta, q, k, v, v_heads, k_heads, key_dim, value_dim, &mut state,
                 &mut out,
             )
             .expect("RsBackend gated_delta_recurrence_cpu");
@@ -512,20 +453,12 @@ impl DiffBackend for RsBackend {
     fn load_expert_bytes(&self, layer_idx: i32, expert_idx: i32) -> Vec<u8> {
         let mut out = vec![0u8; moeflux::riir::VARIANT.expert_size_4bit()];
         self.0
-            .load_expert_bytes(
-                layer_idx as usize,
-                expert_idx as usize,
-                &mut out,
-            )
+            .load_expert_bytes(layer_idx as usize, expert_idx as usize, &mut out)
             .expect("RsBackend load_expert_bytes");
         out
     }
 
-    fn gpu_rms_norm_fused(
-        &mut self,
-        x: &[f32],
-        weight_bf16: &[u8],
-    ) -> Vec<f32> {
+    fn gpu_rms_norm_fused(&mut self, x: &[f32], weight_bf16: &[u8]) -> Vec<f32> {
         let mut out = vec![0.0f32; moeflux::riir::VARIANT.hidden_dim];
         self.0
             .gpu_rms_norm_fused(x, weight_bf16, &mut out)
@@ -533,11 +466,7 @@ impl DiffBackend for RsBackend {
         out
     }
 
-    fn gpu_expert_forward(
-        &mut self,
-        expert_data: &[u8],
-        h_post: &[f32],
-    ) -> Vec<f32> {
+    fn gpu_expert_forward(&mut self, expert_data: &[u8], h_post: &[f32]) -> Vec<f32> {
         let mut out = vec![0.0f32; moeflux::riir::VARIANT.hidden_dim];
         self.0
             .gpu_expert_forward(expert_data, h_post, &mut out)
@@ -584,8 +513,14 @@ impl DiffBackend for RsBackend {
         let mut out = vec![0.0f32; (num_heads * seq_len) as usize];
         self.0
             .attn_scores_batched(
-                num_heads, num_kv_heads, head_dim, seq_len, q, k_cache,
-                scale, &mut out,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                seq_len,
+                q,
+                k_cache,
+                scale,
+                &mut out,
             )
             .expect("RsBackend attn_scores_batched");
         out
@@ -616,19 +551,19 @@ impl DiffBackend for RsBackend {
         let mut out = vec![0.0f32; (num_heads * head_dim) as usize];
         self.0
             .attn_values_batched(
-                num_heads, num_kv_heads, head_dim, seq_len, scores, v_cache,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                seq_len,
+                scores,
+                v_cache,
                 &mut out,
             )
             .expect("RsBackend attn_values_batched");
         out
     }
 
-    fn sigmoid_gate(
-        &mut self,
-        dim: u32,
-        gate: &[f32],
-        x_in: &[f32],
-    ) -> Vec<f32> {
+    fn sigmoid_gate(&mut self, dim: u32, gate: &[f32], x_in: &[f32]) -> Vec<f32> {
         let mut out = x_in.to_vec();
         self.0
             .sigmoid_gate(dim, gate, &mut out)
@@ -673,12 +608,7 @@ impl DiffBackend for RsBackend {
         self.0.discard_deferred_experts();
     }
 
-    fn layer_forward_dump(
-        &mut self,
-        layer_idx: i32,
-        pos: i32,
-        hidden_in: &[f32],
-    ) -> Vec<f32> {
+    fn layer_forward_dump(&mut self, layer_idx: i32, pos: i32, hidden_in: &[f32]) -> Vec<f32> {
         let mut out = vec![0.0f32; moeflux::riir::VARIANT.hidden_dim];
         self.0
             .layer_forward_dump(layer_idx, pos, hidden_in, &mut out)
@@ -893,10 +823,7 @@ fn state_round_trip_rust() {
         argmax(&test_logits),
         "round-trip changed argmax"
     );
-    assert!(
-        cos >= 0.9999,
-        "round-trip cosine {cos:.7} below 0.9999"
-    );
+    assert!(cos >= 0.9999, "round-trip cosine {cos:.7} below 0.9999");
 }
 
 /// The prefetch hit path (normal flow) and the all-miss path
@@ -1079,8 +1006,7 @@ fn slot_reuse_race_regression_rust() {
 #[ignore = "long running; needs moeflux artifacts"]
 fn eval_prompt_matches_per_token_oracle() {
     let prompt: [i32; 16] = [
-        1, 200, 600, 1100, 2, 300, 700, 1200, 3, 400, 800, 1300, 4, 500,
-        900, 1400,
+        1, 200, 600, 1100, 2, 300, 700, 1200, 3, 400, 800, 1300, 4, 500, 900, 1400,
     ];
     let next_token = 7i32;
     let next_pos = prompt.len();
@@ -1158,8 +1084,7 @@ fn eval_prompt_matches_per_token_oracle() {
 #[ignore = "long running; needs moeflux artifacts"]
 fn eval_prompt_chunked_matches_eval_prompt_whole_prompt() {
     let prompt: [i32; 16] = [
-        1, 200, 600, 1100, 2, 300, 700, 1200, 3, 400, 800, 1300, 4, 500,
-        900, 1400,
+        1, 200, 600, 1100, 2, 300, 700, 1200, 3, 400, 800, 1300, 4, 500, 900, 1400,
     ];
     let next_token = 7i32;
     let next_pos = prompt.len();
@@ -1239,8 +1164,7 @@ fn eval_prompt_chunked_matches_eval_prompt_whole_prompt() {
 #[ignore = "long running; needs moeflux artifacts; diagnostic"]
 fn diag_b2_eval_prompt_chunk_1() {
     let prompt: [i32; 16] = [
-        1, 200, 600, 1100, 2, 300, 700, 1200, 3, 400, 800, 1300, 4, 500,
-        900, 1400,
+        1, 200, 600, 1100, 2, 300, 700, 1200, 3, 400, 800, 1300, 4, 500, 900, 1400,
     ];
     let next_token = 7i32;
     let next_pos = prompt.len();
@@ -1272,10 +1196,11 @@ fn diag_b2_eval_prompt_chunk_1() {
     };
     let prompt_cos = cosine_sim(&ref_logits, &prompt_logits);
     let cont_cos = cosine_sim(&ref_cont, &test_cont);
-    eprintln!(
-        "[diag:b2_chunk_1] prompt_cos={prompt_cos:.7} cont_cos={cont_cos:.7}"
+    eprintln!("[diag:b2_chunk_1] prompt_cos={prompt_cos:.7} cont_cos={cont_cos:.7}");
+    assert!(
+        prompt_cos >= 0.9999,
+        "chunk_size=1 prompt cosine {prompt_cos:.7}"
     );
-    assert!(prompt_cos >= 0.9999, "chunk_size=1 prompt cosine {prompt_cos:.7}");
     assert!(cont_cos >= 0.9999, "chunk_size=1 cont cosine {cont_cos:.7}");
 }
 
@@ -1298,8 +1223,7 @@ fn diag_b2_eval_prompt_chunk_1() {
 #[ignore = "long running; needs moeflux artifacts; directional only"]
 fn bench_batched_eval_prompt_vs_per_token() {
     const N: usize = 256;
-    let prompt: Vec<i32> =
-        (0..N).map(|i| ((i * 37 + 5) % 50000 + 1) as i32).collect();
+    let prompt: Vec<i32> = (0..N).map(|i| ((i * 37 + 5) % 50000 + 1) as i32).collect();
 
     // Path A: per-token oracle via eval_token loop.
     let mut rs_oracle: RsBackend = open_backend();
@@ -1339,9 +1263,7 @@ fn bench_batched_eval_prompt_vs_per_token() {
     // Cosine sanity — but we already verify this elsewhere with
     // higher precision. Just make sure the bench wasn't a no-op.
     let cos = cosine_sim(&oracle_logits, &batched_logits);
-    eprintln!(
-        "[bench:eval_prompt_vs_per_token] sanity cosine={cos:.7}"
-    );
+    eprintln!("[bench:eval_prompt_vs_per_token] sanity cosine={cos:.7}");
     assert!(cos >= 0.99, "bench cosine {cos:.7} below sanity floor");
 }
 
@@ -1403,21 +1325,13 @@ fn bench_decode_per_token_vs_batched_n1() {
         let next_tok = argmax(&last_logits_b) as i32;
         rs_batched
             .0
-            .eval_prompt(
-                &[next_tok],
-                PROMPT_LEN + d,
-                0,
-                &mut last_logits_b,
-            )
+            .eval_prompt(&[next_tok], PROMPT_LEN + d, 0, &mut last_logits_b)
             .expect("batched decode N=1");
     }
     let batched_elapsed = t1.elapsed();
-    let batched_decode_tok_s =
-        DECODE_N as f64 / batched_elapsed.as_secs_f64();
+    let batched_decode_tok_s = DECODE_N as f64 / batched_elapsed.as_secs_f64();
 
-    let regression = (oracle_decode_tok_s - batched_decode_tok_s)
-        / oracle_decode_tok_s
-        * 100.0;
+    let regression = (oracle_decode_tok_s - batched_decode_tok_s) / oracle_decode_tok_s * 100.0;
     eprintln!(
         "[bench:decode_per_token_vs_batched_n1] kv_start={PROMPT_LEN} \
          decode_n={DECODE_N} | per-token: {oracle_elapsed:?} \
@@ -1427,9 +1341,7 @@ fn bench_decode_per_token_vs_batched_n1() {
     );
     // Sanity: both should produce the same greedy trajectory.
     let cos = cosine_sim(&last_logits, &last_logits_b);
-    eprintln!(
-        "[bench:decode_per_token_vs_batched_n1] final-logit cos={cos:.7}"
-    );
+    eprintln!("[bench:decode_per_token_vs_batched_n1] final-logit cos={cos:.7}");
     assert!(
         cos >= 0.99,
         "decode bench cosine {cos:.7} below sanity floor — \
@@ -1484,13 +1396,8 @@ fn prompt_cache_start_pos_nonzero_matches() {
     rs.0.state_load(&snap).expect("state_load");
 
     let mut test_prompt_logits = vec![0.0f32; n_vocab];
-    rs.0.eval_prompt(
-        &suffix,
-        prefix.len(),
-        0,
-        &mut test_prompt_logits,
-    )
-    .expect("suffix eval_prompt at start_pos != 0");
+    rs.0.eval_prompt(&suffix, prefix.len(), 0, &mut test_prompt_logits)
+        .expect("suffix eval_prompt at start_pos != 0");
     let test_continuation = rs.eval_token(next_token, full_pos);
 
     let prompt_cos = cosine_sim(&ctrl_prompt_logits, &test_prompt_logits);

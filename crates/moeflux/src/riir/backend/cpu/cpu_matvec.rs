@@ -31,8 +31,8 @@
 use rayon::prelude::*;
 
 use crate::riir::io::embedding::bf16_to_f32;
-use crate::riir::variants::GROUP_SIZE;
 use crate::riir::io::weight_file::WeightFile;
+use crate::riir::variants::GROUP_SIZE;
 
 /// Errors from the CPU matvec primitive.
 #[derive(Debug, thiserror::Error)]
@@ -42,9 +42,7 @@ pub enum CpuMatvecError {
     #[error("in_dim {in_dim} is not a multiple of GROUP_SIZE={group_size}")]
     InDimNotMultiple { in_dim: usize, group_size: usize },
     /// Sliced lengths don't match the declared shape.
-    #[error(
-        "slice length mismatch on '{field}': got {got} elements, expected {expected}"
-    )]
+    #[error("slice length mismatch on '{field}': got {got} elements, expected {expected}")]
     SliceLen {
         field: &'static str,
         got: usize,
@@ -56,9 +54,7 @@ pub enum CpuMatvecError {
     MissingTensor { name: String },
     /// Tensor shape from the manifest doesn't match `[out_dim,
     /// in_dim_packed]`.
-    #[error(
-        "tensor '{name}' has unexpected shape {shape:?} (expected {expected:?})"
-    )]
+    #[error("tensor '{name}' has unexpected shape {shape:?} (expected {expected:?})")]
     ShapeMismatch {
         name: String,
         shape: Vec<usize>,
@@ -145,8 +141,7 @@ pub fn dequant_matvec_4bit_cpu(
         for g in 0..in_groups {
             let scale = bf16_to_f32(scale_row[g]);
             let bias = bf16_to_f32(bias_row[g]);
-            let group_packed = &packed_row
-                [g * packed_per_group..(g + 1) * packed_per_group];
+            let group_packed = &packed_row[g * packed_per_group..(g + 1) * packed_per_group];
             let x_group = &x[g * GROUP_SIZE..(g + 1) * GROUP_SIZE];
             for p in 0..packed_per_group {
                 let word = group_packed[p];
@@ -243,8 +238,7 @@ pub fn dequant_matvec_8bit_v3_cpu(
         for g in 0..in_groups {
             let scale = bf16_to_f32(scale_row[g]);
             let bias = bf16_to_f32(bias_row[g]);
-            let group_packed = &packed_row
-                [g * packed_per_group..(g + 1) * packed_per_group];
+            let group_packed = &packed_row[g * packed_per_group..(g + 1) * packed_per_group];
             let x_group = &x[g * GROUP_SIZE..(g + 1) * GROUP_SIZE];
             for p in 0..packed_per_group {
                 let word = group_packed[p];
@@ -405,11 +399,7 @@ pub fn project_4bit_cpu(
     dequant_matvec_4bit_cpu(packed, scales, biases, in_dim, out_dim, x, out)
 }
 
-fn expect_shape(
-    wf: &WeightFile,
-    name: &str,
-    expected: &[usize],
-) -> Result<(), CpuMatvecError> {
+fn expect_shape(wf: &WeightFile, name: &str, expected: &[usize]) -> Result<(), CpuMatvecError> {
     let info = wf
         .tensor_info(name)
         .ok_or_else(|| CpuMatvecError::MissingTensor {
@@ -425,10 +415,7 @@ fn expect_shape(
     Ok(())
 }
 
-fn bytes_as_u32<'a>(
-    name: &str,
-    bytes: &'a [u8],
-) -> Result<&'a [u32], CpuMatvecError> {
+fn bytes_as_u32<'a>(name: &str, bytes: &'a [u8]) -> Result<&'a [u32], CpuMatvecError> {
     // 4-bit-packed weight blocks store 8 nibbles per u32 in
     // little-endian order — the body is the bit pattern we want.
     static_assertions::assert_eq_size!(u32, [u8; 4]);
@@ -446,10 +433,7 @@ fn bytes_as_u32<'a>(
     Ok(body)
 }
 
-fn bytes_as_u16<'a>(
-    name: &str,
-    bytes: &'a [u8],
-) -> Result<&'a [u16], CpuMatvecError> {
+fn bytes_as_u16<'a>(name: &str, bytes: &'a [u8]) -> Result<&'a [u16], CpuMatvecError> {
     // BF16 scales / biases storage on disk is little-endian u16.
     static_assertions::assert_eq_size!(u16, [u8; 2]);
     static_assertions::const_assert_eq!(std::mem::align_of::<u16>(), 2);
@@ -483,10 +467,7 @@ mod tests {
         let biases = vec![0x0000u16; 1];
         let x = vec![1.0f32; in_dim];
         let mut out = vec![0.0f32; out_dim];
-        dequant_matvec_4bit_cpu(
-            &packed, &scales, &biases, in_dim, out_dim, &x, &mut out,
-        )
-        .unwrap();
+        dequant_matvec_4bit_cpu(&packed, &scales, &biases, in_dim, out_dim, &x, &mut out).unwrap();
         // 64 ones, dot with 64 ones = 64.
         assert_eq!(out[0], 64.0);
     }
@@ -504,10 +485,8 @@ mod tests {
         let biases = vec![0x0000u16; 1];
         let x = vec![1.0f32; in_dim];
         let mut out = vec![0.0f32; out_dim];
-        dequant_matvec_8bit_v3_cpu(
-            &packed, &scales, &biases, in_dim, out_dim, &x, &mut out,
-        )
-        .unwrap();
+        dequant_matvec_8bit_v3_cpu(&packed, &scales, &biases, in_dim, out_dim, &x, &mut out)
+            .unwrap();
         assert_eq!(out[0], 64.0);
     }
 
@@ -523,10 +502,7 @@ mod tests {
         let biases = vec![0x3F80u16; out_dim];
         let x = vec![0.0f32; in_dim];
         let mut out = vec![999.0f32; out_dim];
-        dequant_matvec_4bit_cpu(
-            &packed, &scales, &biases, in_dim, out_dim, &x, &mut out,
-        )
-        .unwrap();
+        dequant_matvec_4bit_cpu(&packed, &scales, &biases, in_dim, out_dim, &x, &mut out).unwrap();
         // Even with bias=1.0, x=0 → every term is 0, sum=0.
         assert_eq!(out, vec![0.0; out_dim]);
     }
@@ -544,10 +520,7 @@ mod tests {
         let biases = vec![0x4000u16; 1];
         let x = vec![1.0f32; in_dim];
         let mut out = vec![0.0f32; out_dim];
-        dequant_matvec_4bit_cpu(
-            &packed, &scales, &biases, in_dim, out_dim, &x, &mut out,
-        )
-        .unwrap();
+        dequant_matvec_4bit_cpu(&packed, &scales, &biases, in_dim, out_dim, &x, &mut out).unwrap();
         // nibble=0 → dequant = 0 * 5 + 2 = 2; sum = 2 × 64 = 128.
         assert_eq!(out[0], 128.0);
     }
@@ -563,12 +536,14 @@ mod tests {
         let biases = vec![0x0000u16; 1];
         let x = vec![1.0f32; in_dim];
         let mut out = vec![0.0f32; out_dim];
-        let err = dequant_matvec_4bit_cpu(
-            &packed, &scales, &biases, in_dim, out_dim, &x, &mut out,
-        )
-        .unwrap_err();
+        let err = dequant_matvec_4bit_cpu(&packed, &scales, &biases, in_dim, out_dim, &x, &mut out)
+            .unwrap_err();
         match err {
-            CpuMatvecError::SliceLen { field, got, expected } => {
+            CpuMatvecError::SliceLen {
+                field,
+                got,
+                expected,
+            } => {
                 assert_eq!(field, "packed");
                 assert_eq!(got, 7);
                 assert_eq!(expected, 8);
@@ -643,8 +618,7 @@ mod tests {
         // weight magnitudes are O(1); column 3 of a [1536, 7168]
         // matrix should produce a [1536]-vector with magnitude in
         // single-digit range, not 0 or 1e10.
-        let max_abs =
-            out.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        let max_abs = out.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
         assert!(
             max_abs > 1e-4 && max_abs < 1e3,
             "q_a_proj column-3 magnitude {max_abs} outside sane range — \
@@ -663,10 +637,8 @@ mod tests {
         let biases = vec![0x0000u16; 1];
         let x = vec![1.0f32; in_dim];
         let mut out = vec![0.0f32; out_dim];
-        let err = dequant_matvec_4bit_cpu(
-            &packed, &scales, &biases, in_dim, out_dim, &x, &mut out,
-        )
-        .unwrap_err();
+        let err = dequant_matvec_4bit_cpu(&packed, &scales, &biases, in_dim, out_dim, &x, &mut out)
+            .unwrap_err();
         assert!(matches!(err, CpuMatvecError::InDimNotMultiple { .. }));
     }
 }

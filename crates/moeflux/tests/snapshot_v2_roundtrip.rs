@@ -57,14 +57,25 @@ fn snapshot_v2_roundtrip_pos2() -> Result<(), Error> {
 
     // Snapshot.
     let need = ctx.state_size();
-    eprintln!("[snapshot-v2] state_size = {} bytes ({:.1} MB)", need, need as f64 / (1024.0 * 1024.0));
-    assert!(need > 0, "state_size returned 0 — Mla branch likely still gated");
+    eprintln!(
+        "[snapshot-v2] state_size = {} bytes ({:.1} MB)",
+        need,
+        need as f64 / (1024.0 * 1024.0)
+    );
+    assert!(
+        need > 0,
+        "state_size returned 0 — Mla branch likely still gated"
+    );
     let mut snap = vec![0u8; need];
     let written = ctx
         .state_save(&mut snap)
         .map_err(|e| panic!("state_save: {e}"))
         .unwrap();
-    assert_eq!(written, need, "state_save wrote {} bytes, want {}", written, need);
+    assert_eq!(
+        written, need,
+        "state_save wrote {} bytes, want {}",
+        written, need
+    );
     eprintln!("[snapshot-v2] state_save wrote {} bytes", written);
 
     // Header magic check (sanity).

@@ -43,9 +43,7 @@ pub enum LinearAttnError {
     InputLen { got: usize, expected: usize },
     #[error("output length {got} != expected {expected}")]
     OutputLen { got: usize, expected: usize },
-    #[error(
-        "conv state length {got} != (kernel_size-1) * channels = {expected}"
-    )]
+    #[error("conv state length {got} != (kernel_size-1) * channels = {expected}")]
     ConvStateLen { got: usize, expected: usize },
     #[error("non-positive shape: channels={channels} kernel_size={kernel_size}")]
     BadConvShape { channels: usize, kernel_size: usize },
@@ -133,19 +131,13 @@ pub fn conv1d_step(
         let mut acc: f32 = 0.0;
         for k in 0..kernel_size - 1 {
             let w_idx = c * kernel_size + k;
-            let w_bits = u16::from_le_bytes([
-                weight_bf16[w_idx * 2],
-                weight_bf16[w_idx * 2 + 1],
-            ]);
+            let w_bits = u16::from_le_bytes([weight_bf16[w_idx * 2], weight_bf16[w_idx * 2 + 1]]);
             let w = bf16_to_f32(w_bits);
             let s = conv_state[k * channels + c];
             acc = s.mul_add(w, acc);
         }
         let w_idx = c * kernel_size + (kernel_size - 1);
-        let w_bits = u16::from_le_bytes([
-            weight_bf16[w_idx * 2],
-            weight_bf16[w_idx * 2 + 1],
-        ]);
+        let w_bits = u16::from_le_bytes([weight_bf16[w_idx * 2], weight_bf16[w_idx * 2 + 1]]);
         let w = bf16_to_f32(w_bits);
         acc = new_input[c].mul_add(w, acc);
         out[c] = acc;
@@ -157,11 +149,7 @@ pub fn conv1d_step(
 
 /// `out[i] = x[i] / sqrt(mean(x*x) + eps)` — bare RMSNorm, no weight.
 /// Bit-exact against the C `cpu_rms_norm_bare` on the same hardware.
-pub fn rms_norm_bare(
-    x: &[f32],
-    eps: f32,
-    out: &mut [f32],
-) -> Result<(), LinearAttnError> {
+pub fn rms_norm_bare(x: &[f32], eps: f32, out: &mut [f32]) -> Result<(), LinearAttnError> {
     let dim = x.len();
     if dim == 0 {
         return Err(LinearAttnError::ZeroDim);
@@ -320,8 +308,7 @@ pub fn gated_delta_recurrence(
         &mut beta_gate,
     )?;
     gated_delta_recurrence_supplied(
-        &g_decay, &beta_gate, q, k, v, v_heads, k_heads, key_dim, value_dim,
-        ssm_state, out_values,
+        &g_decay, &beta_gate, q, k, v, v_heads, k_heads, key_dim, value_dim, ssm_state, out_values,
     )
 }
 
@@ -410,8 +397,7 @@ pub fn gated_delta_recurrence_supplied(
             }
             let delta = (v[v_off + vi] - kv_mem) * b_gate;
             for ki in 0..key_dim {
-                ssm_state[row_off + ki] =
-                    k[k_off + ki].mul_add(delta, ssm_state[row_off + ki]);
+                ssm_state[row_off + ki] = k[k_off + ki].mul_add(delta, ssm_state[row_off + ki]);
             }
         }
 
@@ -496,12 +482,7 @@ pub fn gated_delta_chunkwise(
     ssm_state: &mut [f32],
     out_values: &mut [f32],
 ) -> Result<(), LinearAttnError> {
-    if v_heads == 0
-        || k_heads == 0
-        || key_dim == 0
-        || value_dim == 0
-        || chunk_size == 0
-    {
+    if v_heads == 0 || k_heads == 0 || key_dim == 0 || value_dim == 0 || chunk_size == 0 {
         return Err(LinearAttnError::ZeroDim);
     }
     if v_heads % k_heads != 0 {
@@ -564,13 +545,10 @@ pub fn gated_delta_chunkwise(
             for l in 0..c {
                 let t = chunk_start + l;
                 let kq_lo = t * key_total + kh * key_dim;
-                kc[l * key_dim..(l + 1) * key_dim]
-                    .copy_from_slice(&k[kq_lo..kq_lo + key_dim]);
-                qc[l * key_dim..(l + 1) * key_dim]
-                    .copy_from_slice(&q[kq_lo..kq_lo + key_dim]);
+                kc[l * key_dim..(l + 1) * key_dim].copy_from_slice(&k[kq_lo..kq_lo + key_dim]);
+                qc[l * key_dim..(l + 1) * key_dim].copy_from_slice(&q[kq_lo..kq_lo + key_dim]);
                 let v_lo = t * value_total + vh * value_dim;
-                vc[l * value_dim..(l + 1) * value_dim]
-                    .copy_from_slice(&v[v_lo..v_lo + value_dim]);
+                vc[l * value_dim..(l + 1) * value_dim].copy_from_slice(&v[v_lo..v_lo + value_dim]);
                 // Clamp away from 0: a real forget gate can be exactly
                 // 0.0 (hard reset), and `ln(0) = -inf` makes the later
                 // `exp(L_l - L_i)` compute `(-inf) - (-inf) = NaN`. The
@@ -582,8 +560,7 @@ pub fn gated_delta_chunkwise(
             }
             let gamma_at = |l: usize| log_decay[l].exp();
             // Γ_{l,i} = exp(L_l − L_i), for i ≤ l (bounded in (0,1]).
-            let decay_ratio =
-                |l: usize, i: usize| (log_decay[l] - log_decay[i]).exp();
+            let decay_ratio = |l: usize, i: usize| (log_decay[l] - log_decay[i]).exp();
             let krow = |l: usize| &kc[l * key_dim..(l + 1) * key_dim];
             let qrow = |l: usize| &qc[l * key_dim..(l + 1) * key_dim];
 
@@ -593,8 +570,7 @@ pub fn gated_delta_chunkwise(
             // (S_0·x)[vi] = Σ_ki S_0[vi][ki]·x[ki].
             let s0_apply = |x: &[f32], out: &mut [f32]| {
                 for vi in 0..value_dim {
-                    out[vi] =
-                        dot(&s0[vi * key_dim..(vi + 1) * key_dim], x);
+                    out[vi] = dot(&s0[vi * key_dim..(vi + 1) * key_dim], x);
                 }
             };
 
@@ -602,9 +578,7 @@ pub fn gated_delta_chunkwise(
             let mut a = vec![0.0f32; c * c];
             for l in 0..c {
                 for i in 0..l {
-                    a[l * c + i] = beta[l]
-                        * decay_ratio(l, i)
-                        * dot(krow(i), krow(l));
+                    a[l * c + i] = beta[l] * decay_ratio(l, i) * dot(krow(i), krow(l));
                 }
             }
 
@@ -616,8 +590,7 @@ pub fn gated_delta_chunkwise(
                 let gl = gamma_at(l);
                 let row = &mut u[l * value_dim..(l + 1) * value_dim];
                 for vi in 0..value_dim {
-                    row[vi] = beta[l] * vc[l * value_dim + vi]
-                        - beta[l] * gl * scratch[vi];
+                    row[vi] = beta[l] * vc[l * value_dim + vi] - beta[l] * gl * scratch[vi];
                 }
             }
             // Forward substitution: U_l −= Σ_{i<l} A_{l,i}·U_i.
@@ -648,8 +621,7 @@ pub fn gated_delta_chunkwise(
                     out_l[vi] = gl * scratch[vi];
                 }
                 for i in 0..=l {
-                    let coef =
-                        decay_ratio(l, i) * dot(krow(i), qrow(l));
+                    let coef = decay_ratio(l, i) * dot(krow(i), qrow(l));
                     let ui = &u[i * value_dim..(i + 1) * value_dim];
                     for vi in 0..value_dim {
                         out_l[vi] = coef.mul_add(ui[vi], out_l[vi]);
@@ -660,8 +632,7 @@ pub fn gated_delta_chunkwise(
             // New state: S_C = γ_{C-1}·S_0 + Σ_i Γ_{C-1,i}·U_i·k_iᵀ.
             let last = c - 1;
             let g_last = gamma_at(last);
-            let new_state =
-                &mut ssm_state[s_off..s_off + head_state_stride];
+            let new_state = &mut ssm_state[s_off..s_off + head_state_stride];
             for (dst, src) in new_state.iter_mut().zip(s0.iter()) {
                 *dst = g_last * src;
             }
@@ -671,8 +642,7 @@ pub fn gated_delta_chunkwise(
                 let ui = &u[i * value_dim..(i + 1) * value_dim];
                 for vi in 0..value_dim {
                     let coef = ratio * ui[vi];
-                    let row =
-                        &mut new_state[vi * key_dim..(vi + 1) * key_dim];
+                    let row = &mut new_state[vi * key_dim..(vi + 1) * key_dim];
                     for (rk, &kk) in row.iter_mut().zip(ki.iter()) {
                         *rk = coef.mul_add(kk, *rk);
                     }
@@ -709,11 +679,7 @@ pub fn compute_decay_beta_cpu(
     beta_gate_out: &mut [f32],
 ) -> Result<(), LinearAttnError> {
     let n = alpha.len();
-    if beta.len() != n
-        || a_log.len() != n
-        || g_decay_out.len() != n
-        || beta_gate_out.len() != n
-    {
+    if beta.len() != n || a_log.len() != n || g_decay_out.len() != n || beta_gate_out.len() != n {
         return Err(LinearAttnError::OutputLen {
             got: beta.len(),
             expected: n,
@@ -728,8 +694,7 @@ pub fn compute_decay_beta_cpu(
         });
     }
     for h in 0..n {
-        let dt_b_bits =
-            u16::from_le_bytes([dt_bias_bf16[h * 2], dt_bias_bf16[h * 2 + 1]]);
+        let dt_b_bits = u16::from_le_bytes([dt_bias_bf16[h * 2], dt_bias_bf16[h * 2 + 1]]);
         let dt_b = bf16_to_f32(dt_b_bits);
         let a_val = alpha[h];
         let a_decay = a_log[h].exp();
@@ -769,12 +734,25 @@ mod tests {
         let mut g_decay = vec![0.0f32; 4];
         let mut beta_gate = vec![0.0f32; 4];
         compute_decay_beta_cpu(
-            &alpha, &beta, &a_log, &dt_bias_bf16, &mut g_decay, &mut beta_gate,
+            &alpha,
+            &beta,
+            &a_log,
+            &dt_bias_bf16,
+            &mut g_decay,
+            &mut beta_gate,
         )
         .unwrap();
         for h in 0..4 {
-            assert!((g_decay[h] - 0.5).abs() < 1e-6, "g_decay[{h}] = {}", g_decay[h]);
-            assert!((beta_gate[h] - 0.5).abs() < 1e-6, "beta_gate[{h}] = {}", beta_gate[h]);
+            assert!(
+                (g_decay[h] - 0.5).abs() < 1e-6,
+                "g_decay[{h}] = {}",
+                g_decay[h]
+            );
+            assert!(
+                (beta_gate[h] - 0.5).abs() < 1e-6,
+                "beta_gate[{h}] = {}",
+                beta_gate[h]
+            );
         }
     }
 
@@ -887,8 +865,7 @@ mod tests {
                     &mut out_t,
                 )
                 .expect("per-token oracle");
-                oracle_out[t * value_total..(t + 1) * value_total]
-                    .copy_from_slice(&out_t);
+                oracle_out[t * value_total..(t + 1) * value_total].copy_from_slice(&out_t);
             }
 
             for &chunk_size in &[16usize, 64] {
@@ -914,8 +891,7 @@ mod tests {
                 let cos_out = cosine(&oracle_out, &cw_out);
                 let cos_state = cosine(&oracle_state, &cw_state);
                 let mad_out = max_abs_diff(&oracle_out, &cw_out);
-                let mad_state =
-                    max_abs_diff(&oracle_state, &cw_state);
+                let mad_state = max_abs_diff(&oracle_state, &cw_state);
                 eprintln!(
                     "[chunkwise] n={n_tokens} C={chunk_size}: \
                      out cos={cos_out:.9} max_abs={mad_out:.3e}; \

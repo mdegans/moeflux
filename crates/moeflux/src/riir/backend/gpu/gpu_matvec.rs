@@ -25,7 +25,7 @@
 //! the same device.
 
 use metal::{Buffer, CommandBufferRef, MTLSize, NSUInteger};
-use moeflux_metal::{QmmCall, Kernels, QuantWeights};
+use moeflux_metal::{Kernels, QmmCall, QuantWeights};
 
 use super::encoder::pipeline_bundle;
 use crate::riir::io::mtl_weight_buf::MtlWeightBuf;
@@ -186,8 +186,7 @@ pub fn encode_matvec_n_tokens(
     if use_v3 {
         let num_row_tiles = (out_dim + 7) / 8;
         enc.set_bytes(9, 4, (&num_row_tiles as *const u32).cast());
-        let total_tgs =
-            (num_row_tiles as u64).saturating_mul(n_tokens as u64);
+        let total_tgs = (num_row_tiles as u64).saturating_mul(n_tokens as u64);
         enc.dispatch_thread_groups(
             MTLSize::new(total_tgs as NSUInteger, 1, 1),
             MTLSize::new(256, 1, 1),
@@ -254,8 +253,8 @@ pub fn encode_dense_matmul_n_tokens(
         );
     } else {
         encode_matvec_n_tokens(
-            cmdbuf, pipes, w_buf, w_off, s_off, b_off, input, input_off,
-            output, output_off, in_dim, out_dim, n_tokens, bits,
+            cmdbuf, pipes, w_buf, w_off, s_off, b_off, input, input_off, output, output_off,
+            in_dim, out_dim, n_tokens, bits,
         );
     }
 }

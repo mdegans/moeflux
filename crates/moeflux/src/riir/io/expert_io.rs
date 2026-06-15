@@ -46,7 +46,7 @@ use moeflux_metal::ResidencySet;
 
 use crate::riir::backend::buftype::ExpertBaseBuf;
 use crate::riir::backend::{BufId, MetalBufferPool};
-use crate::riir::variants::{Variant, VARIANT};
+use crate::riir::variants::{VARIANT, Variant};
 
 /// Disable kernel readahead on a successfully-opened layer fd.
 /// Mirrors `fcntl(fd, F_RDAHEAD, 0)` in the C path at
@@ -207,8 +207,7 @@ impl ExpertFiles {
         let v: Variant = VARIANT;
         let subdir = experts_dir.join("packed_experts");
         let mut layers = Vec::with_capacity(v.num_layers);
-        let mut mmap_layers: Vec<Option<Mmap>> =
-            (0..v.num_layers).map(|_| None).collect();
+        let mut mmap_layers: Vec<Option<Mmap>> = (0..v.num_layers).map(|_| None).collect();
         for i in 0..v.num_layers {
             let path = subdir.join(format!("layer_{i:02}.bin"));
             match File::open(&path) {
@@ -219,11 +218,9 @@ impl ExpertFiles {
                     // survives the file handle (closed when `f` drops
                     // at end of this match arm). Returned mapping is
                     // read-only, no aliasing concerns.
-                    let mmap = unsafe { Mmap::map(&f) }.map_err(|e| {
-                        ExpertIoError::Io {
-                            layer: i,
-                            source: e,
-                        }
+                    let mmap = unsafe { Mmap::map(&f) }.map_err(|e| ExpertIoError::Io {
+                        layer: i,
+                        source: e,
                     })?;
                     mmap_layers[i] = Some(mmap);
                     layers.push(Some(f));
@@ -295,9 +292,7 @@ impl ExpertFiles {
                 "moeflux.experts",
                 self.mmap_layers.len() as u64,
             );
-            if self.expert_rset.is_none()
-                && !moeflux_metal::residency_set::is_available()
-            {
+            if self.expert_rset.is_none() && !moeflux_metal::residency_set::is_available() {
                 eprintln!(
                     "[experts] MTLResidencySet unavailable (macOS < 15) \
                      — expert buffers will not be pinned"

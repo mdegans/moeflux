@@ -139,9 +139,7 @@ fn cogito_v2_eval_token_warm() -> Result<(), Error> {
         .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
         .map(|(i, _)| i)
         .unwrap_or(0);
-    eprintln!(
-        "[cogito-warm] warm logits: min={min:.3} max={max:.3} argmax={argmax}",
-    );
+    eprintln!("[cogito-warm] warm logits: min={min:.3} max={max:.3} argmax={argmax}",);
     assert!(finite, "warm logits contain NaN/Inf");
     Ok(())
 }

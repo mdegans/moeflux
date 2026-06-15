@@ -36,9 +36,7 @@
 //! the rest are unused), so test vs. production agree per-element
 //! after slicing.
 
-use metal::{
-    BufferRef, CommandBufferRef, ComputePipelineState, MTLSize, NSUInteger,
-};
+use metal::{BufferRef, CommandBufferRef, ComputePipelineState, MTLSize, NSUInteger};
 
 use crate::riir::backend::gpu::encoder::pipeline_bundle;
 use crate::riir::backend::gpu::metal::{MetalContext, MetalError, MtlBuffer};
@@ -53,10 +51,7 @@ pub enum GpuAttnError {
         actual: usize,
     },
     #[error("non-positive shape: {what} = {value}")]
-    BadShape {
-        what: &'static str,
-        value: i64,
-    },
+    BadShape { what: &'static str, value: i64 },
     #[error("num_heads ({num_heads}) must be a multiple of num_kv_heads ({num_kv_heads})")]
     BadGqa { num_heads: u32, num_kv_heads: u32 },
     #[error("Metal backend: {0}")]
@@ -70,11 +65,7 @@ fn check_pos(what: &'static str, value: i64) -> Result<(), GpuAttnError> {
     Ok(())
 }
 
-fn check_len(
-    what: &'static str,
-    expected: usize,
-    actual: usize,
-) -> Result<(), GpuAttnError> {
+fn check_len(what: &'static str, expected: usize, actual: usize) -> Result<(), GpuAttnError> {
     if actual != expected {
         return Err(GpuAttnError::BadLen {
             what,
@@ -261,7 +252,11 @@ pub fn gpu_attn_scores_batched(
     let heads_per_kv = num_heads / num_kv_heads;
     check_len("q", (num_heads * head_dim) as usize, q.len())?;
     check_len("k_cache", (seq_len * kv_dim) as usize, k_cache.len())?;
-    check_len("scores_out", (num_heads * seq_len) as usize, scores_out.len())?;
+    check_len(
+        "scores_out",
+        (num_heads * seq_len) as usize,
+        scores_out.len(),
+    )?;
 
     let pipe = metal.pipeline("attn_scores_batched")?.clone();
     let device = metal.device();

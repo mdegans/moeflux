@@ -26,8 +26,7 @@
 //! (slice 9d). Per-call alloc is ~µs.
 
 use metal::{
-    Buffer, CommandBufferRef, ComputePipelineState, Device, MTLResourceOptions,
-    MTLSize, NSUInteger,
+    Buffer, CommandBufferRef, ComputePipelineState, Device, MTLResourceOptions, MTLSize, NSUInteger,
 };
 
 use super::encoder::pipeline_bundle;
@@ -41,9 +40,7 @@ pub enum GpuNormError {
     BadXLen { expected: usize, actual: usize },
     #[error("out must be HIDDEN_DIM={expected} floats, got {actual}")]
     BadOutLen { expected: usize, actual: usize },
-    #[error(
-        "weight_bf16 must be HIDDEN_DIM*2={expected} bytes, got {actual}"
-    )]
+    #[error("weight_bf16 must be HIDDEN_DIM*2={expected} bytes, got {actual}")]
     BadWeightLen { expected: usize, actual: usize },
     #[error("Metal backend: {0}")]
     Metal(#[from] MetalError),
@@ -98,10 +95,7 @@ pub fn gpu_rms_norm_fused(
         enc.set_buffer(1, Some(buf_sum_sq.raw()), 0);
         let dim = v.hidden_dim as u32;
         enc.set_bytes(2, 4, (&dim as *const u32).cast());
-        enc.dispatch_thread_groups(
-            MTLSize::new(1, 1, 1),
-            MTLSize::new(256, 1, 1),
-        );
+        enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
         enc.end_encoding();
     }
 
@@ -183,10 +177,7 @@ pub fn encode_rms_norm_bf16_into(
         enc.set_buffer(0, Some(input), 0);
         enc.set_buffer(1, Some(sum_sq), 0);
         enc.set_bytes(2, 4, (&dim as *const u32).cast());
-        enc.dispatch_thread_groups(
-            MTLSize::new(1, 1, 1),
-            MTLSize::new(256, 1, 1),
-        );
+        enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
         enc.end_encoding();
     }
     // Stage 2: apply with bf16 weight — per-element. 256 threads/group.
@@ -354,12 +345,7 @@ pub fn encode_embed_gather_4bit_into(
 /// `dim` floats from `src` → `dst`. Used by the orchestrator's GPU
 /// residual stream (Phase 5) to snapshot `hidden → residual` at the
 /// top of each sub-block without a CPU bounce.
-pub fn encode_buffer_copy_f32(
-    cmdbuf: &CommandBufferRef,
-    src: &Buffer,
-    dst: &Buffer,
-    dim: u32,
-) {
+pub fn encode_buffer_copy_f32(cmdbuf: &CommandBufferRef, src: &Buffer, dst: &Buffer, dim: u32) {
     let bytes = (dim as NSUInteger) * std::mem::size_of::<f32>() as NSUInteger;
     let blit = cmdbuf.new_blit_command_encoder();
     blit.copy_from_buffer(src, 0, dst, 0, bytes);

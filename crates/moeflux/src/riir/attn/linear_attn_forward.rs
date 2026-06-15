@@ -33,9 +33,7 @@
 //! reducing complexity. The function is long but linear; comment
 //! markers (`// ── step N: …`) make it scannable.
 
-use metal::{
-    Buffer, CommandBufferRef, ComputePipelineState, MTLSize, NSUInteger,
-};
+use metal::{Buffer, CommandBufferRef, ComputePipelineState, MTLSize, NSUInteger};
 
 /// Process-wide cache for `MOEFLUX_MOE_GATHER_ID`. Routes the
 /// batched MoE block through `Op::MoeGatherIdFuse` (the one-
@@ -55,11 +53,9 @@ use metal::{
 fn moe_gather_id_enabled() -> bool {
     use std::sync::OnceLock;
     static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| {
-        match std::env::var("MOEFLUX_MOE_GATHER_ID").as_deref() {
-            Ok("0") | Ok("false") | Ok("off") => false,
-            _ => true,
-        }
+    *CACHED.get_or_init(|| match std::env::var("MOEFLUX_MOE_GATHER_ID").as_deref() {
+        Ok("0") | Ok("false") | Ok("off") => false,
+        _ => true,
     })
 }
 
@@ -117,44 +113,40 @@ pub(in crate::riir) fn delta_net_vb_enabled() -> bool {
     })
 }
 
-use crate::riir::backend::buftype::{
-    AlphaStackBuf, AttnInputBuf, AttnOutBuf, BetaGateBuf, BetaStackBuf,
-    BucketActBuf, BucketGateBuf, BucketInputBuf, BucketOutBuf,
-    BucketTokenIdxBuf, BucketUpBuf, BucketWeightsBuf, ConvOutBuf,
-    ConvStateBuf, DeltaOutBuf, DeltaStateBuf, ExpertBaseBuf,
-    ExpertIndicesBuf, GDecayBuf, HiddenBuf, HidsBuf, HtpeBuf, KProjOutBuf,
-    KvCacheKBuf, KvCacheVBuf, LogitsBuf, MoeInputBuf, MoeOutSumBuf,
-    OProjOutBuf, QBuf, QGateBuf, QProjOutBuf, QkvStackBuf, ResidualBuf,
-    RouterIdxBuf, RouterLogitsBuf, RouterWeightsBuf, SharedFfnActBuf,
-    SharedFfnDownBuf, SharedFfnGateBuf, SharedFfnUpBuf, SharedGateBuf,
-    TokenIdsBuf, ValueOutBuf, VProjOutBuf, ZStackBuf,
-};
-use crate::riir::backend::{Backend, BufId, BufferPool, MetalBufferPool};
-use crate::riir::moe::deferred::{
-    gpu_batched_experts_begin, gpu_batched_experts_begin_mmap,
-    DeferredError,
-};
-use crate::riir::moe::expert_forward::{ChainToNormed, ExpertPayload, MoeBuffers};
-use crate::riir::io::expert_io::ExpertFiles;
 use crate::riir::attn::gpu_attn::{
-    encode_attn_scores_batched_into, encode_attn_softmax_batched_into,
+    GpuAttnPipelines, encode_attn_scores_batched_into, encode_attn_softmax_batched_into,
     encode_attn_values_batched_into, encode_sigmoid_gate_into,
-    GpuAttnPipelines,
 };
 use crate::riir::attn::gpu_linear_attn::{
-    encode_compute_decay_beta, encode_conv1d_step, encode_delta_net_step,
-    encode_gated_rms_norm, encode_rms_norm_qk, LinearAttnPipelines,
+    LinearAttnPipelines, encode_compute_decay_beta, encode_conv1d_step, encode_delta_net_step,
+    encode_gated_rms_norm, encode_rms_norm_qk,
 };
-use crate::riir::backend::gpu::gpu_matvec::{encode_matvec, MatvecPipelines, MatvecSpec};
-use crate::riir::backend::gpu::gpu_norm::{encode_rms_norm_bf16_into, RmsNormBf16Pipelines};
+use crate::riir::backend::buftype::{
+    AlphaStackBuf, AttnInputBuf, AttnOutBuf, BetaGateBuf, BetaStackBuf, BucketActBuf,
+    BucketGateBuf, BucketInputBuf, BucketOutBuf, BucketTokenIdxBuf, BucketUpBuf, BucketWeightsBuf,
+    ConvOutBuf, ConvStateBuf, DeltaOutBuf, DeltaStateBuf, ExpertBaseBuf, ExpertIndicesBuf,
+    GDecayBuf, HiddenBuf, HidsBuf, HtpeBuf, KProjOutBuf, KvCacheKBuf, KvCacheVBuf, LogitsBuf,
+    MoeInputBuf, MoeOutSumBuf, OProjOutBuf, QBuf, QGateBuf, QProjOutBuf, QkvStackBuf, ResidualBuf,
+    RouterIdxBuf, RouterLogitsBuf, RouterWeightsBuf, SharedFfnActBuf, SharedFfnDownBuf,
+    SharedFfnGateBuf, SharedFfnUpBuf, SharedGateBuf, TokenIdsBuf, VProjOutBuf, ValueOutBuf,
+    ZStackBuf,
+};
 use crate::riir::backend::gpu::gpu_ctx::GpuLayerCtx;
-use crate::riir::io::layer_weight_cache::LayerWeightCache;
+use crate::riir::backend::gpu::gpu_matvec::{MatvecPipelines, MatvecSpec, encode_matvec};
+use crate::riir::backend::gpu::gpu_norm::{RmsNormBf16Pipelines, encode_rms_norm_bf16_into};
 use crate::riir::backend::gpu::metal::{MetalContext, MetalError};
-use crate::riir::moe::moe_router::moe_router_cpu;
+use crate::riir::backend::{Backend, BufId, BufferPool, MetalBufferPool};
+use crate::riir::io::expert_io::ExpertFiles;
+use crate::riir::io::layer_weight_cache::LayerWeightCache;
 use crate::riir::io::mtl_weight_buf::MtlWeightBuf;
-use crate::riir::snapshot::state::LinearAttnState;
-use crate::riir::variants::{Variant, RMS_NORM_EPS, VARIANT};
 use crate::riir::io::weight_file::WeightFile;
+use crate::riir::moe::deferred::{
+    DeferredError, gpu_batched_experts_begin, gpu_batched_experts_begin_mmap,
+};
+use crate::riir::moe::expert_forward::{ChainToNormed, ExpertPayload, MoeBuffers};
+use crate::riir::moe::moe_router::moe_router_cpu;
+use crate::riir::snapshot::state::LinearAttnState;
+use crate::riir::variants::{RMS_NORM_EPS, VARIANT, Variant};
 
 /// Errors that can surface during a layer forward (linear or full
 /// attention). 4d renamed from `LinearAttnForwardError` once
@@ -162,10 +154,7 @@ use crate::riir::io::weight_file::WeightFile;
 #[derive(Debug, thiserror::Error)]
 pub enum LayerForwardError {
     #[error("missing tensor for layer {layer}: {tensor}")]
-    MissingTensor {
-        layer: usize,
-        tensor: &'static str,
-    },
+    MissingTensor { layer: usize, tensor: &'static str },
     #[error("hidden_in must be HIDDEN_DIM={expected} floats, got {actual}")]
     BadHiddenLen { expected: usize, actual: usize },
     #[error("Metal: {0}")]
@@ -255,16 +244,6 @@ pub struct LayerForwardBuffers {
     pub k_out: BufId<KProjOutBuf>,
     pub v_out: BufId<VProjOutBuf>,
 
-    /// Slice 5d-7b — GPU full-attention buffers.
-    ///
-    /// Per-full-attn-layer KV mirrors (host KV stays canonical for
-    /// `state_save`; these get one-way-synced on append + state_load):
-    /// `gpu_kv_k[fa_idx]` / `gpu_kv_v[fa_idx]` are `GPU_KV_SEQ * kv_dim`
-    /// floats each. `fa_idx` = `full_attn_layer_idx_for(layer_idx)`.
-    /// Mirrors C `g_metal->buf_kv_k[NUM_FULL_ATTN_LAYERS]` allocation
-    /// at `infer.m:1255..1260`.
-    pub gpu_kv_k: Vec<BufId<KvCacheKBuf>>,
-    pub gpu_kv_v: Vec<BufId<KvCacheVBuf>>,
     /// Shared scratch for the GPU SDPA fast path. Reused across layers
     /// because SDPA is layer-sequential per token (matches C). Sizes:
     /// - `gpu_attn_q` / `gpu_attn_out` / `gpu_attn_gate`:
@@ -419,11 +398,7 @@ impl HeadTailScratch {
         let v = VARIANT;
         let chunk = crate::riir::BATCHED_CHUNK_SIZE;
         let token_ids: BufId<TokenIdsBuf> = pool
-            .alloc(
-                chunk * std::mem::size_of::<i32>(),
-                "hts.token_ids",
-                true,
-            )
+            .alloc(chunk * std::mem::size_of::<i32>(), "hts.token_ids", true)
             .expect("HeadTailScratch::new token_ids alloc");
         let logits: BufId<LogitsBuf> = pool
             .alloc(
@@ -680,9 +655,7 @@ impl LayerForwardBuffers {
         let conv_state: Vec<BufId<ConvStateBuf>> = (0..num_linear)
             .map(|_| {
                 pool.alloc(
-                    f32_bytes(
-                        (Variant::CONV_KERNEL_SIZE - 1) * v.linear_conv_dim(),
-                    ),
+                    f32_bytes((Variant::CONV_KERNEL_SIZE - 1) * v.linear_conv_dim()),
                     "lfb.conv_state",
                     true,
                 )
@@ -693,29 +666,12 @@ impl LayerForwardBuffers {
             .map(|_| {
                 pool.alloc(
                     f32_bytes(
-                        v.linear_num_v_heads
-                            * Variant::LINEAR_VALUE_DIM
-                            * Variant::LINEAR_KEY_DIM,
+                        v.linear_num_v_heads * Variant::LINEAR_VALUE_DIM * Variant::LINEAR_KEY_DIM,
                     ),
                     "lfb.delta_state",
                     true,
                 )
                 .expect("LayerForwardBuffers::new pool alloc")
-            })
-            .collect();
-
-        let num_full_attn = num_full_attn_layers(&v);
-        let gpu_kv_floats = crate::riir::variants::GPU_KV_SEQ * kv_dim_full;
-        let gpu_kv_k: Vec<BufId<KvCacheKBuf>> = (0..num_full_attn)
-            .map(|_| {
-                pool.alloc(f32_bytes(gpu_kv_floats), "lfb.gpu_kv_k", true)
-                    .expect("LayerForwardBuffers::new pool alloc")
-            })
-            .collect();
-        let gpu_kv_v: Vec<BufId<KvCacheVBuf>> = (0..num_full_attn)
-            .map(|_| {
-                pool.alloc(f32_bytes(gpu_kv_floats), "lfb.gpu_kv_v", true)
-                    .expect("LayerForwardBuffers::new pool alloc")
             })
             .collect();
 
@@ -737,11 +693,7 @@ impl LayerForwardBuffers {
                 .expect("LayerForwardBuffers::new pool alloc"),
             // Former batch_out[0..7] expanded to named fields.
             q_stack: pool
-                .alloc(
-                    f32_bytes(v.linear_conv_dim()),
-                    "lfb.batch_out[0:qkv]",
-                    true,
-                )
+                .alloc(f32_bytes(v.linear_conv_dim()), "lfb.batch_out[0:qkv]", true)
                 .expect("LayerForwardBuffers::new pool alloc"),
             z_stack: pool
                 .alloc(
@@ -775,11 +727,7 @@ impl LayerForwardBuffers {
                 .alloc(f32_bytes(1), "lfb.batch_out[5:shared_gate]", true)
                 .expect("LayerForwardBuffers::new pool alloc"),
             o_proj_stack: pool
-                .alloc(
-                    f32_bytes(oproj_in_max),
-                    "lfb.batch_out[6:oproj_in]",
-                    true,
-                )
+                .alloc(f32_bytes(oproj_in_max), "lfb.batch_out[6:oproj_in]", true)
                 .expect("LayerForwardBuffers::new pool alloc"),
             conv_state,
             delta_state,
@@ -793,11 +741,7 @@ impl LayerForwardBuffers {
                 .alloc(f32_bytes(v.linear_num_v_heads), "lfb.delta_beta", true)
                 .expect("LayerForwardBuffers::new pool alloc"),
             delta_output: pool
-                .alloc(
-                    f32_bytes(v.linear_total_value()),
-                    "lfb.delta_output",
-                    true,
-                )
+                .alloc(f32_bytes(v.linear_total_value()), "lfb.delta_output", true)
                 .expect("LayerForwardBuffers::new pool alloc"),
             sum_sq: pool
                 .alloc(f32_bytes(1), "lfb.sum_sq", true)
@@ -810,11 +754,7 @@ impl LayerForwardBuffers {
                 )
                 .expect("LayerForwardBuffers::new pool alloc"),
             shared_up_out: pool
-                .alloc(
-                    f32_bytes(v.shared_intermediate),
-                    "lfb.shared_up_out",
-                    true,
-                )
+                .alloc(f32_bytes(v.shared_intermediate), "lfb.shared_up_out", true)
                 .expect("LayerForwardBuffers::new pool alloc"),
             shared_act: pool
                 .alloc(f32_bytes(v.shared_intermediate), "lfb.shared_act", true)
@@ -831,16 +771,12 @@ impl LayerForwardBuffers {
             v_out: pool
                 .alloc(f32_bytes(kv_dim_full), "lfb.v_out", true)
                 .expect("LayerForwardBuffers::new pool alloc"),
-            gpu_kv_k,
-            gpu_kv_v,
             gpu_attn_q: pool
                 .alloc(f32_bytes(q_dim_full), "lfb.gpu_attn_q", true)
                 .expect("LayerForwardBuffers::new pool alloc"),
             gpu_attn_scores: pool
                 .alloc(
-                    f32_bytes(
-                        v.num_attn_heads * crate::riir::variants::GPU_KV_SEQ,
-                    ),
+                    f32_bytes(v.num_attn_heads * crate::riir::variants::GPU_KV_SEQ),
                     "lfb.gpu_attn_scores",
                     true,
                 )
@@ -867,24 +803,10 @@ impl LayerForwardBuffers {
         }
     }
 
-    /// Slice 5d-7b — zero the GPU full-attn KV mirrors. Called from
-    /// `RsCtx::memory_clear` alongside `reset_recurrence`. The host
-    /// KV cache is cleared via `clear_all(layer_states)`; this is the
-    /// matching reset on the GPU side. Mirrors the C path's reset of
-    /// `buf_kv_k` / `buf_kv_v` at `mf_memory_clear`.
-    pub fn reset_gpu_attn_kv_mirrors(&self, pool: &MetalBufferPool) {
-        for &id in &self.gpu_kv_k {
-            zero_f32_buffer(pool.handle(id));
-        }
-        for &id in &self.gpu_kv_v {
-            zero_f32_buffer(pool.handle(id));
-        }
-    }
 }
 
 /// Zero every byte of a shared-storage Metal buffer. Used by
-/// `memory_clear` to reset GPU-resident state (linear-attn
-/// recurrence, full-attn KV mirrors).
+/// `memory_clear` to reset GPU-resident linear-attn recurrence state.
 ///
 /// # Safety
 ///
@@ -983,24 +905,27 @@ pub(in crate::riir) struct OProj {
 
 /// Slice 5d-7b — args for the GPU SDPA fast path encoded at the top
 /// of CMD2 inside [`post_attention_tail`]. Carries the per-call
-/// inputs not derivable from `VARIANT`: which full-attn KV mirror
-/// slot to use, and the current KV length. When `Some`, the tail
+/// inputs not derivable from `VARIANT`: the canonical KV buffers to
+/// attend, and the current KV length. When `Some`, the tail
 /// encodes the 4 attn kernels (`attn_scores_batched` →
 /// `attn_softmax_batched` → `attn_values_batched` → `sigmoid_gate`)
 /// into the same cmdbuf as `o_proj`, residual_add, and post-attn
 /// rms_norm — no extra commit-wait. Q + q_gate are pre-staged into
 /// `buffers.gpu_attn_q` / `buffers.gpu_attn_gate` by the caller; K/V
-/// mirrors are pre-populated by the per-token KV-append memcpy.
+/// are read directly from the canonical pool KV.
 ///
 /// When `None`, the tail follows the existing CPU-attn path: o_proj
 /// reads from `buffers.o_proj_stack` (caller-staged via
 /// `sdpa_cpu` + memcpy).
 pub(in crate::riir) struct GpuAttnEncodeArgs {
-    /// Index into `LayerForwardBuffers::gpu_kv_k` / `gpu_kv_v`. From
-    /// [`full_attn_layer_idx_for`].
-    pub fa_idx: usize,
+    /// Canonical pool KV buffers (`kv_state.k_id` / `v_id`). The oracle
+    /// SDPA kernels read these directly — the prompt region is written
+    /// by both the batched-prefill and per-token append paths, so no
+    /// separate GPU mirror is needed (#2).
+    pub k_cache: BufId<KvCacheKBuf>,
+    pub v_cache: BufId<KvCacheVBuf>,
     /// `kv_state.len` after this token's KV append — the number of
-    /// positions the kernels read from the mirror.
+    /// positions the kernels read from the cache.
     pub kv_len: u32,
 }
 
@@ -1049,15 +974,19 @@ pub fn linear_attn_layer_forward(
     // disables the chain — used for the last layer and the dump hook.
     chain_next_norm_off: Option<u64>,
 ) -> Result<(), LayerForwardError> {
-    let GpuLayerCtx { wf, wf_buf, layer_cache, buffers, buffer_pool } =
-        *gpu;
+    let GpuLayerCtx {
+        wf,
+        wf_buf,
+        layer_cache,
+        buffers,
+        buffer_pool,
+    } = *gpu;
     let v = VARIANT;
-    let linear_layer_idx = linear_layer_idx_for(layer_idx).ok_or(
-        LayerForwardError::MissingTensor {
+    let linear_layer_idx =
+        linear_layer_idx_for(layer_idx).ok_or(LayerForwardError::MissingTensor {
             layer: layer_idx,
             tensor: "linear_layer_idx (called on full-attn layer)",
-        },
-    )?;
+        })?;
 
     // Per-tensor bit width lookup. 4-bit is the default; A3B uses
     // 8-bit for `mlp.gate.weight` and `mlp.shared_expert_gate.weight`.
@@ -1088,12 +1017,13 @@ pub fn linear_attn_layer_forward(
     // (the dispatcher in `layer_forward_dump` already filters; this
     // is defense in depth and matches the symmetric guard in
     // `full_attn_layer_forward`).
-    let attn = layer_cache.attn.linear().ok_or(
-        LayerForwardError::MissingTensor {
+    let attn = layer_cache
+        .attn
+        .linear()
+        .ok_or(LayerForwardError::MissingTensor {
             layer: layer_idx,
             tensor: "linear_attn weights (called on full-attn layer)",
-        },
-    )?;
+        })?;
     let qkv_w = attn.qkv_w;
     let qkv_s = attn.qkv_s;
     let qkv_b = attn.qkv_b;
@@ -1251,8 +1181,7 @@ pub fn linear_attn_layer_forward(
             v.linear_num_v_heads as u32,
         );
 
-        let k_heads_per_v =
-            (v.linear_num_v_heads / v.linear_num_k_heads) as u32;
+        let k_heads_per_v = (v.linear_num_v_heads / v.linear_num_k_heads) as u32;
         encode_delta_net_step(
             cmdbuf,
             &lp.delta_net_step,
@@ -1401,8 +1330,13 @@ pub(in crate::riir) fn post_attention_tail(
     // CMD1. `None` (or CPU-combine) disables the chain.
     chain_next_norm_off: Option<u64>,
 ) -> Result<(), LayerForwardError> {
-    let GpuLayerCtx { wf: _, wf_buf, layer_cache: _, buffers, buffer_pool } =
-        *gpu;
+    let GpuLayerCtx {
+        wf: _,
+        wf_buf,
+        layer_cache: _,
+        buffers,
+        buffer_pool,
+    } = *gpu;
     let intermediates = post_attention_pre_moe(
         metal,
         cmdbuf,
@@ -1456,36 +1390,32 @@ pub(in crate::riir) fn post_attention_pre_moe(
     o_proj: OProj,
     gpu_attn_args: Option<GpuAttnEncodeArgs>,
 ) -> Result<PostAttnIntermediates, LayerForwardError> {
-    let GpuLayerCtx { wf, wf_buf, layer_cache, buffers, buffer_pool } =
-        *gpu;
+    let GpuLayerCtx {
+        wf,
+        wf_buf,
+        layer_cache,
+        buffers,
+        buffer_pool,
+    } = *gpu;
     let v = VARIANT;
 
     // Per-tensor bit widths for the MoE-side matvecs.
-    let gate_bits =
-        bits_of(wf, &format!("model.layers.{layer_idx}.mlp.gate.weight"));
+    let gate_bits = bits_of(wf, &format!("model.layers.{layer_idx}.mlp.gate.weight"));
     let seg_bits = bits_of(
         wf,
-        &format!(
-            "model.layers.{layer_idx}.mlp.shared_expert_gate.weight"
-        ),
+        &format!("model.layers.{layer_idx}.mlp.shared_expert_gate.weight"),
     );
     let s_gate_bits = bits_of(
         wf,
-        &format!(
-            "model.layers.{layer_idx}.mlp.shared_expert.gate_proj.weight"
-        ),
+        &format!("model.layers.{layer_idx}.mlp.shared_expert.gate_proj.weight"),
     );
     let s_up_bits = bits_of(
         wf,
-        &format!(
-            "model.layers.{layer_idx}.mlp.shared_expert.up_proj.weight"
-        ),
+        &format!("model.layers.{layer_idx}.mlp.shared_expert.up_proj.weight"),
     );
     let s_down_bits = bits_of(
         wf,
-        &format!(
-            "model.layers.{layer_idx}.mlp.shared_expert.down_proj.weight"
-        ),
+        &format!("model.layers.{layer_idx}.mlp.shared_expert.down_proj.weight"),
     );
 
     let post_attn_norm_w = layer_cache.post_attention_layernorm_w;
@@ -1553,11 +1483,9 @@ pub(in crate::riir) fn post_attention_pre_moe(
         // o_proj + residual + post-attn rms_norm. Mirrors the C path's
         // `gpu_attn_fuse` block at `infer.m:5091..5163`. Q + q_gate
         // are pre-staged into `buffers.gpu_attn_q` / `gpu_attn_gate` by
-        // the caller; K/V mirrors are pre-populated by the per-token
-        // KV-append memcpy.
-        if let (Some(args), Some(attn_pipes)) =
-            (gpu_attn_args.as_ref(), attn_pipes.as_ref())
-        {
+        // the caller; K/V are read directly from the canonical pool KV
+        // (`args.k_cache` / `v_cache`).
+        if let (Some(args), Some(attn_pipes)) = (gpu_attn_args.as_ref(), attn_pipes.as_ref()) {
             let head_dim = v.head_dim as u32;
             let kv_dim = (v.num_kv_heads * v.head_dim) as u32;
             let num_heads = v.num_attn_heads as u32;
@@ -1569,7 +1497,7 @@ pub(in crate::riir) fn post_attention_pre_moe(
                 cmdbuf,
                 &attn_pipes.scores,
                 buffer_pool.handle(buffers.gpu_attn_q),
-                buffer_pool.handle(buffers.gpu_kv_k[args.fa_idx]),
+                buffer_pool.handle(args.k_cache),
                 buffer_pool.handle(buffers.gpu_attn_scores),
                 num_heads,
                 head_dim,
@@ -1591,7 +1519,7 @@ pub(in crate::riir) fn post_attention_pre_moe(
                 cmdbuf,
                 &attn_pipes.values,
                 buffer_pool.handle(buffers.gpu_attn_scores),
-                buffer_pool.handle(buffers.gpu_kv_v[args.fa_idx]),
+                buffer_pool.handle(args.v_cache),
                 buffer_pool.handle(buffers.gpu_attn_out),
                 num_heads,
                 head_dim,
@@ -1746,8 +1674,7 @@ pub(in crate::riir) fn post_attention_pre_moe(
     }
 
     // ── CPU: MoE router on the gate logits ───────────────────────
-    let mut scores =
-        read_buffer_to_vec(buffer_pool.handle(buffers.gate_logits), v.num_experts);
+    let mut scores = read_buffer_to_vec(buffer_pool.handle(buffers.gate_logits), v.num_experts);
     let mut routing_indices = vec![0i32; k_active];
     let mut routing_weights = vec![0f32; k_active];
     moe_router_cpu(
@@ -1796,31 +1723,22 @@ pub(in crate::riir) fn post_attention_post_o_proj_to_intermediates(
 ) -> Result<PostAttnIntermediates, LayerForwardError> {
     let v = VARIANT;
 
-    let gate_bits =
-        bits_of(wf, &format!("model.layers.{layer_idx}.mlp.gate.weight"));
+    let gate_bits = bits_of(wf, &format!("model.layers.{layer_idx}.mlp.gate.weight"));
     let seg_bits = bits_of(
         wf,
-        &format!(
-            "model.layers.{layer_idx}.mlp.shared_expert_gate.weight"
-        ),
+        &format!("model.layers.{layer_idx}.mlp.shared_expert_gate.weight"),
     );
     let s_gate_bits = bits_of(
         wf,
-        &format!(
-            "model.layers.{layer_idx}.mlp.shared_expert.gate_proj.weight"
-        ),
+        &format!("model.layers.{layer_idx}.mlp.shared_expert.gate_proj.weight"),
     );
     let s_up_bits = bits_of(
         wf,
-        &format!(
-            "model.layers.{layer_idx}.mlp.shared_expert.up_proj.weight"
-        ),
+        &format!("model.layers.{layer_idx}.mlp.shared_expert.up_proj.weight"),
     );
     let s_down_bits = bits_of(
         wf,
-        &format!(
-            "model.layers.{layer_idx}.mlp.shared_expert.down_proj.weight"
-        ),
+        &format!("model.layers.{layer_idx}.mlp.shared_expert.down_proj.weight"),
     );
 
     let post_attn_norm_w = layer_cache.post_attention_layernorm_w;
@@ -1950,8 +1868,7 @@ pub(in crate::riir) fn post_attention_post_o_proj_to_intermediates(
     );
     metal.commit_and_wait_labeled(cmdbuf, "post_attn_post_oproj.cmd");
 
-    let mut scores =
-        read_buffer_to_vec(buffer_pool.handle(buffers.gate_logits), v.num_experts);
+    let mut scores = read_buffer_to_vec(buffer_pool.handle(buffers.gate_logits), v.num_experts);
     let mut routing_indices = vec![0i32; k_active];
     let mut routing_weights = vec![0f32; k_active];
     moe_router_cpu(
@@ -2042,7 +1959,8 @@ pub(in crate::riir) fn moe_dispatch_per_token(
         //   `prefetch.rs` for the state machine.
         let bindings_synced; // backing storage for the pread arm
         let bindings: Vec<(&metal::Buffer, u64)> = if prefetch.mode().is_mmap() {
-            indices.iter()
+            indices
+                .iter()
                 .map(|&idx| {
                     expert_files
                         .mmap_buffer_for_expert(layer_idx, idx as u32)
@@ -2063,16 +1981,14 @@ pub(in crate::riir) fn moe_dispatch_per_token(
             //    have been prefetched into a different buf_idx than
             //    `s`. We record the buf_idx on hit so the encoder
             //    binds the correct prefetch slot.
-            let mut data_set_per_slot: [SlotSource; MAX_K] =
-                [SlotSource::Synced; MAX_K];
+            let mut data_set_per_slot: [SlotSource; MAX_K] = [SlotSource::Synced; MAX_K];
             let mut hit_count: u64 = 0;
             if let Some(status) = prefetch_status {
                 for slot in 0..k {
                     let actual = indices[slot];
                     for buf_idx in 0..status.k {
                         if status.loaded_indices[buf_idx] == actual {
-                            data_set_per_slot[slot] =
-                                SlotSource::Prefetched(buf_idx);
+                            data_set_per_slot[slot] = SlotSource::Prefetched(buf_idx);
                             hit_count += 1;
                             break;
                         }
@@ -2086,19 +2002,21 @@ pub(in crate::riir) fn moe_dispatch_per_token(
             //    so the closure captures `[&mut [u8]; MAX_K]` (Send)
             //    instead of `&mut MoeBuffers` (which it can't).
             let mut dsts = moe.data_synced_slots_mut_array(buffer_pool);
-            pool.install(|| -> Result<(), crate::riir::io::expert_io::ExpertIoError> {
-                dsts[..k]
-                    .par_iter_mut()
-                    .enumerate()
-                    .try_for_each(|(slot, dst)| {
-                        if data_set_per_slot[slot] == SlotSource::Synced {
-                            let expert_idx = indices[slot] as usize;
-                            expert_files.read_expert(layer_idx, expert_idx, *dst)
-                        } else {
-                            Ok(())
-                        }
-                    })
-            })?;
+            pool.install(
+                || -> Result<(), crate::riir::io::expert_io::ExpertIoError> {
+                    dsts[..k]
+                        .par_iter_mut()
+                        .enumerate()
+                        .try_for_each(|(slot, dst)| {
+                            if data_set_per_slot[slot] == SlotSource::Synced {
+                                let expert_idx = indices[slot] as usize;
+                                expert_files.read_expert(layer_idx, expert_idx, *dst)
+                            } else {
+                                Ok(())
+                            }
+                        })
+                },
+            )?;
 
             // 4. Record actuals as the prediction for the next
             //    token's same-layer prefetch. Done before dispatch
@@ -2115,9 +2033,7 @@ pub(in crate::riir) fn moe_dispatch_per_token(
             bindings_synced = (0..k)
                 .map(|slot| match data_set_per_slot[slot] {
                     SlotSource::Synced => moe.data_synced_id(slot),
-                    SlotSource::Prefetched(buf_idx) => {
-                        moe.data_prefetch_id(prefetch_set, buf_idx)
-                    }
+                    SlotSource::Prefetched(buf_idx) => moe.data_prefetch_id(prefetch_set, buf_idx),
                 })
                 .collect::<Vec<_>>();
             bindings_synced
@@ -2165,8 +2081,7 @@ pub(in crate::riir) fn moe_dispatch_per_token(
         let mut expert_data = vec![0u8; k * expert_size];
         for slot in 0..k {
             let expert_idx = indices[slot] as usize;
-            let dst = &mut expert_data
-                [slot * expert_size..(slot + 1) * expert_size];
+            let dst = &mut expert_data[slot * expert_size..(slot + 1) * expert_size];
             expert_files.read_expert(layer_idx, expert_idx, dst)?;
         }
         let h_mid_host = read_buffer_to_vec(buffer_pool.handle(buffers.h_mid), v.hidden_dim);
@@ -2195,7 +2110,6 @@ pub(in crate::riir) fn moe_dispatch_per_token(
 
     Ok(())
 }
-
 
 /// Copy `len` f32s from a shared-storage Metal buffer into a fresh
 /// `Vec`. Used by the layer-forward dump path and full-attn host
@@ -2234,10 +2148,7 @@ fn encode_rms_norm_pair(
         enc.set_buffer(0, Some(input), 0);
         enc.set_buffer(1, Some(sum_sq), 0);
         enc.set_bytes(2, 4, (&dim as *const u32).cast());
-        enc.dispatch_thread_groups(
-            MTLSize::new(1, 1, 1),
-            MTLSize::new(256, 1, 1),
-        );
+        enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
         enc.end_encoding();
     }
     {
@@ -2402,12 +2313,11 @@ where
     let v = VARIANT;
     debug_assert!(k_active <= MAX_K);
 
-    let linear_layer_idx = linear_layer_idx_for(layer_idx).ok_or(
-        LayerForwardError::MissingTensor {
+    let linear_layer_idx =
+        linear_layer_idx_for(layer_idx).ok_or(LayerForwardError::MissingTensor {
             layer: layer_idx,
             tensor: "linear_layer_idx (batched called on full-attn layer)",
-        },
-    )?;
+        })?;
 
     let hidden_dim = v.hidden_dim;
     let conv_dim = v.linear_conv_dim();
@@ -2436,12 +2346,13 @@ where
         &format!("model.layers.{layer_idx}.linear_attn.out_proj.weight"),
     );
 
-    let attn = layer_cache.attn.linear().ok_or(
-        LayerForwardError::MissingTensor {
+    let attn = layer_cache
+        .attn
+        .linear()
+        .ok_or(LayerForwardError::MissingTensor {
             layer: layer_idx,
             tensor: "linear_attn weights (batched called on full-attn layer)",
-        },
-    )?;
+        })?;
     let qkv_w = attn.qkv_w;
     let qkv_s = attn.qkv_s;
     let qkv_b = attn.qkv_b;
@@ -2476,20 +2387,15 @@ where
 
     // Hoist bits lookups for gate + shared_expert_gate so we can build
     // the WeightRefs at graph-build time.
-    let gate_bits =
-        bits_of(wf, &format!("model.layers.{layer_idx}.mlp.gate.weight"));
+    let gate_bits = bits_of(wf, &format!("model.layers.{layer_idx}.mlp.gate.weight"));
     let seg_bits = bits_of(
         wf,
-        &format!(
-            "model.layers.{layer_idx}.mlp.shared_expert_gate.weight"
-        ),
+        &format!("model.layers.{layer_idx}.mlp.shared_expert_gate.weight"),
     );
 
     let value_dim = Variant::LINEAR_VALUE_DIM as u32;
-    let k_heads_per_v =
-        (v.linear_num_v_heads / v.linear_num_k_heads) as u32;
-    let key_offset_per_token =
-        (v.linear_num_k_heads * Variant::LINEAR_KEY_DIM) as u32;
+    let k_heads_per_v = (v.linear_num_v_heads / v.linear_num_k_heads) as u32;
+    let key_offset_per_token = (v.linear_num_k_heads * Variant::LINEAR_KEY_DIM) as u32;
 
     // Build the graph + allocate transient pool BufIds in an inner
     // scope so the `pool` borrow ends before `backend.execute(&graph)`.
@@ -2538,7 +2444,12 @@ where
         // Phase 1b — 4 batched projections (qkv / z / beta / alpha).
         g.push(Op::MatvecNTokens {
             label: "linear_attn.qkv_proj",
-            weight: WeightRef { w_off: qkv_w, s_off: qkv_s, b_off: qkv_b, bits: qkv_bits },
+            weight: WeightRef {
+                w_off: qkv_w,
+                s_off: qkv_s,
+                b_off: qkv_b,
+                bits: qkv_bits,
+            },
             input: normed_id.into(),
             input_off: 0,
             output: qkv_stack_id.into(),
@@ -2549,7 +2460,12 @@ where
         });
         g.push(Op::MatvecNTokens {
             label: "linear_attn.z_proj",
-            weight: WeightRef { w_off: z_w, s_off: z_s, b_off: z_b, bits: z_bits },
+            weight: WeightRef {
+                w_off: z_w,
+                s_off: z_s,
+                b_off: z_b,
+                bits: z_bits,
+            },
             input: normed_id.into(),
             input_off: 0,
             output: z_stack_id.into(),
@@ -2560,7 +2476,12 @@ where
         });
         g.push(Op::MatvecNTokens {
             label: "linear_attn.beta_proj",
-            weight: WeightRef { w_off: beta_w, s_off: beta_s, b_off: beta_b, bits: beta_bits },
+            weight: WeightRef {
+                w_off: beta_w,
+                s_off: beta_s,
+                b_off: beta_b,
+                bits: beta_bits,
+            },
             input: normed_id.into(),
             input_off: 0,
             output: beta_stack_id.into(),
@@ -2571,7 +2492,12 @@ where
         });
         g.push(Op::MatvecNTokens {
             label: "linear_attn.alpha_proj",
-            weight: WeightRef { w_off: alpha_w, s_off: alpha_s, b_off: alpha_b, bits: alpha_bits },
+            weight: WeightRef {
+                w_off: alpha_w,
+                s_off: alpha_s,
+                b_off: alpha_b,
+                bits: alpha_bits,
+            },
             input: normed_id.into(),
             input_off: 0,
             output: alpha_stack_id.into(),
@@ -2641,7 +2567,12 @@ where
         // Phase 1d — o_proj.
         g.push(Op::MatvecNTokens {
             label: "linear_attn.o_proj",
-            weight: WeightRef { w_off: o_w, s_off: o_s, b_off: o_b, bits: o_bits },
+            weight: WeightRef {
+                w_off: o_w,
+                s_off: o_s,
+                b_off: o_b,
+                bits: o_bits,
+            },
             input: value_out_stack_id.into(),
             input_off: 0,
             output: o_proj_stack_id.into(),
@@ -2829,9 +2760,7 @@ where
     //    matvec WeightRefs.
     let s_gate_bits = bits_of(
         wf,
-        &format!(
-            "model.layers.{layer_idx}.mlp.shared_expert.gate_proj.weight"
-        ),
+        &format!("model.layers.{layer_idx}.mlp.shared_expert.gate_proj.weight"),
     );
     let s_up_bits = bits_of(
         wf,
@@ -2839,9 +2768,7 @@ where
     );
     let s_down_bits = bits_of(
         wf,
-        &format!(
-            "model.layers.{layer_idx}.mlp.shared_expert.down_proj.weight"
-        ),
+        &format!("model.layers.{layer_idx}.mlp.shared_expert.down_proj.weight"),
     );
 
     // CPU bucket prep — needs the routing readback above.
@@ -2899,20 +2826,18 @@ where
     // this function. `moe_buffers` is similarly decode-only.
     let _ = moe_buffers;
     let expert_base_id: BufId<ExpertBaseBuf> = match moe.expert_base {
-        None => expert_files
-            .mmap_id_for_expert(layer_idx, 0)
-            .expect("mmap layer present in Mmap mode")
-            .0,
+        None => {
+            expert_files
+                .mmap_id_for_expert(layer_idx, 0)
+                .expect("mmap layer present in Mmap mode")
+                .0
+        }
         Some(base_id) => {
             let expert_size = v.expert_size_4bit();
             let mut blob_scratch = vec![0u8; expert_size];
             let pool = backend.pool_mut();
             for &expert_id in buckets.expert_ids.iter() {
-                expert_files.read_expert(
-                    layer_idx,
-                    expert_id as usize,
-                    &mut blob_scratch,
-                )?;
+                expert_files.read_expert(layer_idx, expert_id as usize, &mut blob_scratch)?;
                 let off = expert_id as usize * expert_size;
                 pool.upload_at(base_id, off, &blob_scratch)?;
             }
@@ -2924,8 +2849,7 @@ where
     // within the layer's mmap buffer (`num_experts` blocks at
     // `expert_size` stride). `expert_indices` expands it per
     // assignment row for the gather kernel's per-row `indices`.
-    let expert_slots: Vec<u32> =
-        buckets.expert_ids.iter().map(|&e| e as u32).collect();
+    let expert_slots: Vec<u32> = buckets.expert_ids.iter().map(|&e| e as u32).collect();
     let mut expert_indices_host = vec![0u32; total_assignments];
     for bi in 0..num_buckets {
         let start = buckets.offsets[bi] as usize;
@@ -2944,15 +2868,12 @@ where
     // promised by the new path; running it anyway would inflate the
     // env=on bench by ~tens of ms per layer.
     if !moe_gather_id_enabled() {
-        let mut bucket_input_host =
-            vec![0.0f32; total_assignments * hidden_dim];
+        let mut bucket_input_host = vec![0.0f32; total_assignments * hidden_dim];
         for assignment_idx in 0..total_assignments {
             let t = buckets.token_idx[assignment_idx] as usize;
-            let src =
-                &h_post_stack[t * hidden_dim..(t + 1) * hidden_dim];
+            let src = &h_post_stack[t * hidden_dim..(t + 1) * hidden_dim];
             let dst_off = assignment_idx * hidden_dim;
-            bucket_input_host[dst_off..dst_off + hidden_dim]
-                .copy_from_slice(src);
+            bucket_input_host[dst_off..dst_off + hidden_dim].copy_from_slice(src);
         }
         let pool = backend.pool_mut();
         pool.upload(moe.bucket_input, unsafe {

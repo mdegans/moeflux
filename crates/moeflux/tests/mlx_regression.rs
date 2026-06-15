@@ -130,12 +130,13 @@ fn run_moeflux(art: &Path, root: &Path, experts_per_tok: u32) -> Vec<f32> {
 }
 
 fn argmax_of(logits: &[f32]) -> u32 {
-    let (idx, _) = logits
-        .iter()
-        .enumerate()
-        .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &v)| {
-            if v > bv { (i, v) } else { (bi, bv) }
-        });
+    let (idx, _) =
+        logits
+            .iter()
+            .enumerate()
+            .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &v)| {
+                if v > bv { (i, v) } else { (bi, bv) }
+            });
     idx as u32
 }
 

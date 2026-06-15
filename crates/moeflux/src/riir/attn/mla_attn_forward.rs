@@ -31,27 +31,20 @@
 //! to GPU. Full-GPU MoE integration with the deferred ring is a
 //! follow-up perf slice.
 
-use metal::{
-    Buffer, Device, MTLResourceOptions, MTLSize, NSUInteger,
-};
+use metal::{Buffer, Device, MTLResourceOptions, MTLSize, NSUInteger};
 
-use crate::riir::backend::gpu::gpu_matvec::{
-    encode_matvec, MatvecPipelines, MatvecSpec,
-};
 use crate::riir::attn::gpu_mla::{
-    encode_mla_kv_cache_append, encode_mla_out_per_head_4bit,
-    encode_mla_q_prime_4bit, encode_mla_sdpa_folded,
-    encode_mla_split_q_kv, GpuMlaError, MlaPipelines,
-};
-use crate::riir::backend::gpu::gpu_norm::{
-    encode_rms_norm_bf16_into, RmsNormBf16Pipelines,
+    GpuMlaError, MlaPipelines, encode_mla_kv_cache_append, encode_mla_out_per_head_4bit,
+    encode_mla_q_prime_4bit, encode_mla_sdpa_folded, encode_mla_split_q_kv,
 };
 use crate::riir::attn::gpu_rope::encode_yarn_rope_apply;
+use crate::riir::backend::gpu::gpu_matvec::{MatvecPipelines, MatvecSpec, encode_matvec};
+use crate::riir::backend::gpu::gpu_norm::{RmsNormBf16Pipelines, encode_rms_norm_bf16_into};
 use crate::riir::backend::gpu::metal::{MetalContext, MetalError};
 use crate::riir::io::mtl_weight_buf::MtlWeightBuf;
+use crate::riir::io::weight_file::WeightFile;
 use crate::riir::snapshot::state::MlaKvCacheGpu;
 use crate::riir::variants::{RMS_NORM_EPS, VARIANT};
-use crate::riir::io::weight_file::WeightFile;
 
 /// Per-token GPU scratch for the MLA forward. One set is reused across
 /// every layer — attention is sequential per token, so layer N+1 doesn't
@@ -66,7 +59,7 @@ pub struct MlaForwardBuffers {
     /// KV chain.
     pub kv_pre: Buffer, // [kv_lora_rank + qk_rope_head_dim]
     pub kv_lat: Buffer, // [kv_lora_rank]   (post-norm, also written to MlaKvCacheGpu.latent)
-    pub k_pe: Buffer, // [qk_rope_head_dim] (post-RoPE, also written to MlaKvCacheGpu.rope_k)
+    pub k_pe: Buffer,   // [qk_rope_head_dim] (post-RoPE, also written to MlaKvCacheGpu.rope_k)
     /// Folded MLA scratch.
     pub q_prime: Buffer, // [num_heads, kv_lora_rank]
     pub v_combine: Buffer, // [num_heads, kv_lora_rank]
@@ -90,11 +83,7 @@ impl MlaForwardBuffers {
             // SAFETY: shared storage, no GPU work in flight on a
             // freshly allocated buffer.
             unsafe {
-                std::ptr::write_bytes(
-                    b.contents() as *mut u8,
-                    0,
-                    n * std::mem::size_of::<f32>(),
-                );
+                std::ptr::write_bytes(b.contents() as *mut u8, 0, n * std::mem::size_of::<f32>());
             }
             b
         };
@@ -140,11 +129,7 @@ impl MlaYarnTables {
             v.yarn_beta_fast,
             v.yarn_beta_slow,
         );
-        let mscale = yarn_get_mscale_full(
-            v.yarn_factor,
-            v.yarn_mscale,
-            v.yarn_mscale_all_dim,
-        );
+        let mscale = yarn_get_mscale_full(v.yarn_factor, v.yarn_mscale, v.yarn_mscale_all_dim);
         let buf = device.new_buffer_with_data(
             inv_freq.as_ptr().cast(),
             (inv_freq.len() * std::mem::size_of::<f32>()) as NSUInteger,
@@ -181,7 +166,9 @@ impl MlaForwardPipelines {
 #[derive(Debug, thiserror::Error)]
 pub enum MlaForwardGpuError {
     #[error("MLA only valid on MLA variants (this build's attn_kind is {kind:?})")]
-    NotMlaVariant { kind: crate::riir::variants::AttnKind },
+    NotMlaVariant {
+        kind: crate::riir::variants::AttnKind,
+    },
     #[error("kv_cache.len {len} would exceed MAX_SEQ_LEN={max} after append")]
     CacheFull { len: i32, max: usize },
     #[error("pos {pos} != kv_cache.len {cache_len} (single-step decode)")]
@@ -236,10 +223,14 @@ pub fn mla_attn_layer_forward_gpu(
             max: crate::riir::variants::MAX_SEQ_LEN,
         });
     }
-    let latent_buf =
-        kv_cache.latent_cache.as_ref().ok_or(MlaForwardGpuError::CacheNotReady)?;
-    let rope_k_buf =
-        kv_cache.rope_k_cache.as_ref().ok_or(MlaForwardGpuError::CacheNotReady)?;
+    let latent_buf = kv_cache
+        .latent_cache
+        .as_ref()
+        .ok_or(MlaForwardGpuError::CacheNotReady)?;
+    let rope_k_buf = kv_cache
+        .rope_k_cache
+        .as_ref()
+        .ok_or(MlaForwardGpuError::CacheNotReady)?;
 
     let v = VARIANT;
     let hidden_dim = v.hidden_dim as u32;
@@ -459,8 +450,7 @@ pub fn mla_attn_layer_forward_gpu(
         64, // group_size
     );
 
-    let softmax_scale =
-        (1.0 / (qk_head_dim as f32).sqrt()) * yarn.mscale * yarn.mscale;
+    let softmax_scale = (1.0 / (qk_head_dim as f32).sqrt()) * yarn.mscale * yarn.mscale;
     encode_mla_sdpa_folded(
         cmdbuf,
         &pipe_sdpa,
@@ -522,11 +512,7 @@ pub fn mla_attn_layer_forward_gpu(
 /// 1-thread-1-output pattern most of our oneshot encodes use. Exposed
 /// for symmetry with the existing dispatchers.
 #[allow(dead_code)]
-fn dispatch_1d(
-    enc: &metal::ComputeCommandEncoderRef,
-    threadgroups: u64,
-    threads: u64,
-) {
+fn dispatch_1d(enc: &metal::ComputeCommandEncoderRef, threadgroups: u64, threads: u64) {
     enc.dispatch_thread_groups(
         MTLSize::new(threadgroups, 1, 1),
         MTLSize::new(threads, 1, 1),

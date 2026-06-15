@@ -61,14 +61,10 @@ use moeflux::riir::attn::linear_attn_forward::MoeGraphScratch;
 use moeflux::riir::backend::buftype::{
     BufId, ExpertBaseBuf, HiddenBuf, ResidualBuf, RouterLogitsBuf,
 };
-use moeflux::riir::backend::{
-    Backend, BufferPool, Graph, MetalBackend, Op, WeightRef,
-};
+use moeflux::riir::backend::{Backend, BufferPool, Graph, MetalBackend, Op, WeightRef};
 use moeflux::riir::moe::moe_router::build_expert_buckets;
-use moeflux::riir::variants::{MlpKind, VARIANT, RMS_NORM_EPS};
-use moeflux::riir::{
-    ExpertFiles, LayerWeightCache, MetalContext, MtlWeightBuf, WeightFile,
-};
+use moeflux::riir::variants::{MlpKind, RMS_NORM_EPS, VARIANT};
+use moeflux::riir::{ExpertFiles, LayerWeightCache, MetalContext, MtlWeightBuf, WeightFile};
 
 use common::diff_helpers::cosine_sim;
 
@@ -93,12 +89,9 @@ const REL_DIFF_FLOOR: f32 = 1e-3;
 
 // Default paths (overridable via env) — mirror the convention used by
 // drama_llama/tests/moeflux_smoke.rs and tests/common/diff_helpers.rs.
-const MLX_DIR_DEFAULT: &str =
-    "/Volumes/Temp Backup/models/moeflux/qwen3-6-35b-a3b-mlx-4bit";
-const ARTIFACTS_DIR_DEFAULT: &str =
-    "/Volumes/Temp Backup/models/moeflux/qwen3-6-35b-a3b-artifacts";
-const EXPERTS_DIR_DEFAULT: &str =
-    "/Volumes/Temp Backup/models/moeflux/qwen3-6-35b-a3b-root";
+const MLX_DIR_DEFAULT: &str = "/Volumes/Temp Backup/models/moeflux/qwen3-6-35b-a3b-mlx-4bit";
+const ARTIFACTS_DIR_DEFAULT: &str = "/Volumes/Temp Backup/models/moeflux/qwen3-6-35b-a3b-artifacts";
+const EXPERTS_DIR_DEFAULT: &str = "/Volumes/Temp Backup/models/moeflux/qwen3-6-35b-a3b-root";
 
 // ────────────────────────────────────────────────────────────────────
 // Helpers
@@ -131,26 +124,21 @@ impl Rng {
 /// crate::riir)`). Defaults to 4-bit for tensors not in the manifest,
 /// floor at 4.
 fn bits_of(wf: &WeightFile, name: &str) -> u32 {
-    wf.tensor_info(name).map(|i| i.bits as u32).unwrap_or(4).max(4)
+    wf.tensor_info(name)
+        .map(|i| i.bits as u32)
+        .unwrap_or(4)
+        .max(4)
 }
 
 fn env_path(var: &str, default: &str) -> std::path::PathBuf {
-    std::path::PathBuf::from(
-        std::env::var(var).unwrap_or_else(|_| default.to_string()),
-    )
+    std::path::PathBuf::from(std::env::var(var).unwrap_or_else(|_| default.to_string()))
 }
 
 // ────────────────────────────────────────────────────────────────────
 // Diagnostic reporter
 // ────────────────────────────────────────────────────────────────────
 
-fn report_diff(
-    layer_idx: usize,
-    n_tokens: usize,
-    hidden: usize,
-    a: &[f32],
-    b: &[f32],
-) {
+fn report_diff(layer_idx: usize, n_tokens: usize, hidden: usize, a: &[f32], b: &[f32]) {
     let a_nz = a.iter().filter(|&&v| v != 0.0).count();
     let b_nz = b.iter().filter(|&&v| v != 0.0).count();
     eprintln!(
@@ -179,9 +167,7 @@ fn report_diff(
         }
         per_token.push((t, row_max, row_at));
     }
-    per_token.sort_by(|x, y| {
-        y.1.partial_cmp(&x.1).unwrap_or(std::cmp::Ordering::Equal)
-    });
+    per_token.sort_by(|x, y| y.1.partial_cmp(&x.1).unwrap_or(std::cmp::Ordering::Equal));
     eprintln!("[engine-op-diff]   top-10 worst tokens (by row max-abs):");
     for &(t, d, c) in per_token.iter().take(10) {
         let idx = t * hidden + c;
@@ -211,26 +197,22 @@ fn run_one_layer_op_diff(layer_idx: usize, n_tokens: usize, seed: u64) {
     let u32_sz = size_of::<u32>();
 
     // ── 1. Open real model ──────────────────────────────────────────
-    let artifacts_dir =
-        env_path("MOEFLUX_SMOKE_ARTIFACTS", ARTIFACTS_DIR_DEFAULT);
+    let artifacts_dir = env_path("MOEFLUX_SMOKE_ARTIFACTS", ARTIFACTS_DIR_DEFAULT);
     let experts_dir = env_path("MOEFLUX_SMOKE_ROOT", EXPERTS_DIR_DEFAULT);
     let _ = env_path("MOEFLUX_SMOKE_MLX", MLX_DIR_DEFAULT); // unused at this layer
 
     let weights_bin = artifacts_dir.join("model_weights.bin");
     let manifest = artifacts_dir.join("model_weights.json");
 
-    let wf = WeightFile::open(&weights_bin, &manifest)
-        .expect("open WeightFile");
+    let wf = WeightFile::open(&weights_bin, &manifest).expect("open WeightFile");
     let mut ef = ExpertFiles::open(&experts_dir).expect("open ExpertFiles");
     let metal = MetalContext::new().expect("open MetalContext");
     let device = metal.device().clone();
     let wf_buf = MtlWeightBuf::wrap(&wf, &device);
-    let mut backend =
-        MetalBackend::new(metal, wf_buf).expect("MetalBackend::new");
+    let mut backend = MetalBackend::new(metal, wf_buf).expect("MetalBackend::new");
     ef.attach_to_device(backend.pool_mut());
-    let layer_cache =
-        LayerWeightCache::build(layer_idx, &wf, backend.weight_buf())
-            .expect("LayerWeightCache::build");
+    let layer_cache = LayerWeightCache::build(layer_idx, &wf, backend.weight_buf())
+        .expect("LayerWeightCache::build");
 
     debug_assert!(
         matches!(v.mlp_kind_at(layer_idx), MlpKind::MoE),
@@ -299,10 +281,7 @@ fn run_one_layer_op_diff(layer_idx: usize, n_tokens: usize, seed: u64) {
     {
         let pool = backend.pool_mut();
         let bytes = unsafe {
-            std::slice::from_raw_parts(
-                h_mid_host.as_ptr() as *const u8,
-                h_mid_host.len() * f32_sz,
-            )
+            std::slice::from_raw_parts(h_mid_host.as_ptr() as *const u8, h_mid_host.len() * f32_sz)
         };
         pool.upload(scratch_a.h_mid, bytes).expect("upload h_mid_a");
         pool.upload(scratch_b.h_mid, bytes).expect("upload h_mid_b");
@@ -315,31 +294,22 @@ fn run_one_layer_op_diff(layer_idx: usize, n_tokens: usize, seed: u64) {
         ))
         .expect("post_attention_layernorm.weight in manifest")
         .offset as u64;
-    let gate_bits =
-        bits_of(&wf, &format!("model.layers.{layer_idx}.mlp.gate.weight"));
+    let gate_bits = bits_of(&wf, &format!("model.layers.{layer_idx}.mlp.gate.weight"));
     let seg_bits = bits_of(
         &wf,
-        &format!(
-            "model.layers.{layer_idx}.mlp.shared_expert_gate.weight"
-        ),
+        &format!("model.layers.{layer_idx}.mlp.shared_expert_gate.weight"),
     );
     let s_gate_bits = bits_of(
         &wf,
-        &format!(
-            "model.layers.{layer_idx}.mlp.shared_expert.gate_proj.weight"
-        ),
+        &format!("model.layers.{layer_idx}.mlp.shared_expert.gate_proj.weight"),
     );
     let s_up_bits = bits_of(
         &wf,
-        &format!(
-            "model.layers.{layer_idx}.mlp.shared_expert.up_proj.weight"
-        ),
+        &format!("model.layers.{layer_idx}.mlp.shared_expert.up_proj.weight"),
     );
     let s_down_bits = bits_of(
         &wf,
-        &format!(
-            "model.layers.{layer_idx}.mlp.shared_expert.down_proj.weight"
-        ),
+        &format!("model.layers.{layer_idx}.mlp.shared_expert.down_proj.weight"),
     );
     let expert_base_id: BufId<ExpertBaseBuf> = ef
         .mmap_id_for_expert(layer_idx, 0)
@@ -350,66 +320,65 @@ fn run_one_layer_op_diff(layer_idx: usize, n_tokens: usize, seed: u64) {
     // graph_router pushes RmsNorm(h_mid → h_post) + gate matvec +
     // shared_gate matvec + softmax_topk + normalize. Same shape both
     // paths; mirrors `linear_attn_forward.rs:2553-2611`.
-    let push_router = |g: &mut Graph,
-                       scratch: &MoeGraphScratch,
-                       gate_logits: BufId<RouterLogitsBuf>| {
-        g.push(Op::RmsNormBf16NTokens {
-            label: "engine_diff.post_attn_rms_norm",
-            x: BufId::<ResidualBuf>::from(scratch.h_mid).into(),
-            weight_off: post_attn_norm_off,
-            out: scratch.h_post.into(),
-            dim: hidden_dim as u32,
-            n_tokens: n_tokens as u32,
-            eps: RMS_NORM_EPS,
-        });
-        g.push(Op::MatvecNTokens {
-            label: "engine_diff.gate_router",
-            weight: WeightRef {
-                w_off: layer_cache.gate.w,
-                s_off: layer_cache.gate.s,
-                b_off: layer_cache.gate.b,
-                bits: gate_bits,
-            },
-            input: scratch.h_post.into(),
-            input_off: 0,
-            output: gate_logits.into(),
-            output_off: 0,
-            in_dim: hidden_dim as u32,
-            out_dim: v.num_experts as u32,
-            n_tokens: n_tokens as u32,
-        });
-        g.push(Op::MatvecNTokens {
-            label: "engine_diff.shared_gate",
-            weight: WeightRef {
-                w_off: layer_cache.shared.seg_w,
-                s_off: layer_cache.shared.seg_s,
-                b_off: layer_cache.shared.seg_b,
-                bits: seg_bits,
-            },
-            input: scratch.h_post.into(),
-            input_off: 0,
-            output: scratch.shared_gate.into(),
-            output_off: 0,
-            in_dim: hidden_dim as u32,
-            out_dim: 1,
-            n_tokens: n_tokens as u32,
-        });
-        g.push(Op::MoeSoftmaxTopK {
-            label: "engine_diff.router_softmax_topk",
-            logits: gate_logits,
-            indices_out: scratch.routing_indices,
-            weights_out: scratch.routing_weights,
-            n_tokens: n_tokens as u32,
-            n_experts: v.num_experts as u32,
-            k: K_ACTIVE as u32,
-        });
-        g.push(Op::MoeNormalizeWeights {
-            label: "engine_diff.router_normalize",
-            weights: scratch.routing_weights,
-            n_tokens: n_tokens as u32,
-            k: K_ACTIVE as u32,
-        });
-    };
+    let push_router =
+        |g: &mut Graph, scratch: &MoeGraphScratch, gate_logits: BufId<RouterLogitsBuf>| {
+            g.push(Op::RmsNormBf16NTokens {
+                label: "engine_diff.post_attn_rms_norm",
+                x: BufId::<ResidualBuf>::from(scratch.h_mid).into(),
+                weight_off: post_attn_norm_off,
+                out: scratch.h_post.into(),
+                dim: hidden_dim as u32,
+                n_tokens: n_tokens as u32,
+                eps: RMS_NORM_EPS,
+            });
+            g.push(Op::MatvecNTokens {
+                label: "engine_diff.gate_router",
+                weight: WeightRef {
+                    w_off: layer_cache.gate.w,
+                    s_off: layer_cache.gate.s,
+                    b_off: layer_cache.gate.b,
+                    bits: gate_bits,
+                },
+                input: scratch.h_post.into(),
+                input_off: 0,
+                output: gate_logits.into(),
+                output_off: 0,
+                in_dim: hidden_dim as u32,
+                out_dim: v.num_experts as u32,
+                n_tokens: n_tokens as u32,
+            });
+            g.push(Op::MatvecNTokens {
+                label: "engine_diff.shared_gate",
+                weight: WeightRef {
+                    w_off: layer_cache.shared.seg_w,
+                    s_off: layer_cache.shared.seg_s,
+                    b_off: layer_cache.shared.seg_b,
+                    bits: seg_bits,
+                },
+                input: scratch.h_post.into(),
+                input_off: 0,
+                output: scratch.shared_gate.into(),
+                output_off: 0,
+                in_dim: hidden_dim as u32,
+                out_dim: 1,
+                n_tokens: n_tokens as u32,
+            });
+            g.push(Op::MoeSoftmaxTopK {
+                label: "engine_diff.router_softmax_topk",
+                logits: gate_logits,
+                indices_out: scratch.routing_indices,
+                weights_out: scratch.routing_weights,
+                n_tokens: n_tokens as u32,
+                n_experts: v.num_experts as u32,
+                k: K_ACTIVE as u32,
+            });
+            g.push(Op::MoeNormalizeWeights {
+                label: "engine_diff.router_normalize",
+                weights: scratch.routing_weights,
+                n_tokens: n_tokens as u32,
+                k: K_ACTIVE as u32,
+            });
+        };
 
     let mut router_a = Graph::new();
     push_router(&mut router_a, &scratch_a, gate_logits_a);
@@ -472,8 +441,7 @@ fn run_one_layer_op_diff(layer_idx: usize, n_tokens: usize, seed: u64) {
     let total_assignments = buckets.token_idx.len();
     debug_assert_eq!(total_assignments, n_tokens * K_ACTIVE);
 
-    let expert_slots: Vec<u32> =
-        buckets.expert_ids.iter().map(|&e| e as u32).collect();
+    let expert_slots: Vec<u32> = buckets.expert_ids.iter().map(|&e| e as u32).collect();
     let mut expert_indices_host = vec![0u32; total_assignments];
     for bi in 0..buckets.expert_ids.len() {
         let start = buckets.offsets[bi] as usize;
@@ -495,14 +463,12 @@ fn run_one_layer_op_diff(layer_idx: usize, n_tokens: usize, seed: u64) {
         })
         .expect("download h_post_a");
     }
-    let mut bucket_input_host =
-        vec![0.0f32; total_assignments * hidden_dim];
+    let mut bucket_input_host = vec![0.0f32; total_assignments * hidden_dim];
     for a in 0..total_assignments {
         let t = buckets.token_idx[a] as usize;
         let src = &h_post_stack[t * hidden_dim..(t + 1) * hidden_dim];
         let dst_off = a * hidden_dim;
-        bucket_input_host[dst_off..dst_off + hidden_dim]
-            .copy_from_slice(src);
+        bucket_input_host[dst_off..dst_off + hidden_dim].copy_from_slice(src);
     }
 
     // ── 8. Upload CPU-built bucket tables to both scratches ──────
@@ -681,8 +647,10 @@ fn run_one_layer_op_diff(layer_idx: usize, n_tokens: usize, seed: u64) {
     let mut b_bytes = vec![0u8; n_tokens * hidden_dim * f32_sz];
     {
         let pool = backend.pool();
-        pool.download(hidden_out_a, &mut a_bytes).expect("download A");
-        pool.download(hidden_out_b, &mut b_bytes).expect("download B");
+        pool.download(hidden_out_a, &mut a_bytes)
+            .expect("download A");
+        pool.download(hidden_out_b, &mut b_bytes)
+            .expect("download B");
     }
     let a_f32: &[f32] = bytemuck::cast_slice(&a_bytes);
     let b_f32: &[f32] = bytemuck::cast_slice(&b_bytes);

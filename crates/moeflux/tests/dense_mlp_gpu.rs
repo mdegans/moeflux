@@ -21,17 +21,16 @@
 use std::path::Path;
 
 use metal::{MTLResourceOptions, NSUInteger};
-use moeflux::riir::backend::gpu::dense_mlp_gpu::{
-    encode_dense_mlp_layer_forward_gpu, DenseMlpPipelines,
-};
 use moeflux::riir::MetalContext;
-use moeflux::riir::moe::mlp_cpu::dense_mlp_swiglu_cpu;
 use moeflux::riir::MtlWeightBuf;
-use moeflux::riir::variants::VARIANT;
 use moeflux::riir::WeightFile;
+use moeflux::riir::backend::gpu::dense_mlp_gpu::{
+    DenseMlpPipelines, encode_dense_mlp_layer_forward_gpu,
+};
+use moeflux::riir::moe::mlp_cpu::dense_mlp_swiglu_cpu;
+use moeflux::riir::variants::VARIANT;
 
-const ROOT: &str =
-    "/Volumes/Temp Backup/models/blallama/cogito-v2-671b";
+const ROOT: &str = "/Volumes/Temp Backup/models/blallama/cogito-v2-671b";
 
 #[test]
 #[ignore = "needs Cogito-V2 weights mmap'd from /Volumes/Temp Backup"]
@@ -53,8 +52,7 @@ fn dense_mlp_layer0_gpu_matches_cpu() {
     let device = metal.device().clone();
     let wf_buf = MtlWeightBuf::wrap(&wf, &device);
 
-    let pipes =
-        DenseMlpPipelines::fetch(&mut metal).expect("fetch pipelines");
+    let pipes = DenseMlpPipelines::fetch(&mut metal).expect("fetch pipelines");
 
     // ---- Synthetic input (sin pattern; same as moe_layer3_smoke) ----
     let mut hidden_host = vec![0.0f32; hidden_dim];
@@ -64,8 +62,7 @@ fn dense_mlp_layer0_gpu_matches_cpu() {
 
     // ---- CPU oracle ----
     let mut out_cpu = vec![0.0f32; hidden_dim];
-    dense_mlp_swiglu_cpu(&wf, 0, &hidden_host, &mut out_cpu)
-        .expect("dense_mlp_swiglu_cpu");
+    dense_mlp_swiglu_cpu(&wf, 0, &hidden_host, &mut out_cpu).expect("dense_mlp_swiglu_cpu");
     assert!(
         out_cpu.iter().all(|x| x.is_finite()),
         "CPU oracle produced non-finite output"
@@ -148,8 +145,11 @@ fn dense_mlp_layer0_gpu_matches_cpu() {
 
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len());
-    let dot: f64 =
-        a.iter().zip(b.iter()).map(|(&x, &y)| x as f64 * y as f64).sum();
+    let dot: f64 = a
+        .iter()
+        .zip(b.iter())
+        .map(|(&x, &y)| x as f64 * y as f64)
+        .sum();
     let na: f64 = a.iter().map(|&x| (x as f64).powi(2)).sum();
     let nb: f64 = b.iter().map(|&x| (x as f64).powi(2)).sum();
     (dot / (na.sqrt() * nb.sqrt())) as f32

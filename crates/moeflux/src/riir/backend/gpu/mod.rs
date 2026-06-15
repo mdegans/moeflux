@@ -20,22 +20,20 @@ use super::buftype::Buf;
 use super::{Backend, BufId, BufferPool, Graph, GraphError, Op};
 
 use ::metal::{Buffer, CommandBuffer, MTLSize, NSRange};
-use metal::{
-    CommandBufferRef, ComputePipelineState, Device, MTLResourceOptions, NSUInteger,
-};
+use metal::{CommandBufferRef, ComputePipelineState, Device, MTLResourceOptions, NSUInteger};
 
 use crate::riir::attn::gpu_linear_attn::LinearAttnPipelines;
 use crate::riir::backend::gpu::gpu_matvec::{
-    encode_matvec_n_tokens, BfMatvecPipelines, MatvecPipelines,
+    BfMatvecPipelines, MatvecPipelines, encode_matvec_n_tokens,
 };
-use crate::riir::moe::gpu_moe_router::MoeRouterPipelines;
 use crate::riir::backend::gpu::gpu_norm::{
-    encode_embed_gather_4bit_into, encode_residual_add_n_tokens_into,
-    encode_rms_norm_bf16_fused_n_tokens, encode_rope_n_tokens_into,
-    RmsNormBf16FusedNTokensPipeline, RmsNormBf16Pipelines,
+    RmsNormBf16FusedNTokensPipeline, RmsNormBf16Pipelines, encode_embed_gather_4bit_into,
+    encode_residual_add_n_tokens_into, encode_rms_norm_bf16_fused_n_tokens,
+    encode_rope_n_tokens_into,
 };
 use crate::riir::backend::gpu::metal::{MetalContext, MetalError, MtlBuffer};
 use crate::riir::io::mtl_weight_buf::MtlWeightBuf;
+use crate::riir::moe::gpu_moe_router::MoeRouterPipelines;
 use crate::riir::variants::GROUP_SIZE;
 use moeflux_metal::{QmmCall, QuantWeights, SdpaCall};
 
@@ -96,14 +94,9 @@ impl MetalBufferPool {
         label: &'static str,
         persistent: bool,
     ) -> BufId<B> {
-        let anchor = MtlBuffer::<u8>::with_aligned_len_u8(
-            &self.device,
-            bytes,
-            alignment,
-        );
+        let anchor = MtlBuffer::<u8>::with_aligned_len_u8(&self.device, bytes, alignment);
         let buf = anchor.buffer().clone();
-        let id: BufId<B> =
-            BufId::from_raw(self.bufid_to_physical.len() as u32);
+        let id: BufId<B> = BufId::from_raw(self.bufid_to_physical.len() as u32);
         let physical = self.buffers.len() as u32;
         self.buffers.push(buf);
         self.aligned_anchors.push(anchor);
@@ -134,8 +127,7 @@ impl MetalBufferPool {
         label: &'static str,
         persistent: bool,
     ) -> BufId<B> {
-        let id: BufId<B> =
-            BufId::from_raw(self.bufid_to_physical.len() as u32);
+        let id: BufId<B> = BufId::from_raw(self.bufid_to_physical.len() as u32);
         let physical = self.buffers.len() as u32;
         self.buffers.push(buf);
         self.labels.push(label);
@@ -161,12 +153,7 @@ impl MetalBufferPool {
         // Metal buffer (Apple guarantee). The byte count matches the
         // allocation; aliasing concerns are caller-managed per the
         // contract above.
-        unsafe {
-            std::slice::from_raw_parts_mut(
-                buf.contents() as *mut u8,
-                bytes,
-            )
-        }
+        unsafe { std::slice::from_raw_parts_mut(buf.contents() as *mut u8, bytes) }
     }
 
     /// Disjoint mut byte slices for the common pread-worker pattern.
@@ -174,10 +161,7 @@ impl MetalBufferPool {
     /// PLUS the caller guarantees the `ids` array is duplicate-free —
     /// otherwise the returned references alias and the &mut semantics
     /// is violated.
-    pub fn as_mut_slices_u8<B: Buf, const N: usize>(
-        &self,
-        ids: [BufId<B>; N],
-    ) -> [&mut [u8]; N] {
+    pub fn as_mut_slices_u8<B: Buf, const N: usize>(&self, ids: [BufId<B>; N]) -> [&mut [u8]; N] {
         ids.map(|id| self.as_mut_slice_u8(id))
     }
 }
@@ -192,13 +176,11 @@ impl BufferPool for MetalBufferPool {
         label: &'static str,
         persistent: bool,
     ) -> Result<BufId<B>, GraphError> {
-        let id: BufId<B> =
-            BufId::from_raw(self.bufid_to_physical.len() as u32);
+        let id: BufId<B> = BufId::from_raw(self.bufid_to_physical.len() as u32);
         let physical = self.buffers.len() as u32;
-        let buf = self.device.new_buffer(
-            bytes as NSUInteger,
-            MTLResourceOptions::StorageModeShared,
-        );
+        let buf = self
+            .device
+            .new_buffer(bytes as NSUInteger, MTLResourceOptions::StorageModeShared);
         // Zero on alloc so encoders that assume a clean slot don't
         // read stale memory. Matches the CPU pool's vec![0u8; bytes]
         // behaviour.
@@ -218,16 +200,9 @@ impl BufferPool for MetalBufferPool {
         &self.buffers[physical]
     }
 
-    fn upload<B: Buf>(
-        &mut self,
-        id: BufId<B>,
-        host: &[u8],
-    ) -> Result<(), GraphError> {
+    fn upload<B: Buf>(&mut self, id: BufId<B>, host: &[u8]) -> Result<(), GraphError> {
         let idx = id.raw() as usize;
-        let label = *self
-            .labels
-            .get(idx)
-            .ok_or(GraphError::BadBufId(id.raw()))?;
+        let label = *self.labels.get(idx).ok_or(GraphError::BadBufId(id.raw()))?;
         let expected = self.byte_sizes[idx];
         // Prefix semantics: `host` may be shorter than the buffer
         // (once-per-run buffers are sized at max chunk width; a
@@ -242,11 +217,7 @@ impl BufferPool for MetalBufferPool {
         let physical = self.bufid_to_physical[idx] as usize;
         let buf = &self.buffers[physical];
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                host.as_ptr(),
-                buf.contents() as *mut u8,
-                host.len(),
-            );
+            std::ptr::copy_nonoverlapping(host.as_ptr(), buf.contents() as *mut u8, host.len());
         }
         Ok(())
     }
@@ -258,10 +229,7 @@ impl BufferPool for MetalBufferPool {
         host: &[u8],
     ) -> Result<(), GraphError> {
         let idx = id.raw() as usize;
-        let label = *self
-            .labels
-            .get(idx)
-            .ok_or(GraphError::BadBufId(id.raw()))?;
+        let label = *self.labels.get(idx).ok_or(GraphError::BadBufId(id.raw()))?;
         let expected = self.byte_sizes[idx];
         if offset + host.len() > expected {
             return Err(GraphError::SizeMismatch {
@@ -282,16 +250,9 @@ impl BufferPool for MetalBufferPool {
         Ok(())
     }
 
-    fn download<B: Buf>(
-        &self,
-        id: BufId<B>,
-        host: &mut [u8],
-    ) -> Result<(), GraphError> {
+    fn download<B: Buf>(&self, id: BufId<B>, host: &mut [u8]) -> Result<(), GraphError> {
         let idx = id.raw() as usize;
-        let label = *self
-            .labels
-            .get(idx)
-            .ok_or(GraphError::BadBufId(id.raw()))?;
+        let label = *self.labels.get(idx).ok_or(GraphError::BadBufId(id.raw()))?;
         let expected = self.byte_sizes[idx];
         // Prefix semantics: see `upload`.
         if host.len() > expected {
@@ -347,7 +308,7 @@ impl BufferPool for MetalBufferPool {
     }
 
     fn commit_plan(&mut self, graph: &Graph) {
-        use super::lifetime::{analyze_lifetimes, greedy_color, ColorId};
+        use super::lifetime::{ColorId, analyze_lifetimes, greedy_color};
         use std::collections::HashMap;
 
         let lifetimes = analyze_lifetimes(graph);
@@ -390,10 +351,8 @@ impl BufferPool for MetalBufferPool {
             }
             let old_physical = self.bufid_to_physical[bufid_idx] as usize;
             let new_phys = *old_to_new.entry(old_physical).or_insert_with(|| {
-                let old_buf = std::mem::replace(
-                    &mut self.buffers[old_physical],
-                    placeholder.clone(),
-                );
+                let old_buf =
+                    std::mem::replace(&mut self.buffers[old_physical], placeholder.clone());
                 let np = new_buffers.len() as u32;
                 new_buffers.push(old_buf);
                 np
@@ -418,11 +377,7 @@ impl BufferPool for MetalBufferPool {
                 MTLResourceOptions::StorageModeShared,
             );
             unsafe {
-                std::ptr::write_bytes(
-                    buf.contents() as *mut u8,
-                    0,
-                    max_size,
-                );
+                std::ptr::write_bytes(buf.contents() as *mut u8, 0, max_size);
             }
             color_to_physical.insert(color, new_buffers.len() as u32);
             new_buffers.push(buf);
@@ -517,10 +472,7 @@ pub struct MetalBackend {
 }
 
 impl MetalBackend {
-    pub fn new(
-        mut metal: MetalContext,
-        wf_buf: MtlWeightBuf,
-    ) -> Result<Self, MetalError> {
+    pub fn new(mut metal: MetalContext, wf_buf: MtlWeightBuf) -> Result<Self, MetalError> {
         // Fetch all pipelines we'll need. Each is a cheap NSObject
         // refcount bump after first compilation; subsequent
         // operations reuse the cache.
@@ -530,24 +482,17 @@ impl MetalBackend {
         let rms_pipes = RmsNormBf16Pipelines::fetch(&mut metal)?;
         let router_pipes = MoeRouterPipelines::fetch(&mut metal)?;
         let linear_attn_pipes = LinearAttnPipelines::fetch(&mut metal)?;
-        let residual_add_n_pso =
-            metal.pipeline("residual_add_n_tokens")?.clone();
+        let residual_add_n_pso = metal.pipeline("residual_add_n_tokens")?.clone();
         let rope_n_pso = metal.pipeline("rope_n_tokens")?.clone();
-        let swiglu_fused_batched_pso =
-            metal.pipeline("swiglu_fused_batched")?.clone();
+        let swiglu_fused_batched_pso = metal.pipeline("swiglu_fused_batched")?.clone();
         let swiglu_fused_pso = metal.pipeline("swiglu_fused")?.clone();
         let sigmoid_gate_pso = metal.pipeline("sigmoid_gate")?.clone();
         let split_q_gate_pso = metal.pipeline("split_q_gate")?.clone();
-        let rms_norm_per_head_pso =
-            metal.pipeline("rms_norm_per_head_n_tokens")?.clone();
-        let kv_cache_append_pso =
-            metal.pipeline("kv_cache_append_n_tokens")?.clone();
-        let moe_combine_residual_n_pso =
-            metal.pipeline("moe_combine_residual_n_tokens")?.clone();
-        let moe_bucket_accumulate_pso =
-            metal.pipeline("moe_bucket_accumulate")?.clone();
-        let embed_gather_4bit_pso =
-            metal.pipeline("embed_gather_4bit")?.clone();
+        let rms_norm_per_head_pso = metal.pipeline("rms_norm_per_head_n_tokens")?.clone();
+        let kv_cache_append_pso = metal.pipeline("kv_cache_append_n_tokens")?.clone();
+        let moe_combine_residual_n_pso = metal.pipeline("moe_combine_residual_n_tokens")?.clone();
+        let moe_bucket_accumulate_pso = metal.pipeline("moe_bucket_accumulate")?.clone();
+        let embed_gather_4bit_pso = metal.pipeline("embed_gather_4bit")?.clone();
 
         let device = metal.device().clone();
         Ok(Self {
@@ -571,12 +516,9 @@ impl MetalBackend {
             moe_combine_residual_n_pso,
             moe_bucket_accumulate_pso,
             embed_gather_4bit_pso,
-            profile_per_op: std::env::var_os("MOEFLUX_PROFILE_PER_OP")
-                .is_some(),
-            moe_gather: std::env::var("MOEFLUX_MOE_GATHER")
-                .map_or(true, |v| v != "0"),
-            matvec_m1_v3: std::env::var("MOEFLUX_MATVEC_M1_V3")
-                .map_or(true, |v| v != "0"),
+            profile_per_op: std::env::var_os("MOEFLUX_PROFILE_PER_OP").is_some(),
+            moe_gather: std::env::var("MOEFLUX_MOE_GATHER").map_or(true, |v| v != "0"),
+            matvec_m1_v3: std::env::var("MOEFLUX_MATVEC_M1_V3").map_or(true, |v| v != "0"),
         })
     }
 
@@ -597,9 +539,7 @@ impl MetalBackend {
     /// step body pass `(&mut MetalContext, &MtlWeightBuf, &mut
     /// MetalBufferPool)` to existing helpers without manually
     /// splitting the borrow at each call site.
-    pub fn parts_mut(
-        &mut self,
-    ) -> (&mut MetalContext, &MtlWeightBuf, &mut MetalBufferPool) {
+    pub fn parts_mut(&mut self) -> (&mut MetalContext, &MtlWeightBuf, &mut MetalBufferPool) {
         (&mut self.metal, &self.wf_buf, &mut self.pool)
     }
 }
@@ -623,8 +563,7 @@ impl Backend for MetalBackend {
     where
         Self: Sized,
     {
-        Self::new(config.metal, config.wf_buf)
-            .map_err(|e| GraphError::Backend(Box::new(e)))
+        Self::new(config.metal, config.wf_buf).map_err(|e| GraphError::Backend(Box::new(e)))
     }
 
     fn pool(&self) -> &MetalBufferPool {
@@ -639,20 +578,12 @@ impl Backend for MetalBackend {
         MetalEncodeCtx { cmdbuf }
     }
 
-    fn submit_and_wait(
-        &self,
-        ctx: MetalEncodeCtx,
-        label: &'static str,
-    ) -> Result<(), GraphError> {
+    fn submit_and_wait(&self, ctx: MetalEncodeCtx, label: &'static str) -> Result<(), GraphError> {
         self.metal.commit_and_wait_labeled(&ctx.cmdbuf, label);
         Ok(())
     }
 
-    fn execute(
-        &self,
-        graph: &Graph,
-        label: &'static str,
-    ) -> Result<(), GraphError> {
+    fn execute(&self, graph: &Graph, label: &'static str) -> Result<(), GraphError> {
         if self.profile_per_op {
             // Instrumentation: one labeled commit per op so
             // `cmdbuf_stats` carries a per-op breakdown. Forfeits the
@@ -777,9 +708,7 @@ impl Backend for MetalBackend {
                 // for A/B work without a rebuild). See the field doc
                 // for full rationale + session-17/18 history.
                 let force_qmm_at_m1 = !self.matvec_m1_v3;
-                if weight.bits == 4
-                    && (*n_tokens > 1 || force_qmm_at_m1)
-                {
+                if weight.bits == 4 && (*n_tokens > 1 || force_qmm_at_m1) {
                     self.metal.kernels().encode(
                         cmd,
                         &QmmCall {
@@ -911,24 +840,14 @@ impl Backend for MetalBackend {
                 let hd = *head_dim;
                 let eps_v = *eps;
                 let enc = cmd.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(
-                    &self.rms_norm_per_head_pso,
-                );
+                enc.set_compute_pipeline_state(&self.rms_norm_per_head_pso);
                 enc.set_buffer(0, Some(self.pool.handle(*x)), 0);
-                enc.set_buffer(
-                    1,
-                    Some(self.wf_buf.buffer()),
-                    *weight_off as NSUInteger,
-                );
+                enc.set_buffer(1, Some(self.wf_buf.buffer()), *weight_off as NSUInteger);
                 enc.set_bytes(2, 4, (&nh as *const u32).cast());
                 enc.set_bytes(3, 4, (&hd as *const u32).cast());
                 enc.set_bytes(4, 4, (&eps_v as *const f32).cast());
                 enc.dispatch_thread_groups(
-                    MTLSize::new(
-                        nh as NSUInteger,
-                        *n_tokens as NSUInteger,
-                        1,
-                    ),
+                    MTLSize::new(nh as NSUInteger, *n_tokens as NSUInteger, 1),
                     MTLSize::new(256, 1, 1),
                 );
                 enc.end_encoding();
@@ -948,9 +867,7 @@ impl Backend for MetalBackend {
                 let ks = *kv_start;
                 let total = nt * kvd;
                 let enc = cmd.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(
-                    &self.kv_cache_append_pso,
-                );
+                enc.set_compute_pipeline_state(&self.kv_cache_append_pso);
                 enc.set_buffer(0, Some(self.pool.handle(*k_src)), 0);
                 enc.set_buffer(1, Some(self.pool.handle(*v_src)), 0);
                 enc.set_buffer(2, Some(self.pool.handle(*k_cache)), 0);
@@ -1070,20 +987,14 @@ impl Backend for MetalBackend {
                 let ptt = *per_token_total;
                 let kopt = *key_offset_per_token;
                 let enc = cmd.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(
-                    &self.linear_attn_pipes.rms_norm_qk,
-                );
+                enc.set_compute_pipeline_state(&self.linear_attn_pipes.rms_norm_qk);
                 enc.set_buffer(0, Some(x_buf), 0);
                 enc.set_bytes(1, 4, (&key_dim_arg as *const u32).cast());
                 enc.set_bytes(2, 4, (&inv_scale as *const f32).cast());
                 enc.set_bytes(3, 4, (&ptt as *const u32).cast());
                 enc.set_bytes(4, 4, (&kopt as *const u32).cast());
                 enc.dispatch_thread_groups(
-                    MTLSize::new(
-                        *num_k_heads as NSUInteger,
-                        *n_tokens as NSUInteger,
-                        1,
-                    ),
+                    MTLSize::new(*num_k_heads as NSUInteger, *n_tokens as NSUInteger, 1),
                     MTLSize::new(*key_dim as NSUInteger, 1, 1),
                 );
                 enc.end_encoding();
@@ -1228,32 +1139,20 @@ impl Backend for MetalBackend {
                 let num_tgs = (conv_dim_arg + 255) / 256;
                 // Pass 1 — compute.
                 let enc = cmd.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(
-                    &self.linear_attn_pipes.conv1d_step,
-                );
+                enc.set_compute_pipeline_state(&self.linear_attn_pipes.conv1d_step);
                 enc.set_buffer(0, Some(state_buf), 0);
                 enc.set_buffer(1, Some(qkv_buf), 0);
-                enc.set_buffer(
-                    2,
-                    Some(self.wf_buf.buffer()),
-                    *weight_off as NSUInteger,
-                );
+                enc.set_buffer(2, Some(self.wf_buf.buffer()), *weight_off as NSUInteger);
                 enc.set_buffer(3, Some(conv_out_buf), 0);
                 enc.set_bytes(4, 4, (&conv_dim_arg as *const u32).cast());
                 enc.dispatch_thread_groups(
-                    MTLSize::new(
-                        num_tgs as NSUInteger,
-                        n_tokens_arg as NSUInteger,
-                        1,
-                    ),
+                    MTLSize::new(num_tgs as NSUInteger, n_tokens_arg as NSUInteger, 1),
                     MTLSize::new(256, 1, 1),
                 );
                 enc.end_encoding();
                 // Pass 2 — history-state update.
                 let enc2 = cmd.new_compute_command_encoder();
-                enc2.set_compute_pipeline_state(
-                    &self.linear_attn_pipes.conv1d_state_update,
-                );
+                enc2.set_compute_pipeline_state(&self.linear_attn_pipes.conv1d_state_update);
                 enc2.set_buffer(0, Some(state_buf), 0);
                 enc2.set_buffer(1, Some(qkv_buf), 0);
                 enc2.set_bytes(2, 4, (&conv_dim_arg as *const u32).cast());
@@ -1286,21 +1185,11 @@ impl Backend for MetalBackend {
                 let beta_gate_buf = self.pool.handle(*beta_gate_out);
                 let nvh = *num_v_heads;
                 let enc = cmd.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(
-                    &self.linear_attn_pipes.compute_decay_beta,
-                );
+                enc.set_compute_pipeline_state(&self.linear_attn_pipes.compute_decay_beta);
                 enc.set_buffer(0, Some(alpha_buf), 0);
                 enc.set_buffer(1, Some(beta_buf), 0);
-                enc.set_buffer(
-                    2,
-                    Some(self.wf_buf.buffer()),
-                    *a_log_off as NSUInteger,
-                );
-                enc.set_buffer(
-                    3,
-                    Some(self.wf_buf.buffer()),
-                    *dt_bias_off as NSUInteger,
-                );
+                enc.set_buffer(2, Some(self.wf_buf.buffer()), *a_log_off as NSUInteger);
+                enc.set_buffer(3, Some(self.wf_buf.buffer()), *dt_bias_off as NSUInteger);
                 enc.set_buffer(4, Some(g_decay_buf), 0);
                 enc.set_buffer(5, Some(beta_gate_buf), 0);
                 enc.set_bytes(6, 4, (&nvh as *const u32).cast());
@@ -1333,8 +1222,7 @@ impl Backend for MetalBackend {
                 let nvh = *num_v_heads;
                 let vd = *value_dim;
                 let kpv = *k_heads_per_v;
-                let key_total =
-                    crate::riir::variants::VARIANT.linear_total_key() as u32;
+                let key_total = crate::riir::variants::VARIANT.linear_total_key() as u32;
                 let n_tokens_arg = *n_tokens;
                 let state_buf = self.pool.handle(*state);
                 let conv_buf = self.pool.handle(*conv_out);
@@ -1342,9 +1230,7 @@ impl Backend for MetalBackend {
                 let bg_buf = self.pool.handle(*beta_gate);
                 let out_buf = self.pool.handle(*output);
                 let enc = cmd.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(
-                    &self.linear_attn_pipes.delta_net_step,
-                );
+                enc.set_compute_pipeline_state(&self.linear_attn_pipes.delta_net_step);
                 enc.set_buffer(0, Some(state_buf), 0);
                 enc.set_buffer(1, Some(conv_buf), 0);
                 enc.set_buffer(2, Some(g_buf), 0);
@@ -1376,8 +1262,7 @@ impl Backend for MetalBackend {
                 let nvh = *num_v_heads;
                 let vd = *value_dim;
                 let kpv = *k_heads_per_v;
-                let key_total =
-                    crate::riir::variants::VARIANT.linear_total_key() as u32;
+                let key_total = crate::riir::variants::VARIANT.linear_total_key() as u32;
                 let n_tokens_arg = *n_tokens;
                 let state_buf = self.pool.handle(*state);
                 let conv_buf = self.pool.handle(*conv_out);
@@ -1385,17 +1270,14 @@ impl Backend for MetalBackend {
                 let bg_buf = self.pool.handle(*beta_gate);
                 let out_buf = self.pool.handle(*output);
 
-                let vb = crate::riir::attn::linear_attn_forward
-                    ::delta_net_vb_enabled();
+                let vb = crate::riir::attn::linear_attn_forward::delta_net_vb_enabled();
 
                 let enc = cmd.new_compute_command_encoder();
                 if vb {
                     // Sequential-recurrent vB: register-only state,
                     // simd_sum dot products, zero barriers.
                     // Grid: (vd/4, nvh, 1), TG: (32, 4, 1).
-                    enc.set_compute_pipeline_state(
-                        &self.linear_attn_pipes.delta_net_sequential,
-                    );
+                    enc.set_compute_pipeline_state(&self.linear_attn_pipes.delta_net_sequential);
                     enc.set_buffer(0, Some(state_buf), 0);
                     enc.set_buffer(1, Some(conv_buf), 0);
                     enc.set_buffer(2, Some(g_buf), 0);
@@ -1416,9 +1298,7 @@ impl Backend for MetalBackend {
                         "gated_delta_net_chunkwise kernel is built with \
                          CW_C=16; Op chunk_size must match"
                     );
-                    enc.set_compute_pipeline_state(
-                        &self.linear_attn_pipes.delta_net_chunkwise,
-                    );
+                    enc.set_compute_pipeline_state(&self.linear_attn_pipes.delta_net_chunkwise);
                     enc.set_buffer(0, Some(state_buf), 0);
                     enc.set_buffer(1, Some(conv_buf), 0);
                     enc.set_buffer(2, Some(g_buf), 0);
@@ -1459,26 +1339,16 @@ impl Backend for MetalBackend {
                 let eps_arg = *eps;
                 let nvh = *num_v_heads;
                 let enc = cmd.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(
-                    &self.linear_attn_pipes.gated_rms_norm,
-                );
+                enc.set_compute_pipeline_state(&self.linear_attn_pipes.gated_rms_norm);
                 enc.set_buffer(0, Some(values_buf), 0);
                 enc.set_buffer(1, Some(z_buf), 0);
-                enc.set_buffer(
-                    2,
-                    Some(self.wf_buf.buffer()),
-                    *weight_off as NSUInteger,
-                );
+                enc.set_buffer(2, Some(self.wf_buf.buffer()), *weight_off as NSUInteger);
                 enc.set_buffer(3, Some(output_buf), 0);
                 enc.set_bytes(4, 4, (&value_dim_arg as *const u32).cast());
                 enc.set_bytes(5, 4, (&eps_arg as *const f32).cast());
                 enc.set_bytes(6, 4, (&nvh as *const u32).cast());
                 enc.dispatch_thread_groups(
-                    MTLSize::new(
-                        nvh as NSUInteger,
-                        *n_tokens as NSUInteger,
-                        1,
-                    ),
+                    MTLSize::new(nvh as NSUInteger, *n_tokens as NSUInteger, 1),
                     MTLSize::new(value_dim_arg as NSUInteger, 1, 1),
                 );
                 enc.end_encoding();
@@ -1508,12 +1378,8 @@ mod tests {
         // Use a size that wouldn't naturally land on a 2 MiB boundary
         // (Apple's allocator only does that incidentally for large
         // allocations).
-        let id: BufId<DeprecatedCogitoBuf> = pool.alloc_aligned(
-            64 * 1024,
-            TWO_MIB,
-            "test.aligned",
-            true,
-        );
+        let id: BufId<DeprecatedCogitoBuf> =
+            pool.alloc_aligned(64 * 1024, TWO_MIB, "test.aligned", true);
         let buf = pool.handle(id);
         let addr = buf.contents() as usize;
         assert_eq!(
@@ -1527,14 +1393,10 @@ mod tests {
     #[ignore = "needs Metal device"]
     fn register_borrowed_round_trip_via_handle() {
         let device = dev();
-        let raw = device.new_buffer(
-            128,
-            MTLResourceOptions::StorageModeShared,
-        );
+        let raw = device.new_buffer(128, MTLResourceOptions::StorageModeShared);
         let raw_ptr_before = raw.contents() as usize;
         let mut pool = MetalBufferPool::new(device);
-        let id: BufId<ExpertBaseBuf> =
-            pool.register_borrowed(raw, 128, "test.borrowed", true);
+        let id: BufId<ExpertBaseBuf> = pool.register_borrowed(raw, 128, "test.borrowed", true);
         let pooled = pool.handle(id);
         // The buffer the pool returns should point to the same memory
         // as the buffer we registered (refcounted clone, same backing).
@@ -1545,9 +1407,7 @@ mod tests {
     #[ignore = "needs Metal device"]
     fn as_mut_slice_u8_writes_visible_through_handle() {
         let mut pool = MetalBufferPool::new(dev());
-        let id: BufId<DeprecatedCogitoBuf> = pool
-            .alloc(64, "test.scratch", true)
-            .expect("alloc");
+        let id: BufId<DeprecatedCogitoBuf> = pool.alloc(64, "test.scratch", true).expect("alloc");
         {
             let slice = pool.as_mut_slice_u8(id);
             assert_eq!(slice.len(), 64);
@@ -1557,9 +1417,7 @@ mod tests {
         }
         // Read back through the regular handle path.
         let buf = pool.handle(id);
-        let read = unsafe {
-            std::slice::from_raw_parts(buf.contents() as *const u8, 64)
-        };
+        let read = unsafe { std::slice::from_raw_parts(buf.contents() as *const u8, 64) };
         for (i, &b) in read.iter().enumerate() {
             assert_eq!(b, (i as u8).wrapping_mul(7));
         }
@@ -1569,12 +1427,9 @@ mod tests {
     #[ignore = "needs Metal device"]
     fn as_mut_slices_u8_disjoint_writes_dont_clobber() {
         let mut pool = MetalBufferPool::new(dev());
-        let a: BufId<DeprecatedCogitoBuf> =
-            pool.alloc(32, "a", true).expect("alloc");
-        let b: BufId<DeprecatedCogitoBuf> =
-            pool.alloc(32, "b", true).expect("alloc");
-        let c: BufId<DeprecatedCogitoBuf> =
-            pool.alloc(32, "c", true).expect("alloc");
+        let a: BufId<DeprecatedCogitoBuf> = pool.alloc(32, "a", true).expect("alloc");
+        let b: BufId<DeprecatedCogitoBuf> = pool.alloc(32, "b", true).expect("alloc");
+        let c: BufId<DeprecatedCogitoBuf> = pool.alloc(32, "c", true).expect("alloc");
         {
             let [sa, sb, sc] = pool.as_mut_slices_u8([a, b, c]);
             sa.fill(0xAA);
@@ -1583,9 +1438,7 @@ mod tests {
         }
         for (id, want) in [(a, 0xAAu8), (b, 0xBBu8), (c, 0xCCu8)] {
             let buf = pool.handle(id);
-            let read = unsafe {
-                std::slice::from_raw_parts(buf.contents() as *const u8, 32)
-            };
+            let read = unsafe { std::slice::from_raw_parts(buf.contents() as *const u8, 32) };
             assert!(
                 read.iter().all(|&v| v == want),
                 "slot for {id:?} should be filled with 0x{want:x}"

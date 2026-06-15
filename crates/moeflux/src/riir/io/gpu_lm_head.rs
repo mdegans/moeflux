@@ -23,8 +23,8 @@ use metal::{Buffer, MTLResourceOptions, NSUInteger};
 use crate::riir::backend::gpu::gpu_matvec::{MatvecPipelines, MatvecSpec, encode_matvec};
 use crate::riir::backend::gpu::metal::{MetalContext, MetalError};
 use crate::riir::io::mtl_weight_buf::{MtlWeightBuf, MtlWeightBufError};
-use crate::riir::variants::VARIANT;
 use crate::riir::io::weight_file::WeightFile;
+use crate::riir::variants::VARIANT;
 
 /// Errors specific to the GPU LM head dispatch.
 #[derive(Debug, thiserror::Error)]

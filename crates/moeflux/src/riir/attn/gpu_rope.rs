@@ -24,12 +24,11 @@
 //! in profiling.
 
 use metal::{
-    Buffer, CommandBufferRef, ComputePipelineState, MTLResourceOptions,
-    MTLSize, NSUInteger,
+    Buffer, CommandBufferRef, ComputePipelineState, MTLResourceOptions, MTLSize, NSUInteger,
 };
 
 use crate::riir::backend::gpu::encoder::ComputeEncoder;
-use crate::riir::backend::gpu::metal::{buffer_as_slice, MetalContext, MetalError};
+use crate::riir::backend::gpu::metal::{MetalContext, MetalError, buffer_as_slice};
 
 /// Errors from the GPU YaRN RoPE dispatch.
 #[derive(Debug, thiserror::Error)]
@@ -186,10 +185,7 @@ mod tests {
             .collect();
         let x_orig = x.clone();
 
-        yarn_rope_apply_oneshot(
-            &mut metal, &mut x, rotary_dim, &inv_freq, 0, 1.0,
-        )
-        .unwrap();
+        yarn_rope_apply_oneshot(&mut metal, &mut x, rotary_dim, &inv_freq, 0, 1.0).unwrap();
 
         for i in 0..x.len() {
             assert!(
@@ -234,26 +230,18 @@ mod tests {
             .collect();
         let mut x_cpu = x_gpu.clone();
 
-        apply_rotary_emb_yarn(pos, &mut x_cpu, rotary_dim, &inv_freq, mscale)
+        apply_rotary_emb_yarn(pos, &mut x_cpu, rotary_dim, &inv_freq, mscale).unwrap();
+        yarn_rope_apply_oneshot(&mut metal, &mut x_gpu, rotary_dim, &inv_freq, pos, mscale)
             .unwrap();
-        yarn_rope_apply_oneshot(
-            &mut metal,
-            &mut x_gpu,
-            rotary_dim,
-            &inv_freq,
-            pos,
-            mscale,
-        )
-        .unwrap();
 
         // 4 ULP for f32 around 1.0 is ~4.8e-7. We use abs-diff
         // because the values straddle 0 and ULP-relative tolerance
         // gets brittle near zero.
-        let max_drift =
-            x_gpu.iter().zip(&x_cpu).map(|(g, c)| (g - c).abs()).fold(
-                0.0f32,
-                f32::max,
-            );
+        let max_drift = x_gpu
+            .iter()
+            .zip(&x_cpu)
+            .map(|(g, c)| (g - c).abs())
+            .fold(0.0f32, f32::max);
         assert!(
             max_drift < 5e-6,
             "GPU/CPU drift {max_drift} exceeds 4 ULP tolerance"

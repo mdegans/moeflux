@@ -17,17 +17,15 @@
 //! reference.
 
 use crate::riir::io::embedding::bf16_to_f32;
-use crate::riir::variants::{RMS_NORM_EPS, VARIANT};
 use crate::riir::io::weight_file::WeightFile;
+use crate::riir::variants::{RMS_NORM_EPS, VARIANT};
 
 /// Errors specific to the RMSNorm port.
 #[derive(Debug, thiserror::Error)]
 pub enum RmsNormError {
     #[error("RMSNorm weight tensor '{name}' missing from manifest")]
     MissingTensor { name: String },
-    #[error(
-        "RMSNorm weight '{name}' size {got} bytes, expected {expected} ({dim} bf16 elements)"
-    )]
+    #[error("RMSNorm weight '{name}' size {got} bytes, expected {expected} ({dim} bf16 elements)")]
     WeightSize {
         name: String,
         got: u64,

@@ -12,14 +12,12 @@ use moeflux::{Ctx, Error};
 fn model_root() -> PathBuf {
     // Default to the layout produced by the session's prep pipeline;
     // override with MOEFLUX_SMOKE_ROOT to point elsewhere.
-    let default =
-        "/Volumes/Temp Backup/models/moeflux/qwen3-6-35b-a3b-root";
+    let default = "/Volumes/Temp Backup/models/moeflux/qwen3-6-35b-a3b-root";
     PathBuf::from(std::env::var("MOEFLUX_SMOKE_ROOT").unwrap_or(default.into()))
 }
 
 fn artifacts() -> PathBuf {
-    let default =
-        "/Volumes/Temp Backup/models/moeflux/qwen3-6-35b-a3b-artifacts";
+    let default = "/Volumes/Temp Backup/models/moeflux/qwen3-6-35b-a3b-artifacts";
     PathBuf::from(std::env::var("MOEFLUX_SMOKE_ARTIFACTS").unwrap_or(default.into()))
 }
 
@@ -60,7 +58,8 @@ fn rust_smoke_35b_a3b() {
 
     // Prefill 4 fabricated low-id tokens.
     let prompt = [1i32, 100, 500, 1000];
-    ctx.eval_prompt(&prompt, 0, 0, &mut logits).expect("prefill");
+    ctx.eval_prompt(&prompt, 0, 0, &mut logits)
+        .expect("prefill");
     logits_look_sane(&logits, "after-prefill");
     assert_eq!(ctx.memory_seq_pos_max(0), 4);
 
@@ -82,7 +81,8 @@ fn rust_smoke_35b_a3b() {
     // State save/load round-trip. Clear + re-prefill so size matches
     // save (same ordering fix as tests/smoke.c).
     ctx.memory_clear();
-    ctx.eval_prompt(&prompt, 0, 0, &mut logits).expect("re-prefill");
+    ctx.eval_prompt(&prompt, 0, 0, &mut logits)
+        .expect("re-prefill");
 
     let snap_size = ctx.state_size();
     assert!(snap_size > 0);
@@ -91,8 +91,10 @@ fn rust_smoke_35b_a3b() {
     assert_eq!(wrote, snap_size);
 
     // Mutate state, then restore.
-    ctx.eval_token(42, 4, 0, &mut logits).expect("mutate-decode-1");
-    ctx.eval_token(43, 5, 0, &mut logits).expect("mutate-decode-2");
+    ctx.eval_token(42, 4, 0, &mut logits)
+        .expect("mutate-decode-1");
+    ctx.eval_token(43, 5, 0, &mut logits)
+        .expect("mutate-decode-2");
     assert_eq!(ctx.memory_seq_pos_max(0), 6);
 
     ctx.state_load(&snap[..wrote]).expect("state_load");

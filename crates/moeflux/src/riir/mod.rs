@@ -31,55 +31,49 @@ pub mod io;
 pub mod moe;
 pub mod snapshot;
 pub mod variants;
-pub use moe::deferred::{DeferredError, DeferredRing, DeferredState};
-pub use io::embedding::{bf16_to_f32, embed_lookup, EmbeddingError};
-pub use moe::expert_forward::{
-    gpu_batched_experts_forward, gpu_expert_forward, ExpertForwardError,
-    MoeBuffers, MAX_K,
-};
-pub use io::expert_io::{ExpertFiles, ExpertIoError};
 pub use attn::gpu_attn::{
-    gpu_attn_scores_batched, gpu_attn_softmax_batched,
-    gpu_attn_values_batched, gpu_sigmoid_gate, GpuAttnError,
+    GpuAttnError, gpu_attn_scores_batched, gpu_attn_softmax_batched, gpu_attn_values_batched,
+    gpu_sigmoid_gate,
 };
-pub use io::gpu_lm_head::{GpuLmHead, GpuLmHeadError};
-pub use backend::gpu::gpu_norm::{gpu_rms_norm_fused, GpuNormError};
 pub use attn::linear_attn::{
-    conv1d_step, gated_delta_recurrence, rms_norm_bare, rms_norm_gated,
-    LinearAttnError,
+    LinearAttnError, conv1d_step, gated_delta_recurrence, rms_norm_bare, rms_norm_gated,
+};
+pub use backend::gpu::gpu_norm::{GpuNormError, gpu_rms_norm_fused};
+pub use io::embedding::{EmbeddingError, bf16_to_f32, embed_lookup};
+pub use io::expert_io::{ExpertFiles, ExpertIoError};
+pub use io::gpu_lm_head::{GpuLmHead, GpuLmHeadError};
+pub use moe::deferred::{DeferredError, DeferredRing, DeferredState};
+pub use moe::expert_forward::{
+    ExpertForwardError, MAX_K, MoeBuffers, gpu_batched_experts_forward, gpu_expert_forward,
 };
 // S7-6c: trait scope for `pool.alloc/handle/upload/download/reset_transient`
 // in `step_internal_batched_gqa`.
+pub use attn::rms_norm::{RmsNormError, rms_norm_cpu, rms_norm_per_head_cpu};
+pub use attn::rope::{RopeError, apply_rotary_emb};
 use backend::BufferPool as _;
+pub use backend::gpu::metal::{CmdbufStat, MetalContext, MetalError, MtlBuffer};
 use backend::{Backend, Graph, MetalBackend, Op, WeightRef};
-pub use io::lm_head::{lm_head_cpu, LmHeadError};
-pub use backend::gpu::metal::{
-    CmdbufStat, MetalContext, MetalError, MtlBuffer,
-};
-pub use moe::moe_router::{moe_router_cpu, MoeRouterError};
-pub use attn::rms_norm::{rms_norm_cpu, rms_norm_per_head_cpu, RmsNormError};
-pub use attn::rope::{apply_rotary_emb, RopeError};
 pub use io::layer_weight_cache::LayerWeightCache;
+pub use io::lm_head::{LmHeadError, lm_head_cpu};
+pub use moe::moe_router::{MoeRouterError, moe_router_cpu};
 // full_attn_layer_forward dropped from pub re-export with the Phase A/B
 // refactor — it's now pub(super) inside riir, and the only external
 // callers in this crate use it transitively via eval_prompt / eval_token.
 use attn::full_attn_forward::full_attn_layer_forward;
 pub use attn::linear_attn_forward::{
-    linear_attn_layer_forward, linear_layer_idx_for, LayerForwardBuffers,
-    LayerForwardError,
+    LayerForwardBuffers, LayerForwardError, linear_attn_layer_forward, linear_layer_idx_for,
 };
 // Backwards-compat aliases — 4d renamed the buffer struct + error.
 #[allow(deprecated)]
 pub use attn::linear_attn_forward::{LinearAttnBuffers, LinearAttnForwardError};
+pub use attn::sdpa::{SdpaError, sdpa_cpu};
 pub use io::mtl_weight_buf::{MtlWeightBuf, MtlWeightBufError};
 pub use io::prefetch::{PrefetchState, PrefetchStatus, SlotSource};
-pub use attn::sdpa::{sdpa_cpu, SdpaError};
-pub use snapshot::state::{
-    alloc_layer_states, clear_all, pos_max, truncate, KvCache, LayerState,
-    LinearAttnState,
-};
-pub use variants::{Variant, VARIANT};
 pub use io::weight_file::{TensorInfo, WeightFile, WeightFileError};
+pub use snapshot::state::{
+    KvCache, LayerState, LinearAttnState, alloc_layer_states, clear_all, pos_max, truncate,
+};
+pub use variants::{VARIANT, Variant};
 
 /// Default cap on stored snapshot checkpoints per [`RsCtx`]. Matches
 /// Anthropic's API limit on `cache_control` breakpoints per prompt
@@ -160,18 +154,16 @@ enum EvalTokenMode {
 fn eval_token_mode() -> EvalTokenMode {
     use std::sync::OnceLock;
     static MODE: OnceLock<EvalTokenMode> = OnceLock::new();
-    *MODE.get_or_init(|| {
-        match std::env::var("MOEFLUX_EVAL_TOKEN").as_deref() {
-            Ok("batched") => EvalTokenMode::Batched,
-            Ok("oracle") | Err(_) => EvalTokenMode::Oracle,
-            Ok(other) => {
-                eprintln!(
-                    "[eval_token] MOEFLUX_EVAL_TOKEN={other:?} \
+    *MODE.get_or_init(|| match std::env::var("MOEFLUX_EVAL_TOKEN").as_deref() {
+        Ok("batched") => EvalTokenMode::Batched,
+        Ok("oracle") | Err(_) => EvalTokenMode::Oracle,
+        Ok(other) => {
+            eprintln!(
+                "[eval_token] MOEFLUX_EVAL_TOKEN={other:?} \
                      unrecognised; using `oracle`. Valid values: \
                      oracle | batched."
-                );
-                EvalTokenMode::Oracle
-            }
+            );
+            EvalTokenMode::Oracle
         }
     })
 }
@@ -181,15 +173,10 @@ fn eval_token_mode() -> EvalTokenMode {
 /// MLA / linear-attention layers route through a separate dispatch
 /// (Phase F); reaching the GPU GQA path with one means the dispatch
 /// wasn't wired — fail loudly at runtime.
-fn full_kv_mut(
-    layer_states: &mut [LayerState],
-    idx: usize,
-) -> Result<&mut KvCache, RsError> {
+fn full_kv_mut(layer_states: &mut [LayerState], idx: usize) -> Result<&mut KvCache, RsError> {
     match &mut layer_states[idx] {
         LayerState::FullAttn(kv) => Ok(kv),
-        LayerState::Mla(_) | LayerState::LinearAttn(_) => {
-            Err(RsError::EvalFailed)
-        }
+        LayerState::Mla(_) | LayerState::LinearAttn(_) => Err(RsError::EvalFailed),
     }
 }
 
@@ -236,14 +223,12 @@ pub struct RsCtx<B: Backend = MetalBackend> {
     /// S10b-2: run-lifetime scratch BufIds for the batched linear-attn
     /// `graph1` (allocated once at max chunk width, reused every step /
     /// layer). Built by [`Self::ensure_linear_resources`].
-    linear_attn_graph_scratch:
-        Option<attn::linear_attn_forward::LinearAttnGraphScratch>,
+    linear_attn_graph_scratch: Option<attn::linear_attn_forward::LinearAttnGraphScratch>,
     /// Prefill arc Phase 2 — run-lifetime scratch for the batched
     /// full-attn `graph1` (allocated once at max chunk width). Built
     /// by [`Self::ensure_linear_resources`] alongside
     /// `linear_attn_graph_scratch`.
-    full_attn_graph_scratch:
-        Option<attn::full_attn_forward::FullAttnGraphScratch>,
+    full_attn_graph_scratch: Option<attn::full_attn_forward::FullAttnGraphScratch>,
     /// Prefill arc Phase 3 — shared run-lifetime scratch for the MoE
     /// block (`graph2`): graph1→MoE boundary buffers + the shared-FFN /
     /// permute-fuse working set. One instance, reused by every layer's
@@ -252,13 +237,11 @@ pub struct RsCtx<B: Backend = MetalBackend> {
     /// Prefill arc Phase 3 — the cross-layer hidden double-buffer,
     /// lifted out of the per-layer attention scratch so it is owned at
     /// run scope. The orchestrator swaps the pair between layers.
-    hidden_double_buffer:
-        Option<attn::linear_attn_forward::HiddenDoubleBuffer>,
+    hidden_double_buffer: Option<attn::linear_attn_forward::HiddenDoubleBuffer>,
     /// Prefill arc Phase 4 — run-lifetime scratch for the orchestrator
     /// head (GPU embedding gather) and tail (GPU final norm + lm_head).
     /// Built by [`Self::ensure_linear_resources`].
-    head_tail_scratch:
-        Option<attn::linear_attn_forward::HeadTailScratch>,
+    head_tail_scratch: Option<attn::linear_attn_forward::HeadTailScratch>,
     /// Slice 4e — pending deferred-experts state. Originally a
     /// single `Option<DeferredState>` (one in-flight K-expert dispatch
     /// at a time); slice 5d-9 widened it to a depth-2
@@ -403,10 +386,7 @@ fn probe_variant_match(wf: &WeightFile) -> Result<(), RsError> {
 /// layer tensors at all. `hidden_dim` is the layer-0
 /// `input_layernorm.weight` length; `None` means that tensor was
 /// absent and the dim check is skipped.
-fn check_variant_dims(
-    top_layer: Option<usize>,
-    hidden_dim: Option<usize>,
-) -> Result<(), RsError> {
+fn check_variant_dims(top_layer: Option<usize>, hidden_dim: Option<usize>) -> Result<(), RsError> {
     let mismatch = |detail: String| RsError::ModelMismatch {
         expected: VARIANT.name,
         detail,
@@ -463,11 +443,9 @@ impl RsCtx<MetalBackend> {
         experts_per_tok: u32,
         _use_2bit: bool,
     ) -> Result<Self, RsError> {
-        let wf = WeightFile::open(weights, manifest)
-            .map_err(|_| RsError::InitFailed)?;
+        let wf = WeightFile::open(weights, manifest).map_err(|_| RsError::InitFailed)?;
         probe_variant_match(&wf)?;
-        let experts = ExpertFiles::open(experts_dir)
-            .map_err(|_| RsError::InitFailed)?;
+        let experts = ExpertFiles::open(experts_dir).map_err(|_| RsError::InitFailed)?;
         let layer_states = alloc_layer_states();
         let k_active = (experts_per_tok as usize).clamp(1, VARIANT.num_experts_per_tok);
         let io_pool = rayon::ThreadPoolBuilder::new()
@@ -526,8 +504,7 @@ impl RsCtx<MetalBackend> {
     /// and the [`Self::metal_mut`] accessor.
     fn ensure_backend(&mut self) -> Result<(), RsError> {
         if self.backend.is_none() {
-            let metal =
-                MetalContext::new().map_err(|_| RsError::InitFailed)?;
+            let metal = MetalContext::new().map_err(|_| RsError::InitFailed)?;
             let device = metal.device().to_owned();
             let wf_buf = MtlWeightBuf::wrap(&self.wf, &device);
             self.backend = Some(
@@ -542,17 +519,16 @@ impl RsCtx<MetalBackend> {
     /// buffer set exist, then return mutable refs to both.
     /// Field-disjoint borrows so two `&mut`s on the same `&mut self`
     /// are valid.
-    fn metal_and_moe_mut(
-        &mut self,
-    ) -> Result<(&mut MetalContext, &mut MoeBuffers), RsError> {
+    fn metal_and_moe_mut(&mut self) -> Result<(&mut MetalContext, &mut MoeBuffers), RsError> {
         self.ensure_backend()?;
         if self.moe_buffers.is_none() {
-            let pool =
-                self.backend.as_mut().expect("just-set").pool_mut();
+            let pool = self.backend.as_mut().expect("just-set").pool_mut();
             self.moe_buffers = Some(MoeBuffers::new(pool));
         }
         let Self {
-            backend, moe_buffers, ..
+            backend,
+            moe_buffers,
+            ..
         } = self;
         Ok((
             backend.as_mut().expect("just-set").metal_mut(),
@@ -614,11 +590,7 @@ impl RsCtx<MetalBackend> {
     /// Embed a single token. Writes `HIDDEN_DIM` floats into `out`.
     /// First per-kernel entry point landed in Phase 3; bit-exact
     /// against the C `mf_embed_lookup`.
-    pub fn embed(
-        &self,
-        token_id: i32,
-        out: &mut [f32],
-    ) -> Result<(), RsError> {
+    pub fn embed(&self, token_id: i32, out: &mut [f32]) -> Result<(), RsError> {
         embed_lookup(&self.wf, token_id, out).map_err(|_| RsError::EvalFailed)
     }
 
@@ -632,8 +604,7 @@ impl RsCtx<MetalBackend> {
         x: &[f32],
         out: &mut [f32],
     ) -> Result<(), RsError> {
-        rms_norm_cpu(&self.wf, weight_name, x, out)
-            .map_err(|_| RsError::EvalFailed)
+        rms_norm_cpu(&self.wf, weight_name, x, out).map_err(|_| RsError::EvalFailed)
     }
 
     /// Per-head CPU RMSNorm, mutating `x_inout` in place. The buffer
@@ -656,12 +627,7 @@ impl RsCtx<MetalBackend> {
     /// position `pos`. `q` is `num_attn_heads * head_dim` floats; `k`
     /// is `num_kv_heads * head_dim`. Bit-exact against
     /// `mf_apply_rotary_emb` on the same hardware.
-    pub fn apply_rotary_emb(
-        &self,
-        pos: i32,
-        q: &mut [f32],
-        k: &mut [f32],
-    ) -> Result<(), RsError> {
+    pub fn apply_rotary_emb(&self, pos: i32, q: &mut [f32], k: &mut [f32]) -> Result<(), RsError> {
         apply_rotary_emb(pos, q, k).map_err(|_| RsError::EvalFailed)
     }
 
@@ -678,18 +644,13 @@ impl RsCtx<MetalBackend> {
         v_cache: &[f32],
         out: &mut [f32],
     ) -> Result<(), RsError> {
-        sdpa_cpu(kv_len, q, q_gate, k_cache, v_cache, out)
-            .map_err(|_| RsError::EvalFailed)
+        sdpa_cpu(kv_len, q, q_gate, k_cache, v_cache, out).map_err(|_| RsError::EvalFailed)
     }
 
     /// CPU LM head matvec. `x` is `HIDDEN_DIM` floats (the post-final-
     /// norm hidden state); `out` is `VOCAB_SIZE` floats (raw logits).
     /// Bit-exact target against `mf_lm_head_cpu` on the same hardware.
-    pub fn lm_head_cpu(
-        &self,
-        x: &[f32],
-        out: &mut [f32],
-    ) -> Result<(), RsError> {
+    pub fn lm_head_cpu(&self, x: &[f32], out: &mut [f32]) -> Result<(), RsError> {
         lm_head_cpu(&self.wf, x, out).map_err(|_| RsError::EvalFailed)
     }
 
@@ -706,8 +667,7 @@ impl RsCtx<MetalBackend> {
         indices: &mut [i32],
         weights: &mut [f32],
     ) -> Result<(), RsError> {
-        moe_router_cpu(scores, k, indices, weights)
-            .map_err(|_| RsError::EvalFailed)
+        moe_router_cpu(scores, k, indices, weights).map_err(|_| RsError::EvalFailed)
     }
 
     /// Depthwise 1D conv step + SiLU. `weight_name` references a bf16
@@ -727,25 +687,13 @@ impl RsCtx<MetalBackend> {
             .wf
             .tensor_bytes(weight_name)
             .ok_or(RsError::EvalFailed)?;
-        conv1d_step(
-            conv_state,
-            new_input,
-            bytes,
-            channels,
-            kernel_size,
-            out,
-        )
-        .map_err(|_| RsError::EvalFailed)
+        conv1d_step(conv_state, new_input, bytes, channels, kernel_size, out)
+            .map_err(|_| RsError::EvalFailed)
     }
 
     /// Bare CPU RMSNorm (no weight). Bit-exact against
     /// `mf_rms_norm_bare_cpu` on the same hardware.
-    pub fn rms_norm_bare_cpu(
-        &self,
-        eps: f32,
-        x: &[f32],
-        out: &mut [f32],
-    ) -> Result<(), RsError> {
+    pub fn rms_norm_bare_cpu(&self, eps: f32, x: &[f32], out: &mut [f32]) -> Result<(), RsError> {
         rms_norm_bare(x, eps, out).map_err(|_| RsError::EvalFailed)
     }
 
@@ -759,8 +707,7 @@ impl RsCtx<MetalBackend> {
         z: &[f32],
         out: &mut [f32],
     ) -> Result<(), RsError> {
-        rms_norm_gated(&self.wf, weight_name, x, z, eps, out)
-            .map_err(|_| RsError::EvalFailed)
+        rms_norm_gated(&self.wf, weight_name, x, z, eps, out).map_err(|_| RsError::EvalFailed)
     }
 
     /// Gated-delta-net recurrence step. Loads `A_log` (f32) and
@@ -785,10 +732,8 @@ impl RsCtx<MetalBackend> {
         ssm_state: &mut [f32],
         out_values: &mut [f32],
     ) -> Result<(), RsError> {
-        let a_log_name =
-            format!("model.layers.{layer_idx}.linear_attn.A_log");
-        let dt_bias_name =
-            format!("model.layers.{layer_idx}.linear_attn.dt_bias");
+        let a_log_name = format!("model.layers.{layer_idx}.linear_attn.A_log");
+        let dt_bias_name = format!("model.layers.{layer_idx}.linear_attn.dt_bias");
         let a_log_bytes = self
             .wf
             .tensor_bytes(&a_log_name)
@@ -803,9 +748,7 @@ impl RsCtx<MetalBackend> {
         }
         let mut a_log = vec![0.0f32; v_heads];
         for (i, chunk) in a_log_bytes.chunks_exact(4).enumerate() {
-            a_log[i] = f32::from_le_bytes([
-                chunk[0], chunk[1], chunk[2], chunk[3],
-            ]);
+            a_log[i] = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
         }
 
         gated_delta_recurrence(
@@ -840,8 +783,7 @@ impl RsCtx<MetalBackend> {
         out: &mut [f32],
     ) -> Result<(), RsError> {
         let metal = self.metal_mut()?;
-        gpu_rms_norm_fused(metal, x, weight_bf16, out)
-            .map_err(|_| RsError::EvalFailed)
+        gpu_rms_norm_fused(metal, x, weight_bf16, out).map_err(|_| RsError::EvalFailed)
     }
 
     /// `attn_scores_batched` (slice 5d-7a). Per-head Q · K^T scaled.
@@ -860,8 +802,15 @@ impl RsCtx<MetalBackend> {
     ) -> Result<(), RsError> {
         let metal = self.metal_mut()?;
         gpu_attn_scores_batched(
-            metal, num_heads, num_kv_heads, head_dim, seq_len, q, k_cache,
-            scale, scores_out,
+            metal,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            seq_len,
+            q,
+            k_cache,
+            scale,
+            scores_out,
         )
         .map_err(|_| RsError::EvalFailed)
     }
@@ -893,8 +842,14 @@ impl RsCtx<MetalBackend> {
     ) -> Result<(), RsError> {
         let metal = self.metal_mut()?;
         gpu_attn_values_batched(
-            metal, num_heads, num_kv_heads, head_dim, seq_len, scores,
-            v_cache, out,
+            metal,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            seq_len,
+            scores,
+            v_cache,
+            out,
         )
         .map_err(|_| RsError::EvalFailed)
     }
@@ -907,8 +862,7 @@ impl RsCtx<MetalBackend> {
         x_inout: &mut [f32],
     ) -> Result<(), RsError> {
         let metal = self.metal_mut()?;
-        gpu_sigmoid_gate(metal, dim, gate, x_inout)
-            .map_err(|_| RsError::EvalFailed)
+        gpu_sigmoid_gate(metal, dim, gate, x_inout).map_err(|_| RsError::EvalFailed)
     }
 
     /// Read one expert's `EXPERT_SIZE`-byte 4-bit blob from disk
@@ -940,8 +894,7 @@ impl RsCtx<MetalBackend> {
         expert_out: &mut [f32],
     ) -> Result<(), RsError> {
         let metal = self.metal_mut()?;
-        gpu_expert_forward(metal, expert_data, h_post, expert_out)
-            .map_err(|_| RsError::EvalFailed)
+        gpu_expert_forward(metal, expert_data, h_post, expert_out).map_err(|_| RsError::EvalFailed)
     }
 
     /// Batched K-expert FFN forward + GPU combine (slice 9b). Encodes
@@ -964,15 +917,15 @@ impl RsCtx<MetalBackend> {
     ) -> Result<(), RsError> {
         self.ensure_backend()?;
         if self.moe_buffers.is_none() {
-            let pool =
-                self.backend.as_mut().expect("just-set").pool_mut();
+            let pool = self.backend.as_mut().expect("just-set").pool_mut();
             self.moe_buffers = Some(MoeBuffers::new(pool));
         }
         let Self {
-            backend, moe_buffers, ..
+            backend,
+            moe_buffers,
+            ..
         } = self;
-        let backend =
-            backend.as_mut().expect("ensure_backend just-set");
+        let backend = backend.as_mut().expect("ensure_backend just-set");
         let (metal, _wf_buf, pool) = backend.parts_mut();
         let bufs = moe_buffers.as_mut().expect("just-set");
         let payload = moe::expert_forward::ExpertPayload {
@@ -1011,9 +964,7 @@ impl RsCtx<MetalBackend> {
         hidden_in: &[f32],
         hidden_out: &mut [f32],
     ) -> Result<(), RsError> {
-        self.layer_forward_dump_inner(
-            layer_idx, pos, hidden_in, hidden_out, true,
-        )
+        self.layer_forward_dump_inner(layer_idx, pos, hidden_in, hidden_out, true)
     }
 
     /// As [`Self::layer_forward_dump`] but lets the caller select
@@ -1032,9 +983,7 @@ impl RsCtx<MetalBackend> {
         hidden_out: &mut [f32],
         gpu_combine: bool,
     ) -> Result<(), RsError> {
-        self.layer_forward_dump_inner(
-            layer_idx, pos, hidden_in, hidden_out, gpu_combine,
-        )
+        self.layer_forward_dump_inner(layer_idx, pos, hidden_in, hidden_out, gpu_combine)
     }
 
     fn layer_forward_dump_inner(
@@ -1052,14 +1001,12 @@ impl RsCtx<MetalBackend> {
         if pos < 0 {
             return Err(RsError::EvalFailed);
         }
-        if hidden_in.len() != v.hidden_dim || hidden_out.len() != v.hidden_dim
-        {
+        if hidden_in.len() != v.hidden_dim || hidden_out.len() != v.hidden_dim {
             return Err(RsError::EvalFailed);
         }
 
         let layer_idx_us = layer_idx as usize;
-        let is_full =
-            v.layer_kind(layer_idx_us) == variants::LayerKind::FullAttn;
+        let is_full = v.layer_kind(layer_idx_us) == variants::LayerKind::FullAttn;
 
         // Ensure all lazy resources exist.
         self.ensure_linear_resources()?;
@@ -1080,15 +1027,11 @@ impl RsCtx<MetalBackend> {
             ..
         } = self;
 
-        let backend =
-            backend.as_mut().expect("ensure_linear_resources");
+        let backend = backend.as_mut().expect("ensure_linear_resources");
         let (metal, wf_buf, buffer_pool) = backend.parts_mut();
-        let layer_caches =
-            layer_caches.as_ref().expect("ensure_linear_resources");
-        let linear_buffers =
-            linear_buffers.as_mut().expect("ensure_linear_resources");
-        let moe_buffers =
-            moe_buffers.as_mut().expect("ensure_linear_resources");
+        let layer_caches = layer_caches.as_ref().expect("ensure_linear_resources");
+        let linear_buffers = linear_buffers.as_mut().expect("ensure_linear_resources");
+        let moe_buffers = moe_buffers.as_mut().expect("ensure_linear_resources");
         let io_pool: &rayon::ThreadPool = &*io_pool;
 
         // Defensive: drain any leaked deferred state from a prior
@@ -1110,8 +1053,7 @@ impl RsCtx<MetalBackend> {
         unsafe {
             std::ptr::copy_nonoverlapping(
                 hidden_in.as_ptr(),
-                buffer_pool.handle(linear_buffers.input).contents()
-                    as *mut f32,
+                buffer_pool.handle(linear_buffers.input).contents() as *mut f32,
                 v.hidden_dim,
             );
         }
@@ -1237,12 +1179,8 @@ impl RsCtx<MetalBackend> {
         // persistent buffers before the next layer (or the test) can
         // overwrite them.
         self.layer_forward_dump(layer_idx, pos, hidden_in, hidden_out)?;
-        let bufs = self
-            .linear_buffers
-            .as_ref()
-            .ok_or(RsError::EvalFailed)?;
-        let pool =
-            self.backend.as_ref().ok_or(RsError::EvalFailed)?.pool();
+        let bufs = self.linear_buffers.as_ref().ok_or(RsError::EvalFailed)?;
+        let pool = self.backend.as_ref().ok_or(RsError::EvalFailed)?.pool();
         let v = VARIANT;
         let read_into = |buf: &::metal::Buffer, dst: Option<&mut [f32]>| {
             if let Some(dst) = dst {
@@ -1289,10 +1227,8 @@ impl RsCtx<MetalBackend> {
             } = self;
             let backend = backend.as_mut().expect("just-set");
             let (metal, wf_buf, _) = backend.parts_mut();
-            *lm_head_gpu = Some(
-                GpuLmHead::new(metal, wf, wf_buf)
-                    .map_err(|_| RsError::InitFailed)?,
-            );
+            *lm_head_gpu =
+                Some(GpuLmHead::new(metal, wf, wf_buf).map_err(|_| RsError::InitFailed)?);
         }
         // Lazy-allocate per-layer MLA KV caches in shared-storage Metal
         // buffers. Idempotent — `ensure_buffers` no-ops on already-
@@ -1314,54 +1250,42 @@ impl RsCtx<MetalBackend> {
         // Used by `step_internal_mla_gpu`; absent on the env-gated CPU
         // fallback path.
         if self.mla_buffers.is_none() {
-            self.mla_buffers =
-                Some(attn::mla_attn_forward::MlaForwardBuffers::new(&device));
+            self.mla_buffers = Some(attn::mla_attn_forward::MlaForwardBuffers::new(&device));
         }
         if self.mla_yarn.is_none() {
-            self.mla_yarn =
-                Some(attn::mla_attn_forward::MlaYarnTables::new(&device));
+            self.mla_yarn = Some(attn::mla_attn_forward::MlaYarnTables::new(&device));
         }
         if self.mla_pipes.is_none() {
-            let metal =
-                self.backend.as_mut().expect("just-set").metal_mut();
+            let metal = self.backend.as_mut().expect("just-set").metal_mut();
             self.mla_pipes = Some(
                 attn::mla_attn_forward::MlaForwardPipelines::new(metal)
                     .map_err(|_| RsError::InitFailed)?,
             );
         }
         // Phase 3 — full-GPU dense MLP + MoE for the MLA path.
-        if VARIANT.first_k_dense_replace > 0 && self.dense_mlp_bufs.is_none()
-        {
-            self.dense_mlp_bufs =
-                Some(backend::gpu::dense_mlp_gpu::DenseMlpBuffers::new(&device));
+        if VARIANT.first_k_dense_replace > 0 && self.dense_mlp_bufs.is_none() {
+            self.dense_mlp_bufs = Some(backend::gpu::dense_mlp_gpu::DenseMlpBuffers::new(&device));
         }
-        if VARIANT.first_k_dense_replace > 0
-            && self.dense_mlp_pipes.is_none()
-        {
-            let metal =
-                self.backend.as_mut().expect("just-set").metal_mut();
+        if VARIANT.first_k_dense_replace > 0 && self.dense_mlp_pipes.is_none() {
+            let metal = self.backend.as_mut().expect("just-set").metal_mut();
             self.dense_mlp_pipes = Some(
                 backend::gpu::dense_mlp_gpu::DenseMlpPipelines::fetch(metal)
                     .map_err(|_| RsError::InitFailed)?,
             );
         }
         if self.moe_buffers.is_none() {
-            let pool =
-                self.backend.as_mut().expect("just-set").pool_mut();
+            let pool = self.backend.as_mut().expect("just-set").pool_mut();
             self.moe_buffers = Some(MoeBuffers::new(pool));
         }
-        if self.shared_expert_bufs.is_none() && VARIANT.shared_intermediate > 0
-        {
-            self.shared_expert_bufs =
-                Some(moe::cogito_moe_gpu::SharedExpertBuffers::new(&device));
+        if self.shared_expert_bufs.is_none() && VARIANT.shared_intermediate > 0 {
+            self.shared_expert_bufs = Some(moe::cogito_moe_gpu::SharedExpertBuffers::new(&device));
         }
         // Phase 1 (cogito-v2 full-GPU): the GPU shared-expert SwiGLU
         // reuses `DenseMlpPipelines` (matvec + swiglu_fused are
         // dim-parametric), so even variants with `first_k_dense_replace
         // == 0` need the dense pipes if they have a shared expert.
         if self.dense_mlp_pipes.is_none() && VARIANT.shared_intermediate > 0 {
-            let metal =
-                self.backend.as_mut().expect("just-set").metal_mut();
+            let metal = self.backend.as_mut().expect("just-set").metal_mut();
             self.dense_mlp_pipes = Some(
                 backend::gpu::dense_mlp_gpu::DenseMlpPipelines::fetch(metal)
                     .map_err(|_| RsError::InitFailed)?,
@@ -1371,8 +1295,7 @@ impl RsCtx<MetalBackend> {
         // router gate. Only allocated for MLA variants (the linear-attn
         // path's gate is 8-bit dequant via the existing MatvecPipelines).
         if self.bf_matvec_pipes.is_none() {
-            let metal =
-                self.backend.as_mut().expect("just-set").metal_mut();
+            let metal = self.backend.as_mut().expect("just-set").metal_mut();
             self.bf_matvec_pipes = Some(
                 backend::gpu::gpu_matvec::BfMatvecPipelines::fetch(metal)
                     .map_err(|_| RsError::InitFailed)?,
@@ -1385,16 +1308,14 @@ impl RsCtx<MetalBackend> {
                 Some(backend::gpu::gpu_norm::MlaForwardScratch::new(&device));
         }
         if self.mla_norm_pipes.is_none() {
-            let metal =
-                self.backend.as_mut().expect("just-set").metal_mut();
+            let metal = self.backend.as_mut().expect("just-set").metal_mut();
             self.mla_norm_pipes = Some(
                 backend::gpu::gpu_norm::RmsNormBf16Pipelines::fetch(metal)
                     .map_err(|_| RsError::InitFailed)?,
             );
         }
         if self.residual_add_pipe.is_none() {
-            let metal =
-                self.backend.as_mut().expect("just-set").metal_mut();
+            let metal = self.backend.as_mut().expect("just-set").metal_mut();
             self.residual_add_pipe = Some(
                 metal
                     .pipeline("residual_add")
@@ -1413,8 +1334,7 @@ impl RsCtx<MetalBackend> {
         // `pread_teardown_landed.md` (2026-05-20).
         {
             let mode = self.expert_io_mode;
-            let pool =
-                self.backend.as_mut().expect("just-set").pool_mut();
+            let pool = self.backend.as_mut().expect("just-set").pool_mut();
             self.experts.attach_to_device(pool, mode);
         }
         // Prefill arc Phase 0b: register the GPU-resident KV cache for
@@ -1430,8 +1350,7 @@ impl RsCtx<MetalBackend> {
                 backend,
                 ..
             } = self;
-            let pool =
-                backend.as_mut().expect("just-set").pool_mut();
+            let pool = backend.as_mut().expect("just-set").pool_mut();
             for layer in layer_states.iter_mut() {
                 if let LayerState::FullAttn(kv) = layer {
                     kv.ensure_buffers(pool);
@@ -1439,15 +1358,13 @@ impl RsCtx<MetalBackend> {
             }
         }
         if self.layer_caches.is_none() {
-            let wf_buf =
-                self.backend.as_ref().expect("just-set").weight_buf();
-            let caches = LayerWeightCache::build_all(&self.wf, wf_buf)
-                .map_err(|_| RsError::InitFailed)?;
+            let wf_buf = self.backend.as_ref().expect("just-set").weight_buf();
+            let caches =
+                LayerWeightCache::build_all(&self.wf, wf_buf).map_err(|_| RsError::InitFailed)?;
             self.layer_caches = Some(caches);
         }
         if self.linear_buffers.is_none() {
-            let pool =
-                self.backend.as_mut().expect("just-set").pool_mut();
+            let pool = self.backend.as_mut().expect("just-set").pool_mut();
             self.linear_buffers = Some(LinearAttnBuffers::new(pool));
         }
         // Construction order matters: `LinearAttnGraphScratch` is
@@ -1457,49 +1374,34 @@ impl RsCtx<MetalBackend> {
         // persistent alloc, so the highest pool BufId stays persistent
         // and `reset_transient` keeps the transients above it.
         if self.linear_attn_graph_scratch.is_none() {
-            let pool =
-                self.backend.as_mut().expect("just-set").pool_mut();
-            self.linear_attn_graph_scratch = Some(
-                attn::linear_attn_forward::LinearAttnGraphScratch::new(
-                    pool,
-                ),
-            );
+            let pool = self.backend.as_mut().expect("just-set").pool_mut();
+            self.linear_attn_graph_scratch =
+                Some(attn::linear_attn_forward::LinearAttnGraphScratch::new(pool));
         }
         if self.full_attn_graph_scratch.is_none() {
-            let pool =
-                self.backend.as_mut().expect("just-set").pool_mut();
-            self.full_attn_graph_scratch = Some(
-                attn::full_attn_forward::FullAttnGraphScratch::new(pool),
-            );
+            let pool = self.backend.as_mut().expect("just-set").pool_mut();
+            self.full_attn_graph_scratch =
+                Some(attn::full_attn_forward::FullAttnGraphScratch::new(pool));
         }
         if self.moe_graph_scratch.is_none() {
             let k_active = self.k_active;
             let mode = self.expert_io_mode;
-            let pool =
-                self.backend.as_mut().expect("just-set").pool_mut();
-            self.moe_graph_scratch = Some(
-                attn::linear_attn_forward::MoeGraphScratch::new(
-                    pool, k_active, mode,
-                ),
-            );
+            let pool = self.backend.as_mut().expect("just-set").pool_mut();
+            self.moe_graph_scratch = Some(attn::linear_attn_forward::MoeGraphScratch::new(
+                pool, k_active, mode,
+            ));
         }
         if self.hidden_double_buffer.is_none() {
-            let pool =
-                self.backend.as_mut().expect("just-set").pool_mut();
-            self.hidden_double_buffer = Some(
-                attn::linear_attn_forward::HiddenDoubleBuffer::new(pool),
-            );
+            let pool = self.backend.as_mut().expect("just-set").pool_mut();
+            self.hidden_double_buffer =
+                Some(attn::linear_attn_forward::HiddenDoubleBuffer::new(pool));
         }
         if self.head_tail_scratch.is_none() {
-            let pool =
-                self.backend.as_mut().expect("just-set").pool_mut();
-            self.head_tail_scratch = Some(
-                attn::linear_attn_forward::HeadTailScratch::new(pool),
-            );
+            let pool = self.backend.as_mut().expect("just-set").pool_mut();
+            self.head_tail_scratch = Some(attn::linear_attn_forward::HeadTailScratch::new(pool));
         }
         if self.moe_buffers.is_none() {
-            let pool =
-                self.backend.as_mut().expect("just-set").pool_mut();
+            let pool = self.backend.as_mut().expect("just-set").pool_mut();
             self.moe_buffers = Some(MoeBuffers::new(pool));
         }
         if self.lm_head_gpu.is_none() {
@@ -1511,10 +1413,8 @@ impl RsCtx<MetalBackend> {
             } = self;
             let backend = backend.as_mut().expect("just-set");
             let (metal, wf_buf, _) = backend.parts_mut();
-            *lm_head_gpu = Some(
-                GpuLmHead::new(metal, wf, wf_buf)
-                    .map_err(|_| RsError::InitFailed)?,
-            );
+            *lm_head_gpu =
+                Some(GpuLmHead::new(metal, wf, wf_buf).map_err(|_| RsError::InitFailed)?);
         }
         Ok(())
     }
@@ -1573,15 +1473,10 @@ impl RsCtx<MetalBackend> {
             return Err(RsError::EvalFailed);
         }
         match eval_token_mode() {
-            EvalTokenMode::Oracle => self
-                .step_internal_per_token_oracle(
-                    token,
-                    pos as i32,
-                    Some(logits),
-                ),
-            EvalTokenMode::Batched => {
-                self.step_internal(&[token], pos as i32, Some(logits))
+            EvalTokenMode::Oracle => {
+                self.step_internal_per_token_oracle(token, pos as i32, Some(logits))
             }
+            EvalTokenMode::Batched => self.step_internal(&[token], pos as i32, Some(logits)),
         }
     }
 
@@ -1664,12 +1559,7 @@ impl RsCtx<MetalBackend> {
             } else {
                 None
             };
-            self.step_internal_batched_gqa(
-                chunk_tokens,
-                chunk_start_pos,
-                chunk_logits,
-                chunk_idx,
-            )?;
+            self.step_internal_batched_gqa(chunk_tokens, chunk_start_pos, chunk_logits, chunk_idx)?;
             chunk_start = chunk_end;
             chunk_idx += 1;
         }
@@ -1722,33 +1612,25 @@ impl RsCtx<MetalBackend> {
             prefetch,
             ..
         } = self;
-        let backend =
-            backend.as_mut().expect("ensure_linear_resources");
+        let backend = backend.as_mut().expect("ensure_linear_resources");
         // S10b-1a-ii: parts_mut destructure is now scoped per-branch
         // (full-attn branch inside the layer loop, post-loop block).
         // The linear-attn branch takes &mut backend directly so the
         // producer can `backend.execute(&graph)` itself in S10b-1b.
-        let layer_caches =
-            layer_caches.as_ref().expect("ensure_linear_resources");
-        let linear_buffers =
-            linear_buffers.as_mut().expect("ensure_linear_resources");
+        let layer_caches = layer_caches.as_ref().expect("ensure_linear_resources");
+        let linear_buffers = linear_buffers.as_mut().expect("ensure_linear_resources");
         let linear_attn_graph_scratch = linear_attn_graph_scratch
             .as_ref()
             .expect("ensure_linear_resources");
         let full_attn_graph_scratch = full_attn_graph_scratch
             .as_ref()
             .expect("ensure_linear_resources");
-        let moe_graph_scratch = moe_graph_scratch
-            .as_ref()
-            .expect("ensure_linear_resources");
+        let moe_graph_scratch = moe_graph_scratch.as_ref().expect("ensure_linear_resources");
         let hidden_double_buffer = hidden_double_buffer
             .as_ref()
             .expect("ensure_linear_resources");
-        let head_tail_scratch = head_tail_scratch
-            .as_ref()
-            .expect("ensure_linear_resources");
-        let moe_buffers =
-            moe_buffers.as_mut().expect("ensure_linear_resources");
+        let head_tail_scratch = head_tail_scratch.as_ref().expect("ensure_linear_resources");
+        let moe_buffers = moe_buffers.as_mut().expect("ensure_linear_resources");
 
         // Drain any stale deferred state — neither batched path uses
         // the ring, but a prior per-token oracle call on the same
@@ -1835,10 +1717,8 @@ impl RsCtx<MetalBackend> {
             // branches that key on `Some(prefetch_env)` are dead
             // code post-2026-05-20 pread teardown and will be
             // pruned alongside the task-7 A/B.
-            let prefetch_env: Option<attn::linear_attn_forward::PrefetchEnv> =
-                None;
-            let is_full = v.layer_kind(layer_idx)
-                == variants::LayerKind::FullAttn;
+            let prefetch_env: Option<attn::linear_attn_forward::PrefetchEnv> = None;
+            let is_full = v.layer_kind(layer_idx) == variants::LayerKind::FullAttn;
             if is_full {
                 let kv_state = full_kv_mut(layer_states, layer_idx)?;
                 // Prefill arc Phase 2: full-attn now mirrors the
@@ -1980,10 +1860,7 @@ impl RsCtx<MetalBackend> {
                     > = hidden_b_id.into();
                     tail.into()
                 },
-                input_off: ((n - 1)
-                    * hidden_dim
-                    * std::mem::size_of::<f32>())
-                    as u64,
+                input_off: ((n - 1) * hidden_dim * std::mem::size_of::<f32>()) as u64,
                 output: head_tail_scratch.logits.into(),
                 output_off: 0,
                 in_dim: hidden_dim as u32,
@@ -1995,10 +1872,7 @@ impl RsCtx<MetalBackend> {
                 .map_err(|_| RsError::EvalFailed)?;
             backend
                 .pool()
-                .download(
-                    head_tail_scratch.logits,
-                    bytemuck::cast_slice_mut(logits),
-                )
+                .download(head_tail_scratch.logits, bytemuck::cast_slice_mut(logits))
                 .expect("pool download logits");
         }
         // Release transient BufIds so the pool doesn't grow across
@@ -2027,9 +1901,9 @@ impl RsCtx<MetalBackend> {
         logits_out: Option<&mut [f32]>,
     ) -> Result<(), RsError> {
         use attn::mla_attn_cpu::mla_attn_layer_forward_cpu;
+        use attn::rope::{compute_yarn_inv_freq, yarn_get_mscale_full};
         use moe::mlp_cpu::dense_mlp_swiglu_cpu;
         use moe::moe_cpu::deepseek_moe_cpu;
-        use attn::rope::{compute_yarn_inv_freq, yarn_get_mscale_full};
         use variants::ROPE_THETA;
 
         self.ensure_mla_resources()?;
@@ -2045,8 +1919,7 @@ impl RsCtx<MetalBackend> {
         } = self;
         let backend = backend.as_mut().expect("ensure_mla_resources");
         let (metal, wf_buf, _) = backend.parts_mut();
-        let lm_head_gpu =
-            lm_head_gpu.as_ref().expect("ensure_mla_resources");
+        let lm_head_gpu = lm_head_gpu.as_ref().expect("ensure_mla_resources");
 
         // YaRN constants — recomputed per token; cache-worthy if perf
         // matters but it's microseconds vs the per-layer matvec cost.
@@ -2058,16 +1931,11 @@ impl RsCtx<MetalBackend> {
             v.yarn_beta_fast,
             v.yarn_beta_slow,
         );
-        let yarn_mscale = yarn_get_mscale_full(
-            v.yarn_factor,
-            v.yarn_mscale,
-            v.yarn_mscale_all_dim,
-        );
+        let yarn_mscale = yarn_get_mscale_full(v.yarn_factor, v.yarn_mscale, v.yarn_mscale_all_dim);
 
         // Embed → host hidden buffer.
         let mut hidden = vec![0.0f32; v.hidden_dim];
-        io::embedding::embed_lookup(wf, token, &mut hidden)
-            .map_err(|_| RsError::EvalFailed)?;
+        io::embedding::embed_lookup(wf, token, &mut hidden).map_err(|_| RsError::EvalFailed)?;
 
         // Per-layer scratch.
         let mut residual = vec![0.0f32; v.hidden_dim];
@@ -2077,8 +1945,7 @@ impl RsCtx<MetalBackend> {
         for layer_idx in 0..v.num_layers {
             // ---- Attention sub-block: residual = h; h = h + mla(norm(h)) ----
             residual.copy_from_slice(&hidden);
-            let pre_norm_name =
-                format!("model.layers.{layer_idx}.input_layernorm.weight");
+            let pre_norm_name = format!("model.layers.{layer_idx}.input_layernorm.weight");
             rms_norm_cpu(wf, &pre_norm_name, &hidden, &mut normed)
                 .map_err(|_| RsError::EvalFailed)?;
 
@@ -2105,9 +1972,8 @@ impl RsCtx<MetalBackend> {
 
             // ---- MLP sub-block: residual = h; h = h + mlp(norm(h)) ----
             residual.copy_from_slice(&hidden);
-            let post_norm_name = format!(
-                "model.layers.{layer_idx}.post_attention_layernorm.weight"
-            );
+            let post_norm_name =
+                format!("model.layers.{layer_idx}.post_attention_layernorm.weight");
             rms_norm_cpu(wf, &post_norm_name, &hidden, &mut normed)
                 .map_err(|_| RsError::EvalFailed)?;
 
@@ -2115,10 +1981,8 @@ impl RsCtx<MetalBackend> {
                 dense_mlp_swiglu_cpu(wf, layer_idx, &normed, &mut block_out)
                     .map_err(|_| RsError::EvalFailed)?;
             } else {
-                deepseek_moe_cpu(
-                    wf, experts, layer_idx, &normed, &mut block_out,
-                )
-                .map_err(|_| RsError::EvalFailed)?;
+                deepseek_moe_cpu(wf, experts, layer_idx, &normed, &mut block_out)
+                    .map_err(|_| RsError::EvalFailed)?;
             }
             for i in 0..v.hidden_dim {
                 hidden[i] = residual[i] + block_out[i];
@@ -2154,13 +2018,12 @@ impl RsCtx<MetalBackend> {
         pos: i32,
         logits_out: Option<&mut [f32]>,
     ) -> Result<(), RsError> {
-        use moe::cogito_moe_gpu::cogito_moe_layer_forward_gpu_buf_io;
+        use attn::mla_attn_forward::mla_attn_layer_forward_gpu;
         use backend::gpu::dense_mlp_gpu::encode_dense_mlp_layer_forward_gpu;
         use backend::gpu::gpu_norm::{
-            encode_buffer_copy_f32, encode_residual_add_into,
-            encode_rms_norm_bf16_into,
+            encode_buffer_copy_f32, encode_residual_add_into, encode_rms_norm_bf16_into,
         };
-        use attn::mla_attn_forward::mla_attn_layer_forward_gpu;
+        use moe::cogito_moe_gpu::cogito_moe_layer_forward_gpu_buf_io;
 
         self.ensure_mla_resources()?;
         let v = VARIANT;
@@ -2187,29 +2050,18 @@ impl RsCtx<MetalBackend> {
         } = self;
         let backend = backend.as_mut().expect("ensure_mla_resources");
         let (metal, wf_buf, pool) = backend.parts_mut();
-        let lm_head_gpu =
-            lm_head_gpu.as_ref().expect("ensure_mla_resources");
-        let mla_buffers =
-            mla_buffers.as_mut().expect("ensure_mla_resources");
+        let lm_head_gpu = lm_head_gpu.as_ref().expect("ensure_mla_resources");
+        let mla_buffers = mla_buffers.as_mut().expect("ensure_mla_resources");
         let mla_yarn = mla_yarn.as_ref().expect("ensure_mla_resources");
         let mla_pipes = mla_pipes.as_ref().expect("ensure_mla_resources");
-        let dense_mlp_bufs =
-            dense_mlp_bufs.as_mut().expect("ensure_mla_resources");
-        let dense_mlp_pipes =
-            dense_mlp_pipes.as_ref().expect("ensure_mla_resources");
-        let shared_expert_bufs =
-            shared_expert_bufs.as_ref().expect("ensure_mla_resources");
-        let bf_matvec_pipes =
-            bf_matvec_pipes.as_ref().expect("ensure_mla_resources");
-        let moe_buffers =
-            moe_buffers.as_mut().expect("ensure_mla_resources");
-        let scratch =
-            mla_residual_scratch.as_ref().expect("ensure_mla_resources");
-        let norm_pipes =
-            mla_norm_pipes.as_ref().expect("ensure_mla_resources");
-        let residual_add_pipe = residual_add_pipe
-            .as_ref()
-            .expect("ensure_mla_resources");
+        let dense_mlp_bufs = dense_mlp_bufs.as_mut().expect("ensure_mla_resources");
+        let dense_mlp_pipes = dense_mlp_pipes.as_ref().expect("ensure_mla_resources");
+        let shared_expert_bufs = shared_expert_bufs.as_ref().expect("ensure_mla_resources");
+        let bf_matvec_pipes = bf_matvec_pipes.as_ref().expect("ensure_mla_resources");
+        let moe_buffers = moe_buffers.as_mut().expect("ensure_mla_resources");
+        let scratch = mla_residual_scratch.as_ref().expect("ensure_mla_resources");
+        let norm_pipes = mla_norm_pipes.as_ref().expect("ensure_mla_resources");
+        let residual_add_pipe = residual_add_pipe.as_ref().expect("ensure_mla_resources");
 
         // Embed → host hidden vec → GPU scratch.hidden buffer (one
         // host->GPU bounce per token; the layer loop is fully GPU
@@ -2236,21 +2088,14 @@ impl RsCtx<MetalBackend> {
             // (called next) builds its own cmdbuf and the synchronous
             // `mla_buffers.pre_norm` host stage further down would race
             // with our normed write if we didn't wait.
-            let pre_norm_name = format!(
-                "model.layers.{layer_idx}.input_layernorm.weight"
-            );
+            let pre_norm_name = format!("model.layers.{layer_idx}.input_layernorm.weight");
             let pre_norm_off = wf_buf
                 .tensor_offset(wf, &pre_norm_name)
                 .map_err(|_| RsError::EvalFailed)?
                 .ok_or(RsError::EvalFailed)?;
             {
                 let cmdbuf = metal.queue().new_command_buffer();
-                encode_buffer_copy_f32(
-                    cmdbuf,
-                    &scratch.hidden,
-                    &scratch.residual,
-                    dim,
-                );
+                encode_buffer_copy_f32(cmdbuf, &scratch.hidden, &scratch.residual, dim);
                 encode_rms_norm_bf16_into(
                     cmdbuf,
                     norm_pipes,
@@ -2267,12 +2112,7 @@ impl RsCtx<MetalBackend> {
                 // from there) sees our normed input. Phase 5b refactor
                 // would parameterize mla_attn's input buffer; for now
                 // we add one GPU buffer-copy per layer.
-                encode_buffer_copy_f32(
-                    cmdbuf,
-                    &scratch.normed,
-                    &mla_buffers.pre_norm,
-                    dim,
-                );
+                encode_buffer_copy_f32(cmdbuf, &scratch.normed, &mla_buffers.pre_norm, dim);
                 cmdbuf.commit();
                 cmdbuf.wait_until_completed();
             }
@@ -2312,21 +2152,15 @@ impl RsCtx<MetalBackend> {
             }
 
             // ---- Pre-MLP block: residual := hidden, normed := rms_norm(hidden) ----
-            let post_norm_name = format!(
-                "model.layers.{layer_idx}.post_attention_layernorm.weight"
-            );
+            let post_norm_name =
+                format!("model.layers.{layer_idx}.post_attention_layernorm.weight");
             let post_norm_off = wf_buf
                 .tensor_offset(wf, &post_norm_name)
                 .map_err(|_| RsError::EvalFailed)?
                 .ok_or(RsError::EvalFailed)?;
             {
                 let cmdbuf = metal.queue().new_command_buffer();
-                encode_buffer_copy_f32(
-                    cmdbuf,
-                    &scratch.hidden,
-                    &scratch.residual,
-                    dim,
-                );
+                encode_buffer_copy_f32(cmdbuf, &scratch.hidden, &scratch.residual, dim);
                 encode_rms_norm_bf16_into(
                     cmdbuf,
                     norm_pipes,
@@ -2346,8 +2180,7 @@ impl RsCtx<MetalBackend> {
             // The post-MLP residual_add reads from whichever buffer the
             // dispatch wrote to (dense_mlp_bufs.out for dense, or
             // moe_buffers.moe_hidden for MoE).
-            let mlp_out: &Buffer = if layer_idx < v.first_k_dense_replace
-            {
+            let mlp_out: &Buffer = if layer_idx < v.first_k_dense_replace {
                 {
                     let cmdbuf = metal.queue().new_command_buffer();
                     encode_dense_mlp_layer_forward_gpu(
@@ -2476,8 +2309,7 @@ impl RsCtx<MetalBackend> {
         // host-only path (used as a diff oracle and as a last-resort
         // fallback if the GPU path regresses).
         if matches!(v.attn_kind, variants::AttnKind::Mla) {
-            let force_cpu =
-                std::env::var_os("MOEFLUX_FORCE_CPU_MLA").is_some();
+            let force_cpu = std::env::var_os("MOEFLUX_FORCE_CPU_MLA").is_some();
             return if force_cpu {
                 self.step_internal_mla_cpu(token, pos, logits_out)
             } else {
@@ -2504,17 +2336,12 @@ impl RsCtx<MetalBackend> {
             prefetch,
             ..
         } = self;
-        let backend =
-            backend.as_mut().expect("ensure_linear_resources");
+        let backend = backend.as_mut().expect("ensure_linear_resources");
         let (metal, wf_buf, buffer_pool) = backend.parts_mut();
-        let layer_caches =
-            layer_caches.as_ref().expect("ensure_linear_resources");
-        let linear_buffers =
-            linear_buffers.as_mut().expect("ensure_linear_resources");
-        let moe_buffers =
-            moe_buffers.as_mut().expect("ensure_linear_resources");
-        let lm_head_gpu =
-            lm_head_gpu.as_ref().expect("ensure_linear_resources");
+        let layer_caches = layer_caches.as_ref().expect("ensure_linear_resources");
+        let linear_buffers = linear_buffers.as_mut().expect("ensure_linear_resources");
+        let moe_buffers = moe_buffers.as_mut().expect("ensure_linear_resources");
+        let lm_head_gpu = lm_head_gpu.as_ref().expect("ensure_linear_resources");
         let io_pool: &rayon::ThreadPool = &*io_pool;
 
         // Defensive bracket — drain stale state from a buggy prior
@@ -2598,8 +2425,8 @@ impl RsCtx<MetalBackend> {
             // capacity) fires it as before.
             if prefetch.mode().is_pread() {
                 if let Some(predicted) = prefetch.predict_for(layer_idx) {
-                    let data_prefetch = moe_buffers
-                        .data_prefetch_slots_mut_array(buffer_pool, prefetch_set);
+                    let data_prefetch =
+                        moe_buffers.data_prefetch_slots_mut_array(buffer_pool, prefetch_set);
                     prefetch.dispatch(
                         layer_idx,
                         predicted,
@@ -2616,12 +2443,10 @@ impl RsCtx<MetalBackend> {
             // combine still writes to bufs.moe_hidden so the post-loop
             // final drain reads from it as before.
             let chain_next = layer_idx + 1 < v.num_layers;
-            let chain_next_norm_off = chain_next.then(|| {
-                layer_caches[layer_idx + 1].input_layernorm_w
-            });
+            let chain_next_norm_off =
+                chain_next.then(|| layer_caches[layer_idx + 1].input_layernorm_w);
 
-            let is_full = v.layer_kind(layer_idx)
-                == variants::LayerKind::FullAttn;
+            let is_full = v.layer_kind(layer_idx) == variants::LayerKind::FullAttn;
             if is_full {
                 let kv_state = full_kv_mut(layer_states, layer_idx)?;
                 let layer_ctx = backend::gpu::gpu_ctx::GpuLayerCtx {
@@ -2723,13 +2548,8 @@ impl RsCtx<MetalBackend> {
                 // Final RMSNorm (`model.norm.weight`) is CPU — small
                 // (HIDDEN_DIM = 2048), bit-exact against C per slice 1.
                 let mut hidden_normed = vec![0.0f32; v.hidden_dim];
-                rms_norm_cpu(
-                    wf,
-                    "model.norm.weight",
-                    &hidden_final,
-                    &mut hidden_normed,
-                )
-                .map_err(|_| RsError::EvalFailed)?;
+                rms_norm_cpu(wf, "model.norm.weight", &hidden_final, &mut hidden_normed)
+                    .map_err(|_| RsError::EvalFailed)?;
 
                 // LM head is GPU — was 59% of CPU time per the
                 // 2026-04-27 profile. The C path's `lm_head_forward`
@@ -2763,16 +2583,13 @@ impl RsCtx<MetalBackend> {
     /// freshly-allocated Ctx.
     pub fn memory_clear(&mut self) {
         clear_all(&mut self.layer_states);
-        if let (Some(bufs), Some(backend)) =
-            (self.linear_buffers.as_ref(), self.backend.as_ref())
-        {
+        if let (Some(bufs), Some(backend)) = (self.linear_buffers.as_ref(), self.backend.as_ref()) {
             let pool = backend.pool();
             bufs.reset_recurrence(pool);
-            // Slice 5d-7b — zero the GPU full-attn KV mirrors
-            // alongside the host-side clear. Without this, the GPU
-            // SDPA fast path would read stale k/v from the previous
-            // sequence at positions [0, prev_len).
-            bufs.reset_gpu_attn_kv_mirrors(pool);
+            // The canonical pool KV needs no GPU-side zeroing here:
+            // `clear_all` resets `kv_state.len` to 0, and the next
+            // sequence overwrites each row via append before any SDPA
+            // read, so positions [0, prev_len) are never read stale.
         }
         // Slice 5d-6b: drain any in-flight prefetch and clear all
         // last-token predictions. After memory_clear the next token
@@ -2839,9 +2656,7 @@ impl RsCtx<MetalBackend> {
         match self.checkpoints.insert(pos, buf) {
             Some(_) => {
                 // Overwrite: refresh LRU position.
-                if let Some(idx) =
-                    self.checkpoint_order.iter().position(|&p| p == pos)
-                {
+                if let Some(idx) = self.checkpoint_order.iter().position(|&p| p == pos) {
                     self.checkpoint_order.remove(idx);
                 }
             }
@@ -2914,9 +2729,7 @@ impl RsCtx<MetalBackend> {
     /// pos-0) alive in the bounded LRU.
     pub fn forget_pos(&mut self, pos: i32) {
         if self.checkpoints.remove(&pos).is_some() {
-            if let Some(idx) =
-                self.checkpoint_order.iter().position(|&p| p == pos)
-            {
+            if let Some(idx) = self.checkpoint_order.iter().position(|&p| p == pos) {
                 self.checkpoint_order.remove(idx);
             }
         }
@@ -3008,8 +2821,9 @@ impl RsCtx<MetalBackend> {
         // is supposed to be a stand-alone restoration primitive.
         // For Mla variants, ensure_linear_resources fails (no
         // linear-attn tensors); for Gqa variants we still need it to
-        // populate gpu_kv_k/v mirrors. Run it best-effort and pass
-        // linear_buffers as Option — the Mla path doesn't read it.
+        // allocate the linear-attn recurrence buffers the load path
+        // pushes into. Run it best-effort and pass linear_buffers as
+        // Option — the Mla path doesn't read it.
         let _ = self.ensure_linear_resources();
         // Always need a Metal device for MLA buffer alloc on load. It
         // exists if either ensure_linear_resources or any prior eval
@@ -3089,15 +2903,13 @@ pub enum RsError {
 
 #[cfg(test)]
 mod variant_guard_tests {
-    use super::{check_variant_dims, RsError, VARIANT};
+    use super::{RsError, VARIANT, check_variant_dims};
 
     /// The dims this binary was actually built for pass cleanly.
     #[test]
     fn matching_dims_ok() {
         let top = VARIANT.num_layers - 1;
-        assert!(
-            check_variant_dims(Some(top), Some(VARIANT.hidden_dim)).is_ok()
-        );
+        assert!(check_variant_dims(Some(top), Some(VARIANT.hidden_dim)).is_ok());
     }
 
     /// A manifest with no `model.layers.*` tensors is rejected.
@@ -3114,10 +2926,7 @@ mod variant_guard_tests {
     fn wrong_layer_count_rejected() {
         // `top == num_layers` means count `num_layers + 1` — a mismatch.
         assert!(matches!(
-            check_variant_dims(
-                Some(VARIANT.num_layers),
-                Some(VARIANT.hidden_dim),
-            ),
+            check_variant_dims(Some(VARIANT.num_layers), Some(VARIANT.hidden_dim),),
             Err(RsError::ModelMismatch { .. })
         ));
     }
@@ -3126,10 +2935,7 @@ mod variant_guard_tests {
     #[test]
     fn wrong_hidden_dim_rejected() {
         assert!(matches!(
-            check_variant_dims(
-                Some(VARIANT.num_layers - 1),
-                Some(VARIANT.hidden_dim + 1),
-            ),
+            check_variant_dims(Some(VARIANT.num_layers - 1), Some(VARIANT.hidden_dim + 1),),
             Err(RsError::ModelMismatch { .. })
         ));
     }

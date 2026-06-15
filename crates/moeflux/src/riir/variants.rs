@@ -314,9 +314,7 @@ impl Variant {
         self.expert_block_bytes_4bit() + self.expert_weight_bytes_4bit()
     }
     pub const fn up_b_off_4bit(&self) -> usize {
-        self.expert_block_bytes_4bit()
-            + self.expert_weight_bytes_4bit()
-            + self.expert_scale_bytes()
+        self.expert_block_bytes_4bit() + self.expert_weight_bytes_4bit() + self.expert_scale_bytes()
     }
     pub const fn down_w_off_4bit(&self) -> usize {
         2 * self.expert_block_bytes_4bit()
@@ -558,8 +556,7 @@ const _: () = {
             "num_attn_heads must be a multiple of num_kv_heads (GQA)"
         );
         assert!(
-            (VARIANT.num_attn_heads * VARIANT.head_dim) % VARIANT.hidden_dim
-                == 0,
+            (VARIANT.num_attn_heads * VARIANT.head_dim) % VARIANT.hidden_dim == 0,
             "num_attn_heads * head_dim must be a multiple of hidden_dim"
         );
     }

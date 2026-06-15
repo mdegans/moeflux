@@ -73,7 +73,11 @@ pub enum GraphError {
     #[error("buffer id {0} out of range")]
     BadBufId(u32),
     #[error("buffer size mismatch for {label:?}: expected {expected} bytes, got {actual}")]
-    SizeMismatch { label: &'static str, expected: usize, actual: usize },
+    SizeMismatch {
+        label: &'static str,
+        expected: usize,
+        actual: usize,
+    },
     /// Backend-specific error escape hatch. Used by [`Backend::open`]
     /// impls to box their typed init error (e.g. `MetalError`) without
     /// forcing this module to depend on backend-specific symbols.
@@ -120,11 +124,7 @@ pub trait BufferPool {
 
     /// Bulk-copy `host` bytes into the buffer at `id`. Prefix semantics
     /// (see trait doc).
-    fn upload<B: Buf>(
-        &mut self,
-        id: BufId<B>,
-        host: &[u8],
-    ) -> Result<(), Self::Error>;
+    fn upload<B: Buf>(&mut self, id: BufId<B>, host: &[u8]) -> Result<(), Self::Error>;
 
     /// Bulk-copy `host` bytes into the buffer at `id` starting at
     /// byte `offset`. `offset + host.len()` must fit the buffer or
@@ -139,11 +139,7 @@ pub trait BufferPool {
     /// Bulk-copy bytes out of the buffer at `id` into `host`. Used
     /// for the routing readback at the two-phase split. Prefix
     /// semantics mirror [`Self::upload`].
-    fn download<B: Buf>(
-        &self,
-        id: BufId<B>,
-        host: &mut [u8],
-    ) -> Result<(), Self::Error>;
+    fn download<B: Buf>(&self, id: BufId<B>, host: &mut [u8]) -> Result<(), Self::Error>;
 
     /// Release all non-persistent allocations. Persistent buffers
     /// keep their `BufId`s; transient ones are eligible to be
@@ -256,19 +252,12 @@ pub trait Backend {
     /// - **CPU:** no-op (already executed inline during
     ///   [`Self::encode_op`]).
     /// - **CoreML (future):** `executable.run()`.
-    fn submit_and_wait(
-        &self,
-        ctx: Self::EncodeCtx,
-        label: &'static str,
-    ) -> Result<(), Self::Error>;
+    fn submit_and_wait(&self, ctx: Self::EncodeCtx, label: &'static str)
+    -> Result<(), Self::Error>;
 
     /// Convenience: full begin → encode → submit cycle. `label` tags
     /// the submission for per-label timing — see [`Self::submit_and_wait`].
-    fn execute(
-        &self,
-        graph: &Graph,
-        label: &'static str,
-    ) -> Result<(), Self::Error> {
+    fn execute(&self, graph: &Graph, label: &'static str) -> Result<(), Self::Error> {
         let mut ctx = self.begin_encoding();
         self.encode_graph(graph, &mut ctx);
         self.submit_and_wait(ctx, label)
@@ -875,9 +864,7 @@ impl Op {
                 shared_gate.raw(),
             ],
             Op::Conv1dStepNTokens {
-                qkv_in,
-                conv_state,
-                ..
+                qkv_in, conv_state, ..
             } => vec![qkv_in.raw(), conv_state.raw()],
             Op::ComputeDecayBetaNTokens {
                 alpha_in, beta_in, ..
@@ -888,24 +875,14 @@ impl Op {
                 g_decay,
                 beta_gate,
                 ..
-            } => vec![
-                state.raw(),
-                conv_out.raw(),
-                g_decay.raw(),
-                beta_gate.raw(),
-            ],
+            } => vec![state.raw(), conv_out.raw(), g_decay.raw(), beta_gate.raw()],
             Op::GatedDeltaNetChunkwise {
                 state,
                 conv_out,
                 g_decay,
                 beta_gate,
                 ..
-            } => vec![
-                state.raw(),
-                conv_out.raw(),
-                g_decay.raw(),
-                beta_gate.raw(),
-            ],
+            } => vec![state.raw(), conv_out.raw(), g_decay.raw(), beta_gate.raw()],
             Op::GatedRmsNormNTokens { values, z, .. } => {
                 vec![values.raw(), z.raw()]
             }
@@ -1094,7 +1071,12 @@ mod tests {
         });
         g.push(Op::MatvecNTokens {
             label: "q_proj",
-            weight: WeightRef { w_off: 0, s_off: 0, b_off: 0, bits: 4 },
+            weight: WeightRef {
+                w_off: 0,
+                s_off: 0,
+                b_off: 0,
+                bits: 4,
+            },
             input: buf::<AttnInputBuf>(6).into(),
             input_off: 0,
             output: buf::<QProjOutBuf>(7).into(),
@@ -1252,7 +1234,12 @@ mod tests {
         g.push(Op::EmbedGatherNTokens {
             label: "embed_gather",
             token_ids: buf::<TokenIdsBuf>(50),
-            weight: WeightRef { w_off: 0, s_off: 0, b_off: 0, bits: 4 },
+            weight: WeightRef {
+                w_off: 0,
+                s_off: 0,
+                b_off: 0,
+                bits: 4,
+            },
             hidden_out: buf::<EmbedOutBuf>(51),
             hidden_dim: 2048,
             n_tokens: 8,
@@ -1415,5 +1402,4 @@ mod tests {
         let id: BufId<MoeInputBuf> = BufId::from_raw(42);
         assert_eq!(format!("{id}"), "%42");
     }
-
 }

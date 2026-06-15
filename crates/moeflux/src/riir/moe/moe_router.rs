@@ -32,19 +32,13 @@
 /// Errors specific to the MoE router port.
 #[derive(Debug, thiserror::Error)]
 pub enum MoeRouterError {
-    #[error(
-        "k {k} must satisfy 1 ≤ k ≤ scores.len() ({n})"
-    )]
+    #[error("k {k} must satisfy 1 ≤ k ≤ scores.len() ({n})")]
     BadK { k: usize, n: usize },
     #[error("scores empty")]
     EmptyScores,
-    #[error(
-        "indices length {got} != k {k}"
-    )]
+    #[error("indices length {got} != k {k}")]
     IndicesLen { got: usize, k: usize },
-    #[error(
-        "weights length {got} != k {k}"
-    )]
+    #[error("weights length {got} != k {k}")]
     WeightsLen { got: usize, k: usize },
 }
 
@@ -435,8 +429,7 @@ mod tests {
         let mut idx = [0i32; 3];
         let mut val = [0.0f32; 3];
         topk(&scores, 3, &mut idx, &mut val).unwrap();
-        let mut pairs: Vec<(i32, f32)> =
-            idx.iter().copied().zip(val.iter().copied()).collect();
+        let mut pairs: Vec<(i32, f32)> = idx.iter().copied().zip(val.iter().copied()).collect();
         pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
         assert_eq!(pairs[0].0, 3); // 0.9
         assert_eq!(pairs[1].0, 1); // 0.5
@@ -501,8 +494,11 @@ mod tests {
 
         // Weights, sorted by their parallel index, must be:
         // idx 5 → 1.1822, idx 7 → 1.3178 (within tolerance).
-        let mut pairs: Vec<(i32, f32)> =
-            indices.iter().copied().zip(weights.iter().copied()).collect();
+        let mut pairs: Vec<(i32, f32)> = indices
+            .iter()
+            .copied()
+            .zip(weights.iter().copied())
+            .collect();
         pairs.sort_by_key(|&(i, _)| i);
 
         let tol = 1e-3;
@@ -570,10 +566,8 @@ mod tests {
         // We re-derive group selection from the inputs and assert
         // coverage. (Defensive: catches off-by-one in the mask.)
         let group_size = n_experts / n_group;
-        let chosen_groups: std::collections::HashSet<usize> = indices
-            .iter()
-            .map(|&i| (i as usize) / group_size)
-            .collect();
+        let chosen_groups: std::collections::HashSet<usize> =
+            indices.iter().map(|&i| (i as usize) / group_size).collect();
         assert!(
             chosen_groups.len() <= topk_group,
             "selected experts span {} groups, must be ≤ {topk_group}",
@@ -581,8 +575,7 @@ mod tests {
         );
 
         // No duplicate indices.
-        let unique: std::collections::HashSet<i32> =
-            indices.iter().copied().collect();
+        let unique: std::collections::HashSet<i32> = indices.iter().copied().collect();
         assert_eq!(unique.len(), k, "duplicate expert indices in output");
     }
 
@@ -649,11 +642,7 @@ mod tests {
             sorted.sort();
             let len = sorted.len();
             sorted.dedup();
-            assert_eq!(
-                sorted.len(),
-                len,
-                "duplicate token in bucket {bi}"
-            );
+            assert_eq!(sorted.len(), len, "duplicate token in bucket {bi}");
         }
     }
 

@@ -49,24 +49,16 @@ unsafe extern "C" {
 pub enum RopeError {
     #[error("position must be non-negative (got {pos})")]
     NegativePos { pos: i32 },
-    #[error(
-        "Q buffer length {got} != num_attn_heads * head_dim ({expected})"
-    )]
+    #[error("Q buffer length {got} != num_attn_heads * head_dim ({expected})")]
     QLen { got: usize, expected: usize },
-    #[error(
-        "K buffer length {got} != num_kv_heads * head_dim ({expected})"
-    )]
+    #[error("K buffer length {got} != num_kv_heads * head_dim ({expected})")]
     KLen { got: usize, expected: usize },
 }
 
 /// Apply rotary position embedding to Q and K at position `pos`.
 /// `q` and `k` are mutated in place. Shape comes from the active
 /// `VARIANT`.
-pub fn apply_rotary_emb(
-    pos: i32,
-    q: &mut [f32],
-    k: &mut [f32],
-) -> Result<(), RopeError> {
+pub fn apply_rotary_emb(pos: i32, q: &mut [f32], k: &mut [f32]) -> Result<(), RopeError> {
     if pos < 0 {
         return Err(RopeError::NegativePos { pos });
     }
@@ -99,9 +91,7 @@ pub fn apply_rotary_emb(
         for i in 0..half {
             // SAFETY: cosf/sinf/powf are scalar libm functions with
             // no preconditions beyond well-formed f32 inputs.
-            let freq = unsafe {
-                1.0f32 / powf(ROPE_THETA, (2 * i) as f32 / rdim_f)
-            };
+            let freq = unsafe { 1.0f32 / powf(ROPE_THETA, (2 * i) as f32 / rdim_f) };
             let angle = pos_f * freq;
             let cos_a = unsafe { cosf(angle) };
             let sin_a = unsafe { sinf(angle) };
@@ -114,9 +104,7 @@ pub fn apply_rotary_emb(
     for h in 0..num_kv_heads {
         let kh = &mut k[h * head_dim..h * head_dim + head_dim];
         for i in 0..half {
-            let freq = unsafe {
-                1.0f32 / powf(ROPE_THETA, (2 * i) as f32 / rdim_f)
-            };
+            let freq = unsafe { 1.0f32 / powf(ROPE_THETA, (2 * i) as f32 / rdim_f) };
             let angle = pos_f * freq;
             let cos_a = unsafe { cosf(angle) };
             let sin_a = unsafe { sinf(angle) };
@@ -160,8 +148,7 @@ pub fn yarn_find_correction_dim(
 ) -> f32 {
     let two_pi = 2.0f32 * std::f32::consts::PI;
     let ln_base = base.ln();
-    (dim as f32 * (max_position_embeddings / (num_rotations * two_pi)).ln())
-        / (2.0 * ln_base)
+    (dim as f32 * (max_position_embeddings / (num_rotations * two_pi)).ln()) / (2.0 * ln_base)
 }
 
 /// Find `(low, high)` correction range. `beta_fast` controls the
@@ -176,12 +163,8 @@ pub fn yarn_find_correction_range(
     base: f32,
     max_position_embeddings: f32,
 ) -> (f32, f32) {
-    let low =
-        yarn_find_correction_dim(beta_fast, dim, base, max_position_embeddings)
-            .floor();
-    let high =
-        yarn_find_correction_dim(beta_slow, dim, base, max_position_embeddings)
-            .ceil();
+    let low = yarn_find_correction_dim(beta_fast, dim, base, max_position_embeddings).floor();
+    let high = yarn_find_correction_dim(beta_slow, dim, base, max_position_embeddings).ceil();
     let dim_max = (dim - 1) as f32;
     (low.clamp(0.0, dim_max), high.clamp(0.0, dim_max))
 }
@@ -204,11 +187,7 @@ pub fn yarn_get_mscale(scale: f32, mscale: f32) -> f32 {
 /// calls, with `mscale_all_dim` as the divisor). This factor is
 /// multiplied into both `cos`/`sin` AND the attention softmax scale
 /// (squared in the latter case — `softmax_scale *= mscale * mscale`).
-pub fn yarn_get_mscale_full(
-    scale: f32,
-    mscale: f32,
-    mscale_all_dim: f32,
-) -> f32 {
+pub fn yarn_get_mscale_full(scale: f32, mscale: f32, mscale_all_dim: f32) -> f32 {
     yarn_get_mscale(scale, mscale) / yarn_get_mscale(scale, mscale_all_dim)
 }
 
@@ -264,13 +243,8 @@ pub fn compute_yarn_inv_freq(
     // Smooth ramp: high-frequency dims (small i) stay at extra;
     // low-frequency dims (large i) switch to inter. The mask returns
     // 1.0 → keep extra, 0.0 → use inter.
-    let (low, high) = yarn_find_correction_range(
-        beta_fast,
-        beta_slow,
-        dim,
-        base,
-        original_max_position,
-    );
+    let (low, high) =
+        yarn_find_correction_range(beta_fast, beta_slow, dim, base, original_max_position);
     let ramp = yarn_linear_ramp_mask(low, high, half);
     // Reference uses `(1 - ramp)` as the keep-extra mask, so:
     // inv_freq = freq_inter * (1 - mask) + freq_extra * mask
@@ -278,8 +252,7 @@ pub fn compute_yarn_inv_freq(
     let mut inv_freq = Vec::with_capacity(half);
     for i in 0..half {
         let mask_extra = 1.0 - ramp[i];
-        inv_freq
-            .push(freq_inter[i] * ramp[i] + freq_extra[i] * mask_extra);
+        inv_freq.push(freq_inter[i] * ramp[i] + freq_extra[i] * mask_extra);
     }
     inv_freq
 }
@@ -409,18 +382,10 @@ mod tests {
         let beta_fast = 32.0f32;
         let beta_slow = 1.0f32;
 
-        let inv = compute_yarn_inv_freq(
-            dim,
-            base,
-            factor,
-            original_max,
-            beta_fast,
-            beta_slow,
-        );
+        let inv = compute_yarn_inv_freq(dim, base, factor, original_max, beta_fast, beta_slow);
         assert_eq!(inv.len(), dim / 2);
         for i in 0..dim / 2 {
-            let expected =
-                1.0 / unsafe { powf(base, (2 * i) as f32 / dim as f32) };
+            let expected = 1.0 / unsafe { powf(base, (2 * i) as f32 / dim as f32) };
             // factor=1 makes freq_extra == freq_inter, so the ramp
             // blend is the identity. Tolerance for f32 powf drift.
             let diff = (inv[i] - expected).abs();
@@ -439,12 +404,10 @@ mod tests {
     #[test]
     fn yarn_inv_freq_is_monotone_decreasing() {
         let inv = compute_yarn_inv_freq(
-            64,    // qk_rope_head_dim
-            10_000.0,
-            40.0,  // factor
-            4096.0,
-            32.0,  // beta_fast
-            1.0,   // beta_slow
+            64, // qk_rope_head_dim
+            10_000.0, 40.0, // factor
+            4096.0, 32.0, // beta_fast
+            1.0,  // beta_slow
         );
         for i in 1..inv.len() {
             assert!(
@@ -462,14 +425,7 @@ mod tests {
     fn yarn_rope_at_pos_zero_mscale_one_is_identity() {
         let rotary_dim = 64;
         let num_heads = 4;
-        let inv_freq = compute_yarn_inv_freq(
-            rotary_dim,
-            10_000.0,
-            40.0,
-            4096.0,
-            32.0,
-            1.0,
-        );
+        let inv_freq = compute_yarn_inv_freq(rotary_dim, 10_000.0, 40.0, 4096.0, 32.0, 1.0);
         let mut x: Vec<f32> = (0..num_heads * rotary_dim)
             .map(|i| i as f32 * 0.01)
             .collect();

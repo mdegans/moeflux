@@ -105,9 +105,7 @@ impl MtlWeightBuf {
                 // second tensor's offset is independent evidence that
                 // the manifest and the mmap agree. Skipped if the
                 // manifest has only one entry.
-                if let Some((name2, info2)) =
-                    wf.iter().find(|(n, _)| *n != name)
-                {
+                if let Some((name2, info2)) = wf.iter().find(|(n, _)| *n != name) {
                     if let Some(bytes2) = wf.tensor_bytes(name2) {
                         debug_assert_eq!(
                             bytes2.as_ptr() as usize,
@@ -192,10 +190,7 @@ impl std::fmt::Debug for MtlWeightBuf {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MtlWeightBuf")
             .field("aligned_len", &self.aligned_len)
-            .field(
-                "size_gb",
-                &(self.aligned_len as f64 / 1e9),
-            )
+            .field("size_gb", &(self.aligned_len as f64 / 1e9))
             .finish()
     }
 }

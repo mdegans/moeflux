@@ -45,23 +45,19 @@
 //! consumer drops 2-bit support — `MoefluxEngine` currently exposes
 //! `use_2bit` so users can opt in.
 
-use metal::{
-    Buffer, BufferRef, CommandBufferRef, ComputePipelineState, MTLSize,
-    NSUInteger,
-};
+use metal::{Buffer, BufferRef, CommandBufferRef, ComputePipelineState, MTLSize, NSUInteger};
 
 use moeflux_metal::{GatherQmmCall, Kernels, QuantWeights};
 
 use crate::riir::backend::buftype::DeprecatedCogitoBuf;
-use crate::riir::backend::{BufId, BufferPool, MetalBufferPool};
-use crate::riir::backend::gpu::gpu_matvec::{encode_matvec_n_tokens, MatvecPipelines};
-use crate::riir::backend::gpu::gpu_norm::{encode_rms_norm_bf16_into, RmsNormBf16Pipelines};
+use crate::riir::backend::gpu::gpu_matvec::{MatvecPipelines, encode_matvec_n_tokens};
+use crate::riir::backend::gpu::gpu_norm::{RmsNormBf16Pipelines, encode_rms_norm_bf16_into};
 use crate::riir::backend::gpu::metal::{
-    buffer_as_mut_slice, buffer_as_slice, MetalContext, MetalError,
-    MtlBuffer,
+    MetalContext, MetalError, MtlBuffer, buffer_as_mut_slice, buffer_as_slice,
 };
+use crate::riir::backend::{BufId, BufferPool, MetalBufferPool};
 use crate::riir::moe::moe_router::ExpertBuckets;
-use crate::riir::variants::{SharedExpertGate, Variant, GROUP_SIZE, VARIANT};
+use crate::riir::variants::{GROUP_SIZE, SharedExpertGate, VARIANT, Variant};
 
 /// Pipeline name for the MoE combine kernel — varies by variant.
 /// Cogito-V2 / DeepSeek-V3 use the unscaled raw-add path; Qwen3 MoE
@@ -137,9 +133,7 @@ pub enum ExpertForwardError {
     BadSharedOutLen { expected: usize, actual: usize },
     #[error("hidden_out must be HIDDEN_DIM={expected} floats, got {actual}")]
     BadHiddenOutLen { expected: usize, actual: usize },
-    #[error(
-        "actual_K out of range: must be 1..={max}, got {actual}"
-    )]
+    #[error("actual_K out of range: must be 1..={max}, got {actual}")]
     BadK { actual: i32, max: usize },
     #[error("expert_weights must be {expected} floats, got {actual}")]
     BadWeightsLen { expected: usize, actual: usize },
@@ -410,26 +404,14 @@ impl MoeBuffers {
         let v: Variant = VARIANT;
         const TWO_MIB: usize = 2 * 1024 * 1024;
         let f32_size = std::mem::size_of::<f32>();
-        let data_synced: [BufId<DeprecatedCogitoBuf>; MAX_K] =
+        let data_synced: [BufId<DeprecatedCogitoBuf>; MAX_K] = std::array::from_fn(|_| {
+            pool.alloc_aligned(v.expert_size_4bit(), TWO_MIB, "moe.data_synced", true)
+        });
+        let data_prefetch: [[BufId<DeprecatedCogitoBuf>; MAX_K]; 2] = std::array::from_fn(|_| {
             std::array::from_fn(|_| {
-                pool.alloc_aligned(
-                    v.expert_size_4bit(),
-                    TWO_MIB,
-                    "moe.data_synced",
-                    true,
-                )
-            });
-        let data_prefetch: [[BufId<DeprecatedCogitoBuf>; MAX_K]; 2] =
-            std::array::from_fn(|_| {
-                std::array::from_fn(|_| {
-                    pool.alloc_aligned(
-                        v.expert_size_4bit(),
-                        TWO_MIB,
-                        "moe.data_prefetch",
-                        true,
-                    )
-                })
-            });
+                pool.alloc_aligned(v.expert_size_4bit(), TWO_MIB, "moe.data_prefetch", true)
+            })
+        });
         // Defense-in-depth: assert 2 MiB alignment held. The pool's
         // `alloc_aligned` is posix_memalign-equivalent by construction;
         // a release-mode failure would indicate a global-allocator bug
@@ -448,33 +430,22 @@ impl MoeBuffers {
         probe("synced", &data_synced[..]);
         probe("prefetch[0]", &data_prefetch[0][..]);
         probe("prefetch[1]", &data_prefetch[1][..]);
-        let gate: [BufId<DeprecatedCogitoBuf>; MAX_K] =
-            std::array::from_fn(|_| {
-                pool.alloc(
-                    v.moe_intermediate * f32_size,
-                    "moe.gate",
-                    true,
-                )
+        let gate: [BufId<DeprecatedCogitoBuf>; MAX_K] = std::array::from_fn(|_| {
+            pool.alloc(v.moe_intermediate * f32_size, "moe.gate", true)
                 .expect("pool.alloc moe.gate")
-            });
-        let up: [BufId<DeprecatedCogitoBuf>; MAX_K] = std::array::from_fn(
-            |_| {
-                pool.alloc(v.moe_intermediate * f32_size, "moe.up", true)
-                    .expect("pool.alloc moe.up")
-            },
-        );
-        let act: [BufId<DeprecatedCogitoBuf>; MAX_K] = std::array::from_fn(
-            |_| {
-                pool.alloc(v.moe_intermediate * f32_size, "moe.act", true)
-                    .expect("pool.alloc moe.act")
-            },
-        );
-        let out: [BufId<DeprecatedCogitoBuf>; MAX_K] = std::array::from_fn(
-            |_| {
-                pool.alloc(v.hidden_dim * f32_size, "moe.out", true)
-                    .expect("pool.alloc moe.out")
-            },
-        );
+        });
+        let up: [BufId<DeprecatedCogitoBuf>; MAX_K] = std::array::from_fn(|_| {
+            pool.alloc(v.moe_intermediate * f32_size, "moe.up", true)
+                .expect("pool.alloc moe.up")
+        });
+        let act: [BufId<DeprecatedCogitoBuf>; MAX_K] = std::array::from_fn(|_| {
+            pool.alloc(v.moe_intermediate * f32_size, "moe.act", true)
+                .expect("pool.alloc moe.act")
+        });
+        let out: [BufId<DeprecatedCogitoBuf>; MAX_K] = std::array::from_fn(|_| {
+            pool.alloc(v.hidden_dim * f32_size, "moe.out", true)
+                .expect("pool.alloc moe.out")
+        });
         let k_max = v.num_experts_per_tok;
         let gate_flat = pool
             .alloc(k_max * v.moe_intermediate * f32_size, "moe.gate_flat", true)
@@ -504,11 +475,7 @@ impl MoeBuffers {
             .alloc(18 * f32_size, "moe.combine_params", true)
             .expect("pool.alloc moe.combine_params");
         let gate_logits: BufId<DeprecatedCogitoBuf> = pool
-            .alloc(
-                v.num_experts.max(1) * f32_size,
-                "moe.gate_logits",
-                true,
-            )
+            .alloc(v.num_experts.max(1) * f32_size, "moe.gate_logits", true)
             .expect("pool.alloc moe.gate_logits");
         Self {
             data_synced,
@@ -556,17 +523,10 @@ impl MoeBuffers {
     pub(crate) fn combine_params_id(&self) -> BufId<DeprecatedCogitoBuf> {
         self.combine_params
     }
-    pub(crate) fn data_synced_id(
-        &self,
-        slot: usize,
-    ) -> BufId<DeprecatedCogitoBuf> {
+    pub(crate) fn data_synced_id(&self, slot: usize) -> BufId<DeprecatedCogitoBuf> {
         self.data_synced[slot]
     }
-    pub(crate) fn data_prefetch_id(
-        &self,
-        set: usize,
-        slot: usize,
-    ) -> BufId<DeprecatedCogitoBuf> {
+    pub(crate) fn data_prefetch_id(&self, set: usize, slot: usize) -> BufId<DeprecatedCogitoBuf> {
         debug_assert!(set < 2);
         debug_assert!(slot < MAX_K);
         self.data_prefetch[set][slot]
@@ -611,44 +571,30 @@ impl MoeBuffers {
     }
 
     /// Owned-form accessor for the post-attn-norm input buffer.
-    pub(crate) fn input_buffer<'p>(
-        &self,
-        pool: &'p MetalBufferPool,
-    ) -> &'p metal::Buffer {
+    pub(crate) fn input_buffer<'p>(&self, pool: &'p MetalBufferPool) -> &'p metal::Buffer {
         pool.handle(self.input)
     }
 
     /// Owned-form accessor for the residual-input buffer.
-    pub(crate) fn h_mid_buffer<'p>(
-        &self,
-        pool: &'p MetalBufferPool,
-    ) -> &'p metal::Buffer {
+    pub(crate) fn h_mid_buffer<'p>(&self, pool: &'p MetalBufferPool) -> &'p metal::Buffer {
         pool.handle(self.h_mid)
     }
 
     /// Owned-form accessor for the shared-expert output buffer.
-    pub(crate) fn shared_out_buffer<'p>(
-        &self,
-        pool: &'p MetalBufferPool,
-    ) -> &'p metal::Buffer {
+    pub(crate) fn shared_out_buffer<'p>(&self, pool: &'p MetalBufferPool) -> &'p metal::Buffer {
         pool.handle(self.shared_out)
     }
 
     /// Stage `hidden` into `bufs.input` (host copy into shared-storage
     /// Metal buffer). Caller must ensure no GPU work in flight.
-    pub(crate) fn stage_host_input(
-        &self,
-        pool: &MetalBufferPool,
-        hidden: &[f32],
-    ) {
+    pub(crate) fn stage_host_input(&self, pool: &MetalBufferPool, hidden: &[f32]) {
         debug_assert_eq!(hidden.len(), VARIANT.hidden_dim);
         let buf = pool.handle(self.input);
         // SAFETY: same discipline as `MtlBuffer::as_mut_slice` — caller
         // ensures no concurrent GPU read. Shared-storage buffer is
         // alive while `buf` is held; alignment of f32 on the
         // posix_memalign / Metal allocation is guaranteed.
-        let dst: &mut [f32] =
-            unsafe { buffer_as_mut_slice::<f32>(buf, VARIANT.hidden_dim) };
+        let dst: &mut [f32] = unsafe { buffer_as_mut_slice::<f32>(buf, VARIANT.hidden_dim) };
         dst.copy_from_slice(hidden);
     }
 
@@ -661,51 +607,37 @@ impl MoeBuffers {
         let buf = pool.handle(self.h_mid);
         // SAFETY: see method docs — caller's GPU-quiescence invariant
         // covers the canonical `buffer_as_mut_slice` contract.
-        let dst: &mut [f32] =
-            unsafe { buffer_as_mut_slice::<f32>(buf, VARIANT.hidden_dim) };
+        let dst: &mut [f32] = unsafe { buffer_as_mut_slice::<f32>(buf, VARIANT.hidden_dim) };
         dst.fill(0.0);
     }
 
     /// Read back `bufs.moe_hidden` to a host `Vec<f32>`. Caller must
     /// ensure the cmdbuf that wrote it has completed.
-    pub(crate) fn moe_hidden_to_vec(
-        &self,
-        pool: &MetalBufferPool,
-    ) -> Vec<f32> {
+    pub(crate) fn moe_hidden_to_vec(&self, pool: &MetalBufferPool) -> Vec<f32> {
         let buf = pool.handle(self.moe_hidden);
         // SAFETY: see method docs — caller has drained the writing
         // cmdbuf, so no concurrent GPU access. Forwards to
         // `buffer_as_slice`.
-        let src: &[f32] =
-            unsafe { buffer_as_slice::<f32>(buf, VARIANT.hidden_dim) };
+        let src: &[f32] = unsafe { buffer_as_slice::<f32>(buf, VARIANT.hidden_dim) };
         src.to_vec()
     }
 
     /// Owned-form accessor for the post-combine hidden buffer. Phase 5
     /// GPU residual stream uses this to read the MoE output directly
     /// into a downstream `residual_add` dispatch without a host bounce.
-    pub fn moe_hidden_ref<'p>(
-        &self,
-        pool: &'p MetalBufferPool,
-    ) -> &'p metal::Buffer {
+    pub fn moe_hidden_ref<'p>(&self, pool: &'p MetalBufferPool) -> &'p metal::Buffer {
         pool.handle(self.moe_hidden)
     }
 
     /// Owned-form accessor for the router-gate-logits buffer. Used as
     /// the output target by the GPU `bf16_matvec` dispatch.
-    pub(crate) fn gate_logits_buffer<'p>(
-        &self,
-        pool: &'p MetalBufferPool,
-    ) -> &'p metal::Buffer {
+    pub(crate) fn gate_logits_buffer<'p>(&self, pool: &'p MetalBufferPool) -> &'p metal::Buffer {
         pool.handle(self.gate_logits)
     }
 
     /// Read back `bufs.gate_logits` to a host `Vec<f32>`. Caller must
     /// ensure the cmdbuf that wrote it has completed.
-    pub(crate) fn gate_logits_to_vec(
-        &self,
-        pool: &MetalBufferPool,
-    ) -> Vec<f32> {
+    pub(crate) fn gate_logits_to_vec(&self, pool: &MetalBufferPool) -> Vec<f32> {
         let buf = pool.handle(self.gate_logits);
         let n = VARIANT.num_experts.max(1);
         // SAFETY: see method docs — caller has drained the writing
@@ -853,7 +785,10 @@ pub(crate) fn gpu_batched_experts_encode(
     // gate/up matvecs while down (in_dim=2048) stays on v3.
     let matvec = MatvecPipelines::fetch(metal)?;
     let swiglu = metal.pipeline("swiglu_fused")?.clone();
-    let v3_experts = metal.pipeline("dequant_matvec_4bit_v3_experts").ok().cloned();
+    let v3_experts = metal
+        .pipeline("dequant_matvec_4bit_v3_experts")
+        .ok()
+        .cloned();
     let combine_flat = metal.pipeline("moe_combine_residual_flat")?.clone();
 
     let expert_size = v.expert_size_4bit();
@@ -865,20 +800,17 @@ pub(crate) fn gpu_batched_experts_encode(
     bufs.stage_host_input(buffer_pool, h_post);
     {
         let buf = buffer_pool.handle(bufs.h_mid_id());
-        let dst: &mut [f32] =
-            unsafe { buffer_as_mut_slice::<f32>(buf, v.hidden_dim) };
+        let dst: &mut [f32] = unsafe { buffer_as_mut_slice::<f32>(buf, v.hidden_dim) };
         dst.copy_from_slice(h_mid);
     }
     {
         let buf = buffer_pool.handle(bufs.shared_out_id());
-        let dst: &mut [f32] =
-            unsafe { buffer_as_mut_slice::<f32>(buf, v.hidden_dim) };
+        let dst: &mut [f32] = unsafe { buffer_as_mut_slice::<f32>(buf, v.hidden_dim) };
         dst.copy_from_slice(shared_out);
     }
     {
         let buf = buffer_pool.handle(bufs.combine_params_id());
-        let params: &mut [f32] =
-            unsafe { buffer_as_mut_slice::<f32>(buf, 18) };
+        let params: &mut [f32] = unsafe { buffer_as_mut_slice::<f32>(buf, 18) };
         params.fill(0.0);
         params[..k].copy_from_slice(expert_weights);
         params[16] = shared_gate_score;
@@ -893,9 +825,20 @@ pub(crate) fn gpu_batched_experts_encode(
     let h_mid_buf = bufs.h_mid_buffer(buffer_pool).clone();
     let shared_out_buf = bufs.shared_out_buffer(buffer_pool).clone();
     emit_batched_experts(
-        cmdbuf, &matvec, &swiglu, v3_experts.as_ref(), &combine_flat,
-        bufs, buffer_pool, &input_buf, &h_mid_buf, &shared_out_buf,
-        k, v, &bindings, None,
+        cmdbuf,
+        &matvec,
+        &swiglu,
+        v3_experts.as_ref(),
+        &combine_flat,
+        bufs,
+        buffer_pool,
+        &input_buf,
+        &h_mid_buf,
+        &shared_out_buf,
+        k,
+        v,
+        &bindings,
+        None,
     );
     Ok(cmdbuf.to_owned())
 }
@@ -934,13 +877,15 @@ pub(crate) fn gpu_batched_experts_encode_mmap(
 
     let matvec = MatvecPipelines::fetch(metal)?;
     let swiglu = metal.pipeline("swiglu_fused")?.clone();
-    let v3_experts = metal.pipeline("dequant_matvec_4bit_v3_experts").ok().cloned();
+    let v3_experts = metal
+        .pipeline("dequant_matvec_4bit_v3_experts")
+        .ok()
+        .cloned();
     let combine_flat = metal.pipeline("moe_combine_residual_flat")?.clone();
 
     {
         let buf = buffer_pool.handle(bufs.combine_params_id());
-        let params: &mut [f32] =
-            unsafe { buffer_as_mut_slice::<f32>(buf, 18) };
+        let params: &mut [f32] = unsafe { buffer_as_mut_slice::<f32>(buf, 18) };
         params.fill(0.0);
         params[..k].copy_from_slice(expert_weights);
         params[16] = shared_gate_score;
@@ -948,9 +893,20 @@ pub(crate) fn gpu_batched_experts_encode_mmap(
 
     let cmdbuf = metal.queue().new_command_buffer();
     emit_batched_experts(
-        cmdbuf, &matvec, &swiglu, v3_experts.as_ref(), &combine_flat,
-        bufs, buffer_pool, input, h_mid, shared_out,
-        k, v, expert_bindings, chain,
+        cmdbuf,
+        &matvec,
+        &swiglu,
+        v3_experts.as_ref(),
+        &combine_flat,
+        bufs,
+        buffer_pool,
+        input,
+        h_mid,
+        shared_out,
+        k,
+        v,
+        expert_bindings,
+        chain,
     );
     Ok(cmdbuf.to_owned())
 }
@@ -1015,7 +971,9 @@ fn emit_batched_experts(
             // about the dispatch *shape*, not the IO source.
             eprintln!(
                 "[moe] expert dispatch: hidden_dim={} k={} v3_experts={} → {}",
-                v.hidden_dim, k, v3_experts.is_some(),
+                v.hidden_dim,
+                k,
+                v3_experts.is_some(),
                 if v.hidden_dim <= 4096 && k <= 8 && v3_experts.is_some() {
                     "batched"
                 } else {
@@ -1025,9 +983,7 @@ fn emit_batched_experts(
         }
     }
 
-    let use_batched = v.hidden_dim <= 4096
-        && k <= 8
-        && v3_experts.is_some();
+    let use_batched = v.hidden_dim <= 4096 && k <= 8 && v3_experts.is_some();
 
     if use_batched {
         let v3e = v3_experts.unwrap();
@@ -1042,20 +998,34 @@ fn emit_batched_experts(
         {
             let enc = cmdbuf.new_compute_command_encoder();
             encode_matvec_experts(
-                enc, v3e, expert_bindings, input, gate_flat,
-                v.moe_intermediate as u32, v.hidden_dim as u32, group_size,
+                enc,
+                v3e,
+                expert_bindings,
+                input,
+                gate_flat,
+                v.moe_intermediate as u32,
+                v.hidden_dim as u32,
+                group_size,
                 v.gate_w_off_4bit() as u32,
                 v.gate_s_off_4bit() as u32,
                 v.gate_b_off_4bit() as u32,
-                k_u32, 0,
+                k_u32,
+                0,
             );
             encode_matvec_experts(
-                enc, v3e, expert_bindings, input, up_flat,
-                v.moe_intermediate as u32, v.hidden_dim as u32, group_size,
+                enc,
+                v3e,
+                expert_bindings,
+                input,
+                up_flat,
+                v.moe_intermediate as u32,
+                v.hidden_dim as u32,
+                group_size,
                 v.up_w_off_4bit() as u32,
                 v.up_s_off_4bit() as u32,
                 v.up_b_off_4bit() as u32,
-                k_u32, 0,
+                k_u32,
+                0,
             );
             enc.end_encoding();
         }
@@ -1064,7 +1034,11 @@ fn emit_batched_experts(
         {
             let enc = cmdbuf.new_compute_command_encoder();
             encode_swiglu_into_buf(
-                enc, swiglu, gate_flat, up_flat, act_flat,
+                enc,
+                swiglu,
+                gate_flat,
+                up_flat,
+                act_flat,
                 k_u32 * v.moe_intermediate as u32,
             );
             enc.end_encoding();
@@ -1074,12 +1048,19 @@ fn emit_batched_experts(
         {
             let enc = cmdbuf.new_compute_command_encoder();
             encode_matvec_experts(
-                enc, v3e, expert_bindings, act_flat, out_flat,
-                v.hidden_dim as u32, v.moe_intermediate as u32, group_size,
+                enc,
+                v3e,
+                expert_bindings,
+                act_flat,
+                out_flat,
+                v.hidden_dim as u32,
+                v.moe_intermediate as u32,
+                group_size,
                 v.down_w_off_4bit() as u32,
                 v.down_s_off_4bit() as u32,
                 v.down_b_off_4bit() as u32,
-                k_u32, v.moe_intermediate as u32,
+                k_u32,
+                v.moe_intermediate as u32,
             );
             enc.end_encoding();
         }
@@ -1094,27 +1075,55 @@ fn emit_batched_experts(
             {
                 let enc = cmdbuf.new_compute_command_encoder();
                 encode_matvec_into(
-                    enc, matvec, wb, base_off,
-                    v.gate_w_off_4bit(), v.gate_s_off_4bit(), v.gate_b_off_4bit(),
-                    input, gate_buf, v.moe_intermediate as u32, v.hidden_dim as u32,
+                    enc,
+                    matvec,
+                    wb,
+                    base_off,
+                    v.gate_w_off_4bit(),
+                    v.gate_s_off_4bit(),
+                    v.gate_b_off_4bit(),
+                    input,
+                    gate_buf,
+                    v.moe_intermediate as u32,
+                    v.hidden_dim as u32,
                 );
                 encode_matvec_into(
-                    enc, matvec, wb, base_off,
-                    v.up_w_off_4bit(), v.up_s_off_4bit(), v.up_b_off_4bit(),
-                    input, up_buf, v.moe_intermediate as u32, v.hidden_dim as u32,
+                    enc,
+                    matvec,
+                    wb,
+                    base_off,
+                    v.up_w_off_4bit(),
+                    v.up_s_off_4bit(),
+                    v.up_b_off_4bit(),
+                    input,
+                    up_buf,
+                    v.moe_intermediate as u32,
+                    v.hidden_dim as u32,
                 );
                 enc.end_encoding();
             }
             {
                 let enc = cmdbuf.new_compute_command_encoder();
                 encode_swiglu_into_buf(
-                    enc, swiglu, gate_buf, up_buf, act_buf,
+                    enc,
+                    swiglu,
+                    gate_buf,
+                    up_buf,
+                    act_buf,
                     v.moe_intermediate as u32,
                 );
                 encode_matvec_into(
-                    enc, matvec, wb, base_off,
-                    v.down_w_off_4bit(), v.down_s_off_4bit(), v.down_b_off_4bit(),
-                    act_buf, out_buf, v.hidden_dim as u32, v.moe_intermediate as u32,
+                    enc,
+                    matvec,
+                    wb,
+                    base_off,
+                    v.down_w_off_4bit(),
+                    v.down_s_off_4bit(),
+                    v.down_b_off_4bit(),
+                    act_buf,
+                    out_buf,
+                    v.hidden_dim as u32,
+                    v.moe_intermediate as u32,
                 );
                 enc.end_encoding();
             }
@@ -1129,14 +1138,18 @@ fn emit_batched_experts(
                 Some(c) => c.combine_out,
                 None => moe_hidden_buf,
             };
-            let combine_params_buf =
-                buffer_pool.handle(bufs.combine_params_id());
+            let combine_params_buf = buffer_pool.handle(bufs.combine_params_id());
             let enc = cmdbuf.new_compute_command_encoder();
             encode_combine_flat(
-                enc, combine_flat, h_mid, shared_out, combine_out,
+                enc,
+                combine_flat,
+                h_mid,
+                shared_out,
+                combine_out,
                 buffer_pool.handle(bufs.out_flat_id()),
                 combine_params_buf,
-                v.hidden_dim as u32, k as u32,
+                v.hidden_dim as u32,
+                k as u32,
             );
             enc.end_encoding();
         } else {
@@ -1400,17 +1413,43 @@ pub fn encode_moe_batched_permute_fuse(
     debug_assert_eq!(expert_slots.len(), buckets.expert_ids.len());
     if gather {
         encode_moe_gather(
-            cmdbuf, kernels, swiglu, bucket_accumulate, expert_base,
-            expert_stride, expert_indices, bucket_input, bucket_gate,
-            bucket_up, bucket_act, bucket_out, bucket_token_idx,
-            bucket_weights, out_sum, buckets, v,
+            cmdbuf,
+            kernels,
+            swiglu,
+            bucket_accumulate,
+            expert_base,
+            expert_stride,
+            expert_indices,
+            bucket_input,
+            bucket_gate,
+            bucket_up,
+            bucket_act,
+            bucket_out,
+            bucket_token_idx,
+            bucket_weights,
+            out_sum,
+            buckets,
+            v,
         );
     } else {
         encode_moe_per_bucket(
-            cmdbuf, matvec, swiglu, bucket_accumulate, expert_base,
-            expert_stride, expert_slots, bucket_input, bucket_gate,
-            bucket_up, bucket_act, bucket_out, bucket_token_idx,
-            bucket_weights, out_sum, buckets, v,
+            cmdbuf,
+            matvec,
+            swiglu,
+            bucket_accumulate,
+            expert_base,
+            expert_stride,
+            expert_slots,
+            bucket_input,
+            bucket_gate,
+            bucket_up,
+            bucket_act,
+            bucket_out,
+            bucket_token_idx,
+            bucket_weights,
+            out_sum,
+            buckets,
+            v,
         );
     }
 }
@@ -1474,10 +1513,7 @@ fn encode_bucket_scatter(
     enc.set_bytes(5, 4, (&b_size as *const u32).cast());
     let tgs_x = b_size as NSUInteger;
     let tgs_y = ((hidden_dim + 255) / 256) as NSUInteger;
-    enc.dispatch_thread_groups(
-        MTLSize::new(tgs_x, tgs_y, 1),
-        MTLSize::new(1, 256, 1),
-    );
+    enc.dispatch_thread_groups(MTLSize::new(tgs_x, tgs_y, 1), MTLSize::new(1, 256, 1));
     enc.end_encoding();
 }
 
@@ -1519,8 +1555,13 @@ fn encode_moe_gather(
     // One GEMM whose RHS weight is gathered per row. `packed/scales/
     // biases_offset` are expert 0's sub-tensor offsets within its
     // block; the kernel reaches expert e via `e * stride_w/stride_s`.
-    let gather = |w_off: u64, s_off: u64, b_off: u64, input: &Buffer,
-                  output: &Buffer, in_dim: u32, out_dim: u32| {
+    let gather = |w_off: u64,
+                  s_off: u64,
+                  b_off: u64,
+                  input: &Buffer,
+                  output: &Buffer,
+                  in_dim: u32,
+                  out_dim: u32| {
         kernels.encode(
             cmdbuf,
             &GatherQmmCall {
@@ -1595,8 +1636,15 @@ fn encode_moe_gather(
             continue;
         }
         encode_bucket_scatter(
-            cmdbuf, bucket_accumulate, bucket_out, bucket_token_idx,
-            bucket_weights, out_sum, start, b_size, hidden_dim,
+            cmdbuf,
+            bucket_accumulate,
+            bucket_out,
+            bucket_token_idx,
+            bucket_weights,
+            out_sum,
+            start,
+            b_size,
+            hidden_dim,
         );
     }
 }
@@ -1893,8 +1941,15 @@ fn encode_moe_per_bucket(
 
         // 5. scatter-add weighted into out_sum.
         encode_bucket_scatter(
-            cmdbuf, bucket_accumulate, bucket_out, bucket_token_idx,
-            bucket_weights, out_sum, start, b_size, hidden_dim,
+            cmdbuf,
+            bucket_accumulate,
+            bucket_out,
+            bucket_token_idx,
+            bucket_weights,
+            out_sum,
+            start,
+            b_size,
+            hidden_dim,
         );
     }
 }
@@ -1995,10 +2050,7 @@ pub mod synth {
     pub fn h_post_seeded() -> Vec<f32> {
         let v = VARIANT;
         (0..v.hidden_dim)
-            .map(|i| {
-                (i as f32 - v.hidden_dim as f32 / 2.0) * 1e-3
-                    / v.hidden_dim as f32
-            })
+            .map(|i| (i as f32 - v.hidden_dim as f32 / 2.0) * 1e-3 / v.hidden_dim as f32)
             .collect()
     }
 
@@ -2014,9 +2066,7 @@ pub mod synth {
             for block in 0..3 {
                 let block_off = block * v.expert_block_bytes_4bit();
                 let w_end = block_off + v.expert_weight_bytes_4bit();
-                let mut state: u64 = 0xCAFE_BEEF
-                    ^ ((slot as u64) << 32)
-                    ^ (block as u64);
+                let mut state: u64 = 0xCAFE_BEEF ^ ((slot as u64) << 32) ^ (block as u64);
                 for byte in &mut dst[block_off..w_end] {
                     state = state
                         .wrapping_mul(6364136223846793005)
@@ -2054,9 +2104,7 @@ pub mod synth {
     /// Sum-to-1 routing weights for K experts. Mirrors what the MoE
     /// router would emit after softmax + top-K + normalize.
     pub fn expert_weights_seeded(k: usize) -> Vec<f32> {
-        let raw: Vec<f32> = (0..k)
-            .map(|i| ((i as f32) * 0.37 + 1.0).abs())
-            .collect();
+        let raw: Vec<f32> = (0..k).map(|i| ((i as f32) * 0.37 + 1.0).abs()).collect();
         let total: f32 = raw.iter().sum();
         raw.iter().map(|w| w / total).collect()
     }

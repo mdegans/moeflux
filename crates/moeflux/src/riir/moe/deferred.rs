@@ -43,13 +43,13 @@
 
 use std::collections::VecDeque;
 
-use crate::riir::moe::expert_forward::{
-    ChainToNormed, ExpertForwardError, ExpertPayload, MoeBuffers,
-    gpu_batched_experts_encode, gpu_batched_experts_encode_mmap,
-};
-use crate::riir::backend::gpu::metal::{buffer_as_slice, MetalContext};
-use crate::riir::variants::VARIANT;
+use crate::riir::backend::gpu::metal::{MetalContext, buffer_as_slice};
 use crate::riir::backend::{Backend as _, BufferPool as _, MetalBackend, MetalBufferPool};
+use crate::riir::moe::expert_forward::{
+    ChainToNormed, ExpertForwardError, ExpertPayload, MoeBuffers, gpu_batched_experts_encode,
+    gpu_batched_experts_encode_mmap,
+};
+use crate::riir::variants::VARIANT;
 use crate::riir::{RsCtx, RsError};
 
 /// Slice 5d-9 — bounded ring of in-flight deferred K-expert dispatches.
@@ -348,8 +348,7 @@ pub(crate) fn complete_deferred_experts_into(
     state.cmd_buffer.wait_until_completed();
     match state.mode {
         DeferredMode::Gpu => {
-            hidden_out
-                .copy_from_slice(&bufs.moe_hidden_to_vec(buffer_pool));
+            hidden_out.copy_from_slice(&bufs.moe_hidden_to_vec(buffer_pool));
         }
         DeferredMode::Cpu {
             h_mid,
@@ -419,8 +418,7 @@ fn cpu_combine(
         // SAFETY: caller has awaited the cmdbuf via
         // `wait_until_completed`; no concurrent GPU dispatch reads
         // from `bufs.out[k]`.
-        let expert_k: &[f32] =
-            unsafe { buffer_as_slice::<f32>(out_buf, dim) };
+        let expert_k: &[f32] = unsafe { buffer_as_slice::<f32>(out_buf, dim) };
         crate::riir::backend::cpu::cpu_ops::cpu_vec_madd(&mut moe_out, expert_k, expert_weights[k]);
     }
 
@@ -491,8 +489,7 @@ impl RsCtx<MetalBackend> {
             deferred,
             ..
         } = self;
-        let backend =
-            backend.as_mut().expect("metal_and_moe_mut just-set");
+        let backend = backend.as_mut().expect("metal_and_moe_mut just-set");
         let (metal, _wf_buf, pool) = backend.parts_mut();
         let bufs = moe_buffers.as_mut().expect("metal_and_moe_mut just-set");
         let payload = ExpertPayload {

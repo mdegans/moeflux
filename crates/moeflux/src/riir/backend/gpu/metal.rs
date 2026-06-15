@@ -241,8 +241,7 @@ impl MetalContext {
             .new_library_with_source(SHADER_SOURCE, &options)
             .map_err(MetalError::LibraryCompile)?;
 
-        let kernels = Kernels::new(&device)
-            .map_err(|e| MetalError::MlxKernels(e.to_string()))?;
+        let kernels = Kernels::new(&device).map_err(|e| MetalError::MlxKernels(e.to_string()))?;
 
         Ok(Self {
             device,
@@ -610,14 +609,9 @@ pub unsafe fn buffer_as_slice<T>(buf: &metal::BufferRef, n: usize) -> &[T] {
 /// See [`buffer_as_slice`]; the caller additionally holds unique
 /// access to the buffer for the returned slice's lifetime — no other
 /// CPU or GPU reader/writer.
-pub unsafe fn buffer_as_mut_slice<T>(
-    buf: &metal::BufferRef,
-    n: usize,
-) -> &mut [T] {
+pub unsafe fn buffer_as_mut_slice<T>(buf: &metal::BufferRef, n: usize) -> &mut [T] {
     // SAFETY: forwarded to the caller's contract above.
-    unsafe {
-        std::slice::from_raw_parts_mut(buf.contents() as *mut T, n)
-    }
+    unsafe { std::slice::from_raw_parts_mut(buf.contents() as *mut T, n) }
 }
 
 impl MtlBuffer<u8> {

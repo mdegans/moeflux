@@ -18,14 +18,14 @@
 //! not the load-bearing bottleneck the diff oracle exists to verify.
 
 use crate::riir::backend::cpu::cpu_matvec::{
-    bf16_matvec_cpu, dequant_matvec_4bit_bytes_cpu, CpuMatvecError,
+    CpuMatvecError, bf16_matvec_cpu, dequant_matvec_4bit_bytes_cpu,
 };
 use crate::riir::io::embedding::bf16_to_f32;
 use crate::riir::io::expert_io::{ExpertFiles, ExpertIoError};
-use crate::riir::moe::mlp_cpu::{shared_expert_swiglu_cpu, MlpForwardError};
-use crate::riir::moe::moe_router::{noaux_tc_router_cpu, ExpertBuckets, MoeRouterError};
-use crate::riir::variants::{Variant, GROUP_SIZE, VARIANT};
 use crate::riir::io::weight_file::WeightFile;
+use crate::riir::moe::mlp_cpu::{MlpForwardError, shared_expert_swiglu_cpu};
+use crate::riir::moe::moe_router::{ExpertBuckets, MoeRouterError, noaux_tc_router_cpu};
+use crate::riir::variants::{GROUP_SIZE, VARIANT, Variant};
 
 /// Errors specific to the CPU MoE forward.
 #[derive(Debug, thiserror::Error)]
@@ -36,9 +36,7 @@ pub enum MoeForwardError {
     OutLen { got: usize, expected: usize },
     #[error("missing tensor '{name}'")]
     MissingTensor { name: String },
-    #[error(
-        "router-gate bias '{name}' size {got} bytes, expected {expected}"
-    )]
+    #[error("router-gate bias '{name}' size {got} bytes, expected {expected}")]
     BiasSize {
         name: String,
         got: usize,
@@ -88,19 +86,16 @@ pub fn deepseek_moe_cpu(
     }
 
     // ---- Router: gate logits + correction bias ----
-    let gate_w_name =
-        format!("model.layers.{layer_idx}.mlp.gate.weight");
-    let bias_name = format!(
-        "model.layers.{layer_idx}.mlp.gate.e_score_correction_bias"
-    );
+    let gate_w_name = format!("model.layers.{layer_idx}.mlp.gate.weight");
+    let bias_name = format!("model.layers.{layer_idx}.mlp.gate.e_score_correction_bias");
 
     // gate.weight is BF16 [num_experts, hidden_dim] — read as raw
     // u16 slice via `tensor_bytes`, then bf16_matvec.
-    let gate_w_bytes = wf
-        .tensor_bytes(&gate_w_name)
-        .ok_or_else(|| MoeForwardError::MissingTensor {
-            name: gate_w_name.clone(),
-        })?;
+    let gate_w_bytes =
+        wf.tensor_bytes(&gate_w_name)
+            .ok_or_else(|| MoeForwardError::MissingTensor {
+                name: gate_w_name.clone(),
+            })?;
     // 2 bytes per BF16; expected count = num_experts * hidden_dim.
     let expected_gate_bytes = num_experts * hidden_dim * 2;
     if gate_w_bytes.len() != expected_gate_bytes {
@@ -113,19 +108,13 @@ pub fn deepseek_moe_cpu(
     let gate_w = bytemuck_u16(gate_w_bytes);
 
     let mut gate_logits = vec![0.0f32; num_experts];
-    bf16_matvec_cpu(
-        gate_w,
-        hidden_dim,
-        num_experts,
-        hidden,
-        &mut gate_logits,
-    )?;
+    bf16_matvec_cpu(gate_w, hidden_dim, num_experts, hidden, &mut gate_logits)?;
 
-    let bias_bytes = wf.tensor_bytes(&bias_name).ok_or_else(|| {
-        MoeForwardError::MissingTensor {
+    let bias_bytes = wf
+        .tensor_bytes(&bias_name)
+        .ok_or_else(|| MoeForwardError::MissingTensor {
             name: bias_name.clone(),
-        }
-    })?;
+        })?;
     let expected_bias_bytes = num_experts * 2;
     if bias_bytes.len() != expected_bias_bytes {
         return Err(MoeForwardError::BiasSize {
@@ -135,8 +124,7 @@ pub fn deepseek_moe_cpu(
         });
     }
     let bias_u16 = bytemuck_u16(bias_bytes);
-    let bias_f32: Vec<f32> =
-        bias_u16.iter().map(|&b| bf16_to_f32(b)).collect();
+    let bias_f32: Vec<f32> = bias_u16.iter().map(|&b| bf16_to_f32(b)).collect();
 
     let mut indices = vec![0i32; k];
     let mut weights = vec![0.0f32; k];
@@ -213,19 +201,21 @@ fn run_packed_expert_swiglu(
     let mut gate = vec![0.0f32; intermediate];
     let mut up = vec![0.0f32; intermediate];
     dequant_matvec_4bit_bytes_cpu(
-        gate_w, gate_s, gate_b, hidden_dim, intermediate, hidden, &mut gate,
+        gate_w,
+        gate_s,
+        gate_b,
+        hidden_dim,
+        intermediate,
+        hidden,
+        &mut gate,
     )?;
-    dequant_matvec_4bit_bytes_cpu(
-        up_w, up_s, up_b, hidden_dim, intermediate, hidden, &mut up,
-    )?;
+    dequant_matvec_4bit_bytes_cpu(up_w, up_s, up_b, hidden_dim, intermediate, hidden, &mut up)?;
     for i in 0..intermediate {
         let g = gate[i];
         let silu = g / (1.0 + (-g).exp());
         gate[i] = silu * up[i];
     }
-    dequant_matvec_4bit_bytes_cpu(
-        down_w, down_s, down_b, intermediate, hidden_dim, &gate, out,
-    )?;
+    dequant_matvec_4bit_bytes_cpu(down_w, down_s, down_b, intermediate, hidden_dim, &gate, out)?;
     Ok(())
 }
 
@@ -297,9 +287,7 @@ pub fn moe_permute_fuse_cpu(
             expected: total_slots * hidden_dim,
         });
     }
-    if buckets.token_idx.len() != total_slots
-        || buckets.weights.len() != total_slots
-    {
+    if buckets.token_idx.len() != total_slots || buckets.weights.len() != total_slots {
         return Err(MoeForwardError::OutLen {
             got: buckets.token_idx.len(),
             expected: total_slots,
@@ -367,9 +355,7 @@ mod tests {
         let manifest = Path::new(
             "/Volumes/Temp Backup/models/blallama/cogito-v2-671b/artifacts/model_weights.json",
         );
-        let experts_dir = Path::new(
-            "/Volumes/Temp Backup/models/blallama/cogito-v2-671b/root",
-        );
+        let experts_dir = Path::new("/Volumes/Temp Backup/models/blallama/cogito-v2-671b/root");
         let wf = WeightFile::open(bin, manifest).expect("open weights");
         let ef = ExpertFiles::open(experts_dir).expect("open experts");
 
@@ -381,8 +367,7 @@ mod tests {
             *h = ((i as f32) * 0.001).sin();
         }
         let mut out = vec![0.0f32; v.hidden_dim];
-        deepseek_moe_cpu(&wf, &ef, 3, &hidden, &mut out)
-            .expect("MoE layer 3");
+        deepseek_moe_cpu(&wf, &ef, 3, &hidden, &mut out).expect("MoE layer 3");
         assert!(
             out.iter().all(|x| x.is_finite()),
             "non-finite output at index {:?}",

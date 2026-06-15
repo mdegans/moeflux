@@ -21,8 +21,8 @@
 //! forced.
 
 use crate::riir::io::mtl_weight_buf::{MtlWeightBuf, MtlWeightBufError};
-use crate::riir::variants::{LayerKind, VARIANT};
 use crate::riir::io::weight_file::WeightFile;
+use crate::riir::variants::{LayerKind, VARIANT};
 
 /// Tensor offsets specific to a linear-attention (GatedDeltaNet)
 /// layer. Every slot is required for layers of this kind; missing
@@ -161,17 +161,14 @@ impl LayerWeightCache {
                 .ok_or(MtlWeightBufError::MissingTensor { name })
         };
 
-        let input_layernorm_w =
-            need(format!("model.layers.{layer_idx}.input_layernorm.weight"))?;
+        let input_layernorm_w = need(format!("model.layers.{layer_idx}.input_layernorm.weight"))?;
         let post_attention_layernorm_w = need(format!(
             "model.layers.{layer_idx}.post_attention_layernorm.weight"
         ))?;
 
         let attn = match VARIANT.layer_kind(layer_idx) {
             LayerKind::LinearAttn => {
-                let p = |suffix: &str| {
-                    format!("model.layers.{layer_idx}.linear_attn.{suffix}")
-                };
+                let p = |suffix: &str| format!("model.layers.{layer_idx}.linear_attn.{suffix}");
                 LayerAttnW::LinearAttn(LinearAttnW {
                     qkv_w: need(p("in_proj_qkv.weight"))?,
                     qkv_s: need(p("in_proj_qkv.scales"))?,
@@ -195,9 +192,7 @@ impl LayerWeightCache {
                 })
             }
             LayerKind::FullAttn => {
-                let s = |suffix: &str| {
-                    format!("model.layers.{layer_idx}.self_attn.{suffix}")
-                };
+                let s = |suffix: &str| format!("model.layers.{layer_idx}.self_attn.{suffix}");
                 LayerAttnW::FullAttn(FullAttnW {
                     q_proj_w: need(s("q_proj.weight"))?,
                     q_proj_s: need(s("q_proj.scales"))?,
@@ -217,8 +212,7 @@ impl LayerWeightCache {
             }
         };
 
-        let m =
-            |suffix: &str| format!("model.layers.{layer_idx}.mlp.{suffix}");
+        let m = |suffix: &str| format!("model.layers.{layer_idx}.mlp.{suffix}");
         let gate = GateW {
             w: need(m("gate.weight"))?,
             s: need(m("gate.scales"))?,

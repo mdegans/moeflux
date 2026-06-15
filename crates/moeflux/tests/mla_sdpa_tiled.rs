@@ -30,11 +30,10 @@
 
 use metal::{Buffer, MTLResourceOptions, NSUInteger};
 
-use moeflux::riir::attn::gpu_mla::{
-    encode_mla_sdpa_folded, encode_mla_sdpa_folded_tiled, MlaPipelines,
-    MLA_MAX_CACHE_TG,
-};
 use moeflux::riir::MetalContext;
+use moeflux::riir::attn::gpu_mla::{
+    MLA_MAX_CACHE_TG, MlaPipelines, encode_mla_sdpa_folded, encode_mla_sdpa_folded_tiled,
+};
 use moeflux::riir::variants::VARIANT;
 
 fn make_buf_f32(metal: &MetalContext, n: usize) -> Buffer {
@@ -47,28 +46,24 @@ fn make_buf_f32(metal: &MetalContext, n: usize) -> Buffer {
 fn fill_buf_f32(buf: &Buffer, data: &[f32]) {
     let n = data.len();
     unsafe {
-        std::ptr::copy_nonoverlapping(
-            data.as_ptr(),
-            buf.contents() as *mut f32,
-            n,
-        );
+        std::ptr::copy_nonoverlapping(data.as_ptr(), buf.contents() as *mut f32, n);
     }
 }
 
 fn read_buf_f32(buf: &Buffer, n: usize) -> Vec<f32> {
     let mut v = vec![0.0f32; n];
     unsafe {
-        std::ptr::copy_nonoverlapping(
-            buf.contents() as *const f32,
-            v.as_mut_ptr(),
-            n,
-        );
+        std::ptr::copy_nonoverlapping(buf.contents() as *const f32, v.as_mut_ptr(), n);
     }
     v
 }
 
 fn cosine(a: &[f32], b: &[f32]) -> f64 {
-    let dot: f64 = a.iter().zip(b).map(|(x, y)| (*x as f64) * (*y as f64)).sum();
+    let dot: f64 = a
+        .iter()
+        .zip(b)
+        .map(|(x, y)| (*x as f64) * (*y as f64))
+        .sum();
     let na: f64 = a.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
     let nb: f64 = b.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
     dot / (na * nb).max(1e-30)
@@ -196,9 +191,7 @@ fn mla_tiled_long_context_8k_smoke() {
     let nonzero = tiled.iter().any(|&x| x != 0.0);
     let mn = tiled.iter().cloned().fold(f32::INFINITY, f32::min);
     let mx = tiled.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    eprintln!(
-        "[mla-tiled-8k] finite={finite} nonzero={nonzero} min={mn:.4e} max={mx:.4e}"
-    );
+    eprintln!("[mla-tiled-8k] finite={finite} nonzero={nonzero} min={mn:.4e} max={mx:.4e}");
     assert!(finite, "non-finite outputs at cache_len=8192");
     assert!(nonzero, "all-zero outputs at cache_len=8192");
 }

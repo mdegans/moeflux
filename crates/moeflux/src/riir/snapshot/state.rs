@@ -28,7 +28,7 @@ use metal::{Buffer, Device, MTLResourceOptions, NSUInteger};
 use crate::riir::backend::buftype::{KvCacheKBuf, KvCacheVBuf};
 use crate::riir::backend::gpu::MetalBufferPool;
 use crate::riir::backend::{BufId, BufferPool};
-use crate::riir::variants::{Variant, MAX_SEQ_LEN, VARIANT};
+use crate::riir::variants::{MAX_SEQ_LEN, VARIANT, Variant};
 
 /// Full-attention key/value cache for one layer. **GPU-resident**:
 /// `k_id` and `v_id` are pool [`BufId`]s for `MTLResourceStorageMode
@@ -84,33 +84,16 @@ impl KvCache {
     /// the `MlaKvCacheGpu::ensure_buffers` note. `persistent = true`
     /// keeps the buffers out of `commit_plan` lifetime coloring.
     pub fn ensure_buffers(&mut self, pool: &mut MetalBufferPool) {
-        let entries =
-            MAX_SEQ_LEN * VARIANT.num_kv_heads * VARIANT.head_dim;
+        let entries = MAX_SEQ_LEN * VARIANT.num_kv_heads * VARIANT.head_dim;
         let bytes = entries * std::mem::size_of::<f32>();
         let device = pool.device().clone();
         if self.k_id.is_none() {
-            let buf = device.new_buffer(
-                bytes as NSUInteger,
-                MTLResourceOptions::StorageModeShared,
-            );
-            self.k_id = Some(pool.register_borrowed(
-                buf,
-                bytes,
-                "kv.k_cache",
-                true,
-            ));
+            let buf = device.new_buffer(bytes as NSUInteger, MTLResourceOptions::StorageModeShared);
+            self.k_id = Some(pool.register_borrowed(buf, bytes, "kv.k_cache", true));
         }
         if self.v_id.is_none() {
-            let buf = device.new_buffer(
-                bytes as NSUInteger,
-                MTLResourceOptions::StorageModeShared,
-            );
-            self.v_id = Some(pool.register_borrowed(
-                buf,
-                bytes,
-                "kv.v_cache",
-                true,
-            ));
+            let buf = device.new_buffer(bytes as NSUInteger, MTLResourceOptions::StorageModeShared);
+            self.v_id = Some(pool.register_borrowed(buf, bytes, "kv.v_cache", true));
         }
     }
 
@@ -138,19 +121,11 @@ impl KvCache {
     ///
     /// Caller must guarantee no GPU work is reading or writing the
     /// underlying buffer concurrently.
-    pub unsafe fn k_slice<'p>(
-        &self,
-        pool: &'p MetalBufferPool,
-        len: usize,
-    ) -> &'p [f32] {
-        let buf = pool.handle(
-            self.k_id.expect("k_slice called before ensure_buffers"),
-        );
+    pub unsafe fn k_slice<'p>(&self, pool: &'p MetalBufferPool, len: usize) -> &'p [f32] {
+        let buf = pool.handle(self.k_id.expect("k_slice called before ensure_buffers"));
         let n = len * VARIANT.num_kv_heads * VARIANT.head_dim;
         // SAFETY: caller upholds the no-concurrent-GPU-work invariant.
-        unsafe {
-            std::slice::from_raw_parts(buf.contents() as *const f32, n)
-        }
+        unsafe { std::slice::from_raw_parts(buf.contents() as *const f32, n) }
     }
 
     /// Mutable counterpart to [`Self::k_slice`] over the row window
@@ -168,19 +143,12 @@ impl KvCache {
         start_row: usize,
         end_row: usize,
     ) -> &'p mut [f32] {
-        let buf = pool.handle(
-            self.k_id
-                .expect("k_slice_mut called before ensure_buffers"),
-        );
+        let buf = pool.handle(self.k_id.expect("k_slice_mut called before ensure_buffers"));
         let stride = VARIANT.num_kv_heads * VARIANT.head_dim;
         // SAFETY: caller upholds the no-concurrent-GPU-work invariant.
         unsafe {
-            let p =
-                (buf.contents() as *mut f32).add(start_row * stride);
-            std::slice::from_raw_parts_mut(
-                p,
-                (end_row - start_row) * stride,
-            )
+            let p = (buf.contents() as *mut f32).add(start_row * stride);
+            std::slice::from_raw_parts_mut(p, (end_row - start_row) * stride)
         }
     }
 
@@ -189,19 +157,11 @@ impl KvCache {
     /// # Safety
     ///
     /// See [`Self::k_slice`].
-    pub unsafe fn v_slice<'p>(
-        &self,
-        pool: &'p MetalBufferPool,
-        len: usize,
-    ) -> &'p [f32] {
-        let buf = pool.handle(
-            self.v_id.expect("v_slice called before ensure_buffers"),
-        );
+    pub unsafe fn v_slice<'p>(&self, pool: &'p MetalBufferPool, len: usize) -> &'p [f32] {
+        let buf = pool.handle(self.v_id.expect("v_slice called before ensure_buffers"));
         let n = len * VARIANT.num_kv_heads * VARIANT.head_dim;
         // SAFETY: caller upholds the no-concurrent-GPU-work invariant.
-        unsafe {
-            std::slice::from_raw_parts(buf.contents() as *const f32, n)
-        }
+        unsafe { std::slice::from_raw_parts(buf.contents() as *const f32, n) }
     }
 
     /// Mutable counterpart to [`Self::v_slice`].
@@ -215,19 +175,12 @@ impl KvCache {
         start_row: usize,
         end_row: usize,
     ) -> &'p mut [f32] {
-        let buf = pool.handle(
-            self.v_id
-                .expect("v_slice_mut called before ensure_buffers"),
-        );
+        let buf = pool.handle(self.v_id.expect("v_slice_mut called before ensure_buffers"));
         let stride = VARIANT.num_kv_heads * VARIANT.head_dim;
         // SAFETY: caller upholds the no-concurrent-GPU-work invariant.
         unsafe {
-            let p =
-                (buf.contents() as *mut f32).add(start_row * stride);
-            std::slice::from_raw_parts_mut(
-                p,
-                (end_row - start_row) * stride,
-            )
+            let p = (buf.contents() as *mut f32).add(start_row * stride);
+            std::slice::from_raw_parts_mut(p, (end_row - start_row) * stride)
         }
     }
 }
@@ -304,23 +257,15 @@ impl MlaKvCacheGpu {
         // values (writes still see zero on first read of unwritten
         // pages, matching the explicit-memset behavior bit-for-bit).
         if self.latent_cache.is_none() {
-            let bytes = (MAX_SEQ_LEN * VARIANT.kv_lora_rank
-                * std::mem::size_of::<f32>())
-                as NSUInteger;
-            let buf = device.new_buffer(
-                bytes,
-                MTLResourceOptions::StorageModeShared,
-            );
+            let bytes =
+                (MAX_SEQ_LEN * VARIANT.kv_lora_rank * std::mem::size_of::<f32>()) as NSUInteger;
+            let buf = device.new_buffer(bytes, MTLResourceOptions::StorageModeShared);
             self.latent_cache = Some(buf);
         }
         if self.rope_k_cache.is_none() {
-            let bytes = (MAX_SEQ_LEN * VARIANT.qk_rope_head_dim
-                * std::mem::size_of::<f32>())
-                as NSUInteger;
-            let buf = device.new_buffer(
-                bytes,
-                MTLResourceOptions::StorageModeShared,
-            );
+            let bytes =
+                (MAX_SEQ_LEN * VARIANT.qk_rope_head_dim * std::mem::size_of::<f32>()) as NSUInteger;
+            let buf = device.new_buffer(bytes, MTLResourceOptions::StorageModeShared);
             self.rope_k_cache = Some(buf);
         }
     }
@@ -336,8 +281,7 @@ impl MlaKvCacheGpu {
         let old_len = self.len;
         if new_len < old_len {
             if let Some(buf) = &self.latent_cache {
-                let stride_bytes =
-                    VARIANT.kv_lora_rank * std::mem::size_of::<f32>();
+                let stride_bytes = VARIANT.kv_lora_rank * std::mem::size_of::<f32>();
                 let start = (new_len as usize) * stride_bytes;
                 let end = (old_len as usize) * stride_bytes;
                 // SAFETY: shared-storage buffer; truncate is called
@@ -345,26 +289,17 @@ impl MlaKvCacheGpu {
                 // checkpoint restore), with no GPU work in flight.
                 unsafe {
                     let p = buf.contents() as *mut u8;
-                    std::ptr::write_bytes(
-                        p.add(start),
-                        0,
-                        end - start,
-                    );
+                    std::ptr::write_bytes(p.add(start), 0, end - start);
                 }
             }
             if let Some(buf) = &self.rope_k_cache {
-                let stride_bytes = VARIANT.qk_rope_head_dim
-                    * std::mem::size_of::<f32>();
+                let stride_bytes = VARIANT.qk_rope_head_dim * std::mem::size_of::<f32>();
                 let start = (new_len as usize) * stride_bytes;
                 let end = (old_len as usize) * stride_bytes;
                 // SAFETY: see above.
                 unsafe {
                     let p = buf.contents() as *mut u8;
-                    std::ptr::write_bytes(
-                        p.add(start),
-                        0,
-                        end - start,
-                    );
+                    std::ptr::write_bytes(p.add(start), 0, end - start);
                 }
             }
         }
@@ -389,9 +324,7 @@ impl MlaKvCacheGpu {
         let n = len * VARIANT.kv_lora_rank;
         // SAFETY: caller upholds the no-concurrent-GPU-work invariant
         // documented on this fn.
-        unsafe {
-            std::slice::from_raw_parts(buf.contents() as *const f32, n)
-        }
+        unsafe { std::slice::from_raw_parts(buf.contents() as *const f32, n) }
     }
 
     /// Mutable counterpart to [`Self::latent_slice`] over the row
@@ -400,11 +333,7 @@ impl MlaKvCacheGpu {
     /// # Safety
     ///
     /// See [`Self::latent_slice`].
-    pub unsafe fn latent_slice_mut(
-        &mut self,
-        start_row: usize,
-        end_row: usize,
-    ) -> &mut [f32] {
+    pub unsafe fn latent_slice_mut(&mut self, start_row: usize, end_row: usize) -> &mut [f32] {
         let buf = self
             .latent_cache
             .as_ref()
@@ -413,12 +342,8 @@ impl MlaKvCacheGpu {
         // SAFETY: caller upholds the no-concurrent-GPU-work invariant
         // documented on this fn.
         unsafe {
-            let p =
-                (buf.contents() as *mut f32).add(start_row * stride);
-            std::slice::from_raw_parts_mut(
-                p,
-                (end_row - start_row) * stride,
-            )
+            let p = (buf.contents() as *mut f32).add(start_row * stride);
+            std::slice::from_raw_parts_mut(p, (end_row - start_row) * stride)
         }
     }
 
@@ -436,9 +361,7 @@ impl MlaKvCacheGpu {
         let n = len * VARIANT.qk_rope_head_dim;
         // SAFETY: caller upholds the no-concurrent-GPU-work invariant
         // documented on this fn.
-        unsafe {
-            std::slice::from_raw_parts(buf.contents() as *const f32, n)
-        }
+        unsafe { std::slice::from_raw_parts(buf.contents() as *const f32, n) }
     }
 
     /// Mutable counterpart to [`Self::rope_k_slice`] over the row
@@ -447,11 +370,7 @@ impl MlaKvCacheGpu {
     /// # Safety
     ///
     /// See [`Self::latent_slice`].
-    pub unsafe fn rope_k_slice_mut(
-        &mut self,
-        start_row: usize,
-        end_row: usize,
-    ) -> &mut [f32] {
+    pub unsafe fn rope_k_slice_mut(&mut self, start_row: usize, end_row: usize) -> &mut [f32] {
         let buf = self
             .rope_k_cache
             .as_ref()
@@ -460,12 +379,8 @@ impl MlaKvCacheGpu {
         // SAFETY: caller upholds the no-concurrent-GPU-work invariant
         // documented on this fn.
         unsafe {
-            let p =
-                (buf.contents() as *mut f32).add(start_row * stride);
-            std::slice::from_raw_parts_mut(
-                p,
-                (end_row - start_row) * stride,
-            )
+            let p = (buf.contents() as *mut f32).add(start_row * stride);
+            std::slice::from_raw_parts_mut(p, (end_row - start_row) * stride)
         }
     }
 }
@@ -489,11 +404,9 @@ pub struct LinearAttnState {
 impl LinearAttnState {
     /// Allocate a zeroed state sized for the active variant.
     pub fn new() -> Self {
-        let conv_entries =
-            (Variant::CONV_KERNEL_SIZE - 1) * VARIANT.linear_conv_dim();
-        let ssm_entries = VARIANT.linear_num_v_heads
-            * Variant::LINEAR_VALUE_DIM
-            * Variant::LINEAR_KEY_DIM;
+        let conv_entries = (Variant::CONV_KERNEL_SIZE - 1) * VARIANT.linear_conv_dim();
+        let ssm_entries =
+            VARIANT.linear_num_v_heads * Variant::LINEAR_VALUE_DIM * Variant::LINEAR_KEY_DIM;
         Self {
             conv_state: vec![0.0f32; conv_entries].into_boxed_slice(),
             ssm_state: vec![0.0f32; ssm_entries].into_boxed_slice(),
@@ -553,9 +466,7 @@ pub fn alloc_layer_states() -> Vec<LayerState> {
                 AttnKind::Gqa => LayerState::FullAttn(KvCache::new()),
                 AttnKind::Mla => LayerState::Mla(MlaKvCacheGpu::new()),
             },
-            LayerKind::LinearAttn => {
-                LayerState::LinearAttn(LinearAttnState::new())
-            }
+            LayerKind::LinearAttn => LayerState::LinearAttn(LinearAttnState::new()),
         })
         .collect()
 }
@@ -581,14 +492,12 @@ pub fn truncate(layers: &mut [LayerState], p0: i32, p1: i32) {
     for layer in layers {
         match layer {
             LayerState::FullAttn(kv) => {
-                let effective_end =
-                    if p1 < 0 || p1 > kv.len { kv.len } else { p1 };
+                let effective_end = if p1 < 0 || p1 > kv.len { kv.len } else { p1 };
                 let truncate_to = new_len.min(effective_end);
                 kv.truncate(truncate_to);
             }
             LayerState::Mla(mla) => {
-                let effective_end =
-                    if p1 < 0 || p1 > mla.len { mla.len } else { p1 };
+                let effective_end = if p1 < 0 || p1 > mla.len { mla.len } else { p1 };
                 let truncate_to = new_len.min(effective_end);
                 mla.truncate(truncate_to);
             }
@@ -657,19 +566,17 @@ mod tests {
     #[test]
     fn truncate_drops_full_attn_len() {
         let mut layers = alloc_layer_states();
-        let injected = layers
-            .iter_mut()
-            .find_map(|l| match l {
-                LayerState::FullAttn(kv) => {
-                    kv.len = 7;
-                    Some(())
-                }
-                LayerState::Mla(mla) => {
-                    mla.len = 7;
-                    Some(())
-                }
-                LayerState::LinearAttn(_) => None,
-            });
+        let injected = layers.iter_mut().find_map(|l| match l {
+            LayerState::FullAttn(kv) => {
+                kv.len = 7;
+                Some(())
+            }
+            LayerState::Mla(mla) => {
+                mla.len = 7;
+                Some(())
+            }
+            LayerState::LinearAttn(_) => None,
+        });
         assert!(
             injected.is_some(),
             "variant must have at least one full-attn (GQA or MLA) layer",

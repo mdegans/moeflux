@@ -20,35 +20,30 @@
 
 use metal::{Buffer, MTLResourceOptions, NSUInteger};
 
+use moeflux::riir::MetalContext;
+use moeflux::riir::MtlBuffer;
+use moeflux::riir::WeightFile;
 use moeflux::riir::backend::cpu::cpu_matvec::{bf16_matvec_cpu, dequant_matvec_4bit_cpu};
-use moeflux::riir::moe::expert_forward::{
-    encode_moe_batched_permute_fuse, gpu_expert_forward,
-};
-use moeflux_metal::SdpaCall;
 use moeflux::riir::backend::gpu::gpu_matvec::{
-    encode_bf16_matmul_n_tokens, encode_matvec_n_tokens, BfMatvecPipelines,
-    MatvecPipelines,
-};
-use moeflux::riir::moe::gpu_moe_router::{
-    encode_moe_router, MoeRouterPipelines,
+    BfMatvecPipelines, MatvecPipelines, encode_bf16_matmul_n_tokens, encode_matvec_n_tokens,
 };
 use moeflux::riir::backend::gpu::gpu_norm::{
-    encode_residual_add_n_tokens_into, encode_rms_norm_bf16_fused_n_tokens,
-    RmsNormBf16FusedNTokensPipeline,
+    RmsNormBf16FusedNTokensPipeline, encode_residual_add_n_tokens_into,
+    encode_rms_norm_bf16_fused_n_tokens,
 };
-use moeflux::riir::MetalContext;
+use moeflux::riir::backend::{Backend, BufferPool, CpuBackend, Graph, Op};
+use moeflux::riir::moe::expert_forward::{encode_moe_batched_permute_fuse, gpu_expert_forward};
+use moeflux::riir::moe::gpu_moe_router::{MoeRouterPipelines, encode_moe_router};
 use moeflux::riir::moe::moe_router::{build_expert_buckets, moe_router_cpu};
 use moeflux::riir::sdpa_cpu;
 use moeflux::riir::variants::VARIANT;
-use moeflux::riir::MtlBuffer;
-use moeflux::riir::backend::{Backend, BufferPool, CpuBackend, Graph, Op};
-use moeflux::riir::WeightFile;
+use moeflux_metal::SdpaCall;
 
 const GROUP_SIZE: u32 = 64;
 
 mod common;
 
-use common::diff_helpers::{cosine_sim, COSINE_FLOOR};
+use common::diff_helpers::{COSINE_FLOOR, cosine_sim};
 
 // ---------------------------------------------------------------------------
 // Local helpers — buffer plumbing + deterministic synthetic data.
@@ -63,22 +58,14 @@ fn make_buf<T>(metal: &MetalContext, n: usize) -> Buffer {
 
 fn write_buf<T: Copy>(buf: &Buffer, data: &[T]) {
     unsafe {
-        std::ptr::copy_nonoverlapping(
-            data.as_ptr(),
-            buf.contents() as *mut T,
-            data.len(),
-        );
+        std::ptr::copy_nonoverlapping(data.as_ptr(), buf.contents() as *mut T, data.len());
     }
 }
 
 fn read_buf_f32(buf: &Buffer, n: usize) -> Vec<f32> {
     let mut v = vec![0.0f32; n];
     unsafe {
-        std::ptr::copy_nonoverlapping(
-            buf.contents() as *const f32,
-            v.as_mut_ptr(),
-            n,
-        );
+        std::ptr::copy_nonoverlapping(buf.contents() as *const f32, v.as_mut_ptr(), n);
     }
     v
 }
@@ -139,8 +126,7 @@ fn bf16_matmul_n_tokens_matches_cpu() {
     let weights_f32: Vec<f32> = (0..(out_dim as usize * in_dim as usize))
         .map(|_| rng.next_f32() * 0.1)
         .collect();
-    let weights_bf16: Vec<u16> =
-        weights_f32.iter().copied().map(f32_to_bf16).collect();
+    let weights_bf16: Vec<u16> = weights_f32.iter().copied().map(f32_to_bf16).collect();
     // Re-decode for the CPU oracle so it sees the same quantized values
     // the GPU sees (avoids spurious mismatch from f32→bf16 rounding).
     let weights_f32_decoded: Vec<f32> = weights_bf16
@@ -154,20 +140,12 @@ fn bf16_matmul_n_tokens_matches_cpu() {
         .collect();
 
     // ---- CPU oracle, per-token ----
-    let mut cpu_out =
-        vec![0.0f32; n_tokens as usize * out_dim as usize];
+    let mut cpu_out = vec![0.0f32; n_tokens as usize * out_dim as usize];
     for t in 0..(n_tokens as usize) {
         let x = &inputs_f32[t * in_dim as usize..(t + 1) * in_dim as usize];
-        let out = &mut cpu_out
-            [t * out_dim as usize..(t + 1) * out_dim as usize];
-        bf16_matvec_cpu(
-            &weights_bf16,
-            in_dim as usize,
-            out_dim as usize,
-            x,
-            out,
-        )
-        .expect("bf16_matvec_cpu");
+        let out = &mut cpu_out[t * out_dim as usize..(t + 1) * out_dim as usize];
+        bf16_matvec_cpu(&weights_bf16, in_dim as usize, out_dim as usize, x, out)
+            .expect("bf16_matvec_cpu");
     }
     assert!(
         cpu_out.iter().all(|x| x.is_finite()),
@@ -181,27 +159,23 @@ fn bf16_matmul_n_tokens_matches_cpu() {
     // ---- GPU dispatch ----
     let mut metal = MetalContext::new().expect("open Metal");
     let device = metal.device().clone();
-    let pipes = BfMatvecPipelines::fetch(&mut metal)
-        .expect("fetch BfMatvecPipelines");
+    let pipes = BfMatvecPipelines::fetch(&mut metal).expect("fetch BfMatvecPipelines");
 
     let w_buf = make_buf::<u16>(&metal, weights_bf16.len());
     write_buf(&w_buf, &weights_bf16);
     let in_buf = make_buf::<f32>(&metal, inputs_f32.len());
     write_buf(&in_buf, &inputs_f32);
-    let out_buf =
-        make_buf::<f32>(&metal, n_tokens as usize * out_dim as usize);
+    let out_buf = make_buf::<f32>(&metal, n_tokens as usize * out_dim as usize);
 
     let queue = metal.queue();
     let cmdbuf = queue.new_command_buffer();
     encode_bf16_matmul_n_tokens(
-        cmdbuf, &pipes, &w_buf, 0, &in_buf, &out_buf, in_dim, out_dim,
-        n_tokens,
+        cmdbuf, &pipes, &w_buf, 0, &in_buf, &out_buf, in_dim, out_dim, n_tokens,
     );
     cmdbuf.commit();
     cmdbuf.wait_until_completed();
 
-    let gpu_out =
-        read_buf_f32(&out_buf, n_tokens as usize * out_dim as usize);
+    let gpu_out = read_buf_f32(&out_buf, n_tokens as usize * out_dim as usize);
     assert!(
         gpu_out.iter().all(|x| x.is_finite()),
         "GPU output has non-finite values"
@@ -247,13 +221,11 @@ fn bf16_matmul_n_tokens_n1_matches_single_matvec() {
     let weights_bf16: Vec<u16> = (0..(out_dim as usize * in_dim as usize))
         .map(|_| f32_to_bf16(rng.next_f32() * 0.1))
         .collect();
-    let input_f32: Vec<f32> =
-        (0..in_dim as usize).map(|_| rng.next_f32()).collect();
+    let input_f32: Vec<f32> = (0..in_dim as usize).map(|_| rng.next_f32()).collect();
 
     let mut metal = MetalContext::new().expect("open Metal");
     let device = metal.device().clone();
-    let pipes = BfMatvecPipelines::fetch(&mut metal)
-        .expect("fetch BfMatvecPipelines");
+    let pipes = BfMatvecPipelines::fetch(&mut metal).expect("fetch BfMatvecPipelines");
 
     let w_buf = make_buf::<u16>(&metal, weights_bf16.len());
     write_buf(&w_buf, &weights_bf16);
@@ -265,11 +237,25 @@ fn bf16_matmul_n_tokens_n1_matches_single_matvec() {
     let queue = metal.queue();
     let cmdbuf = queue.new_command_buffer();
     encode_bf16_matvec(
-        cmdbuf, &pipes, &w_buf, 0, &in_buf, &out_single, in_dim, out_dim,
+        cmdbuf,
+        &pipes,
+        &w_buf,
+        0,
+        &in_buf,
+        &out_single,
+        in_dim,
+        out_dim,
     );
     encode_bf16_matmul_n_tokens(
-        cmdbuf, &pipes, &w_buf, 0, &in_buf, &out_batched, in_dim,
-        out_dim, 1,
+        cmdbuf,
+        &pipes,
+        &w_buf,
+        0,
+        &in_buf,
+        &out_batched,
+        in_dim,
+        out_dim,
+        1,
     );
     cmdbuf.commit();
     cmdbuf.wait_until_completed();
@@ -300,12 +286,7 @@ fn bf16_matmul_n_tokens_n1_matches_single_matvec() {
 /// Reinterpret a `&[T]` of plain-old-data as raw bytes — for pool
 /// `upload` of typed host buffers.
 fn as_u8<T>(v: &[T]) -> &[u8] {
-    unsafe {
-        std::slice::from_raw_parts(
-            v.as_ptr() as *const u8,
-            std::mem::size_of_val(v),
-        )
-    }
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }
 
 /// Minimal on-disk [`WeightFile`] (one tiny bf16 tensor) so a
@@ -313,8 +294,7 @@ fn as_u8<T>(v: &[T]) -> &[u8] {
 /// Op reads only pool buffers, never the weight file, so the contents
 /// are irrelevant — only that `WeightFile::open` succeeds.
 fn dummy_weight_file(tag: &str) -> WeightFile {
-    let dir = std::env::temp_dir()
-        .join(format!("moeflux-bdo-{}-{}", tag, std::process::id()));
+    let dir = std::env::temp_dir().join(format!("moeflux-bdo-{}-{}", tag, std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("mkdir dummy WF dir");
     let bin = dir.join("model_weights.bin");
@@ -364,22 +344,13 @@ fn pack_weights_into_buf(
     let s_bytes = scales.len() * std::mem::size_of::<u16>();
     let b_bytes = biases.len() * std::mem::size_of::<u16>();
     let total = w_bytes + s_bytes + b_bytes;
-    let buf = metal.device().new_buffer(
-        total as NSUInteger,
-        MTLResourceOptions::StorageModeShared,
-    );
+    let buf = metal
+        .device()
+        .new_buffer(total as NSUInteger, MTLResourceOptions::StorageModeShared);
     unsafe {
         let base = buf.contents() as *mut u8;
-        std::ptr::copy_nonoverlapping(
-            packed.as_ptr() as *const u8,
-            base,
-            w_bytes,
-        );
-        std::ptr::copy_nonoverlapping(
-            scales.as_ptr() as *const u8,
-            base.add(w_bytes),
-            s_bytes,
-        );
+        std::ptr::copy_nonoverlapping(packed.as_ptr() as *const u8, base, w_bytes);
+        std::ptr::copy_nonoverlapping(scales.as_ptr() as *const u8, base.add(w_bytes), s_bytes);
         std::ptr::copy_nonoverlapping(
             biases.as_ptr() as *const u8,
             base.add(w_bytes + s_bytes),
@@ -391,20 +362,16 @@ fn pack_weights_into_buf(
 
 fn run_4bit_n_tokens_test(in_dim: u32, out_dim: u32, n_tokens: u32, seed: u64) {
     let mut rng = XorShift64::new(seed);
-    let (packed, scales, biases) =
-        gen_4bit_weights(&mut rng, out_dim as usize, in_dim as usize);
+    let (packed, scales, biases) = gen_4bit_weights(&mut rng, out_dim as usize, in_dim as usize);
     let inputs_f32: Vec<f32> = (0..(n_tokens as usize * in_dim as usize))
         .map(|_| rng.next_f32())
         .collect();
 
     // ---- CPU oracle, per-token ----
-    let mut cpu_out =
-        vec![0.0f32; n_tokens as usize * out_dim as usize];
+    let mut cpu_out = vec![0.0f32; n_tokens as usize * out_dim as usize];
     for t in 0..(n_tokens as usize) {
-        let x =
-            &inputs_f32[t * in_dim as usize..(t + 1) * in_dim as usize];
-        let out = &mut cpu_out
-            [t * out_dim as usize..(t + 1) * out_dim as usize];
+        let x = &inputs_f32[t * in_dim as usize..(t + 1) * in_dim as usize];
+        let out = &mut cpu_out[t * out_dim as usize..(t + 1) * out_dim as usize];
         dequant_matvec_4bit_cpu(
             &packed,
             &scales,
@@ -423,27 +390,23 @@ fn run_4bit_n_tokens_test(in_dim: u32, out_dim: u32, n_tokens: u32, seed: u64) {
 
     // ---- GPU dispatch ----
     let mut metal = MetalContext::new().expect("open Metal");
-    let pipes = MatvecPipelines::fetch(&mut metal)
-        .expect("fetch MatvecPipelines");
+    let pipes = MatvecPipelines::fetch(&mut metal).expect("fetch MatvecPipelines");
 
-    let (w_buf, w_off, s_off, b_off) =
-        pack_weights_into_buf(&metal, &packed, &scales, &biases);
+    let (w_buf, w_off, s_off, b_off) = pack_weights_into_buf(&metal, &packed, &scales, &biases);
     let in_buf = make_buf::<f32>(&metal, inputs_f32.len());
     write_buf(&in_buf, &inputs_f32);
-    let out_buf =
-        make_buf::<f32>(&metal, n_tokens as usize * out_dim as usize);
+    let out_buf = make_buf::<f32>(&metal, n_tokens as usize * out_dim as usize);
 
     let queue = metal.queue();
     let cmdbuf = queue.new_command_buffer();
     encode_matvec_n_tokens(
-        cmdbuf, &pipes, &w_buf, w_off, s_off, b_off, &in_buf, 0,
-        &out_buf, 0, in_dim, out_dim, n_tokens, 4,
+        cmdbuf, &pipes, &w_buf, w_off, s_off, b_off, &in_buf, 0, &out_buf, 0, in_dim, out_dim,
+        n_tokens, 4,
     );
     cmdbuf.commit();
     cmdbuf.wait_until_completed();
 
-    let gpu_out =
-        read_buf_f32(&out_buf, n_tokens as usize * out_dim as usize);
+    let gpu_out = read_buf_f32(&out_buf, n_tokens as usize * out_dim as usize);
     assert!(
         gpu_out.iter().all(|x| x.is_finite()),
         "GPU output has non-finite values"
@@ -496,17 +459,13 @@ fn dequant_matvec_4bit_n_tokens_v3_n1_matches_single() {
     let in_dim: u32 = 1024;
     let out_dim: u32 = 256;
     let mut rng = XorShift64::new(0xD3CAFE_BABE_0003);
-    let (packed, scales, biases) =
-        gen_4bit_weights(&mut rng, out_dim as usize, in_dim as usize);
-    let input: Vec<f32> =
-        (0..in_dim as usize).map(|_| rng.next_f32()).collect();
+    let (packed, scales, biases) = gen_4bit_weights(&mut rng, out_dim as usize, in_dim as usize);
+    let input: Vec<f32> = (0..in_dim as usize).map(|_| rng.next_f32()).collect();
 
     let mut metal = MetalContext::new().expect("open Metal");
-    let pipes = MatvecPipelines::fetch(&mut metal)
-        .expect("fetch MatvecPipelines");
+    let pipes = MatvecPipelines::fetch(&mut metal).expect("fetch MatvecPipelines");
 
-    let (w_buf, w_off, s_off, b_off) =
-        pack_weights_into_buf(&metal, &packed, &scales, &biases);
+    let (w_buf, w_off, s_off, b_off) = pack_weights_into_buf(&metal, &packed, &scales, &biases);
     let in_buf = make_buf::<f32>(&metal, input.len());
     write_buf(&in_buf, &input);
     let out_single = make_buf::<f32>(&metal, out_dim as usize);
@@ -538,8 +497,20 @@ fn dequant_matvec_4bit_n_tokens_v3_n1_matches_single() {
         enc.end_encoding();
     }
     encode_matvec_n_tokens(
-        cmdbuf, &pipes, &w_buf, w_off, s_off, b_off, &in_buf, 0,
-        &out_batched, 0, in_dim, out_dim, 1, 4,
+        cmdbuf,
+        &pipes,
+        &w_buf,
+        w_off,
+        s_off,
+        b_off,
+        &in_buf,
+        0,
+        &out_batched,
+        0,
+        in_dim,
+        out_dim,
+        1,
+        4,
     );
     cmdbuf.commit();
     cmdbuf.wait_until_completed();
@@ -590,8 +561,7 @@ fn run_batched_sdpa_flash(
     fold: u32,
     vb: bool,
 ) -> Vec<f32> {
-    let out_total =
-        n_tokens as usize * num_heads as usize * head_dim as usize;
+    let out_total = n_tokens as usize * num_heads as usize * head_dim as usize;
 
     let q_buf = make_buf::<f32>(metal, q_data.len());
     write_buf(&q_buf, q_data);
@@ -632,13 +602,7 @@ fn run_batched_sdpa_flash(
 /// absolute position `start_pos` against a per-token `sdpa_cpu` oracle
 /// (each query `q` attends to `KV[0 .. start_pos+q+1]`). Per-token
 /// cosine must clear `COSINE_FLOOR`.
-fn flash_diff_tokenwise(
-    n_tokens: u32,
-    start_pos: u32,
-    seed: u64,
-    fold: u32,
-    vb: bool,
-) {
+fn flash_diff_tokenwise(n_tokens: u32, start_pos: u32, seed: u64, fold: u32, vb: bool) {
     let num_heads = VARIANT.num_attn_heads as u32;
     let num_kv_heads = VARIANT.num_kv_heads as u32;
     let head_dim = VARIANT.head_dim as u32;
@@ -677,8 +641,19 @@ fn flash_diff_tokenwise(
 
     let mut metal = MetalContext::new().expect("open Metal");
     let gpu = run_batched_sdpa_flash(
-        &mut metal, &q_data, &k_data, &v_data, n_tokens, num_heads,
-        heads_per_kv, head_dim, kv_dim, start_pos, kv_len, scale, fold,
+        &mut metal,
+        &q_data,
+        &k_data,
+        &v_data,
+        n_tokens,
+        num_heads,
+        heads_per_kv,
+        head_dim,
+        kv_dim,
+        start_pos,
+        kv_len,
+        scale,
+        fold,
         vb,
     );
 
@@ -879,20 +854,10 @@ fn gen_synth_expert_blob(rng: &mut XorShift64) -> Vec<u8> {
         buf[off..off + src_bytes.len()].copy_from_slice(src_bytes);
     };
     let as_bytes_u32 = |v: &[u32]| -> &[u8] {
-        unsafe {
-            std::slice::from_raw_parts(
-                v.as_ptr() as *const u8,
-                std::mem::size_of_val(v),
-            )
-        }
+        unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
     };
     let as_bytes_u16 = |v: &[u16]| -> &[u8] {
-        unsafe {
-            std::slice::from_raw_parts(
-                v.as_ptr() as *const u8,
-                std::mem::size_of_val(v),
-            )
-        }
+        unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
     };
 
     // gate: [mi, h]
@@ -940,12 +905,7 @@ fn moe_permute_fuse_n_tokens_matches_tokenwise() {
     // Routing fixture: 8 distinct experts in use (0..7), 4 empty (8..11).
     // Each (token, slot) pair distinct within a token (top-K invariant).
     // Bucket sizes: every non-empty bucket has 2 tokens.
-    let routing_experts: [[i32; 4]; 4] = [
-        [0, 1, 2, 3],
-        [2, 3, 4, 5],
-        [4, 5, 6, 7],
-        [6, 7, 0, 1],
-    ];
+    let routing_experts: [[i32; 4]; 4] = [[0, 1, 2, 3], [2, 3, 4, 5], [4, 5, 6, 7], [6, 7, 0, 1]];
 
     let mut per_token_indices = vec![0i32; n_tokens * k_active];
     let mut per_token_weights = vec![0.0f32; n_tokens * k_active];
@@ -954,8 +914,7 @@ fn moe_permute_fuse_n_tokens_matches_tokenwise() {
             per_token_indices[t * k_active + s] = routing_experts[t][s];
             // Bounded positive weights — keep arithmetic well-conditioned
             // for the FP-reorder envelope.
-            per_token_weights[t * k_active + s] =
-                rng.next_f32() * 0.4 + 0.3;
+            per_token_weights[t * k_active + s] = rng.next_f32() * 0.4 + 0.3;
         }
     }
 
@@ -979,12 +938,11 @@ fn moe_permute_fuse_n_tokens_matches_tokenwise() {
     let synth_blobs: Vec<Vec<u8>> = (0..unique_experts.len())
         .map(|_| gen_synth_expert_blob(&mut rng))
         .collect();
-    let expert_to_blob_idx: std::collections::HashMap<i32, usize> =
-        unique_experts
-            .iter()
-            .enumerate()
-            .map(|(i, &e)| (e, i))
-            .collect();
+    let expert_to_blob_idx: std::collections::HashMap<i32, usize> = unique_experts
+        .iter()
+        .enumerate()
+        .map(|(i, &e)| (e, i))
+        .collect();
 
     // ---- Tokenwise reference: gpu_expert_forward per (t, s), sum
     // weighted into per_token_ref[t].
@@ -1032,11 +990,9 @@ fn moe_permute_fuse_n_tokens_matches_tokenwise() {
     let mut expert_base_host = vec![0u8; num_buckets * expert_size];
     for (bi, &e) in buckets.expert_ids.iter().enumerate() {
         let blob = &synth_blobs[expert_to_blob_idx[&e]];
-        expert_base_host[bi * expert_size..(bi + 1) * expert_size]
-            .copy_from_slice(blob);
+        expert_base_host[bi * expert_size..(bi + 1) * expert_size].copy_from_slice(blob);
     }
-    let expert_base =
-        MtlBuffer::<u8>::with_data(metal.device(), &expert_base_host);
+    let expert_base = MtlBuffer::<u8>::with_data(metal.device(), &expert_base_host);
     let expert_slots: Vec<u32> = (0..num_buckets as u32).collect();
     let mut expert_indices_host = vec![0u32; total_assignments];
     for bi in 0..num_buckets {
@@ -1066,8 +1022,7 @@ fn moe_permute_fuse_n_tokens_matches_tokenwise() {
     write_buf(&w_buf, &buckets.weights);
     let out_sum_buf = make_buf::<f32>(&metal, n_tokens * h);
 
-    let matvec_pipes =
-        MatvecPipelines::fetch(&mut metal).expect("fetch MatvecPipelines");
+    let matvec_pipes = MatvecPipelines::fetch(&mut metal).expect("fetch MatvecPipelines");
     let swiglu = metal
         .pipeline("swiglu_fused")
         .expect("swiglu_fused pipeline")
@@ -1174,9 +1129,7 @@ fn moe_permute_fuse_n_tokens_matches_tokenwise() {
         let bw = pool
             .alloc(total_assignments * f32_sz, "bucket_weights", false)
             .unwrap();
-        let os = pool
-            .alloc(n_tokens * h * f32_sz, "out_sum", false)
-            .unwrap();
+        let os = pool.alloc(n_tokens * h * f32_sz, "out_sum", false).unwrap();
         pool.upload(eb, &expert_base_host).unwrap();
         pool.upload(ei, as_u8(&expert_indices_host)).unwrap();
         pool.upload(bin, as_u8(&packed_input)).unwrap();
@@ -1201,7 +1154,8 @@ fn moe_permute_fuse_n_tokens_matches_tokenwise() {
             out_sum: os,
             buckets: buckets.clone(),
         });
-        cpu.execute(&g, "moe_pf_op_diff").expect("CpuBackend execute");
+        cpu.execute(&g, "moe_pf_op_diff")
+            .expect("CpuBackend execute");
 
         let mut out_bytes = vec![0u8; n_tokens * h * f32_sz];
         cpu.pool().download(os, &mut out_bytes).unwrap();
@@ -1224,7 +1178,9 @@ fn moe_permute_fuse_n_tokens_matches_tokenwise() {
             assert!(
                 cos >= COSINE_FLOOR,
                 "cpu-op token {} cosine {:.9} below floor {}",
-                t, cos, COSINE_FLOOR
+                t,
+                cos,
+                COSINE_FLOOR
             );
         }
     }
@@ -1434,8 +1390,9 @@ fn rms_norm_bf16_fused_n_tokens_matches_cpu() {
     let x: Vec<f32> = (0..(n_tokens * dim))
         .map(|_| rng.next_f32() * 0.5)
         .collect();
-    let weight_bf16: Vec<u16> =
-        (0..dim).map(|_| f32_to_bf16(rng.next_f32() * 0.1)).collect();
+    let weight_bf16: Vec<u16> = (0..dim)
+        .map(|_| f32_to_bf16(rng.next_f32() * 0.1))
+        .collect();
 
     // CPU reference: per-token rms_norm.
     let mut cpu_out = vec![0.0f32; n_tokens * dim];
@@ -1450,8 +1407,7 @@ fn rms_norm_bf16_fused_n_tokens_matches_cpu() {
 
     // GPU: single fused dispatch.
     let mut metal = MetalContext::new().expect("MetalContext::new");
-    let pipe = RmsNormBf16FusedNTokensPipeline::fetch(&mut metal)
-        .expect("rms_norm fused pipe");
+    let pipe = RmsNormBf16FusedNTokensPipeline::fetch(&mut metal).expect("rms_norm fused pipe");
 
     let x_buf = make_buf::<f32>(&metal, n_tokens * dim);
     write_buf(&x_buf, &x);
@@ -1493,7 +1449,10 @@ fn rms_norm_bf16_fused_n_tokens_matches_cpu() {
         assert!(
             cos >= COSINE_FLOOR,
             "token {} cosine {:.9} below floor {} (max_abs={:.3e})",
-            t, cos, COSINE_FLOOR, m
+            t,
+            cos,
+            COSINE_FLOOR,
+            m
         );
     }
     eprintln!(
@@ -1509,12 +1468,8 @@ fn residual_add_n_tokens_matches_cpu() {
     let dim: usize = 2048;
 
     let mut rng = XorShift64::new(0xB0_FE_DD_02);
-    let a: Vec<f32> = (0..(n_tokens * dim))
-        .map(|_| rng.next_f32())
-        .collect();
-    let b: Vec<f32> = (0..(n_tokens * dim))
-        .map(|_| rng.next_f32())
-        .collect();
+    let a: Vec<f32> = (0..(n_tokens * dim)).map(|_| rng.next_f32()).collect();
+    let b: Vec<f32> = (0..(n_tokens * dim)).map(|_| rng.next_f32()).collect();
 
     // CPU ref: element-wise add.
     let cpu_out: Vec<f32> = a.iter().zip(b.iter()).map(|(x, y)| x + y).collect();

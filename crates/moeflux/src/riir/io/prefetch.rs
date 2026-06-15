@@ -47,11 +47,11 @@
 //! state machine in [`super::deferred`].
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver};
+use std::sync::mpsc::{Receiver, sync_channel};
 
-use crate::riir::moe::expert_forward::MAX_K;
-use crate::riir::io::expert_io_mode::ExpertIoMode;
 use crate::riir::io::expert_io::{ExpertFiles, ExpertIoError};
+use crate::riir::io::expert_io_mode::ExpertIoMode;
+use crate::riir::moe::expert_forward::MAX_K;
 
 /// Per-slot decision: which buffer the K-expert encoder reads from.
 /// Set by the per-slot resolution in
@@ -171,12 +171,7 @@ impl DataPrefetchPtr {
     ///   outlive the underlying allocation.
     unsafe fn as_mut_slice<'a>(self) -> &'a mut [u8] {
         // SAFETY: forwarded — see the safety contract above.
-        unsafe {
-            std::slice::from_raw_parts_mut(
-                self.ptr_addr as *mut u8,
-                self.len,
-            )
-        }
+        unsafe { std::slice::from_raw_parts_mut(self.ptr_addr as *mut u8, self.len) }
     }
 }
 
@@ -318,11 +313,7 @@ impl PrefetchState {
 
     /// Record this token's actual routing for `layer_idx`, becoming
     /// the prediction for the next token's same layer.
-    pub fn record_actual(
-        &mut self,
-        layer_idx: usize,
-        actual: [i32; MAX_K],
-    ) {
+    pub fn record_actual(&mut self, layer_idx: usize, actual: [i32; MAX_K]) {
         if let Some(slot) = self.last_token_indices.get_mut(layer_idx) {
             *slot = Some(actual);
         }
@@ -358,8 +349,7 @@ impl PrefetchState {
         // Capture the K disjoint slot pointers BEFORE spawning;
         // the borrow checker's `data_prefetch: [&mut [u8]; MAX_K]`
         // input is consumed by this conversion.
-        let mut slot_ptrs: [Option<DataPrefetchPtr>; MAX_K] =
-            std::array::from_fn(|_| None);
+        let mut slot_ptrs: [Option<DataPrefetchPtr>; MAX_K] = std::array::from_fn(|_| None);
         for (i, dst) in data_prefetch.into_iter().enumerate() {
             slot_ptrs[i] = Some(DataPrefetchPtr::from_slice(dst));
         }

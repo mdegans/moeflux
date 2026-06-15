@@ -45,9 +45,7 @@ pub enum WeightFileError {
     Json(#[from] serde_json::Error),
     #[error("manifest missing 'tensors' key")]
     MissingTensors,
-    #[error(
-        "tensor '{name}' span [{offset}, {end}) extends past mmap'd file ({file_size} bytes)"
-    )]
+    #[error("tensor '{name}' span [{offset}, {end}) extends past mmap'd file ({file_size} bytes)")]
     OutOfBounds {
         name: String,
         offset: u64,
@@ -89,10 +87,7 @@ impl WeightFile {
     /// are typically `<artifacts>/model_weights.bin` and
     /// `<artifacts>/model_weights.json` (matching the C `Ctx::open`
     /// argument order).
-    pub fn open(
-        bin_path: &Path,
-        manifest_path: &Path,
-    ) -> Result<Self, WeightFileError> {
+    pub fn open(bin_path: &Path, manifest_path: &Path) -> Result<Self, WeightFileError> {
         let file = File::open(bin_path)?;
         // SAFETY: mmap of a regular file we just opened. The file
         // descriptor is closed when `file` drops (after Mmap takes
@@ -219,9 +214,7 @@ struct RawTensor {
     bits: Option<i32>,
 }
 
-fn parse_manifest(
-    path: &Path,
-) -> Result<HashMap<String, TensorInfo>, WeightFileError> {
+fn parse_manifest(path: &Path) -> Result<HashMap<String, TensorInfo>, WeightFileError> {
     let bytes = std::fs::read(path)?;
     let raw: RawManifest = serde_json::from_slice(&bytes)?;
     let mut out = HashMap::with_capacity(raw.tensors.len());
@@ -229,13 +222,9 @@ fn parse_manifest(
         // Default bits=4 for U32-packed tensors that lack the
         // explicit field (older manifests). Non-U32 tensors are
         // unquantized — bits=0.
-        let bits = t.bits.unwrap_or_else(|| {
-            if t.dtype == "U32" {
-                4
-            } else {
-                0
-            }
-        });
+        let bits = t
+            .bits
+            .unwrap_or_else(|| if t.dtype == "U32" { 4 } else { 0 });
         out.insert(
             name,
             TensorInfo {

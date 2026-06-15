@@ -69,13 +69,13 @@
 //! naive form for clarity; the folded form is a follow-up
 //! optimization once the model is producing tokens.
 
-use crate::riir::backend::cpu::cpu_matvec::{project_4bit_cpu, CpuMatvecError};
+use crate::riir::attn::rms_norm::{RmsNormError, rms_norm_per_head_cpu};
+use crate::riir::attn::rope::{YarnError, apply_rotary_emb_yarn};
+use crate::riir::backend::cpu::cpu_matvec::{CpuMatvecError, project_4bit_cpu};
+use crate::riir::io::weight_file::WeightFile;
 use crate::riir::moe::moe_router::softmax;
-use crate::riir::attn::rms_norm::{rms_norm_per_head_cpu, RmsNormError};
-use crate::riir::attn::rope::{apply_rotary_emb_yarn, YarnError};
 use crate::riir::snapshot::state::MlaKvCacheGpu;
 use crate::riir::variants::{MAX_SEQ_LEN, VARIANT};
-use crate::riir::io::weight_file::WeightFile;
 
 /// Errors specific to the MLA CPU forward.
 #[derive(Debug, thiserror::Error)]
@@ -181,8 +181,7 @@ pub fn mla_attn_layer_forward_cpu(
 
     // ---- Q chain ----
     let q_a_name = format!("model.layers.{layer_idx}.self_attn.q_a_proj");
-    let q_a_norm =
-        format!("model.layers.{layer_idx}.self_attn.q_a_layernorm.weight");
+    let q_a_norm = format!("model.layers.{layer_idx}.self_attn.q_a_layernorm.weight");
     let q_b_name = format!("model.layers.{layer_idx}.self_attn.q_b_proj");
 
     let mut q_lat = vec![0.0f32; q_lora_rank];
@@ -209,10 +208,8 @@ pub fn mla_attn_layer_forward_cpu(
     }
 
     // ---- KV chain ----
-    let kv_a_name =
-        format!("model.layers.{layer_idx}.self_attn.kv_a_proj_with_mqa");
-    let kv_a_norm =
-        format!("model.layers.{layer_idx}.self_attn.kv_a_layernorm.weight");
+    let kv_a_name = format!("model.layers.{layer_idx}.self_attn.kv_a_proj_with_mqa");
+    let kv_a_norm = format!("model.layers.{layer_idx}.self_attn.kv_a_layernorm.weight");
 
     let mut kv_pre = vec![0.0f32; kv_lora_rank + rope];
     project_4bit_cpu(
@@ -223,13 +220,7 @@ pub fn mla_attn_layer_forward_cpu(
         hidden,
         &mut kv_pre,
     )?;
-    rms_norm_per_head_cpu(
-        wf,
-        &kv_a_norm,
-        1,
-        kv_lora_rank,
-        &mut kv_pre[..kv_lora_rank],
-    )?;
+    rms_norm_per_head_cpu(wf, &kv_a_norm, 1, kv_lora_rank, &mut kv_pre[..kv_lora_rank])?;
 
     // ---- YaRN RoPE on the rope halves ----
     apply_rotary_emb_yarn(pos, &mut q_pe, rope, yarn_inv_freq, yarn_mscale)?;
@@ -270,10 +261,8 @@ pub fn mla_attn_layer_forward_cpu(
     // SDPA loop below borrows `latent_cache_view` / `rope_k_cache_view`
     // instead of re-deriving slices through the accessor each step.
     // SAFETY: see the mutable accessor above.
-    let latent_cache_view: &[f32] =
-        unsafe { kv_cache.latent_slice(cache_len) };
-    let rope_k_cache_view: &[f32] =
-        unsafe { kv_cache.rope_k_slice(cache_len) };
+    let latent_cache_view: &[f32] = unsafe { kv_cache.latent_slice(cache_len) };
+    let rope_k_cache_view: &[f32] = unsafe { kv_cache.rope_k_slice(cache_len) };
 
     // ---- Decompress kv_b_proj @ latent[j] for every cached j ----
     // decoded_all layout: [cache_len, num_heads, kv_b_per_head] flat.
@@ -282,10 +271,9 @@ pub fn mla_attn_layer_forward_cpu(
     let kv_b_name = format!("model.layers.{layer_idx}.self_attn.kv_b_proj");
     let mut decoded_all = vec![0.0f32; cache_len * num_heads * kv_b_per_head];
     for j in 0..cache_len {
-        let latent_j = &latent_cache_view
-            [j * kv_lora_rank..(j + 1) * kv_lora_rank];
-        let dec_j = &mut decoded_all
-            [j * num_heads * kv_b_per_head..(j + 1) * num_heads * kv_b_per_head];
+        let latent_j = &latent_cache_view[j * kv_lora_rank..(j + 1) * kv_lora_rank];
+        let dec_j =
+            &mut decoded_all[j * num_heads * kv_b_per_head..(j + 1) * num_heads * kv_b_per_head];
         project_4bit_cpu(
             wf,
             &kv_b_name,
@@ -299,8 +287,7 @@ pub fn mla_attn_layer_forward_cpu(
     // ---- SDPA per head ----
     // softmax_scale = (1/sqrt(qk_head_dim)) * mscale². For Cogito-V2's
     // mscale=1.0/mscale_all_dim=1.0 this collapses to 1/sqrt(192).
-    let softmax_scale =
-        (1.0 / (qk_head_dim as f32).sqrt()) * yarn_mscale * yarn_mscale;
+    let softmax_scale = (1.0 / (qk_head_dim as f32).sqrt()) * yarn_mscale * yarn_mscale;
 
     let mut head_out = vec![0.0f32; num_heads * v_head_dim];
     let mut scores = vec![0.0f32; cache_len];
@@ -310,11 +297,10 @@ pub fn mla_attn_layer_forward_cpu(
         let q_nope_h = &q_h[..nope];
         let q_pe_h = &q_h[nope..nope + rope];
         for j in 0..cache_len {
-            let dec_jh = &decoded_all[(j * num_heads + h) * kv_b_per_head
-                ..(j * num_heads + h + 1) * kv_b_per_head];
+            let dec_jh = &decoded_all
+                [(j * num_heads + h) * kv_b_per_head..(j * num_heads + h + 1) * kv_b_per_head];
             let k_nope_jh = &dec_jh[..nope];
-            let rope_k_j =
-                &rope_k_cache_view[j * rope..(j + 1) * rope];
+            let rope_k_j = &rope_k_cache_view[j * rope..(j + 1) * rope];
             let mut s = 0.0f32;
             for c in 0..nope {
                 s = q_nope_h[c].mul_add(k_nope_jh[c], s);
@@ -328,8 +314,8 @@ pub fn mla_attn_layer_forward_cpu(
         let head_out_h = &mut head_out[h * v_head_dim..(h + 1) * v_head_dim];
         head_out_h.fill(0.0);
         for j in 0..cache_len {
-            let dec_jh = &decoded_all[(j * num_heads + h) * kv_b_per_head
-                ..(j * num_heads + h + 1) * kv_b_per_head];
+            let dec_jh = &decoded_all
+                [(j * num_heads + h) * kv_b_per_head..(j * num_heads + h + 1) * kv_b_per_head];
             let v_jh = &dec_jh[nope..nope + v_head_dim];
             let w = scores[j];
             for c in 0..v_head_dim {
@@ -359,10 +345,7 @@ mod tests {
     /// Calling MLA forward on a non-MLA variant must fail cleanly,
     /// not silently mis-decode. This catches a mis-dispatch in the
     /// integration step (Phase G).
-    #[cfg(any(
-        feature = "model-qwen3-5-a17b",
-        feature = "model-qwen3-6-35b-a3b",
-    ))]
+    #[cfg(any(feature = "model-qwen3-5-a17b", feature = "model-qwen3-6-35b-a3b",))]
     #[test]
     fn rejects_non_mla_variant() {
         // Can't actually construct a real WeightFile in unit-test
@@ -400,26 +383,20 @@ mod tests {
             v.yarn_beta_fast,
             v.yarn_beta_slow,
         );
-        let mscale = yarn_get_mscale_full(
-            v.yarn_factor,
-            v.yarn_mscale,
-            v.yarn_mscale_all_dim,
-        );
+        let mscale = yarn_get_mscale_full(v.yarn_factor, v.yarn_mscale, v.yarn_mscale_all_dim);
 
         // Hidden = pulse at index 7 (no particular meaning; just a
         // non-zero, non-uniform input the kernel can transform).
         let mut hidden = vec![0.0f32; v.hidden_dim];
         hidden[7] = 1.0;
-        let device = metal::Device::system_default()
-            .expect("Metal device for MLA KV cache buffers");
+        let device =
+            metal::Device::system_default().expect("Metal device for MLA KV cache buffers");
         let mut cache = MlaKvCacheGpu::new();
         cache.ensure_buffers(&device);
         let mut out = vec![0.0f32; v.hidden_dim];
 
-        mla_attn_layer_forward_cpu(
-            &wf, 0, 0, &hidden, &mut cache, &inv_freq, mscale, &mut out,
-        )
-        .expect("MLA forward should succeed");
+        mla_attn_layer_forward_cpu(&wf, 0, 0, &hidden, &mut cache, &inv_freq, mscale, &mut out)
+            .expect("MLA forward should succeed");
 
         assert_eq!(cache.len, 1, "cache should advance to 1");
         assert!(
@@ -428,10 +405,7 @@ mod tests {
             out.iter().position(|v| !v.is_finite()),
         );
         let max_abs = out.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
-        assert!(
-            max_abs > 0.0,
-            "output is all zeros — likely a wiring bug"
-        );
+        assert!(max_abs > 0.0, "output is all zeros — likely a wiring bug");
         assert!(
             max_abs < 1e6,
             "output magnitude {max_abs} suspiciously large"
