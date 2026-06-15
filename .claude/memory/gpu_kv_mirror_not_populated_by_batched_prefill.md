@@ -1,5 +1,19 @@
 # BUG: oracle decode attends a zero KV mirror after batched prefill
 
+> **FIX LANDED 2026-06-15** (moeflux `6e4c103`, Fable 5) — Option A
+> (the "preferred" direction below). The oracle GPU SDPA encoders now
+> read the canonical pool KV (`GpuAttnEncodeArgs.k_cache/v_cache`);
+> the `gpu_kv_k/v` mirrors, the per-token mirror memcpy, the
+> `state_load` mirror sync, and `reset_gpu_attn_kv_mirrors` are all
+> deleted. Verified: byte-identical layout (position-major, stride =
+> kv_dim; SDPA K/V indexing is seq_stride-independent), canonical KV
+> already carries every N+M row after prefill+decode (oracle path
+> writes canonical at full_attn_forward.rs:408-416; sub-32 CPU
+> fallback already read canonical). Builds clean.
+> **STILL PENDING: GPU acceptance-test run** on the 18 GB artifacts —
+> the four red diagnostics below must flip green. Until then this memo
+> stays; delete it once verified and issue #2 is closed.
+
 **Found 2026-06-12** during drama_llama v0.8.0 pre-publish validation,
 by Claude (Fable 5), chasing a failing `partial_hit_output_matches_
 fresh_session`. Affects **moeflux 0.1.0-pre.3 as published** and
