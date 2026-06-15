@@ -10,9 +10,25 @@
 > already carries every N+M row after prefill+decode (oracle path
 > writes canonical at full_attn_forward.rs:408-416; sub-32 CPU
 > fallback already read canonical). Builds clean.
-> **STILL PENDING: GPU acceptance-test run** on the 18 GB artifacts —
-> the four red diagnostics below must flip green. Until then this memo
-> stays; delete it once verified and issue #2 is closed.
+>
+> **VERIFIED 2026-06-15 (GPU).** moeflux `checkpoint_restore`:
+> 23/23 green incl. the direct repro
+> `oracle_decode_after_batched_prefill_matches_oracle_prefill` and the
+> three localization tests; every regression guard held
+> (`batched_prefill_syncs_canonical_kv`, save/load identity — deleting
+> the `state_load` mirror sync did not break restore). drama_llama
+> `moeflux_session_pollution`: 2/2 green —
+> `partial_hit_output_matches_fresh_session` (the original symptom)
+> now produces cached==fresh output, and
+> `three_consecutive_completions_do_not_degenerate` passes with clean
+> facts (Apollo 11 / 1969, no swap). Decode perf unaffected (18.2
+> tok/s, at/above baseline — verified by bench.py after a reboot that
+> cleared an unrelated GPU-state slowdown; see
+> [[feedback-reboot-on-gpu-weirdness]]).
+>
+> Kept only for the one open follow-up: **re-baseline the qwen3
+> long-form degradation** — the rep-penalty conclusions may partially
+> attribute to this bug. Delete this memo once that's done.
 
 **Found 2026-06-12** during drama_llama v0.8.0 pre-publish validation,
 by Claude (Fable 5), chasing a failing `partial_hit_output_matches_
