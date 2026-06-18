@@ -30,7 +30,67 @@ Plan file: `/Users/mdegans/.claude/plans/melodic-enchanting-lecun.md`.
    known-failure). Plus: `load_golden_or_skip` hardened (skip only on
    file-absent), stale comment fixes (`MAX_K` is 16, not 8).
 
-## The OPEN regression — a17b decode ~8× slower at k=10
+## ROOT CAUSE FOUND (2026-06-18) — it is NOT k=10/chunking; it is `fcf0ae4`
+
+Bisected this session (Opus 4.8). The k=10/chunking hypothesis below is
+**DISPROVEN**. Evidence chain:
+- a3b (current HEAD, k=8, **Mmap** path): healthy (16.7 tok/s warm) — the
+  shared code + chunking-at-k=8 are fine.
+- a17b forced to **k=8** on current code (`MOEFLUX_FORCE_K=8` build knob):
+  **0.204 tok/s** — still broken. k=10 is a no-op at k=8 (1 chunk,
+  `expert_base=0`), so **k is exonerated**. Same-k bracket: pre.3 1.589 →
+  current 0.204, only engine delta = `fcf0ae4`.
+- Only non-test engine commit since pre.3 is **`fcf0ae4`** ("oracle SDPA
+  reads canonical KV, deleting the vestigial GPU mirror"). `f63352f` is
+  test-only.
+
+**Mechanism:** `fcf0ae4` pointed the per-token GPU SDPA fast path at the
+**canonical KV pool** (`kv_state.k_id/v_id`, sized `[MAX_SEQ_LEN(1M) ×
+num_kv_heads × head_dim]` = ~4.3 GB/full-attn-layer, ~64 GB across a17b's
+~15 full-attn layers) instead of the old `GPU_KV_SEQ(8192)`-row mirror
+(~320 MB total). On the RAM-tight a17b Pread config (202 GiB experts, 96
+GiB RAM) the GPU now making the 64 GB canonical buffers resident evicts
+expert pages → disk thrash → idle-GPU/single-core-CPU decode. a3b is
+immune (total footprint fits RAM).
+
+**Confirmed by experiment** (`MOEFLUX_FORCE_CPU_SDPA=1`, full_attn_forward
+gate → CPU SDPA, GPU never touches canonical KV): decode **0.204 → 0.644
+tok/s at k=10** (3.2× despite MORE experts; prefill 0.38→1.19). Does not
+fully reach 1.589 because CPU SDPA over 15 full-attn layers is itself
+slower than the baseline's small-mirror GPU SDPA — it is a diagnostic,
+not the fix.
+
+## FIX LANDED (2026-06-18) — mode-gated CPU-SDPA in Pread mode
+
+Tried two fixes:
+- **(B) small GPU-resident mirror** synced from canonical: works (a17b
+  512-tok **1.338**) but is ~2% over CPU-SDPA (1.313) — full-attn SDPA is
+  a tiny slice of an expert-streaming-bound decode, so the mirror's GPU
+  speedup is noise. Reverted: not worth the buffers + sync state.
+- **(A, SHIPPED) mode-gate the GPU SDPA fast path off in Pread mode.**
+  `full_attn_pre_moe_layer_forward`'s `gpu_attn_ready` gate gains
+  `&& !gpu.expert_io_mode.is_pread()`. Pread (a17b/cogito) → CPU SDPA
+  (reads only the host KV prefix, never binds the 64 GB canonical →
+  no residency thrash; CPU-SDPA was always correct — the zero-mirror bug
+  was the *mirror*, not canonical). Mmap (a3b, fits RAM) → keeps GPU SDPA
+  (a3b CPU-SDPA measured −17%, so gating matters). Threaded
+  `expert_io_mode` into `GpuLayerCtx` (gpu_ctx.rs + 4 construct sites in
+  mod.rs; 5 destructures get `..`).
+
+**Validated:** a17b 512-tok **0.204 → 1.292** (6.3×, correct k=10; residual
+vs 1.589 is the honest +25%-experts I/O cost). a3b warm **17.0** (no
+regression). checkpoint_restore **23/23 pass single-threaded** incl. the
+zero-mirror diagnostic. NOTE: the suite SIGSEGVs under *parallel* test
+threads (23 model contexts contending for one GPU) — pre-existing harness
+artifact, reproduces without this change; run model-test binaries with
+`--test-threads=1`.
+
+KEPT (per user): `forced_k` + `MOEFLUX_FORCE_K` build override
+(variants.rs) — debug A/B knob, `#[allow(dead_code)]`, no-op when unset.
+The `MOEFLUX_FORCE_CPU_SDPA` bisect env knob was removed (replaced by the
+mode gate).
+
+## (HISTORICAL, pre-bisect) The regression — a17b decode ~8× slower
 
 - **~0.19 tok/s** vs the warm k=8 baseline **1.589 tok/s** (~8×). Two
   post-reboot 48-token runs: 0.195 then 0.189 (decode_hit 0.315 both) — stable,

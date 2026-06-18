@@ -980,6 +980,7 @@ pub fn linear_attn_layer_forward(
         layer_cache,
         buffers,
         buffer_pool,
+        ..
     } = *gpu;
     let v = VARIANT;
     let linear_layer_idx =
@@ -1336,6 +1337,7 @@ pub(in crate::riir) fn post_attention_tail(
         layer_cache: _,
         buffers,
         buffer_pool,
+        ..
     } = *gpu;
     let intermediates = post_attention_pre_moe(
         metal,
@@ -1396,6 +1398,7 @@ pub(in crate::riir) fn post_attention_pre_moe(
         layer_cache,
         buffers,
         buffer_pool,
+        ..
     } = *gpu;
     let v = VARIANT;
 

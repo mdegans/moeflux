@@ -227,6 +227,7 @@ pub(in crate::riir) fn full_attn_pre_moe_layer_forward(
         layer_cache,
         buffers,
         buffer_pool,
+        ..
     } = *gpu;
     let v = VARIANT;
 
@@ -425,13 +426,26 @@ pub(in crate::riir) fn full_attn_pre_moe_layer_forward(
 
     // ── Decide between GPU SDPA fast path and CPU SDPA ──────────
     //
-    // Match C `infer.m:5054` exactly: gate fires when the layer is
-    // full-attn, KV mirror fits in the persistent buffer, and we're
-    // past the GPU dispatch break-even point (kv_len < 32 keeps
-    // command-encoder overhead from dominating).
+    // Base gate (matches C `infer.m:5054`): full-attn layer, KV fits the
+    // persistent buffer, and past the GPU dispatch break-even point
+    // (kv_len < 32 keeps command-encoder overhead from dominating).
+    //
+    // Plus the I/O-mode gate (#2 perf regression): the GPU SDPA fast path
+    // binds the canonical KV pool buffers (~2 GB/full-attn-layer). In
+    // `Pread` mode — the working set exceeds RAM (a17b: 202 GiB experts /
+    // 96 GiB RAM) and experts stream from disk — making those buffers
+    // GPU-resident evicts the streamed expert pages and collapses decode
+    // (~8×, idle GPU / disk-bound). So route full-attn through CPU SDPA,
+    // which reads only the host-resident KV prefix and leaves the GPU
+    // free for expert streaming; the full-attn SDPA is a tiny slice of an
+    // expert-streaming-bound decode, so the cost is negligible. In `Mmap`
+    // mode (a3b — fits RAM, no streaming pressure) keep GPU SDPA: ~17%
+    // faster full-attn with no eviction.
     let kv_len = kv_state.len;
-    let gpu_attn_ready =
-        fa_idx.is_some() && kv_len >= 32 && (kv_len as usize) < crate::riir::variants::GPU_KV_SEQ;
+    let gpu_attn_ready = fa_idx.is_some()
+        && kv_len >= 32
+        && (kv_len as usize) < crate::riir::variants::GPU_KV_SEQ
+        && !gpu.expert_io_mode.is_pread();
 
     let gpu_attn_args = if gpu_attn_ready {
         // Stage Q + q_gate (both post-norm + RoPE for q) into the
@@ -555,6 +569,7 @@ pub(in crate::riir) fn full_attn_layer_forward(
         layer_cache: _,
         buffers,
         buffer_pool,
+        ..
     } = *gpu;
     let intermediates = full_attn_pre_moe_layer_forward(
         metal,

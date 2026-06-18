@@ -375,6 +375,39 @@ pub const GPU_KV_SEQ: usize = 8192;
 
 // --- Per-variant selection ---------------------------------------
 
+/// Debug-only compile-time override for `num_experts_per_tok`, set via
+/// the `MOEFLUX_FORCE_K` build env (`MOEFLUX_FORCE_K=8 cargo build …`).
+/// Baked at compile time so every reader of `VARIANT.num_experts_per_tok`
+/// (decode dispatch, prefill gather-id, PSO selection, buffer sizing)
+/// sees the same k — handy for A/B-ing top-k against perf/quality without
+/// an inconsistent build (e.g. it isolated the a17b 8→10 transition while
+/// chasing the #2 decode regression). Absent/unparseable → `default`, so
+/// production builds are unaffected. Currently wired into the a17b
+/// variant only; `#[allow(dead_code)]` covers variants that don't call it.
+#[allow(dead_code)]
+const fn forced_k(default: usize) -> usize {
+    match option_env!("MOEFLUX_FORCE_K") {
+        None => default,
+        Some(s) => {
+            let bytes = s.as_bytes();
+            if bytes.is_empty() {
+                return default;
+            }
+            let mut acc = 0usize;
+            let mut i = 0;
+            while i < bytes.len() {
+                let b = bytes[i];
+                if b < b'0' || b > b'9' {
+                    return default;
+                }
+                acc = acc * 10 + (b - b'0') as usize;
+                i += 1;
+            }
+            acc
+        }
+    }
+}
+
 #[cfg(feature = "model-qwen3-5-a17b")]
 pub const VARIANT: Variant = Variant {
     name: "Qwen3.5-397B-A17B-4bit",
@@ -385,7 +418,7 @@ pub const VARIANT: Variant = Variant {
     head_dim: 256,
     vocab_size: 248320,
     num_experts: 512,
-    num_experts_per_tok: 10,
+    num_experts_per_tok: forced_k(10),
     moe_intermediate: 1024,
     shared_intermediate: 1024,
     full_attn_interval: 4,

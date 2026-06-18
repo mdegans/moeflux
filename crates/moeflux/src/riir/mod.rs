@@ -1016,6 +1016,7 @@ impl RsCtx<MetalBackend> {
 
         // Field-disjoint mutable borrows for the forward call.
         let k_active = self.k_active;
+        let expert_io_mode = self.expert_io_mode;
         let Self {
             wf,
             backend,
@@ -1076,6 +1077,7 @@ impl RsCtx<MetalBackend> {
                 layer_cache: &layer_caches[layer_idx_us],
                 buffers: linear_buffers,
                 buffer_pool,
+                expert_io_mode,
             };
             full_attn_layer_forward(
                 metal,
@@ -1108,6 +1110,7 @@ impl RsCtx<MetalBackend> {
                 layer_cache: &layer_caches[layer_idx_us],
                 buffers: linear_buffers,
                 buffer_pool,
+                expert_io_mode,
             };
             linear_attn_layer_forward(
                 metal,
@@ -2322,6 +2325,7 @@ impl RsCtx<MetalBackend> {
 
         self.ensure_linear_resources()?;
         let k_active = self.k_active;
+        let expert_io_mode = self.expert_io_mode;
 
         // Field-disjoint mutable borrows for the layer loop. Same
         // pattern as `layer_forward_dump_inner`.
@@ -2458,6 +2462,7 @@ impl RsCtx<MetalBackend> {
                     layer_cache: &layer_caches[layer_idx],
                     buffers: linear_buffers,
                     buffer_pool,
+                    expert_io_mode,
                 };
                 full_attn_layer_forward(
                     metal,
@@ -2490,6 +2495,7 @@ impl RsCtx<MetalBackend> {
                     layer_cache: &layer_caches[layer_idx],
                     buffers: linear_buffers,
                     buffer_pool,
+                    expert_io_mode,
                 };
                 linear_attn_layer_forward(
                     metal,

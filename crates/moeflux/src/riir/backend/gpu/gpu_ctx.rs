@@ -13,6 +13,7 @@
 
 use crate::riir::attn::linear_attn_forward::LayerForwardBuffers;
 use crate::riir::backend::MetalBufferPool;
+use crate::riir::io::expert_io_mode::ExpertIoMode;
 use crate::riir::io::layer_weight_cache::LayerWeightCache;
 use crate::riir::io::mtl_weight_buf::MtlWeightBuf;
 use crate::riir::io::weight_file::WeightFile;
@@ -20,8 +21,9 @@ use crate::riir::io::weight_file::WeightFile;
 /// The shared-borrow half of a layer-forward call's context. See the
 /// module docs for why `&mut MetalContext` is excluded.
 ///
-/// All fields are shared references, so the struct is `Copy` — passing
-/// it by value or `&` is equally cheap, and it compiles away entirely.
+/// All fields are shared references or small `Copy` scalars, so the
+/// struct is `Copy` — passing it by value or `&` is equally cheap, and
+/// it compiles away entirely.
 #[derive(Clone, Copy)]
 pub struct GpuLayerCtx<'a> {
     /// The on-disk weight file (tensor metadata + mmap).
@@ -34,4 +36,13 @@ pub struct GpuLayerCtx<'a> {
     pub buffers: &'a LayerForwardBuffers,
     /// The lifetime-colored Metal buffer pool.
     pub buffer_pool: &'a MetalBufferPool,
+    /// Expert-streaming I/O mode for this run. Gates the oracle full-attn
+    /// GPU SDPA fast path: in `Pread` mode the canonical KV pool buffers
+    /// (~2 GB/full-attn-layer) must NOT be bound to a GPU kernel — their
+    /// residency evicts the streamed expert working set and collapses
+    /// decode (#2 perf regression) — so full-attn falls back to CPU SDPA,
+    /// which reads only the host-resident KV prefix. In `Mmap` mode (the
+    /// working set fits RAM) the GPU SDPA fast path is kept: faster, with
+    /// no eviction pressure.
+    pub expert_io_mode: ExpertIoMode,
 }
