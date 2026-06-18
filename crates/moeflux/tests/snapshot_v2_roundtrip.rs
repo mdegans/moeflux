@@ -35,7 +35,6 @@ fn open_ctx() -> Result<Ctx, Error> {
         &art("model_weights.json"),
         &PathBuf::from(ROOT).join("mlx/tokenizer.json"),
         &PathBuf::from(ROOT).join("root"),
-        /* experts_per_tok = */ 8,
         /* use_2bit       = */ false,
     )
 }

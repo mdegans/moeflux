@@ -171,11 +171,18 @@ kernel void moeflux_mm_id_map0_impl(
     htpe[ide] = n_all;
 }
 
-// Single instantiation for a3b (top-k = 8). Add more if/when
-// other variants land.
+// Per-top-k instantiations. a3b routes top-8, a17b top-10. The
+// template body is shared — only the compile-time `K_TOPK` (loop
+// bounds, indices stride, hids encoding) differs, so the inner
+// loops still unroll per variant. The dispatch in `lib.rs`
+// (`MoeIdMap0Call::encode`) picks the PSO by the runtime `k`.
 template [[host_name("moeflux_mm_id_map0_k8")]]
 kernel decltype(moeflux_mm_id_map0_impl<8>)
 moeflux_mm_id_map0_impl<8>;
+
+template [[host_name("moeflux_mm_id_map0_k10")]]
+kernel decltype(moeflux_mm_id_map0_impl<10>)
+moeflux_mm_id_map0_impl<10>;
 
 // ===============================================================
 // Main matmul — one dispatch over all experts.

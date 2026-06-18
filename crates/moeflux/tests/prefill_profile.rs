@@ -39,9 +39,9 @@ fn artifacts() -> PathBuf {
     PathBuf::from(std::env::var("MOEFLUX_SMOKE_ARTIFACTS").unwrap_or(default.into()))
 }
 
-/// Open the a3b Ctx. `experts_per_tok = 8` is the model's real
-/// routing width (`variants.rs` `num_experts_per_tok`) — the MoE
-/// phase should be profiled at production cost.
+/// Open the a3b Ctx. Top-k is the model's real routing width
+/// (`variants.rs` `num_experts_per_tok` = 8) — variant-driven, so the
+/// MoE phase is always profiled at production cost.
 fn open_ctx() -> Ctx {
     let art = artifacts();
     let root = model_root();
@@ -50,7 +50,6 @@ fn open_ctx() -> Ctx {
         &art.join("model_weights.json"),
         &art.join("vocab.bin"),
         &root,
-        /* experts_per_tok */ 8,
         /* use_2bit */ false,
     )
     .expect("Ctx::open")

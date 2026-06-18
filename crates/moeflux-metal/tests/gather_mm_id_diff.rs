@@ -17,7 +17,7 @@
 
 use metal::{Device, MTLResourceOptions};
 use moeflux_metal::{
-    Kernels, MoeGatherIdCall, MoeIdMap0Call, MOE_MM_ID_TOPK,
+    moe_mm_id_supports_topk, Kernels, MoeGatherIdCall, MoeIdMap0Call,
 };
 
 const COSINE_FLOOR: f32 = 0.9999;
@@ -147,9 +147,9 @@ fn run_case(
     n_out: usize,
     seed: u64,
 ) {
-    assert_eq!(
-        k as u32, MOE_MM_ID_TOPK,
-        "test fixture k must equal kernel MOE_MM_ID_TOPK"
+    assert!(
+        moe_mm_id_supports_topk(k as u32),
+        "test fixture k={k} not a supported gather-id top-k"
     );
     assert_eq!(k_in % 64, 0);
 
@@ -362,7 +362,7 @@ fn moe_mm_id_diff_tiny() {
         "tiny",
         /* n_experts */ 8,
         /* n_tokens */ 16,
-        /* k */ MOE_MM_ID_TOPK as usize,
+        /* k */ 8,
         /* k_in */ 128,
         /* n_out */ 64,
         /* seed */ 0xCAFE_F00D,
@@ -377,7 +377,7 @@ fn moe_mm_id_diff_mid() {
         "mid",
         32,
         64,
-        MOE_MM_ID_TOPK as usize,
+        8,
         512,
         256,
         0xBEEF_BABE,
@@ -406,9 +406,9 @@ fn run_down_shape_case(
     n_out: usize,
     seed: u64,
 ) {
-    assert_eq!(
-        k as u32, MOE_MM_ID_TOPK,
-        "test fixture k must equal kernel MOE_MM_ID_TOPK"
+    assert!(
+        moe_mm_id_supports_topk(k as u32),
+        "test fixture k={k} not a supported gather-id top-k"
     );
     assert_eq!(k_in % 64, 0);
 
@@ -663,7 +663,7 @@ fn moe_mm_id_diff_down_shape() {
         "down-shape",
         /* n_experts */ 32,
         /* n_tokens */ 64,
-        /* k */ MOE_MM_ID_TOPK as usize,
+        /* k */ 8,
         /* k_in */ 512,
         /* n_out */ 256,
         /* seed */ 0xD0_BEEF,
@@ -678,7 +678,7 @@ fn moe_mm_id_diff_a3b_scale_gate() {
         "a3b-scale-gate",
         /* n_experts */ 256,
         /* n_tokens */ 64,
-        /* k */ MOE_MM_ID_TOPK as usize,
+        /* k */ 8,
         /* k_in */ 2048,
         /* n_out */ 512,
         /* seed */ 0xA3B_5CA1E,
@@ -693,9 +693,45 @@ fn moe_mm_id_diff_a3b_scale_down() {
         "a3b-scale-down",
         /* n_experts */ 256,
         /* n_tokens */ 64,
-        /* k */ MOE_MM_ID_TOPK as usize,
+        /* k */ 8,
         /* k_in */ 512,
         /* n_out */ 2048,
         /* seed */ 0xA3B_D0_5CA,
+    );
+}
+
+// ---------------------------------------------------------------------
+// k=10 coverage (a17b). Exercises the `moeflux_mm_id_map0_k10` map0
+// instantiation (compile-time `K_TOPK=10`: indices stride + hids
+// `token*10+slot` encoding) and the matmul's runtime-`k` hids decode
+// (`id / 10`, `id % 10`). n_experts >= 10 so every token can pick 10
+// distinct experts.
+// ---------------------------------------------------------------------
+
+#[test]
+fn moe_mm_id_diff_k10_gate() {
+    // Gate/up shape (ne11=1) at k=10.
+    run_case(
+        "k10-gate",
+        /* n_experts */ 32,
+        /* n_tokens */ 64,
+        /* k */ 10,
+        /* k_in */ 512,
+        /* n_out */ 256,
+        /* seed */ 0xA17B_6A1E,
+    );
+}
+
+#[test]
+fn moe_mm_id_diff_k10_down() {
+    // Down shape (ne11=k) at k=10 — per-(token, slot) activations.
+    run_down_shape_case(
+        "k10-down",
+        /* n_experts */ 32,
+        /* n_tokens */ 64,
+        /* k */ 10,
+        /* k_in */ 512,
+        /* n_out */ 256,
+        /* seed */ 0xA17B_D0_5C,
     );
 }

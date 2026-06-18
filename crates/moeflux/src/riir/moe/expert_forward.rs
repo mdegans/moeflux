@@ -974,7 +974,7 @@ fn emit_batched_experts(
                 v.hidden_dim,
                 k,
                 v3_experts.is_some(),
-                if v.hidden_dim <= 4096 && k <= 8 && v3_experts.is_some() {
+                if v.hidden_dim <= 4096 && k <= MAX_K && v3_experts.is_some() {
                     "batched"
                 } else {
                     "per-expert (fallback)"
@@ -983,7 +983,7 @@ fn emit_batched_experts(
         }
     }
 
-    let use_batched = v.hidden_dim <= 4096 && k <= 8 && v3_experts.is_some();
+    let use_batched = v.hidden_dim <= 4096 && k <= MAX_K && v3_experts.is_some();
 
     if use_batched {
         let v3e = v3_experts.unwrap();
@@ -1065,7 +1065,10 @@ fn emit_batched_experts(
             enc.end_encoding();
         }
     } else {
-        // Fallback: per-expert loop (hidden_dim > 4096 or k > 8)
+        // Fallback: per-expert loop (hidden_dim > 4096 — i.e. Cogito-V2,
+        // whose 7168 hidden won't fit the batched kernel's x_shared, or
+        // k > MAX_K). The batched matvec now chunks experts in groups of
+        // 8, so a17b's k=10 takes the batched path above, not this one.
         for slot in 0..k {
             let (wb, base_off) = expert_bindings[slot];
             let gate_buf = buffer_pool.handle(bufs.gate_id(slot));
@@ -1288,14 +1291,7 @@ fn encode_matvec_experts(
     input_stride: u32,
 ) {
     enc.set_compute_pipeline_state(pipeline);
-    for i in 0..8usize {
-        let (buf, off) = if i < expert_bindings.len() {
-            expert_bindings[i]
-        } else {
-            expert_bindings[0]
-        };
-        enc.set_buffer(i as NSUInteger, Some(buf), off as NSUInteger);
-    }
+    // Bindings/params that don't vary across chunks.
     enc.set_buffer(8, Some(input), 0);
     enc.set_buffer(9, Some(output), 0);
     enc.set_bytes(10, 4, (&out_dim as *const u32).cast());
@@ -1306,13 +1302,36 @@ fn encode_matvec_experts(
     enc.set_bytes(15, 4, (&b_byte_off as *const u32).cast());
     let num_row_tiles = (out_dim + 7) / 8;
     enc.set_bytes(16, 4, (&num_row_tiles as *const u32).cast());
-    enc.set_bytes(17, 4, (&k as *const u32).cast());
     enc.set_bytes(18, 4, (&input_stride as *const u32).cast());
-    let total_tgs = num_row_tiles * k;
-    enc.dispatch_thread_groups(
-        MTLSize::new(total_tgs as NSUInteger, 1, 1),
-        MTLSize::new(256, 1, 1),
-    );
+
+    // The kernel binds at most 8 expert blobs (blob0..blob7), so cover
+    // any k (a3b=8, a17b=10, up to MAX_K) by dispatching in chunks of
+    // <=8 experts. Each chunk binds its 8 blobs, passes `expert_base`
+    // (its global offset) and `k_active` = the chunk's expert count.
+    // Chunks write disjoint `out[(base+e)*out_dim..]` regions, so they
+    // are hazard-free within this one encoder.
+    const CHUNK: u32 = 8;
+    let mut base = 0u32;
+    while base < k {
+        let chunk_k = (k - base).min(CHUNK);
+        for i in 0..CHUNK as usize {
+            let global = base as usize + i;
+            let (buf, off) = if global < expert_bindings.len() {
+                expert_bindings[global]
+            } else {
+                expert_bindings[0]
+            };
+            enc.set_buffer(i as NSUInteger, Some(buf), off as NSUInteger);
+        }
+        enc.set_bytes(17, 4, (&chunk_k as *const u32).cast());
+        enc.set_bytes(19, 4, (&base as *const u32).cast());
+        let total_tgs = num_row_tiles * chunk_k;
+        enc.dispatch_thread_groups(
+            MTLSize::new(total_tgs as NSUInteger, 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
+        base += CHUNK;
+    }
 }
 
 /// Encode the flat-buffer variant of moe_combine_residual.

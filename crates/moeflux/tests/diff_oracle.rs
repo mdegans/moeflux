@@ -67,7 +67,6 @@ pub trait DiffBackend {
         manifest: &Path,
         vocab: &Path,
         experts_dir: &Path,
-        experts_per_tok: u32,
         use_2bit: bool,
     ) -> Self;
 
@@ -288,19 +287,11 @@ impl DiffBackend for RsBackend {
         manifest: &Path,
         vocab: &Path,
         experts_dir: &Path,
-        experts_per_tok: u32,
         use_2bit: bool,
     ) -> Self {
         Self(
-            RsCtx::open(
-                weights,
-                manifest,
-                vocab,
-                experts_dir,
-                experts_per_tok,
-                use_2bit,
-            )
-            .expect("RsBackend RsCtx::open"),
+            RsCtx::open(weights, manifest, vocab, experts_dir, use_2bit)
+                .expect("RsBackend RsCtx::open"),
         )
     }
 
@@ -654,14 +645,7 @@ impl DiffBackend for RsBackend {
 /// place.
 pub fn open_backend<B: DiffBackend>() -> B {
     let p = default_a3b_paths();
-    B::open(
-        &p.weights,
-        &p.manifest,
-        &p.vocab,
-        &p.root,
-        p.experts_per_tok,
-        p.use_2bit,
-    )
+    B::open(&p.weights, &p.manifest, &p.vocab, &p.root, p.use_2bit)
 }
 
 // ---------------------------------------------------------------------------

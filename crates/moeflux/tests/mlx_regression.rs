@@ -89,22 +89,22 @@ fn parse_golden_text(text: &str) -> Golden {
 }
 
 fn load_golden_or_skip(path: &Path, variant: &str) -> Golden {
-    match parse_golden(path) {
-        Some(g) => g,
-        None => {
-            // Emit a clear skip message rather than panicking. A17B's
-            // MLX golden needs a host with ~220 GB RAM to regenerate
-            // (the MLX 4-bit checkpoint is 209 GB; MLX loads it all at
-            // once, unlike moeflux's streaming path). If you're on
-            // such a host, see the generator invocation at the top of
-            // this file.
-            eprintln!(
-                "[{variant}] SKIP  fixture not found at {path:?} — \
-                 regenerate with tools/mlx_reference/generate_goldens.py"
-            );
-            std::process::exit(0);
-        }
+    // Skip ONLY when the fixture is genuinely absent (e.g. a host that
+    // never regenerated the MLX golden). On a dev machine the file is
+    // always present, so the test actually runs. A present-but-
+    // unreadable/unparseable fixture is a real failure, not a skip — it
+    // must surface loudly rather than masquerade as a clean pass (see
+    // `parse_golden_text`, which panics on malformed content).
+    if !path.exists() {
+        eprintln!(
+            "[{variant}] SKIP  fixture not found at {path:?} — \
+             regenerate with tools/mlx_reference/generate_goldens.py"
+        );
+        std::process::exit(0);
     }
+    parse_golden(path).unwrap_or_else(|| {
+        panic!("[{variant}] golden present at {path:?} but could not be read")
+    })
 }
 
 fn fixtures_dir() -> PathBuf {
@@ -113,13 +113,12 @@ fn fixtures_dir() -> PathBuf {
         .join("fixtures")
 }
 
-fn run_moeflux(art: &Path, root: &Path, experts_per_tok: u32) -> Vec<f32> {
+fn run_moeflux(art: &Path, root: &Path) -> Vec<f32> {
     let mut ctx = Ctx::open(
         &art.join("model_weights.bin"),
         &art.join("model_weights.json"),
         &art.join("vocab.bin"),
         root,
-        experts_per_tok,
         /* use_2bit */ false,
     )
     .expect("Ctx::open");
@@ -213,7 +212,7 @@ fn mlx_regression_a3b() {
         &fixtures_dir().join("mlx_golden_qwen3-6-35b-a3b.txt"),
         "qwen3-6-35b-a3b",
     );
-    let logits = run_moeflux(&art, &root, /* K = */ 8);
+    let logits = run_moeflux(&art, &root);
     assert_matches_golden(&logits, &golden, "qwen3-6-35b-a3b");
 }
 
@@ -233,9 +232,10 @@ fn mlx_regression_a17b() {
         &fixtures_dir().join("mlx_golden_qwen3-5-a17b.txt"),
         "qwen3-5-a17b",
     );
-    // A17B's config specifies num_experts_per_tok=10, but moeflux's MAX_K=8
-    // truncates internally — pass 10 here to match MLX's top-K selection
-    // (moeflux still only runs top 8, but it's the same 8 MLX picks).
-    let logits = run_moeflux(&art, &root, /* K = */ 10);
+    // A17B routes top-10 (`num_experts_per_tok=10`, well under MAX_K=16) —
+    // now variant-driven, no runtime knob. moeflux runs the full 10 via the
+    // `moeflux_mm_id_map0_k10` gather-id instantiation, matching MLX's
+    // top-10 selection exactly.
+    let logits = run_moeflux(&art, &root);
     assert_matches_golden(&logits, &golden, "qwen3-5-a17b");
 }

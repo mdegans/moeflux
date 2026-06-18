@@ -62,6 +62,7 @@ use moeflux::riir::backend::buftype::{
     BufId, ExpertBaseBuf, HiddenBuf, ResidualBuf, RouterLogitsBuf,
 };
 use moeflux::riir::backend::{Backend, BufferPool, Graph, MetalBackend, Op, WeightRef};
+use moeflux::riir::io::expert_io_mode;
 use moeflux::riir::moe::moe_router::build_expert_buckets;
 use moeflux::riir::variants::{MlpKind, RMS_NORM_EPS, VARIANT};
 use moeflux::riir::{ExpertFiles, LayerWeightCache, MetalContext, MtlWeightBuf, WeightFile};
@@ -210,7 +211,13 @@ fn run_one_layer_op_diff(layer_idx: usize, n_tokens: usize, seed: u64) {
     let device = metal.device().clone();
     let wf_buf = MtlWeightBuf::wrap(&wf, &device);
     let mut backend = MetalBackend::new(metal, wf_buf).expect("MetalBackend::new");
-    ef.attach_to_device(backend.pool_mut());
+    // Resolve the expert-IO mode exactly as `RsCtx::open` does (the
+    // `MOEFLUX_EXPERT_IO` env override / 0.75×RAM auto-gate). For the
+    // a3b variant this test compiles under, the working set fits RAM
+    // and the gate picks `Mmap`; threading the resolved value keeps
+    // the test honest if it's ever exercised on a larger variant.
+    let io_mode = expert_io_mode::select();
+    ef.attach_to_device(backend.pool_mut(), io_mode);
     let layer_cache = LayerWeightCache::build(layer_idx, &wf, backend.weight_buf())
         .expect("LayerWeightCache::build");
 
@@ -225,8 +232,8 @@ fn run_one_layer_op_diff(layer_idx: usize, n_tokens: usize, seed: u64) {
     // entirely: persistent buffers stay allocated, transients are
     // simply not lifetime-colored. Memory waste is acceptable for an
     // `#[ignore]`-gated test.
-    let scratch_a = MoeGraphScratch::new(backend.pool_mut(), K_ACTIVE);
-    let scratch_b = MoeGraphScratch::new(backend.pool_mut(), K_ACTIVE);
+    let scratch_a = MoeGraphScratch::new(backend.pool_mut(), K_ACTIVE, io_mode);
+    let scratch_b = MoeGraphScratch::new(backend.pool_mut(), K_ACTIVE, io_mode);
     let hidden_out_a: BufId<HiddenBuf> = backend
         .pool_mut()
         .alloc(

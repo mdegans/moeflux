@@ -202,12 +202,10 @@ pub struct RsCtx<B: Backend = MetalBackend> {
     /// files leave the slot empty per the C path's tolerance
     /// semantics.
     experts: ExpertFiles,
-    /// Active top-K (`experts_per_tok` from [`Self::open`]). Mirrors
-    /// `mf_ctx.K` — the runtime number of experts to route per
-    /// token. The variant's `num_experts_per_tok` is an architectural
-    /// MAX; this is the user-selected active value (typically
-    /// smaller, e.g. 4 for the dump-hook test even though A3B's
-    /// architectural max is 8).
+    /// Active top-K — the number of experts routed per token. Set
+    /// once at [`Self::open`] from the compiled variant's
+    /// `num_experts_per_tok` (a3b=8, a17b=10); it is model shape, not
+    /// a runtime knob.
     k_active: usize,
     /// Per-layer KV / linear-attn recurrence state. One entry per
     /// layer; the variant tag matches the C-side
@@ -440,14 +438,19 @@ impl RsCtx<MetalBackend> {
         manifest: &Path,
         _vocab: &Path,
         experts_dir: &Path,
-        experts_per_tok: u32,
         _use_2bit: bool,
     ) -> Result<Self, RsError> {
         let wf = WeightFile::open(weights, manifest).map_err(|_| RsError::InitFailed)?;
         probe_variant_match(&wf)?;
         let experts = ExpertFiles::open(experts_dir).map_err(|_| RsError::InitFailed)?;
         let layer_states = alloc_layer_states();
-        let k_active = (experts_per_tok as usize).clamp(1, VARIANT.num_experts_per_tok);
+        // Top-k is model shape, not a runtime knob — it comes solely
+        // from the compiled variant. (A runtime `experts_per_tok`
+        // parameter used to live here; it let callers disagree with the
+        // variant — the root of the k=4 test crash and the a17b k=8
+        // under-activation. Removed; the only source of truth is
+        // `VARIANT.num_experts_per_tok`: a3b=8, a17b=10.)
+        let k_active = VARIANT.num_experts_per_tok;
         let io_pool = rayon::ThreadPoolBuilder::new()
             .num_threads(8)
             .thread_name(|i| format!("moeflux-io-{}", i))

@@ -38,10 +38,6 @@ fn open_ctx() -> Ctx {
         &art.join("model_weights.json"),
         &art.join("vocab.bin"),
         &root,
-        // Must match the compiled variant's MOE_MM_ID_TOPK (8 for
-        // qwen3-6-35b-a3b) — the Metal MoE pipeline asserts on it.
-        /* experts_per_tok */
-        8,
         /* use_2bit */ false,
     )
     .expect("Ctx::open")

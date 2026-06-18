@@ -216,27 +216,37 @@ const VB_TILE_Q: u32 = 8;
 /// Same for both slots.
 const FA_THREADS: u32 = 256;
 
-/// MoE map0 pre-pass kernel name — builds `htpe[]` + `hids[][]` from
-/// per-token expert indices. Single instantiation for top-k = 8.
+/// MoE map0 pre-pass kernel names — build `htpe[]` + `hids[][]` from
+/// per-token expert indices. One instantiation per supported top-k
+/// (`a3b` routes 8, `a17b` routes 10); `MoeIdMap0Call::encode` picks
+/// by the runtime `k`.
 const MOE_MM_ID_MAP0_K8: &str = "moeflux_mm_id_map0_k8";
+const MOE_MM_ID_MAP0_K10: &str = "moeflux_mm_id_map0_k10";
 /// MoE single-dispatch gathered matmul (one of gate / up / down).
 const MOE_MM_ID: &str = "moeflux_mm_id";
 /// Topk-combine reduction kernel — `[n_tokens, k, hidden] × [n_tokens, k]
 /// → [n_tokens, hidden]`.
 const MOE_COMBINE_TOPK: &str = "moeflux_combine_topk";
 
-/// Top-k for the map0 specialization — a3b. If other variants ship,
-/// add their own `MOE_MM_ID_MAP0_K*` instantiation in
-/// `gather_mm_id.metal` and a sibling PSO entry here.
-pub const MOE_MM_ID_TOPK: u32 = 8;
+/// Top-k values the gather-id path supports — one `MOE_MM_ID_MAP0_K*`
+/// map0 instantiation (and PSO) per entry. The main matmul and
+/// `combine_topk` are runtime-`k`, so this set is governed solely by
+/// which map0 specializations are compiled in `gather_mm_id.metal`.
+/// a3b routes 8, a17b routes 10. To support another top-k: add the
+/// `<k>` template instantiation in the shader, a `MOE_MM_ID_MAP0_K*`
+/// PSO here, a dispatch arm in `MoeIdMap0Call::encode`, and the value
+/// below.
+pub const MOE_MM_ID_SUPPORTED_TOPK: &[u32] = &[8, 10];
+
+/// True when the gather-id path has a map0 PSO for `k`.
+pub fn moe_mm_id_supports_topk(k: u32) -> bool {
+    MOE_MM_ID_SUPPORTED_TOPK.contains(&k)
+}
 
 /// Threadgroup-memory budget for the main matmul. NR0×NK halfs
 /// (sa = 4 KB) + NR1×NK halfs (sb = 2 KB) during the K-loop;
 /// reused as NR0×NR1 floats (8 KB) for the output stage. Max wins.
 const MOE_MM_ID_TG_MEM: NSUInteger = 8192;
-/// Threadgroup-memory budget for map0 — `n_experts × topk × u16`.
-/// For a3b: 256 × 8 × 2 = 4096 bytes. Hardcoded for the k=8 variant.
-const MOE_MM_ID_MAP0_TG_MEM: NSUInteger = 4096;
 /// Threads-per-threadgroup for the main matmul (4 simdgroups × 32).
 const MOE_MM_ID_THREADS: NSUInteger = 128;
 /// Output-row tile (must match `NR0` in `gather_mm_id.metal`).
@@ -478,8 +488,10 @@ pub struct Kernels {
     /// Slot vB (experimental) — staging-based SDPA.
     sdpa_vb: ComputePipelineState,
     /// MoE map0 pre-pass — `htpe[]` + `hids[][]` from per-token expert
-    /// indices. Top-k = 8 instantiation (`moeflux_mm_id_map0_k8`).
+    /// indices. One PSO per supported top-k (a3b: 8, a17b: 10);
+    /// `MoeIdMap0Call::encode` selects by the runtime `k`.
     moe_mm_id_map0_k8: ComputePipelineState,
+    moe_mm_id_map0_k10: ComputePipelineState,
     /// MoE one-dispatch gathered matmul (`moeflux_mm_id`). One PSO
     /// services gate, up, and down — args differ per call site.
     moe_mm_id: ComputePipelineState,
@@ -586,6 +598,7 @@ impl Kernels {
         // the dispatch site via `MoeIdMap0Call::encode`. The main
         // mm_id PSO needs at least 128 threads (4 simdgroups).
         let moe_mm_id_map0_k8 = build(MOE_MM_ID_MAP0_K8)?;
+        let moe_mm_id_map0_k10 = build(MOE_MM_ID_MAP0_K10)?;
         let moe_mm_id = build(MOE_MM_ID)?;
         let moe_combine_topk = build(MOE_COMBINE_TOPK)?;
 
@@ -600,6 +613,7 @@ impl Kernels {
             sdpa_gqa2_dd: build(SDPA_GQA2_DD)?,
             sdpa_vb: build(SDPA_VB)?,
             moe_mm_id_map0_k8,
+            moe_mm_id_map0_k10,
             moe_mm_id,
             moe_combine_topk,
         })
@@ -856,7 +870,8 @@ pub struct MoeIdMap0Call<'a> {
     pub hids_offset: u64,
     pub n_experts: u32,
     pub n_tokens: u32,
-    /// Top-k. Currently must equal [`MOE_MM_ID_TOPK`] = 8.
+    /// Top-k. Must be one of [`MOE_MM_ID_SUPPORTED_TOPK`] (selects the
+    /// map0 PSO); a3b routes 8, a17b routes 10.
     pub k: u32,
 }
 
@@ -896,7 +911,7 @@ pub struct MoeGatherIdCall<'a> {
     pub n_out: u32,
     pub n_experts: u32,
     pub n_tokens: u32,
-    /// Top-k (must equal [`MOE_MM_ID_TOPK`]).
+    /// Top-k (must be one of [`MOE_MM_ID_SUPPORTED_TOPK`]).
     pub k: u32,
     /// Activation broadcast dim. 1 for gate/up (no slot dim); k
     /// for down (per-slot activations).
@@ -947,11 +962,18 @@ impl KernelCall for MoeIdMap0Call<'_> {
         if self.n_tokens == 0 || self.n_experts == 0 {
             return;
         }
-        debug_assert_eq!(
-            self.k, MOE_MM_ID_TOPK,
-            "MoeIdMap0Call::k must equal MOE_MM_ID_TOPK ({} != {})",
-            self.k, MOE_MM_ID_TOPK
-        );
+        // map0 is the only compile-time-`k` kernel — pick the PSO whose
+        // `K_TOPK` matches this dispatch. The matmul + combine kernels
+        // are runtime-`k` and need no selection.
+        let map0_pso = match self.k {
+            8 => &kernels.moe_mm_id_map0_k8,
+            10 => &kernels.moe_mm_id_map0_k10,
+            other => panic!(
+                "MoeIdMap0Call: no map0 PSO for k={other}; supported: \
+                 {MOE_MM_ID_SUPPORTED_TOPK:?} (add a MOE_MM_ID_MAP0_K* \
+                 instantiation in gather_mm_id.metal)"
+            ),
+        };
 
         let args = MoeMmIdMap0Args {
             n_experts: self.n_experts as i32,
@@ -960,7 +982,7 @@ impl KernelCall for MoeIdMap0Call<'_> {
         };
 
         let enc = cmdbuf.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&kernels.moe_mm_id_map0_k8);
+        enc.set_compute_pipeline_state(map0_pso);
         enc.set_bytes(
             0,
             std::mem::size_of::<MoeMmIdMap0Args>() as NSUInteger,
@@ -969,7 +991,15 @@ impl KernelCall for MoeIdMap0Call<'_> {
         enc.set_buffer(1, Some(self.indices), self.indices_offset);
         enc.set_buffer(2, Some(self.htpe), self.htpe_offset);
         enc.set_buffer(3, Some(self.hids), self.hids_offset);
-        enc.set_threadgroup_memory_length(0, MOE_MM_ID_MAP0_TG_MEM);
+        // shmem = one threadgroup of `n_experts` threads, each writing
+        // `k` uint16_t slots: `n_experts × k × 2` bytes. (Was hardcoded
+        // for a3b's 256×8×2; now sized from the actual n_experts and k.)
+        let map0_tg_mem = (self.n_experts as usize)
+            .checked_mul(self.k as usize)
+            .and_then(|n| n.checked_mul(std::mem::size_of::<u16>()))
+            .expect("map0 threadgroup memory overflow")
+            as NSUInteger;
+        enc.set_threadgroup_memory_length(0, map0_tg_mem);
 
         // One threadgroup; one thread per expert.
         enc.dispatch_thread_groups(
@@ -985,10 +1015,13 @@ impl KernelCall for MoeGatherIdCall<'_> {
         if self.n_tokens == 0 || self.n_experts == 0 {
             return;
         }
-        debug_assert_eq!(
-            self.k, MOE_MM_ID_TOPK,
-            "MoeGatherIdCall::k must equal MOE_MM_ID_TOPK ({} != {})",
-            self.k, MOE_MM_ID_TOPK
+        // The matmul is runtime-`k` (it decodes hids via `id / args.k`,
+        // `id % args.k`); this only guards that map0 ran a matching PSO
+        // so the `token*k + slot` hids encoding is decodable.
+        debug_assert!(
+            moe_mm_id_supports_topk(self.k),
+            "MoeGatherIdCall::k={} unsupported; supported: {:?}",
+            self.k, MOE_MM_ID_SUPPORTED_TOPK
         );
 
         let args = MoeMmIdArgs {

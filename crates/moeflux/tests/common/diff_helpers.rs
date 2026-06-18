@@ -154,7 +154,6 @@ pub struct A3BPaths {
     pub manifest: PathBuf,
     pub vocab: PathBuf,
     pub root: PathBuf,
-    pub experts_per_tok: u32,
     pub use_2bit: bool,
 }
 
@@ -166,7 +165,6 @@ pub fn default_a3b_paths() -> A3BPaths {
         manifest: art.join("model_weights.json"),
         vocab: art.join("vocab.bin"),
         root,
-        experts_per_tok: 4,
         use_2bit: false,
     }
 }

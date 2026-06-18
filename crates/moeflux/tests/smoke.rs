@@ -39,7 +39,6 @@ fn rust_smoke_35b_a3b() {
         &art.join("model_weights.json"),
         &art.join("vocab.bin"),
         &root,
-        /* experts_per_tok */ 4,
         /* use_2bit */ false,
     )
     .expect("Ctx::open");
@@ -110,6 +109,6 @@ fn open_with_missing_files_fails_cleanly() {
     // Non-existent paths → mf_init_model returns NULL → Error::InitFailed.
     // Does not need a real model.
     let bogus = PathBuf::from("/nonexistent/moeflux/path");
-    let err = Ctx::open(&bogus, &bogus, &bogus, &bogus, 4, false).unwrap_err();
+    let err = Ctx::open(&bogus, &bogus, &bogus, &bogus, false).unwrap_err();
     assert!(matches!(err, Error::InitFailed));
 }

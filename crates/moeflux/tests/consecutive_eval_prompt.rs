@@ -72,7 +72,6 @@ fn open_ctx() -> Ctx {
         &art.join("model_weights.json"),
         &art.join("vocab.bin"),
         &root,
-        /* experts_per_tok */ 4,
         /* use_2bit */ false,
     )
     .expect("Ctx::open")

@@ -1026,6 +1026,14 @@ kernel void dequant_matvec_4bit_v3_experts(
     constant uint& num_row_tiles [[buffer(16)]],
     constant uint& k_active      [[buffer(17)]],
     constant uint& input_stride  [[buffer(18)]],
+    // Global index of the first expert in THIS dispatch. The kernel
+    // binds at most 8 expert blobs (blob0..blob7), so callers with
+    // k_active > 8 dispatch in chunks of <=8 experts, each chunk
+    // passing its own `expert_base` so the x/out indexing stays in the
+    // global [0, k) expert space. `expert_k` below is chunk-local
+    // (0..k_active for this dispatch); `expert_base + expert_k` is the
+    // global slot.
+    constant uint& expert_base   [[buffer(19)]],
     uint tgid_flat  [[threadgroup_position_in_grid]],
     uint lid        [[thread_position_in_threadgroup]],
     uint simd_lane  [[thread_index_in_simdgroup]],
@@ -1053,9 +1061,11 @@ kernel void dequant_matvec_4bit_v3_experts(
     uint packed_cols = in_dim / 8;
     uint num_groups  = in_dim / group_size;
 
-    // Cache this expert's input slice
+    // Cache this expert's input slice. `input_stride == 0` broadcasts
+    // one shared input across experts (gate/up); otherwise it's the
+    // per-expert row pitch (down). Index in the global expert space.
     threadgroup float x_shared[4096];
-    device const float* x_k = x + expert_k * input_stride;
+    device const float* x_k = x + (expert_base + expert_k) * input_stride;
     for (uint i = lid; i < in_dim; i += 256) {
         x_shared[i] = x_k[i];
     }
@@ -1100,7 +1110,7 @@ kernel void dequant_matvec_4bit_v3_experts(
 
     float sum = simd_sum(acc);
     if (simd_lane == 0) {
-        out[expert_k * out_dim + row] = sum;
+        out[(expert_base + expert_k) * out_dim + row] = sum;
     }
 }
 

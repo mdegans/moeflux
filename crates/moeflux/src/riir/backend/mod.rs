@@ -615,7 +615,8 @@ pub enum Op {
         down_mid: BufId<DownMidBuf>,
         n_tokens: u32,
         n_experts: u32,
-        /// Top-k. Must equal `moeflux_metal::MOE_MM_ID_TOPK` (= 8 for a3b).
+        /// Top-k. Must be one of `moeflux_metal::MOE_MM_ID_SUPPORTED_TOPK`
+        /// (a3b routes 8, a17b routes 10).
         k: u32,
     },
 

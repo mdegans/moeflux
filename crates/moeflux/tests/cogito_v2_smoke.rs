@@ -38,7 +38,6 @@ fn cogito_v2_eval_token_smoke() -> Result<(), Error> {
         // blallama, not moeflux.
         &PathBuf::from(ROOT).join("mlx/tokenizer.json"),
         &PathBuf::from(ROOT).join("root"),
-        /* experts_per_tok = */ 8,
         /* use_2bit       = */ false,
     )?;
 
@@ -102,7 +101,6 @@ fn cogito_v2_eval_token_warm() -> Result<(), Error> {
         &art("model_weights.json"),
         &PathBuf::from(ROOT).join("mlx/tokenizer.json"),
         &PathBuf::from(ROOT).join("root"),
-        /* experts_per_tok = */ 8,
         /* use_2bit       = */ false,
     )?;
 
