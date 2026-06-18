@@ -128,14 +128,24 @@ mode gate).
 4. **Profile per-token decode**: GPU command-buffer time vs IO-wait — is the
    idle GPU IO-bound (disk) or dispatch-overhead-bound?
 
-## Publish status: ON HOLD
-- Target `0.1.0-pre.4` (bump workspace `Cargo.toml:9` + `moeflux`'s
-  `moeflux-metal` dep; publish `-p moeflux-metal` then `-p moeflux`). **Not
-  done** — holding on the decode regression (don't ship a17b 8× slower). The
-  a3b portion is green & publishable; decide next session whether to publish
-  with a known-issue note or fix first.
-- **Loose ends to clean up:** drama_llama has a **TEMP `[patch.crates-io]
-  moeflux = { path = local }`** in its `Cargo.toml` (added for local k=10
-  validation) — REMOVE at/before publish. drama_llama's call-site edits
-  (experts_per_tok removal) are uncommitted and depend on the unpublished
-  moeflux API.
+## Publish status: SHIPPED (2026-06-18) — `0.1.0-pre.4`
+
+`moeflux-metal` + `moeflux` **v0.1.0-pre.4 published to crates.io**.
+main pushed (`f2d1c9b`), tag `v0.1.0-pre.4` pushed. Contains: a17b k=10,
+the Pread CPU-SDPA decode fix (0.20→1.29 tok/s), and honestly-fallible
+buffer alloc. Publish needs `moeflux` with `--no-verify` — the crate
+`compile_error!`s without exactly one `model-*` feature, so crates.io's
+default-feature verify build can't compile it (this is expected; the code
+is validated with features locally). Workspace version is at
+`Cargo.toml:9` (`version.workspace = true` in both crates); the
+`moeflux→moeflux-metal` dep is pinned `=<version>` in
+`crates/moeflux/Cargo.toml`. Publish order: `-p moeflux-metal` then
+`-p moeflux --no-verify`.
+
+- **Remaining loose end (drama_llama, not moeflux):** drama_llama still has
+  the **TEMP `[patch.crates-io] moeflux = { path = local }`** in its
+  `Cargo.toml` + uncommitted call-site edits (experts_per_tok removal).
+  Now that pre.4 is published with the k=10 API, drama_llama should drop
+  the patch, bump its moeflux dep to `=0.1.0-pre.4`, and commit the
+  call-site edits. (Left for the downstream repo; the local patch is
+  harmless for dev benches in the meantime.)
