@@ -83,6 +83,14 @@ pub enum GraphError {
     /// forcing this module to depend on backend-specific symbols.
     #[error("backend error: {0}")]
     Backend(Box<dyn std::error::Error + Send + Sync + 'static>),
+    /// A device buffer allocation returned nil. On Metal,
+    /// `newBufferWithLength:` yields nil when the device is out of
+    /// memory or the request exceeds the working-set budget (e.g. many
+    /// model contexts at once). Surfaced here instead of dereferencing
+    /// the null buffer — the eager zero-fill / `contents()` use would
+    /// otherwise SIGSEGV.
+    #[error("device buffer allocation failed for {label:?}: {bytes} bytes (out of device memory?)")]
+    AllocFailed { label: &'static str, bytes: usize },
 }
 
 /// Backend-specific buffer pool.
@@ -177,7 +185,12 @@ pub trait BufferPool {
     ///   at — survive [`Self::reset_transient`]. A run-lifetime
     ///   scratch set is therefore allocated `persistent = false`,
     ///   `commit_plan`'d once, and thereafter behaves as persistent.
-    fn commit_plan(&mut self, _graph: &Graph) {}
+    ///
+    /// Returns [`GraphError::AllocFailed`] if a backing buffer
+    /// allocation fails (device out of memory).
+    fn commit_plan(&mut self, _graph: &Graph) -> Result<(), GraphError> {
+        Ok(())
+    }
 }
 
 /// Backend trait. Owns the device / executor + pool + pipeline /

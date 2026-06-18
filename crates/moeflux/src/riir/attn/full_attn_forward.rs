@@ -956,7 +956,7 @@ where
     // First call lifetime-colors graph1's transients (topology is
     // layer- and step-invariant); then latch.
     if !scratch.commit_planned.get() {
-        backend.pool_mut().commit_plan(&graph);
+        backend.pool_mut().commit_plan(&graph)?;
         scratch.commit_planned.set(true);
     }
     backend.execute(&graph, "graph_full_attn")?;

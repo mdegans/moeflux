@@ -164,6 +164,31 @@ impl MetalBufferPool {
     pub fn as_mut_slices_u8<B: Buf, const N: usize>(&self, ids: [BufId<B>; N]) -> [&mut [u8]; N] {
         ids.map(|id| self.as_mut_slice_u8(id))
     }
+
+    /// Allocate a zero-filled `StorageModeShared` buffer, or
+    /// [`GraphError::AllocFailed`] if the device returns nil (out of
+    /// device memory / over the working-set budget). `metal::Device::
+    /// new_buffer` is infallible at the Rust level — a nil from
+    /// `newBufferWithLength:` becomes a null-wrapping `Buffer` — so we
+    /// detect it via `contents()`. This matters because the zero-fill
+    /// below eagerly touches every page: a null buffer would SIGSEGV
+    /// here (the cause of the parallel-test crash — many model contexts
+    /// over-committing RAM) instead of surfacing a recoverable error.
+    fn new_shared_zeroed(&self, bytes: usize, label: &'static str) -> Result<Buffer, GraphError> {
+        let buf = self
+            .device
+            .new_buffer(bytes as NSUInteger, MTLResourceOptions::StorageModeShared);
+        if bytes > 0 && buf.contents().is_null() {
+            return Err(GraphError::AllocFailed { label, bytes });
+        }
+        // Zero on alloc so encoders that assume a clean slot don't
+        // read stale memory. Matches the CPU pool's vec![0u8; bytes]
+        // behaviour.
+        unsafe {
+            std::ptr::write_bytes(buf.contents() as *mut u8, 0, bytes);
+        }
+        Ok(buf)
+    }
 }
 
 impl BufferPool for MetalBufferPool {
@@ -178,15 +203,7 @@ impl BufferPool for MetalBufferPool {
     ) -> Result<BufId<B>, GraphError> {
         let id: BufId<B> = BufId::from_raw(self.bufid_to_physical.len() as u32);
         let physical = self.buffers.len() as u32;
-        let buf = self
-            .device
-            .new_buffer(bytes as NSUInteger, MTLResourceOptions::StorageModeShared);
-        // Zero on alloc so encoders that assume a clean slot don't
-        // read stale memory. Matches the CPU pool's vec![0u8; bytes]
-        // behaviour.
-        unsafe {
-            std::ptr::write_bytes(buf.contents() as *mut u8, 0, bytes);
-        }
+        let buf = self.new_shared_zeroed(bytes, label)?;
         self.buffers.push(buf);
         self.labels.push(label);
         self.persistent.push(persistent);
@@ -307,7 +324,7 @@ impl BufferPool for MetalBufferPool {
             .unwrap_or("<bad-bufid>")
     }
 
-    fn commit_plan(&mut self, graph: &Graph) {
+    fn commit_plan(&mut self, graph: &Graph) -> Result<(), GraphError> {
         use super::lifetime::{ColorId, analyze_lifetimes, greedy_color};
         use std::collections::HashMap;
 
@@ -372,13 +389,7 @@ impl BufferPool for MetalBufferPool {
             if max_size == 0 {
                 continue;
             }
-            let buf = self.device.new_buffer(
-                max_size as NSUInteger,
-                MTLResourceOptions::StorageModeShared,
-            );
-            unsafe {
-                std::ptr::write_bytes(buf.contents() as *mut u8, 0, max_size);
-            }
+            let buf = self.new_shared_zeroed(max_size, "commit_plan.color")?;
             color_to_physical.insert(color, new_buffers.len() as u32);
             new_buffers.push(buf);
         }
@@ -398,6 +409,7 @@ impl BufferPool for MetalBufferPool {
         for buf in aliasable.keys() {
             self.persistent[*buf as usize] = true;
         }
+        Ok(())
     }
 }
 

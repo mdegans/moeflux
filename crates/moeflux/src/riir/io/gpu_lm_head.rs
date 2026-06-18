@@ -92,6 +92,13 @@ impl GpuLmHead {
             (v.vocab_size * std::mem::size_of::<f32>()) as NSUInteger,
             MTLResourceOptions::StorageModeShared,
         );
+        // Guard the infallible allocs: a nil buffer (device OOM) would
+        // SIGSEGV on the later host readback of logits rather than fail
+        // attributably.
+        assert!(
+            !input_buf.contents().is_null() && !logits_buf.contents().is_null(),
+            "lm_head buffer allocation failed (out of device memory?)"
+        );
 
         let w_off = wf_buf
             .tensor_offset(wf, "lm_head.weight")?

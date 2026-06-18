@@ -2662,7 +2662,7 @@ where
     // step-invariant, so one pass holds for the whole run. graph2 has
     // its own latch on `moe` (prefill-arc Phase 3 split the latches).
     if !scratch.commit_planned.get() {
-        backend.pool_mut().commit_plan(&graph);
+        backend.pool_mut().commit_plan(&graph)?;
         scratch.commit_planned.set(true);
     }
     // Submit + wait. Single cmdbuf, single commit (the S7-1a fusion
@@ -3036,7 +3036,7 @@ where
     // S10b-2 Phase 4: color graph2's transients on the first call,
     // then latch — `commit_plan` runs exactly once per run.
     if !moe.commit_planned.get() {
-        backend.pool_mut().commit_plan(&graph2);
+        backend.pool_mut().commit_plan(&graph2)?;
         moe.commit_planned.set(true);
     }
     backend.execute(&graph2, "graph_moe")?;

@@ -89,10 +89,25 @@ impl KvCache {
         let device = pool.device().clone();
         if self.k_id.is_none() {
             let buf = device.new_buffer(bytes as NSUInteger, MTLResourceOptions::StorageModeShared);
+            // `new_buffer` is infallible at the Rust level: a nil from
+            // `newBufferWithLength:` (device OOM / over working-set
+            // budget) becomes a null-wrapping `Buffer`, and the later
+            // `contents()` deref (KV append / SDPA) would SIGSEGV. Fail
+            // with an attributable message instead. (This path's
+            // signature isn't fallible; the pool's `new_shared_zeroed`
+            // returns `GraphError::AllocFailed` for the recoverable case.)
+            assert!(
+                !buf.contents().is_null(),
+                "kv.k_cache allocation failed: {bytes} bytes (out of device memory?)"
+            );
             self.k_id = Some(pool.register_borrowed(buf, bytes, "kv.k_cache", true));
         }
         if self.v_id.is_none() {
             let buf = device.new_buffer(bytes as NSUInteger, MTLResourceOptions::StorageModeShared);
+            assert!(
+                !buf.contents().is_null(),
+                "kv.v_cache allocation failed: {bytes} bytes (out of device memory?)"
+            );
             self.v_id = Some(pool.register_borrowed(buf, bytes, "kv.v_cache", true));
         }
     }
@@ -260,12 +275,22 @@ impl MlaKvCacheGpu {
             let bytes =
                 (MAX_SEQ_LEN * VARIANT.kv_lora_rank * std::mem::size_of::<f32>()) as NSUInteger;
             let buf = device.new_buffer(bytes, MTLResourceOptions::StorageModeShared);
+            // See the Gqa KV note above: guard the infallible alloc so a
+            // nil buffer fails attributably instead of a later SIGSEGV.
+            assert!(
+                !buf.contents().is_null(),
+                "mla.latent_cache allocation failed: {bytes} bytes (out of device memory?)"
+            );
             self.latent_cache = Some(buf);
         }
         if self.rope_k_cache.is_none() {
             let bytes =
                 (MAX_SEQ_LEN * VARIANT.qk_rope_head_dim * std::mem::size_of::<f32>()) as NSUInteger;
             let buf = device.new_buffer(bytes, MTLResourceOptions::StorageModeShared);
+            assert!(
+                !buf.contents().is_null(),
+                "mla.rope_k_cache allocation failed: {bytes} bytes (out of device memory?)"
+            );
             self.rope_k_cache = Some(buf);
         }
     }

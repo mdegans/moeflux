@@ -198,7 +198,7 @@ impl BufferPool for CpuBufferPool {
             .unwrap_or("<bad-bufid>")
     }
 
-    fn commit_plan(&mut self, graph: &Graph) {
+    fn commit_plan(&mut self, graph: &Graph) -> Result<(), GraphError> {
         use super::lifetime::{ColorId, analyze_lifetimes, greedy_color};
         use std::collections::HashMap;
 
@@ -280,6 +280,7 @@ impl BufferPool for CpuBufferPool {
         for buf in aliasable.keys() {
             self.persistent[*buf as usize] = true;
         }
+        Ok(())
     }
 }
 

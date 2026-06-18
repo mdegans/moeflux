@@ -50,6 +50,14 @@ impl DenseMlpBuffers {
                 (n * std::mem::size_of::<f32>()) as NSUInteger,
                 MTLResourceOptions::StorageModeShared,
             );
+            // Guard the infallible alloc: the zero-fill below derefs
+            // `contents()`, which is null if `new_buffer` failed (device
+            // OOM) — SIGSEGV otherwise.
+            assert!(
+                n == 0 || !b.contents().is_null(),
+                "dense-MLP buffer allocation failed: {} bytes (out of device memory?)",
+                n * std::mem::size_of::<f32>()
+            );
             // SAFETY: shared storage, no GPU work in flight on a fresh buffer.
             unsafe {
                 std::ptr::write_bytes(b.contents() as *mut u8, 0, n * std::mem::size_of::<f32>());
