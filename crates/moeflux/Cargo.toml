@@ -34,6 +34,6 @@ static_assertions = { workspace = true }
 sysinfo     = { workspace = true }
 # Vendored, MLX-derived Metal kernels — the tiled quantized GEMM that
 # replaces the memory-bound 4-bit dequant matvec.
-moeflux-metal = { version = "=0.1.0-pre.3", path = "../moeflux-metal" }
+moeflux-metal = { version = "=0.1.0-pre.4", path = "../moeflux-metal" }
 
 [dev-dependencies]
